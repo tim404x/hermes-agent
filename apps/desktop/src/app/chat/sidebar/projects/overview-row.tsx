@@ -10,6 +10,7 @@ import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
 import { $sidebarShowAllSessions } from '@/store/layout'
 import { fetchProjectSessions, projectProfile } from '@/store/projects'
+import { $sessionListDensity } from '@/store/session-list-density'
 
 import {
   SIDEBAR_LEAD_ICON_SIZE,
@@ -28,7 +29,9 @@ import { shellOwnsPress } from '../reorderable-list'
 import {
   expandedProjectSessions,
   latestProjectSessions,
+  previewWindowMaxHeight,
   PROJECT_PREVIEW_COUNT,
+  PROJECT_PREVIEW_LOADED,
   PROJECT_SESSION_PAGE,
   useRevealedRows,
   useWorkspaceNodeOpen
@@ -121,18 +124,20 @@ export function ProjectOverviewRow({
 }: ProjectOverviewRowProps) {
   const { t } = useI18n()
   const s = t.sidebar
+  const density = useStore($sessionListDensity)
   const isActive = project.id === activeProjectId
   const [open, toggleOpen] = useWorkspaceNodeOpen(project.id)
   // The appearance popover anchors here (the full row) so it opens flush with
   // the sidebar's content edge regardless of which side the sidebar is on.
   const rowRef = useRef<HTMLDivElement>(null)
   const showAllSessions = useStore($sidebarShowAllSessions)
-  // The tree payload previews only the most-recent few sessions per project
-  // (kept light on purpose); "Show all" hydrates THIS project's lanes on demand
-  // rather than widening every project's preview window.
+  // The tree payload previews PROJECT_PREVIEW_LOADED sessions per project (kept
+  // light on purpose, and scrolled in place below the fold); "Show all" hydrates
+  // THIS project's remaining lanes on demand rather than widening every
+  // project's preview payload.
   const [expanded, setExpanded] = useState<SidebarProjectTree | null>(null)
   const [expanding, setExpanding] = useState(false)
-  const limit = showAllSessions || expanded ? Infinity : PROJECT_PREVIEW_COUNT
+  const limit = showAllSessions || expanded ? Infinity : PROJECT_PREVIEW_LOADED
   const fetched = (previewSessions ?? []).slice(0, limit)
   const recent = fetched.length ? fetched : latestProjectSessions(project, limit)
   // The hydrated lanes come straight from the backend, so — like the drill-in
@@ -140,12 +145,17 @@ export function ProjectOverviewRow({
   const visible = expanded && isSessionHidden ? excludeProjectSessions(expanded, isSessionHidden) : expanded
   const preview = renderRows ? (visible ? expandedProjectSessions(recent, visible) : recent) : []
   // Once hydrated, the whole project is reachable but mounts a page at a time
-  // (a project can hold thousands of chats; the collapsed preview stays 3).
+  // (a project can hold thousands of chats; the collapsed preview still holds
+  // PROJECT_PREVIEW_LOADED and shows three of them).
   const page = useRevealedRows(preview, PROJECT_SESSION_PAGE)
   const rows = expanded ? page.shown : preview
   const total = project.sessionCount - hiddenSessionCount
   const hiddenCount = total - preview.length
   const offerShowAll = !showAllSessions && !expanded && preview.length > 0 && hiddenCount > 0
+  // Past three rows the preview stops growing and starts scrolling: the glance
+  // keeps its height, and the rest of the loaded chats are a wheel away instead
+  // of behind a drill-in.
+  const previewScrolls = preview.length > PROJECT_PREVIEW_COUNT
 
   const showAll = () => {
     // All-profiles view has no single backend to ask for one project's lanes;
@@ -278,7 +288,19 @@ export function ProjectOverviewRow({
         </ProjectContextMenu>
       )}
       {open && preview.length > 0 && (
-        <SidebarRowNest>
+        <SidebarRowNest
+          // The window is defined in ROWS, so its height is measured from the
+          // active density rather than hardcoded. Only scrolls once there is
+          // something past the third row — a two-chat project renders exactly
+          // as it always did, no scroller, no reserved gutter.
+          //
+          // NO `overscroll-contain` here: this scroller is nested inside the
+          // sidebar's own (index.tsx SCROLL_Y). Containing overscroll swallows
+          // the wheel at this list's ends instead of chaining it out to the
+          // sidebar — the same dead-zone the virtualized list hit in #84964.
+          className={cn(previewScrolls && 'scrollbar-fade overflow-y-auto overflow-x-hidden')}
+          style={previewScrolls ? { maxHeight: previewWindowMaxHeight(density) } : undefined}
+        >
           {renderRows?.(rows)}
           {offerShowAll && (
             <WorkspaceShowMoreRow disabled={expanding} label={s.projects.showAllCount(total)} onClick={showAll} />
