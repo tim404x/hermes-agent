@@ -2342,6 +2342,7 @@ export const jaOverrides = {
     review: 'レビュー',
     logs: 'ログ',
     cronJobs: 'Cronジョブ',
+    ungrouped: 'グループなし',
     groupAriaGrouped: 'セッションを単一リストとして表示',
     groupAriaUngrouped: 'ワークスペースごとにセッションをグループ化',
     showProjects: 'プロジェクトを表示',
