@@ -31,6 +31,7 @@ export const SIDEBAR_FILTERED_PAGE_SIZE = 300
 const SIDEBAR_PINNED_STORAGE_KEY = 'hermes.desktop.pinnedSessions'
 const SIDEBAR_AGENTS_GROUPED_STORAGE_KEY = 'hermes.desktop.agentsGroupedByWorkspace'
 const SIDEBAR_CRON_OPEN_STORAGE_KEY = 'hermes.desktop.sidebarCronOpen'
+const SIDEBAR_UNGROUPED_OPEN_STORAGE_KEY = 'hermes.desktop.sidebarUngroupedOpen'
 const SIDEBAR_MESSAGING_OPEN_STORAGE_KEY = 'hermes.desktop.sidebarMessagingOpen'
 const SIDEBAR_SESSION_ORDER_STORAGE_KEY = 'hermes.desktop.sessionOrder'
 const SIDEBAR_SESSION_ORDER_MANUAL_STORAGE_KEY = 'hermes.desktop.sessionOrder.manual'
@@ -208,6 +209,11 @@ export const $dismissedWorktreeIds = persistentAtom(
 )
 export const $sidebarPinsOpen = atom(true)
 export const $sidebarRecentsOpen = atom(true)
+// The flat recents list that hangs BELOW the project overview while the sidebar
+// is grouped by project ("Ungrouped"). Persisted and open by default: it is the
+// list you were already looking at before you switched to Projects, so hiding
+// it on first paint would read as sessions having gone missing.
+export const $sidebarUngroupedOpen = persistentAtom(SIDEBAR_UNGROUPED_OPEN_STORAGE_KEY, true, Codecs.bool)
 // Cron-job sessions live in their own section below recents, collapsed by
 // default (it only renders at all when cron sessions exist) so the
 // scheduler's `[IMPORTANT: …]` first-message previews don't spam recents.
@@ -582,6 +588,10 @@ export function setSidebarRecentsOpen(open: boolean) {
 
 export function setSidebarCronOpen(open: boolean) {
   $sidebarCronOpen.set(open)
+}
+
+export function setSidebarUngroupedOpen(open: boolean) {
+  $sidebarUngroupedOpen.set(open)
 }
 
 export function toggleSidebarMessagingOpen(sourceId: string) {

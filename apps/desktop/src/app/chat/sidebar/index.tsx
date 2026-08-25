@@ -54,6 +54,7 @@ import {
   $sidebarSessionOrderManual,
   $sidebarShowArchived,
   $sidebarStatusFilter,
+  $sidebarUngroupedOpen,
   $sidebarWorkspaceOrderIds,
   $sidebarWorkspaceParentOrderIds,
   filterVisibleProjects,
@@ -66,6 +67,7 @@ import {
   setSidebarRecentsOpen,
   setSidebarSessionOrderIds,
   setSidebarSessionOrderManual,
+  setSidebarUngroupedOpen,
   setSidebarWorkspaceOrderIds,
   setSidebarWorkspaceParentOrderIds,
   SIDEBAR_SESSIONS_PAGE_SIZE,
@@ -157,7 +159,7 @@ import {
   orderProjectsByIds,
   overlayLiveLanes,
   overlayLivePreviews,
-  PROJECT_PREVIEW_COUNT,
+  PROJECT_PREVIEW_LOADED,
   ProjectBackRow,
   ProjectMenu,
   projectTreeCwd,
@@ -376,6 +378,7 @@ export function ChatSidebar({
   const pinsOpen = useStore($sidebarPinsOpen)
   const agentsOpen = useStore($sidebarRecentsOpen)
   const cronOpen = useStore($sidebarCronOpen)
+  const ungroupedOpen = useStore($sidebarUngroupedOpen)
   // The sidebar highlight tracks the FOCUSED session — the interacted tile's
   // tab, else the main selection — so it stays 1:1 with whatever tab is active.
   const selectedSessionId = useStore($focusedStoredSessionId)
@@ -1125,7 +1128,7 @@ export function ChatSidebar({
   // matching the flat Recents list. Keyed by project id for the rows.
   const overviewPreviews = useMemo<Record<string, SessionInfo[]>>(
     () =>
-      overlayLivePreviews(projectOverview ?? [], agentSessions, projects, PROJECT_PREVIEW_COUNT, {
+      overlayLivePreviews(projectOverview ?? [], agentSessions, projects, PROJECT_PREVIEW_LOADED, {
         removed: removedSessionIds,
         // Rank before the trim, so "3 priciest in this project" isn't "3 most
         // recent, priciest first".
@@ -1160,6 +1163,13 @@ export function ChatSidebar({
     projectTreeLoading &&
     !projectOverview?.length &&
     !(inProject && (enteredProject?.sessionCount ?? 0) > 0)
+
+  // "Ungrouped" is the flat recents list kept below the project OVERVIEW, so
+  // switching to Projects groups your work without taking away the plain
+  // chronological list. It's an overview companion only: inside a project the
+  // section above already IS a session list, and a second one under it would
+  // just be the same rows twice.
+  const showUngroupedRecents = worktreeGroupingActive && !inProject && !projectsSkeletonVisible
 
   const runKeyedLoad = useCallback(
     (
@@ -1842,9 +1852,91 @@ export function ChatSidebar({
                 removedSessionIds={inProject ? removedSessionIds : undefined}
                 rootClassName={cn(
                   'min-h-32 flex-1 overflow-hidden p-0',
-                  !recentsVirtualizes && 'compact:min-h-0 compact:flex-none compact:overflow-visible'
+                  !recentsVirtualizes && 'compact:min-h-0 compact:flex-none compact:overflow-visible',
+                  // With Ungrouped underneath, the project list stops being the
+                  // whole pane and takes a little over half of it, scrolling in
+                  // place (its content already owns a scroller). Without the
+                  // cap, flex-1 on both leaves the recents list a two-row slit
+                  // on a tall project list.
+                  showUngroupedRecents && 'max-h-[55%] flex-none compact:max-h-none'
                 )}
                 sessions={displayAgentSessions}
+                sortable={!showAllProfiles && agentSessions.length > 1}
+              />
+            )}
+
+            {/* "Ungrouped": the flat recents list, kept underneath the project
+                overview so grouping by project doesn't cost you the plain
+                chronological list you were just reading. Overview only — once
+                you enter a project, the section above IS that project's
+                content and owns the whole pane. */}
+            {!trimmedQuery && showUngroupedRecents && (
+              <SidebarSessionsSection
+                activeSessionId={activeSidebarSessionId}
+                card={cardRows}
+                contentClassName={cn('flex min-h-0 flex-1 flex-col gap-px pb-1.75', SCROLL_Y, COMPACT_FLAT)}
+                dndSensors={dndSensors}
+                emptyState={
+                  showSessionSkeletons ? (
+                    <SidebarSessionSkeletons />
+                  ) : (
+                    <div className="grid min-h-16 place-items-center rounded-lg px-2 text-center text-xs text-(--ui-text-tertiary)">
+                      {filtersActive ? s.noFilterMatches : pinnedSessions.length > 0 ? s.allPinned : s.noSessions}
+                    </div>
+                  )
+                }
+                footer={
+                  // The projects section above can't page: its rows are a
+                  // backend tree, not a window over recents. This list IS that
+                  // window, so it carries the pagination the flat view has.
+                  !showSessionSkeletons && hasMoreSessions ? (
+                    <SidebarLoadMoreRow
+                      loading={sessionsLoading || recentsLoadMorePending}
+                      onClick={() => void onLoadMoreRecents()}
+                      step={0}
+                    />
+                  ) : null
+                }
+                forceEmptyState={showSessionSkeletons}
+                // `grouping` reads 'project' for the whole view while the tree
+                // is on, so the status/date choice isn't legible here — this
+                // list is chronological, the way recents always are, unless a
+                // magnitude sort has ranked it globally.
+                grouping={rankedGlobally ? 'none' : 'date'}
+                headerAction={
+                  <div className="flex shrink-0 items-center gap-0.5">
+                    <Tip label={s.nav['new-session']}>
+                      <Button
+                        aria-label={s.nav['new-session']}
+                        className={HEADER_ACTION_BTN}
+                        onClick={event => {
+                          event.stopPropagation()
+                          onNewSessionInWorkspace(null)
+                        }}
+                        size="icon-xs"
+                        variant="ghost"
+                      >
+                        <Codicon name="add" size="0.75rem" />
+                      </Button>
+                    </Tip>
+                  </div>
+                }
+                label={s.ungrouped}
+                manualOrderIds={agentOrderManual ? agentOrderIds : sortOrderIds}
+                onArchiveSession={onArchiveSession}
+                onBranchSession={onBranchSession}
+                onDeleteSession={onDeleteSession}
+                onNewSessionInWorkspace={onNewSessionInWorkspace}
+                onReorderSessions={showAllProfiles ? undefined : reorderSessions}
+                onResumeSession={onResumeSession}
+                onToggle={() => setSidebarUngroupedOpen(!ungroupedOpen)}
+                onTogglePin={pinSession}
+                onToggleUnread={toggleUnread}
+                open={ungroupedOpen}
+                pinned={false}
+                rootClassName="flex min-h-24 flex-1 flex-col overflow-hidden p-0 compact:min-h-0 compact:flex-none compact:overflow-visible"
+                sessions={displayAgentSessions}
+                showProfileTags={showAllProfiles}
                 sortable={!showAllProfiles && agentSessions.length > 1}
               />
             )}

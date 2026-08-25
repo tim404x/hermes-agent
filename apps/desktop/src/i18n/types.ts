@@ -1979,6 +1979,7 @@ export interface Translations {
     pinned: string
     sessions: string
     cronJobs: string
+    ungrouped: string
     groupAriaGrouped: string
     groupAriaUngrouped: string
     showProjects: string
