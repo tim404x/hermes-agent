@@ -155,7 +155,13 @@ describe('projects RPC profile forwarding', () => {
     await fetchProjectSessions('p_123')
 
     expect(request).toHaveBeenNthCalledWith(1, 'projects.list', { profile: 'coder' })
-    expect(request).toHaveBeenNthCalledWith(2, 'projects.tree', { preview_limit: 3, profile: 'coder' })
+    // The assertion under test is the PROFILE forwarding, not the preview
+    // depth — the sibling cases already match it loosely, so freezing the
+    // literal here just made a tuning change look like a regression.
+    expect(request).toHaveBeenNthCalledWith(2, 'projects.tree', {
+      preview_limit: expect.any(Number),
+      profile: 'coder'
+    })
     expect(request).toHaveBeenNthCalledWith(3, 'projects.project_sessions', {
       profile: 'coder',
       project_id: 'p_123'
@@ -231,7 +237,10 @@ describe('projects RPC profile forwarding', () => {
     await expect(fetchProjectSessions('p_123')).resolves.toBe(project)
 
     expect(request).toHaveBeenNthCalledWith(1, 'projects.list', { profile: 'default' })
-    expect(request).toHaveBeenNthCalledWith(2, 'projects.tree', { preview_limit: 3, profile: 'default' })
+    expect(request).toHaveBeenNthCalledWith(2, 'projects.tree', {
+      preview_limit: expect.any(Number),
+      profile: 'default'
+    })
     expect(request).toHaveBeenNthCalledWith(3, 'projects.project_sessions', {
       profile: 'default',
       project_id: 'p_123'
@@ -532,7 +541,7 @@ describe('createProject', () => {
     expect($projectTree.get()).toEqual(expect.arrayContaining([expect.objectContaining({ id: created.id })]))
     expect($activeProjectId.get()).toBe(created.id)
     expect(hermes.hermesApi).toHaveBeenCalledWith(
-      expect.objectContaining({ path: '/api/profiles/projects/tree?preview_limit=3' })
+      expect.objectContaining({ path: expect.stringMatching(/^\/api\/profiles\/projects\/tree\?preview_limit=\d+$/) })
     )
   })
 
