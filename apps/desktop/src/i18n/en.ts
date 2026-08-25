@@ -3562,6 +3562,7 @@ export const en: Translations = {
     review: 'Review',
     logs: 'Logs',
     cronJobs: 'Cron jobs',
+    ungrouped: 'Ungrouped',
     groupAriaGrouped: 'Show sessions as a single list',
     groupAriaUngrouped: 'Group sessions by workspace',
     showProjects: 'Show projects',

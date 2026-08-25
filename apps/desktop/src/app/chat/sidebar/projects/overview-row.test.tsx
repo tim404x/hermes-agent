@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo } from '@/hermes'
 import type * as ProjectsStore from '@/store/projects'
@@ -43,10 +43,13 @@ vi.mock('@/store/projects', async importOriginal => ({
 }))
 
 // Keep the pure helpers real (they are the logic under test); stub only the
-// persisted open/collapse hook and the in-memory fallback preview.
+// persisted open/collapse hook, the in-memory fallback preview, and the
+// density-measured window height — so the preview-window cases can assert a
+// fixed px maxHeight without depending on the active density.
 vi.mock('./model', async () => ({
   ...(await vi.importActual<typeof Model>('./model')),
   latestProjectSessions: () => [],
+  previewWindowMaxHeight: () => '86px',
   useWorkspaceNodeOpen: () => [workspaceOpen.value, vi.fn()]
 }))
 
@@ -179,5 +182,57 @@ describe('ProjectOverviewRow', () => {
     fireEvent.click(screen.getByRole('button', { name: 'New session in Home' }))
 
     expect(onNewSession).toHaveBeenCalledWith(null)
+  })
+
+  describe('preview window', () => {
+    const sessions = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `s${i}` }) as unknown as SessionInfo)
+
+    // The nest is the only element that carries both rows and a maxHeight.
+    const nest = (container: HTMLElement) => container.querySelector<HTMLElement>('[style*="max-height"]')
+
+    beforeEach(() => {
+      workspaceOpen.value = true
+    })
+
+    afterEach(() => {
+      workspaceOpen.value = false
+    })
+
+    it('renders every loaded preview row, not just the three that fit', () => {
+      const renderRows = vi.fn((_rows: SessionInfo[]) => null)
+
+      render(<ProjectOverviewRow previewSessions={sessions(8)} project={project} renderRows={renderRows} />)
+
+      expect(renderRows.mock.calls.at(-1)?.[0]).toHaveLength(8)
+    })
+
+    it('caps the preview at a fixed window and scrolls it once past three rows', () => {
+      const { container } = render(
+        <ProjectOverviewRow previewSessions={sessions(8)} project={project} renderRows={() => null} />
+      )
+
+      const window = nest(container)
+      expect(window).toBeTruthy()
+      expect(window?.style.maxHeight).toBe('86px')
+      expect(window?.className).toContain('overflow-y-auto')
+    })
+
+    it('leaves a short preview unbounded — no window, no scroller', () => {
+      const { container } = render(
+        <ProjectOverviewRow previewSessions={sessions(3)} project={project} renderRows={() => null} />
+      )
+
+      expect(nest(container)).toBeNull()
+    })
+
+    it('never traps the wheel: the window must not contain its overscroll', () => {
+      // The nest sits INSIDE the sidebar's own scroller — containing overscroll
+      // here kills wheel chaining at the list's ends (#84964).
+      const { container } = render(
+        <ProjectOverviewRow previewSessions={sessions(8)} project={project} renderRows={() => null} />
+      )
+
+      expect(nest(container)?.className).not.toContain('overscroll-contain')
+    })
   })
 })
