@@ -397,9 +397,14 @@ interface ProjectTreePayload {
   scoped_session_ids: string[]
 }
 
-// Expanded previews need the complete existing tree window before the renderer
-// finds its two recency groups. Keep the normal three-row payload unchanged.
-const projectTreePreviewLimit = () => ($sidebarShowAllSessions.get() ? 2000 : 3)
+// How many recent sessions each project carries in the overview payload. The
+// sidebar SHOWS three (PROJECT_PREVIEW_COUNT) and scrolls the rest inside the
+// preview window, so this is the depth of that little scroller — not the number
+// of rows on screen. Keep the two in step.
+const PROJECT_TREE_PREVIEW_LIMIT = 10
+// Expanded previews (the "show all" toggle) request the whole tree window;
+// otherwise the scrollable preview depth above.
+const projectTreePreviewLimit = () => ($sidebarShowAllSessions.get() ? 2000 : PROJECT_TREE_PREVIEW_LIMIT)
 // The all-profiles fan-out reads one database per profile, so it is allowed the
 // same headroom as the cross-profile session list rather than the interactive
 // default.
