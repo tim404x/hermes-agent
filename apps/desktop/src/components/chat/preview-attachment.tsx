@@ -4,18 +4,16 @@ import { useEffect, useRef, useState } from 'react'
 import { useSessionView } from '@/app/chat/session-view'
 import { useI18n } from '@/i18n'
 import { Download, MonitorPlay } from '@/lib/icons'
-import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
+import { normalizeOrLocalPreviewTarget, openPreviewTargetInBrowser } from '@/lib/local-preview'
 import { downloadGatewayMediaFile } from '@/lib/media'
 import { previewName } from '@/lib/preview-targets'
 import { notifyError } from '@/store/notifications'
-import { $previewTabSources, closePreviewForSource, openPreview, type PreviewRecordSource } from '@/store/preview'
 
-export function PreviewAttachment({ source = 'manual', target }: { source?: PreviewRecordSource; target: string }) {
+export function PreviewAttachment({ target }: { target: string }) {
   const { t } = useI18n()
   // This link lives in one session's transcript; resolve it against THAT
   // session's cwd, not the primary chat's.
   const cwd = useStore(useSessionView().$cwd)
-  const openSources = useStore($previewTabSources)
   const [opening, setOpening] = useState(false)
   const [downloading, setDownloading] = useState(false)
   const [downloaded, setDownloaded] = useState(false)
@@ -24,7 +22,6 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
   const requestTokenRef = useRef(0)
   const targetRef = useRef(target)
   const name = previewName(target)
-  const isActive = openSources.includes(target)
 
   cwdRef.current = cwd
   targetRef.current = target
@@ -45,14 +42,15 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
     setOpening(false)
   }, [cwd, target])
 
-  async function togglePreview() {
+  // Attachment links open in the user's REAL default browser, never the in-app
+  // preview pane. An attachment is a finished artifact (a PDF, a rendered
+  // report) that the user goes on to print, annotate, or share from the browser
+  // they actually live in, so the embedded pane was a dead end they had to
+  // escape from every time. `openPreviewTargetInBrowser` handles the remote
+  // case too: when the file lives on a remote gateway it arrives as a dataUrl
+  // and is staged to a local temp file before the browser is handed the path.
+  async function openInBrowser() {
     if (opening) {
-      return
-    }
-
-    if (isActive) {
-      closePreviewForSource(target)
-
       return
     }
 
@@ -78,7 +76,7 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
         throw new Error(`Could not open preview target: ${requestTarget}`)
       }
 
-      openPreview(preview, source)
+      await openPreviewTargetInBrowser(preview)
     } catch (error) {
       if (
         !mountedRef.current ||
@@ -147,10 +145,11 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
       <button
         className="shrink-0 rounded-md border border-(--ui-stroke-tertiary) bg-background/40 px-2 py-1 text-[0.7rem] font-medium text-muted-foreground transition-colors hover:bg-accent/55 hover:text-foreground disabled:opacity-50"
         disabled={opening}
-        onClick={() => void togglePreview()}
+        onClick={() => void openInBrowser()}
+        title={t.preview.openInBrowser}
         type="button"
       >
-        {opening ? t.preview.opening : isActive ? t.preview.hide : t.preview.openPreview}
+        {opening ? t.preview.opening : t.preview.openInBrowser}
       </button>
     </div>
   )

@@ -12,16 +12,21 @@ import { MarkdownTextContent } from './markdown-text'
 // connections read the file directly, remote connections fetch it over the
 // authenticated /api/fs bridge. Media-extension paths keep their inline
 // player instead.
+//
+// The affordance opens the resolved file in the user's real default browser
+// (label "Open in browser"), not the in-app pane; these assertions care that
+// the link is routed through the attachment at all, not which surface it
+// lands on.
 describe('MarkdownLink filesystem hrefs', () => {
   afterEach(cleanup)
 
   it('routes an absolute file path link through the preview attachment', async () => {
     render(<MarkdownTextContent isRunning={false} text="Wrote it: [report](/home/user/report.md)" />)
 
-    // PreviewAttachment paints the filename + an Open preview button —
+    // PreviewAttachment paints the filename + an open-in-browser button —
     // that's the view-time door, not a dead <a>.
     await screen.findByText('report.md')
-    expect(screen.getByRole('button', { name: 'Open preview' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Open in browser' })).toBeTruthy()
     expect(document.querySelector('a[href="/home/user/report.md"]')).toBeNull()
   })
 
@@ -32,7 +37,7 @@ describe('MarkdownLink filesystem hrefs', () => {
 
     await screen.findByText('notes.txt')
     await screen.findByText('todo.md')
-    expect(screen.getAllByRole('button', { name: 'Open preview' })).toHaveLength(2)
+    expect(screen.getAllByRole('button', { name: 'Open in browser' })).toHaveLength(2)
   })
 
   it('renders a media player for a media-extension path link', async () => {
@@ -53,7 +58,7 @@ describe('MarkdownLink filesystem hrefs', () => {
     // Fragment anchors survive untouched; relative links are NOT rewritten
     // (they keep Streamdown's pre-existing handling) — neither gains a
     // preview affordance.
-    expect(screen.queryByRole('button', { name: 'Open preview' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Open in browser' })).toBeNull()
     expect(document.querySelector('a[href="#section-2"]')).not.toBeNull()
   })
 })
