@@ -2456,6 +2456,9 @@ export const ruOverrides = {
     row: {
       pin: 'Закрепить',
       unpin: 'Открепить',
+      pinInProject: 'Закрепить в проекте',
+      unpinFromProject: 'Открепить в проекте',
+      projectPinFailed: 'Не удалось обновить закрепление в проекте',
       markUnread: 'Отметить как непрочитанное',
       markRead: 'Отметить как прочитанное',
       unreadFailed: 'Не удалось обновить состояние непрочитанных',
