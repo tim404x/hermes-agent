@@ -21,12 +21,14 @@ interface SessionRowCommonProps {
   branchStem?: string
   card?: boolean
   isPinned: boolean
+  isProjectPinned?: boolean
   isSelected: boolean
   unread: boolean
   onArchive: () => void
   onBranch?: () => void
   onDelete: () => void
   onPin: () => void
+  onToggleProjectPin?: () => void
   onToggleUnread: () => void
   onResume: () => void
   reorderable?: boolean
@@ -52,6 +54,8 @@ export interface VirtualSessionListProps {
   onDeleteSession: (sessionId: string) => void
   onResumeSession: (sessionId: string, session?: SessionInfo) => void
   onTogglePin: (sessionId: string) => void
+  /** "Pin in project" toggle; undefined on non-project surfaces hides the item. */
+  onToggleProjectPin?: (session: SessionInfo) => void
   onToggleUnread: (sessionId: string) => void
   pinned: boolean
   showProfileTags?: boolean
@@ -77,6 +81,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   onDeleteSession,
   onResumeSession,
   onTogglePin,
+  onToggleProjectPin,
   onToggleUnread,
   pinned,
   showProfileTags = false,
@@ -162,11 +167,13 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
       branchStem,
       card,
       isPinned: pinned,
+      isProjectPinned: session.project_pinned_at != null,
       isSelected: session.id === activeSessionId,
       onArchive: () => onArchiveSession(session.id),
       onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
       onDelete: () => onDeleteSession(session.id),
       onPin: () => onTogglePin(sessionPinId(session)),
+      onToggleProjectPin: onToggleProjectPin ? () => onToggleProjectPin(session) : undefined,
       onToggleUnread: () => onToggleUnread(session.id),
       onResume: () => onResumeSession(session.id, session),
       reorderable,

@@ -563,6 +563,12 @@ export interface SessionInfo {
    *  survive a refresh (#113273). Undefined against older backends; treat
    *  as visible. */
   hidden?: boolean
+  /** "Pin in project" stamp (`sessions.project_pinned_at`, epoch seconds).
+   *  Orthogonal to {@link pinned}: the row STAYS in its project and sorts to
+   *  the top of it, newest pin first (see `compareProjectRank`). Null or
+   *  undefined = not pinned in its project; a backend predating the column
+   *  never sends it, which degrades to plain recency. */
+  project_pinned_at?: null | number
   /** Derived read state (backend watermark: `last_read_at` vs `last_active`,
    *  see `SessionDB.session_unread`). True when the conversation was
    *  explicitly marked unread or a response arrived after it was last read.
