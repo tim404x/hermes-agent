@@ -117,12 +117,12 @@ export function ProjectOverviewRow({
   // the sidebar's content edge regardless of which side the sidebar is on.
   const rowRef = useRef<HTMLDivElement>(null)
   const showAllSessions = useStore($sidebarShowAllSessions)
-  // Default loads PROJECT_PREVIEW_LOADED rows (three shown, the rest scrollable);
+  // Default loads PROJECT_PREVIEW_LOADED rows (PROJECT_PREVIEW_COUNT shown, the rest scrollable);
   // the "show all" toggle lifts the cap so the window scrolls the whole project.
   const limit = showAllSessions ? Infinity : PROJECT_PREVIEW_LOADED
   const fetched = (previewSessions ?? []).slice(0, limit)
   const preview = renderRows ? (fetched.length ? fetched : latestProjectSessions(project, limit)) : []
-  // Past three rows the preview stops growing and starts scrolling: the glance
+  // Past PROJECT_PREVIEW_COUNT rows the preview stops growing and starts scrolling: the glance
   // keeps its height, and the rest of the project's recent chats are a wheel
   // away instead of behind a drill-in.
   const previewScrolls = preview.length > PROJECT_PREVIEW_COUNT
