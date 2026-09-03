@@ -611,6 +611,8 @@ _RENAME_FLAG_SETTERS = (
     ("archived", lambda db, sid, v: db.set_session_archived(sid, v)),
     ("hidden", lambda db, sid, v: db.set_session_hidden(sid, v)),
     ("pinned", lambda db, sid, v: db.set_session_pinned(sid, v)),
+    # "Pin in project": ordering hint inside the project (pin time), not a keep flag.
+    ("project_pinned", lambda db, sid, v: db.set_session_project_pinned(sid, v)),
     ("unread", lambda db, sid, v: db.set_session_read(sid, read=not v)),
 )
 
@@ -628,7 +630,7 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
         if body.title is None and all(getattr(body, f) is None for f in flags):
             raise HTTPException(
                 status_code=400,
-                detail="Nothing to update; provide 'title', 'archived', 'hidden', 'pinned', and/or 'unread'.",
+                detail="Nothing to update; provide 'title', 'archived', 'hidden', 'pinned', 'project_pinned', and/or 'unread'.",
             )
         if body.title is not None:
             try:

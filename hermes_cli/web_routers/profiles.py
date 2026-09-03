@@ -213,6 +213,12 @@ def _recency(s: Dict[str, Any]) -> Any:
     return s.get("last_active") or s.get("started_at") or 0
 
 
+def _project_rank(s: Dict[str, Any]) -> tuple:
+    """Same rank as project_tree._session_rank: "pin in project" first (newest pin on top),
+    then recency — the cross-profile merge must not undo the per-profile order it was handed."""
+    return (float(s.get("project_pinned_at") or 0.0), _recency(s))
+
+
 def _read_profile_db(name: str, home, errors: Optional[List[Dict[str, str]]],
                      fn: Callable[[Any], Any]) -> Any:
     """``fn(db)`` against the profile's read-only state.db; None when the file is missing,
@@ -552,7 +558,7 @@ def _merge_profile_tree(
             existing[total_key] = (existing.get(total_key) or 0) + (project.get(total_key) or 0)
         existing["lastActive"] = max(existing.get("lastActive") or 0, project.get("lastActive") or 0)
         previews = (existing.get("previewSessions") or []) + (project.get("previewSessions") or [])
-        previews.sort(key=_recency, reverse=True)
+        previews.sort(key=_project_rank, reverse=True)
         existing["previewSessions"] = previews[:preview_limit]
 
 

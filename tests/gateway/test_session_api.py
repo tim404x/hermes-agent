@@ -883,6 +883,37 @@ async def test_patch_session_rejects_non_boolean_pinned(adapter, session_db):
 
 
 @pytest.mark.asyncio
+async def test_patch_session_project_pinned_round_trips_as_a_timestamp(adapter, session_db):
+    """`project_pinned` is a boolean on the wire but a pin TIME in the row.
+
+    The desktop sorts a project's sessions on `project_pinned_at` (newest pin
+    first), so the response must expose the stamp — not echo the boolean — and
+    unpinning must clear it back to null rather than to 0.
+    """
+    session_id = session_db.create_session("project-pin-session", "api_server")
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.patch(f"/api/sessions/{session_id}", json={"project_pinned": True})
+        assert resp.status == 200, await resp.text()
+        stamp = (await resp.json())["session"]["project_pinned_at"]
+        assert isinstance(stamp, float) and stamp > 1_600_000_000
+
+        # Orthogonal to the global keep flag.
+        assert (await resp.json())["session"]["pinned"] is False
+
+        resp = await cli.get(f"/api/sessions/{session_id}")
+        assert (await resp.json())["session"]["project_pinned_at"] == stamp
+
+        resp = await cli.patch(f"/api/sessions/{session_id}", json={"project_pinned": False})
+        assert (await resp.json())["session"]["project_pinned_at"] is None
+
+        resp = await cli.patch(f"/api/sessions/{session_id}", json={"project_pinned": "yes"})
+        assert resp.status == 400, await resp.text()
+        assert (await resp.json())["error"]["code"] == "invalid_session_field"
+
+
+@pytest.mark.asyncio
 async def test_patch_session_still_rejects_unknown_fields(adapter, session_db):
     session_id = session_db.create_session("unknown-field-session", "api_server")
     app = _create_session_app(adapter)

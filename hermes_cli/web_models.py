@@ -243,6 +243,9 @@ class SessionRename(BaseModel):
     archived: Optional[bool] = None
     hidden: Optional[bool] = None  # also used by cross-profile reconciliation
     pinned: Optional[bool] = None  # durable "keep" (Desktop pins); exempt from auto_archive
+    # "Pin in project": keeps the session at the top of ITS PROJECT in the Desktop sidebar
+    # (stored as the pin time, newest first). Orthogonal to `pinned`, which moves it OUT to Pinned.
+    project_pinned: Optional[bool] = None
     # Read-state watermark (sessions.last_read_at): True = unread, False = read now, None = leave.
     unread: Optional[bool] = None
     profile: Optional[str] = None  # session owned by another profile (opens its state.db)

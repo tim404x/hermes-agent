@@ -333,6 +333,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     archived INTEGER NOT NULL DEFAULT 0,
     pinned INTEGER NOT NULL DEFAULT 0,
     hidden INTEGER NOT NULL DEFAULT 0,
+    project_pinned_at REAL,
     last_read_at REAL,
     tool_names TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id),

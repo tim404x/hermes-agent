@@ -323,6 +323,9 @@ def _project_tree_row(r: dict) -> dict:
         started_at=r.get("started_at") or 0, ended_at=r.get("ended_at"),
         last_active=r.get("last_active") or r.get("started_at") or 0,
         source=r.get("source"), archived=bool(r.get("archived")),
+        # "Pin in project" stamp (epoch seconds, None = unpinned): the tree builder sorts on it and
+        # the sidebar's optimistic overlay must see the same value or a pinned row snaps back.
+        project_pinned_at=r.get("project_pinned_at"),
         **{k: r.get(k) or 0 for k in (
             "message_count", "tool_call_count", "input_tokens", "output_tokens")},
         **{k: r.get(k) for k in ("actual_cost_usd", "estimated_cost_usd", "model")},

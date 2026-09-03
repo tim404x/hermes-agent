@@ -242,6 +242,20 @@ def _repo_node(root: str, label: str) -> dict:
     return {"id": root, "label": label, "path": root, "groups": [], "sessionCount": 0}
 
 
+def _session_rank(session: dict) -> tuple[float, float]:
+    """Sort key for session rows INSIDE a project: pinned-in-project first,
+    newest pin on top, then plain recency.
+
+    ``project_pinned_at`` is the pin time (None when unpinned), so an unpinned
+    row scores 0.0 and sorts below every pinned one while unpinned rows keep
+    their pure-recency order among themselves. The desktop's optimistic
+    overlay (``compareProjectRank`` in workspace-groups.ts) implements the
+    same rule; the two must agree or a freshly pinned row snaps back on the
+    next tree refresh. Use with ``reverse=True``.
+    """
+    return (float(session.get("project_pinned_at") or 0.0), _session_time(session))
+
+
 def _build_repos(sessions: list[dict], resolve: Optional[Resolve], hydrate: bool) -> list[dict]:
     """Build the ``repo -> lane -> sessions`` subtree for a set of sessions."""
     lanes: dict[str, tuple[dict, dict]] = {}  # lane identity -> (group, placement)
@@ -257,7 +271,7 @@ def _build_repos(sessions: list[dict], resolve: Optional[Resolve], hydrate: bool
         lanes[lane_identity][0]["sessions"].append(session)
     repos: dict[str, dict] = {}
     for group, placement in lanes.values():
-        group["sessions"].sort(key=_session_time, reverse=True)
+        group["sessions"].sort(key=_session_rank, reverse=True)
         repo_key = placement["repo_key"]
         repo = repos.setdefault(_path_key(repo_key), _repo_node(repo_key, placement["repo_label"]))
         repo["groups"].append(group)
@@ -419,7 +433,7 @@ def build_tree(
     def _previews(project_sessions: list[dict]) -> list[dict]:
         if preview_limit <= 0:
             return []
-        return sorted(project_sessions, key=_session_time, reverse=True)[:preview_limit]
+        return sorted(project_sessions, key=_session_rank, reverse=True)[:preview_limit]
 
     def _scope(project_sessions: list[dict]) -> None:
         scoped_ids.extend(s["id"] for s in project_sessions if s.get("id"))
@@ -474,7 +488,7 @@ def build_tree(
 
     # Tier 0: whatever the tiers above could not place. Leads the list; omitted when empty.
     if homeless:
-        homeless.sort(key=_session_time, reverse=True)
+        homeless.sort(key=_session_rank, reverse=True)
         _scope(homeless)
         result.insert(0, _home_project(homeless, hydrate, _previews(homeless)))
 

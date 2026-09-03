@@ -883,6 +883,13 @@ class SessionSessionsMixin:
         """Hide/unhide a session and its compression lineage from the default listing; still resumable."""
         return self._set_lineage_column("hidden", session_id, int(hidden))
 
+    def set_session_project_pinned(self, session_id: str, pinned: bool) -> bool:
+        """Pin/unpin a session INSIDE its project (whole compression lineage). Unlike ``pinned`` this
+        is an ordering hint, not a keep flag: never touches the auto_archive sweep, never moves the
+        row out of its project. ``project_pinned_at`` stores the pin TIME (NULL = unpinned) so the
+        Desktop lists the newest pin first without a client-side order list."""
+        return self._set_lineage_column("project_pinned_at", session_id, time.time() if pinned else None)
+
     def set_session_read(self, session_id: str, read: bool = True) -> bool:
         """Mark read/unread across the compression lineage. ``last_read_at`` is a watermark: unread when
         activity postdates it (no write on the message path). NULL = never tracked = read; 0 = unread."""

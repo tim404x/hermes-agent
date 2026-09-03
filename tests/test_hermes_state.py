@@ -4448,6 +4448,60 @@ class TestSessionPinAndStaleArchive:
         assert db.set_session_pinned("s1", False) is True
         assert self._pinned(db, "s1") == 0
 
+    # ── "pin in project" stamp ───────────────────────────────────────────
+    def _project_pinned_at(self, db, sid):
+        row = db._conn.execute(
+            "SELECT project_pinned_at FROM sessions WHERE id = ?", (sid,)
+        ).fetchone()
+        return row["project_pinned_at"] if row is not None else None
+
+    def test_set_session_project_pinned_stamps_time_and_clears(self, db):
+        db.create_session(session_id="s1", source="cli")
+        before = time.time()
+        assert db.set_session_project_pinned("s1", True) is True
+        stamp = self._project_pinned_at(db, "s1")
+        assert isinstance(stamp, float) and before - 1 <= stamp <= time.time() + 1
+        assert db.set_session_project_pinned("s1", False) is True
+        assert self._project_pinned_at(db, "s1") is None
+
+    def test_project_pin_is_not_the_keep_flag(self, db):
+        # Orthogonal flags: pinning in a project must not set `pinned`, and
+        # vice versa, or the row would jump to the global Pinned section.
+        db.create_session(session_id="s1", source="cli")
+        db.set_session_project_pinned("s1", True)
+        assert self._pinned(db, "s1") == 0
+        db.set_session_pinned("s1", True)
+        db.set_session_pinned("s1", False)
+        assert self._project_pinned_at(db, "s1") is not None
+
+    def test_later_project_pin_gets_a_greater_stamp(self, db):
+        # "Newest pin on top" is derived from this ordering, so it must be
+        # strictly monotonic across two writes.
+        db.create_session(session_id="a", source="cli")
+        db.create_session(session_id="b", source="cli")
+        db.set_session_project_pinned("a", True)
+        time.sleep(0.01)
+        db.set_session_project_pinned("b", True)
+        assert self._project_pinned_at(db, "b") > self._project_pinned_at(db, "a")
+
+    def test_project_pin_covers_the_compression_lineage(self, db):
+        # Pinning the surfaced tip must stamp the compressed root too (and the
+        # reverse), so the pin survives the id rotation auto-compression does.
+        db.create_session(session_id="root", source="cli")
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=?, end_reason='compression' WHERE id=?",
+            (time.time(), "root"),
+        )
+        db._conn.commit()
+        db.create_session(session_id="tip", source="cli", parent_session_id="root")
+
+        assert db.set_session_project_pinned("tip", True) is True
+        assert self._project_pinned_at(db, "root") is not None
+        assert self._project_pinned_at(db, "root") == self._project_pinned_at(db, "tip")
+
+        assert db.set_session_project_pinned("root", False) is True
+        assert self._project_pinned_at(db, "tip") is None
+
 
 
     # ── pinned back-fill past the page window ─────────────────────────────
