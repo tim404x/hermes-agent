@@ -343,6 +343,9 @@ def _project_tree_row(entry) -> dict:
         "title": s.title, "preview": entry.preview,
         "started_at": s.started_at or 0, "ended_at": s.ended_at, "last_active": entry.last_active or s.started_at or 0,
         "source": s.source, "archived": bool(s.archived),
+        # "Pin in project" stamp (epoch seconds, None = unpinned): the tree builder sorts on it and
+        # the sidebar's optimistic overlay must see the same value or a pinned row snaps back.
+        "project_pinned_at": s.project_pinned_at,
         "message_count": s.message_count or 0, "tool_call_count": s.tool_call_count or 0,
         "input_tokens": s.input_tokens or 0, "output_tokens": s.output_tokens or 0,
         "actual_cost_usd": s.actual_cost_usd, "estimated_cost_usd": s.estimated_cost_usd, "model": s.model,
