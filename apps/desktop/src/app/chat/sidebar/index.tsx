@@ -132,6 +132,7 @@ import {
 import { $sessionDotStateById, sessionStatusBucket } from '@/store/session-dot-state'
 import { $focusedSessionIsTile, $focusedStoredSessionId } from '@/store/session-focus'
 import { $unconfirmedPinWrites } from '@/store/session-pin-sync'
+import { toggleProjectPin } from '@/store/session-project-pin'
 import { $removedSessionIds } from '@/store/session-removal'
 import { $workingSessionIds } from '@/store/session-states'
 import { ackAllSessionsRead } from '@/store/session-unread'
@@ -510,6 +511,14 @@ export function ChatSidebar({
     }
 
     markSessionUnread(storedId, row.unread !== true).catch(err => notifyError(err, s.row.unreadFailed))
+  }
+
+  // "Pin in project" from a row menu. Optimistic paint + rollback live in the
+  // store; only the toast is decided here. Wired ONLY into the project surface
+  // (overview preview + entered project), never the flat lists — see the
+  // `onToggleProjectPin` prop on the sessions section below.
+  const toggleProjectPinRow = (session: SessionInfo) => {
+    toggleProjectPin(session).catch(err => notifyError(err, s.row.projectPinFailed))
   }
 
   // Only surface the profile switcher when more than one profile exists, so
@@ -1997,6 +2006,11 @@ export function ChatSidebar({
                 onResumeSession={onResumeSession}
                 onToggle={() => setSidebarRecentsOpen(!agentsOpen)}
                 onTogglePin={pinSession}
+                // Project pins only make sense where rows are grouped by
+                // project (overview preview + entered project). In the flat
+                // date/status view the same section IS Recents, which has no
+                // project to pin in — leave it off and the item stays hidden.
+                onToggleProjectPin={worktreeGroupingActive ? toggleProjectPinRow : undefined}
                 onToggleUnread={toggleUnread}
                 open={agentsOpen}
                 pinned={false}
