@@ -927,7 +927,10 @@ async def backfill_session_owner_profiles(body: SessionOwnerBackfill, request: R
 async def rename_session_endpoint(session_id: str, body: SessionRename, request: Request):
     """Title and sidebar flags share one authoritative revision and receipt."""
     from hermes_cli.web_server_sessions import _mutate_session_request
-    payload = {key: getattr(body, key) for key in ('title', 'archived', 'hidden', 'pinned', 'unread')
+    # ``project_pinned`` is an ordering hint inside the project (stored as the pin time), not a
+    # keep flag; it rides the same sidebar receipt as the durable flags.
+    payload = {key: getattr(body, key)
+               for key in ('title', 'archived', 'hidden', 'pinned', 'project_pinned', 'unread')
                if getattr(body, key) is not None}
     return await _mutate_session_request(request, body.profile, session_id,
         request_id=body.request_id, expected_revision=body.expected_revision,
