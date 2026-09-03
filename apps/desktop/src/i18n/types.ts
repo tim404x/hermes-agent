@@ -3010,6 +3010,9 @@ export interface Translations {
     row: {
       pin: string
       unpin: string
+      pinInProject: string
+      unpinFromProject: string
+      projectPinFailed: string
       markUnread: string
       markRead: string
       unreadFailed: string
