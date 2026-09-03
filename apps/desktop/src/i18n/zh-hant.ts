@@ -2018,6 +2018,9 @@ export const zhHant = defineLocale({
     row: {
       pin: '釘選',
       unpin: '取消釘選',
+      pinInProject: '在專案中釘選',
+      unpinFromProject: '取消專案釘選',
+      projectPinFailed: '無法更新專案釘選',
       markUnread: '標記為未讀',
       markRead: '標記為已讀',
       unreadFailed: '無法更新未讀狀態',

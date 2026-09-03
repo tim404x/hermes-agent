@@ -2097,6 +2097,9 @@ export const ja = defineLocale({
     row: {
       pin: 'ピン留め',
       unpin: 'ピン留めを解除',
+      pinInProject: 'プロジェクト内でピン留め',
+      unpinFromProject: 'プロジェクトのピン留めを解除',
+      projectPinFailed: 'プロジェクトのピン留めを更新できませんでした',
       markUnread: '未読にする',
       markRead: '既読にする',
       unreadFailed: '未読状態を更新できませんでした',

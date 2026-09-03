@@ -134,6 +134,19 @@ export const branchLaneId = (repoRoot: string, branch?: string): string =>
 /** A session's recency stamp (last activity, falling back to creation). */
 export const sessionRecency = (session: SessionInfo): number => session.last_active || session.started_at || 0
 
+/** Epoch seconds a row was pinned INSIDE its project; 0 when it is not. */
+export const projectPinTime = (session: SessionInfo): number => session.project_pinned_at ?? 0
+
+/**
+ * Order for session rows within a project: pinned-in-project first, newest pin
+ * on top, then plain recency. MUST match `tui_gateway/project_tree.py::
+ * _session_rank` — the backend orders the authoritative tree with it and this
+ * is the optimistic overlay's copy; if they drift, a row pinned a moment ago
+ * snaps back to its chronological slot on the next tree refresh.
+ */
+export const compareProjectRank = (a: SessionInfo, b: SessionInfo): number =>
+  projectPinTime(b) - projectPinTime(a) || sessionRecency(b) - sessionRecency(a)
+
 /** Default-branch names that pin to the top and read as the repo's trunk. */
 const TRUNK_BRANCHES = new Set(['main', 'master', 'trunk', 'develop'])
 
@@ -449,7 +462,7 @@ export function sessionProjectColor(session: SessionInfo, projects: ProjectInfo[
 }
 
 const upsertSession = (rows: SessionInfo[], session: SessionInfo): SessionInfo[] =>
-  [session, ...rows.filter(row => row.id !== session.id)].sort((a, b) => sessionRecency(b) - sessionRecency(a))
+  [session, ...rows.filter(row => row.id !== session.id)].sort(compareProjectRank)
 
 /** A live row's placement path, with an exact repo-root fallback when cwd is absent. */
 function livePathForRepo(repoRoot: string, session: SessionInfo): string {
@@ -813,7 +826,10 @@ export function overlayLivePreviews(
       }
     }
 
-    const pool = [...map.values()].sort((a, b) => sessionRecency(b) - sessionRecency(a))
+    // Project pins lead (newest first), then recency. The user's explicit sort
+    // key (rankIds) still runs after this and wins when set: an explicit sort
+    // is a stronger statement than a pin.
+    const pool = [...map.values()].sort(compareProjectRank)
 
     out[node.id] = rankSessions(pool, rankIds).slice(0, limit)
   }

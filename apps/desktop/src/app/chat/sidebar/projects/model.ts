@@ -11,7 +11,7 @@ import type { SessionListDensity } from '@/store/session-list-density'
 
 import { sessionRowEstimate } from '../session-row-details'
 
-import { sessionRecency, type SidebarProjectTree } from './workspace-groups'
+import { compareProjectRank, sessionRecency, type SidebarProjectTree } from './workspace-groups'
 
 // Page size when revealing more already-loaded rows within a workspace group.
 export const SIDEBAR_GROUP_PAGE = 5
@@ -63,8 +63,10 @@ const projectActivityTime = (project: SidebarProjectTree): number =>
   )
 
 // The project's most-recent sessions, for the overview preview under each row.
+// Same rank as the backend tree (pin-in-project first, then recency) so this
+// fallback never disagrees with the previewSessions it stands in for.
 export const latestProjectSessions = (project: SidebarProjectTree, limit: number): SessionInfo[] =>
-  [...projectSessions(project)].sort((a, b) => sessionRecency(b) - sessionRecency(a)).slice(0, limit)
+  [...projectSessions(project)].sort(compareProjectRank).slice(0, limit)
 
 // Home is a fixture, not a project: it always leads the overview, above the
 // active project and outside any hand-picked order.

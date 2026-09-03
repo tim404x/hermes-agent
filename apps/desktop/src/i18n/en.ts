@@ -2429,6 +2429,9 @@ export const en: Translations = {
     row: {
       pin: 'Pin',
       unpin: 'Unpin',
+      pinInProject: 'Pin in project',
+      unpinFromProject: 'Unpin from project',
+      projectPinFailed: 'Could not update the project pin',
       markUnread: 'Mark as unread',
       markRead: 'Mark as read',
       unreadFailed: 'Could not update unread state',

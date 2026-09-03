@@ -353,6 +353,23 @@ export function setSessionPinnedRemote(id: string, pinned: boolean, profile?: st
   })
 }
 
+// "Pin in project": a boolean on the wire, a pin TIME in the row
+// (`project_pinned_at`), so the backend orders the project's sessions newest
+// pin first. Unlike setSessionPinnedRemote this is the source of truth, not a
+// mirror — the sidebar has no local copy of project pins to fall back on.
+export function setSessionProjectPinnedRemote(
+  id: string,
+  pinned: boolean,
+  profile?: string | null
+): Promise<{ ok: boolean }> {
+  return hermesApi<{ ok: boolean }>({
+    ...(profile ? { profile } : {}),
+    path: `/api/sessions/${encodeURIComponent(id)}`,
+    method: 'PATCH',
+    body: { project_pinned: pinned, ...(profile ? { profile } : {}) }
+  })
+}
+
 // Mirror a sidebar unread toggle to the backend read-state watermark
 // (sessions.last_read_at via SessionDB.set_session_read). Same profile
 // routing as the other session mutations: a remote session's row lives only

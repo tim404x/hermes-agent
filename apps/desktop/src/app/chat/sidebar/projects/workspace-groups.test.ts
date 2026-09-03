@@ -6,6 +6,7 @@ import type { ProjectInfo, SessionInfo } from '@/types/hermes'
 
 import {
   baseName,
+  compareProjectRank,
   excludeProjectSessions,
   kanbanWorktreeDir,
   liveSessionProjectId,
@@ -1130,6 +1131,76 @@ describe('overlayLivePreviews', () => {
     const previews = overlayLivePreviews([homeNode([])], [makeCwdSession(null, { id: 'fresh' })], [], 3)
 
     expect(previews[NO_PROJECT_ID].map(s => s.id)).toEqual(['fresh'])
+  })
+
+  it('leads with project-pinned rows, newest pin first, ahead of fresher unpinned ones', () => {
+    // Recency alone would list fresh -> old-pin -> new-pin. The pin stamp is
+    // the primary key and must beat a much more recent unpinned chat.
+    const project = projectNode({
+      id: '/www/app',
+      previewSessions: [
+        makeCwdSession('/www/app', { id: 'old-pin', last_active: 10, started_at: 10, project_pinned_at: 100 }),
+        makeCwdSession('/www/app', { id: 'fresh', last_active: 999, started_at: 999 })
+      ]
+    })
+
+    const live = [makeCwdSession('/www/app', { id: 'new-pin', last_active: 5, started_at: 5, project_pinned_at: 200 })]
+
+    expect(overlayLivePreviews([project], live, [], 5)['/www/app'].map(s => s.id)).toEqual([
+      'new-pin',
+      'old-pin',
+      'fresh'
+    ])
+  })
+
+  it('lets a live row carry an optimistic project pin over the snapshot copy', () => {
+    // The store flips `project_pinned_at` on the live row the moment the user
+    // pins; the backend snapshot still says unpinned until the next refresh.
+    // Live wins, so the row jumps to the top on the same frame.
+    const project = projectNode({
+      id: '/www/app',
+      previewSessions: [
+        makeCwdSession('/www/app', { id: 'fresh', last_active: 999, started_at: 999 }),
+        makeCwdSession('/www/app', { id: 'stale', last_active: 1, started_at: 1 })
+      ]
+    })
+
+    const live = [makeCwdSession('/www/app', { id: 'stale', last_active: 1, started_at: 1, project_pinned_at: 50 })]
+
+    expect(overlayLivePreviews([project], live, [], 5)['/www/app'].map(s => s.id)).toEqual(['stale', 'fresh'])
+  })
+
+  it('still lets an explicit sort key outrank project pins', () => {
+    // An explicit sort is a stronger statement than a pin: the filter menu's
+    // rank runs after the pin ordering and wins.
+    const project = projectNode({
+      id: '/www/app',
+      previewSessions: [
+        makeCwdSession('/www/app', { id: 'pinned', last_active: 1, started_at: 1, project_pinned_at: 100 }),
+        makeCwdSession('/www/app', { id: 'ranked-first', last_active: 2, started_at: 2 })
+      ]
+    })
+
+    const previews = overlayLivePreviews([project], [], [], 5, { rankIds: ['ranked-first', 'pinned'] })
+
+    expect(previews['/www/app'].map(s => s.id)).toEqual(['ranked-first', 'pinned'])
+  })
+})
+
+describe('compareProjectRank', () => {
+  it('treats a missing or null stamp as unpinned and falls back to recency', () => {
+    const a = makeCwdSession('/p', { id: 'a', last_active: 1, started_at: 1 })
+    const b = makeCwdSession('/p', { id: 'b', last_active: 3, started_at: 3, project_pinned_at: null })
+    const c = makeCwdSession('/p', { id: 'c', last_active: 2, started_at: 2 })
+
+    expect([a, b, c].sort(compareProjectRank).map(s => s.id)).toEqual(['b', 'c', 'a'])
+  })
+
+  it('orders two pinned rows by pin time, not activity', () => {
+    const olderPinButActive = makeCwdSession('/p', { id: 'x', last_active: 900, started_at: 1, project_pinned_at: 10 })
+    const newerPinButIdle = makeCwdSession('/p', { id: 'y', last_active: 1, started_at: 1, project_pinned_at: 20 })
+
+    expect([olderPinButActive, newerPinButIdle].sort(compareProjectRank).map(s => s.id)).toEqual(['y', 'x'])
   })
 })
 

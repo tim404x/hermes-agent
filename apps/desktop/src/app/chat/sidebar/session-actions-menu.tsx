@@ -99,10 +99,17 @@ interface SessionActions {
   sessionId: string
   title: string
   pinned?: boolean
+  /** "Pin in project" state (`project_pinned_at` set). Drives the label of the
+   *  project-pin item; only meaningful when {@link onProjectPin} is wired. */
+  projectPinned?: boolean
   /** Backend-derived read state — drives the Mark as unread/read label. */
   unread?: boolean
   profile?: string
   onPin?: () => void
+  /** Toggle "pin in project" — keep this row at the top of ITS project. Only
+   *  project surfaces wire it (overview preview + entered-project lanes); flat
+   *  Recents/Pinned/Cron/Messaging leave it undefined and the item is hidden. */
+  onProjectPin?: () => void
   /** Toggle the persisted read-state watermark for this row. */
   onToggleUnread?: () => void
   onBranch?: () => void
@@ -185,9 +192,11 @@ function useSessionActions({
   sessionId,
   title,
   pinned = false,
+  projectPinned = false,
   unread = false,
   profile,
   onPin,
+  onProjectPin,
   onToggleUnread,
   onBranch,
   onArchive,
@@ -303,6 +312,25 @@ function useSessionActions({
         onPin?.()
       }
     }),
+    // "Pin in project" sits right under Pin as its sibling: same verb, narrower
+    // scope (top of THIS project, not a separate section). Only rendered on
+    // project surfaces — a Home/Recents/Cron row has no project to pin in.
+    ...(onProjectPin
+      ? [
+          spec({
+            // A globally pinned row is filtered OUT of its project list into the
+            // Pinned section, so a project pin would have nothing to move. Keep
+            // the item visible but inert rather than vanishing it mid-menu.
+            disabled: pinned,
+            icon: 'pinned',
+            label: projectPinned ? r.unpinFromProject : r.pinInProject,
+            onSelect: () => {
+              triggerHaptic('selection')
+              onProjectPin()
+            }
+          })
+        ]
+      : []),
     // One read-state item, driven by BOTH unread sources: the transient
     // finished-unread dot (isUnread) and the backend watermark (unread).
     // "Mark as read" clears whichever is lit; "Mark as unread" arms the

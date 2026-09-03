@@ -2593,6 +2593,9 @@ export const zh: Translations = {
     row: {
       pin: '置顶',
       unpin: '取消置顶',
+      pinInProject: '在项目中置顶',
+      unpinFromProject: '取消项目置顶',
+      projectPinFailed: '无法更新项目置顶',
       markUnread: '标记为未读',
       markRead: '标记为已读',
       unreadFailed: '无法更新未读状态',
