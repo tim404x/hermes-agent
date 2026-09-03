@@ -301,6 +301,9 @@ export const arChrome = {
     row: {
       pin: 'تثبيت',
       unpin: 'إلغاء التثبيت',
+      pinInProject: 'تثبيت في المشروع',
+      unpinFromProject: 'إلغاء التثبيت من المشروع',
+      projectPinFailed: 'تعذر تحديث تثبيت المشروع',
       markUnread: 'وضع علامة كغير مقروء',
       markRead: 'وضع علامة كمقروء',
       unreadFailed: 'تعذر تحديث حالة القراءة',
