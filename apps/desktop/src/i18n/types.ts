@@ -2990,6 +2990,9 @@ export interface Translations extends NoticeTranslations {
     row: {
       pin: string
       unpin: string
+      pinInProject: string
+      unpinFromProject: string
+      projectPinFailed: string
       markUnread: string
       markRead: string
       unreadFailed: string
