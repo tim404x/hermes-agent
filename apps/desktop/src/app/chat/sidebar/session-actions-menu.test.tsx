@@ -56,6 +56,7 @@ vi.mock('@/i18n', () => ({
           hideTabBar: 'Hide tab bar',
           markRead: 'Mark as read',
           pin: 'Pin',
+          pinInProject: 'Pin in project',
           rename: 'Rename',
           renameDesc: 'Leave empty to clear.',
           renameFailed: 'Rename failed',
@@ -63,6 +64,7 @@ vi.mock('@/i18n', () => ({
           renamed: 'Renamed',
           sessionActions: 'Session actions',
           unpin: 'Unpin',
+          unpinFromProject: 'Unpin from project',
           untitledPlaceholder: 'Untitled'
         }
       },
@@ -286,5 +288,85 @@ describe('SessionActionsMenu', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
     expect(await screen.findByText('Session deleted')).toBeTruthy()
     expect(onDelete).toHaveBeenCalledTimes(1)
+  })
+})
+
+// "Pin in project" is the sibling of Pin with a narrower scope. Its presence
+// is decided by the SURFACE (only project lists wire `onProjectPin`), its
+// label by `projectPinned`, and it goes inert on a globally pinned row, which
+// the Pinned section already owns.
+describe('SessionActionsMenu — pin in project', () => {
+  const openMenu = async () => {
+    const trigger = screen.getByRole('button', { name: 'Session actions' })
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.pointerUp(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(trigger)
+
+    return screen.findByRole('menu')
+  }
+
+  const kebab = (
+    <button aria-label="Session actions" type="button">
+      ⋮
+    </button>
+  )
+
+  it('is absent on surfaces that do not wire onProjectPin (flat Recents, Pinned, Cron)', async () => {
+    render(
+      <SessionActionsMenu onPin={vi.fn()} sessionId="s1" title="My session">
+        {kebab}
+      </SessionActionsMenu>
+    )
+    await openMenu()
+
+    expect(screen.getByRole('menuitem', { name: 'Pin' })).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: /in project|from project/i })).toBeNull()
+  })
+
+  it('renders "Pin in project" right after Pin and fires the handler', async () => {
+    const onProjectPin = vi.fn()
+    render(
+      <SessionActionsMenu onPin={vi.fn()} onProjectPin={onProjectPin} sessionId="s1" title="My session">
+        {kebab}
+      </SessionActionsMenu>
+    )
+    const menu = await openMenu()
+
+    const items = within(menu)
+      .getAllByRole('menuitem')
+      .map(el => el.textContent?.trim())
+
+    expect(items.indexOf('Pin in project')).toBe(items.indexOf('Pin') + 1)
+
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Pin in project' }))
+    expect(onProjectPin).toHaveBeenCalledTimes(1)
+  })
+
+  it('reads "Unpin from project" once the row carries a project pin', async () => {
+    render(
+      <SessionActionsMenu onPin={vi.fn()} onProjectPin={vi.fn()} projectPinned sessionId="s1" title="My session">
+        {kebab}
+      </SessionActionsMenu>
+    )
+    await openMenu()
+
+    expect(screen.getByRole('menuitem', { name: 'Unpin from project' })).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: 'Pin in project' })).toBeNull()
+  })
+
+  it('is disabled, not hidden, on a globally pinned row', async () => {
+    const onProjectPin = vi.fn()
+    render(
+      <SessionActionsMenu onPin={vi.fn()} onProjectPin={onProjectPin} pinned sessionId="s1" title="My session">
+        {kebab}
+      </SessionActionsMenu>
+    )
+    await openMenu()
+
+    const item = screen.getByRole('menuitem', { name: 'Pin in project' })
+    expect(item.getAttribute('aria-disabled')).toBe('true')
+
+    fireEvent.click(item)
+    expect(onProjectPin).not.toHaveBeenCalled()
   })
 })
