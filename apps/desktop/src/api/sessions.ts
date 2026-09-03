@@ -428,6 +428,18 @@ export function setSessionPinnedRemote(id: string, pinned: boolean, profile?: st
   return mutateSessionHttp(id, 'PATCH', { pinned }, sessionWriteProfile(profile))
 }
 
+// "Pin in project": a boolean on the wire, a pin TIME in the row
+// (`project_pinned_at`), so the backend orders the project's sessions newest
+// pin first. Unlike setSessionPinnedRemote this is the source of truth, not a
+// mirror — the sidebar has no local copy of project pins to fall back on.
+export function setSessionProjectPinnedRemote(
+  id: string,
+  pinned: boolean,
+  profile?: string | null
+): Promise<{ ok: boolean }> {
+  return mutateSessionHttp(id, 'PATCH', { project_pinned: pinned }, sessionWriteProfile(profile))
+}
+
 export function setSessionUnreadRemote(id: string, unread: boolean, profile?: string | null): Promise<{ ok: boolean }> {
   return mutateSessionHttp(id, 'PATCH', { unread }, sessionWriteProfile(profile))
 }
