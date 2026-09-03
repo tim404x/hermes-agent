@@ -152,7 +152,7 @@ export function ProjectOverviewRow({
   const total = project.sessionCount - hiddenSessionCount
   const hiddenCount = total - preview.length
   const offerShowAll = !showAllSessions && !expanded && preview.length > 0 && hiddenCount > 0
-  // Past three rows the preview stops growing and starts scrolling: the glance
+  // Past PROJECT_PREVIEW_COUNT rows the preview stops growing and starts scrolling: the glance
   // keeps its height, and the rest of the loaded chats are a wheel away instead
   // of behind a drill-in.
   const previewScrolls = preview.length > PROJECT_PREVIEW_COUNT

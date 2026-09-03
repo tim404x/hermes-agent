@@ -17,8 +17,9 @@ import { sessionRecency, type SidebarProjectTree } from './workspace-groups'
 export const SIDEBAR_GROUP_PAGE = 5
 
 // Recent sessions VISIBLE under each project in the overview. The preview is a
-// glance, not a list — three rows is the height it gets.
-export const PROJECT_PREVIEW_COUNT = 3
+// glance, not a list — five rows is the height it gets: three left the current
+// thread of a busy project out of view too often.
+export const PROJECT_PREVIEW_COUNT = 5
 
 // How many rows the preview actually HOLDS. The window still shows
 // PROJECT_PREVIEW_COUNT of them; the rest are reachable by scrolling inside it,
