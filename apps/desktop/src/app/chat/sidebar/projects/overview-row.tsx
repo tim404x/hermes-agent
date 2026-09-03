@@ -105,7 +105,7 @@ export function ProjectOverviewRow({
   const rowRef = useRef<HTMLDivElement>(null)
   const fetched = (previewSessions ?? []).slice(0, PROJECT_PREVIEW_LOADED)
   const preview = renderRows ? (fetched.length ? fetched : latestProjectSessions(project, PROJECT_PREVIEW_LOADED)) : []
-  // Past three rows the preview stops growing and starts scrolling: the glance
+  // Past PROJECT_PREVIEW_COUNT rows the preview stops growing and starts scrolling: the glance
   // keeps its height, and the rest of the project's recent chats are a wheel
   // away instead of behind a drill-in.
   const previewScrolls = preview.length > PROJECT_PREVIEW_COUNT

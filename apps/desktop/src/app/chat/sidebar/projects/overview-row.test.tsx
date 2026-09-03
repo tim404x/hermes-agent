@@ -27,7 +27,7 @@ vi.mock('@/i18n', () => ({
 const nodeOpen = vi.hoisted(() => ({ current: false }))
 
 vi.mock('./model', () => ({
-  PROJECT_PREVIEW_COUNT: 3,
+  PROJECT_PREVIEW_COUNT: 5,
   PROJECT_PREVIEW_LOADED: 10,
   latestProjectSessions: () => [],
   previewWindowMaxHeight: () => '86px',
@@ -111,7 +111,7 @@ describe('ProjectOverviewRow', () => {
       nodeOpen.current = false
     })
 
-    it('renders every loaded preview row, not just the three that fit', () => {
+    it('renders every loaded preview row, not just the ones that fit the window', () => {
       const renderRows = vi.fn((_rows: SessionInfo[]) => null)
 
       render(<ProjectOverviewRow previewSessions={sessions(8)} project={project} renderRows={renderRows} />)
@@ -119,7 +119,7 @@ describe('ProjectOverviewRow', () => {
       expect(renderRows.mock.calls.at(-1)?.[0]).toHaveLength(8)
     })
 
-    it('caps the preview at a fixed window and scrolls it once past three rows', () => {
+    it('caps the preview at a fixed window and scrolls it once past the visible rows', () => {
       const { container } = render(
         <ProjectOverviewRow previewSessions={sessions(8)} project={project} renderRows={() => null} />
       )

@@ -381,7 +381,7 @@ interface ProjectTreePayload {
 }
 
 // How many recent sessions each project carries in the overview payload. The
-// sidebar SHOWS three (PROJECT_PREVIEW_COUNT) and scrolls the rest inside the
+// sidebar SHOWS five (PROJECT_PREVIEW_COUNT) and scrolls the rest inside the
 // preview window, so this is the depth of that little scroller — not the number
 // of rows on screen. Keep the two in step.
 const PROJECT_TREE_PREVIEW_LIMIT = 10
