@@ -146,6 +146,11 @@ def apply_action(holder, conn, session_id, operation, payload, *, prepared=None,
                         affected.update(_set_session_title_in_transaction(
                             holder, conn, sid, value, source=TITLE_SOURCE_USER))
             result[key] = conn.execute('SELECT title FROM sessions WHERE id=?', (tip,)).fetchone()[0]
+        elif key == 'project_pinned':
+            # Fork carry "pin in project": the pin TIME orders the chat inside its project (NULL = unpinned).
+            affected.update(_set_lineage_column_in_transaction(
+                holder, conn, 'project_pinned_at', session_id, time.time() if value else None))
+            result[key] = value
         else:
             column = 'last_read_at' if key == 'unread' else key
             stored = (0.0 if value else time.time()) if key == 'unread' else int(value)
