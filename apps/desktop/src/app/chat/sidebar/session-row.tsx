@@ -60,6 +60,8 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   /** TUI-style tree stem for branched sessions (`└─ ` / `├─ `). */
   branchStem?: string
   isPinned: boolean
+  /** "Pin in project" state; only project surfaces pass {@link onToggleProjectPin}. */
+  isProjectPinned?: boolean
   isSelected: boolean
   /** Backend-derived read state — same value the dot paints. */
   unread: boolean
@@ -67,6 +69,9 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   onBranch?: () => void
   onDelete: () => void
   onPin: () => void
+  /** Toggle "pin in project" for this row. Undefined on non-project surfaces
+   *  (flat Recents, Pinned, Cron, Messaging), which hides the menu item. */
+  onToggleProjectPin?: () => void
   /** Toggle the persisted read-state watermark. */
   onToggleUnread: () => void
   onResume: () => void
@@ -128,12 +133,14 @@ function SidebarSessionRowImpl({
   session,
   branchStem,
   isPinned,
+  isProjectPinned = false,
   isSelected,
   unread,
   onArchive,
   onBranch,
   onDelete,
   onPin,
+  onToggleProjectPin,
   onToggleUnread,
   onResume,
   reorderable = false,
@@ -331,9 +338,11 @@ function SidebarSessionRowImpl({
         onBranch={onBranch}
         onDelete={onDelete}
         onPin={onPin}
+        onProjectPin={onToggleProjectPin}
         onToggleUnread={onToggleUnread}
         pinned={isPinned}
         profile={session.profile}
+        projectPinned={isProjectPinned}
         sessionId={session.id}
         title={title}
         unread={unread}
@@ -361,9 +370,11 @@ function SidebarSessionRowImpl({
       onBranch={onBranch}
       onDelete={onDelete}
       onPin={onPin}
+      onProjectPin={onToggleProjectPin}
       onToggleUnread={onToggleUnread}
       pinned={isPinned}
       profile={session.profile}
+      projectPinned={isProjectPinned}
       sessionId={session.id}
       title={title}
       unread={unread}
@@ -648,6 +659,9 @@ function rowPropsEqual(a: SidebarSessionRowProps, b: SidebarSessionRowProps): bo
   return (
     a.session === b.session &&
     a.isPinned === b.isPinned &&
+    a.isProjectPinned === b.isProjectPinned &&
+    // Presence toggles the menu item; the closure itself is a fresh forwarder.
+    (a.onToggleProjectPin == null) === (b.onToggleProjectPin == null) &&
     a.isSelected === b.isSelected &&
     a.unread === b.unread &&
     a.branchStem === b.branchStem &&

@@ -114,6 +114,9 @@ interface SidebarSessionsSectionProps {
   onArchiveSession: (sessionId: string) => void
   onBranchSession?: (sessionId: string, profile?: string) => void
   onTogglePin: (sessionId: string) => void
+  /** "Pin in project" toggle; only PROJECT surfaces pass it (the overview
+   *  preview and entered-project lanes). Undefined hides the menu item. */
+  onToggleProjectPin?: (session: SessionInfo) => void
   onToggleUnread: (sessionId: string) => void
   onNewSessionInWorkspace?: (path: null | string) => void
   /** Create a new session as a tile at a drop target (drag from a project "+"). */
@@ -205,6 +208,7 @@ export function SidebarSessionsSection({
   onArchiveSession,
   onBranchSession,
   onTogglePin,
+  onToggleProjectPin,
   onToggleUnread,
   onNewSessionInWorkspace,
   onNewSessionSplit,
@@ -281,11 +285,13 @@ export function SidebarSessionsSection({
         branchStem,
         card,
         isPinned: pinned,
+        isProjectPinned: session.project_pinned_at != null,
         isSelected: session.id === activeSessionId,
         onArchive: () => onArchiveSession(session.id),
         onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
         onDelete: () => onDeleteSession(session.id),
         onPin: () => onTogglePin(sessionPinId(session)),
+        onToggleProjectPin: onToggleProjectPin ? () => onToggleProjectPin(session) : undefined,
         onToggleUnread: () => onToggleUnread(session.id),
         onResume: () => onResumeSession(session.id, session),
         reorderable: draggable && !branchStem,
@@ -311,6 +317,7 @@ export function SidebarSessionsSection({
       onDeleteSession,
       onResumeSession,
       onTogglePin,
+      onToggleProjectPin,
       onToggleUnread,
       pinned,
       showProfileTags
@@ -592,6 +599,7 @@ export function SidebarSessionsSection({
         onDeleteSession={onDeleteSession}
         onResumeSession={onResumeSession}
         onTogglePin={onTogglePin}
+        onToggleProjectPin={onToggleProjectPin}
         onToggleUnread={onToggleUnread}
         pinned={pinned}
         rows={visibleRows}
@@ -647,11 +655,13 @@ export function SidebarSessionsSection({
 interface SortableSessionRowProps {
   session: SessionInfo
   isPinned: boolean
+  isProjectPinned?: boolean
   isSelected: boolean
   unread: boolean
   onArchive: () => void
   onDelete: () => void
   onPin: () => void
+  onToggleProjectPin?: () => void
   onToggleUnread: () => void
   onResume: () => void
 }
