@@ -72,7 +72,7 @@ IMPORT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 SESSION_PROJECTION_FIELDS: tuple[str, ...] = (
     "id", "source", "session_key", "display_name", "model", "parent_session_id", "started_at", "ended_at", "end_reason", "message_count",
     "tool_call_count", "cwd", "git_branch", "git_repo_root", "title", "title_source", "profile_name", "archived", "pinned", "hidden",
-    "last_read_at", "handoff_state",
+    "last_read_at", "handoff_state", "project_pinned_at",
 )
 
 #: One exported transcript row: the stored row ``MessageRepository.read_transcript`` serves; ``as_wire_row()`` is its exported wire dict.
@@ -145,7 +145,7 @@ class PruneReclaimEstimate:
 
 @dataclass(frozen=True, slots=True)
 class SessionExportRow:
-    """One exported ``sessions`` row: the 66 columns as stored, in table order (``model_config`` and ``origin_json`` are the stored text, flags the stored 0/1). ``system_prompt`` is resolved through the prompt store; ``tool_names`` is resolved by ``export_session`` and the stored hash in ``export_all``. ``last_active`` is set by ``export_all`` only; ``reset_from`` and ``branched_from`` are the ``_reset_from`` / ``_branched_from`` markers lifted out of ``model_config``. ``as_dict()`` is the row dict: an unset extra has no key."""
+    """One exported ``sessions`` row: the 67 columns as stored (66 upstream + the fork's ``project_pinned_at``), in table order (``model_config`` and ``origin_json`` are the stored text, flags the stored 0/1). ``system_prompt`` is resolved through the prompt store; ``tool_names`` is resolved by ``export_session`` and the stored hash in ``export_all``. ``last_active`` is set by ``export_all`` only; ``reset_from`` and ``branched_from`` are the ``_reset_from`` / ``_branched_from`` markers lifted out of ``model_config``. ``as_dict()`` is the row dict: an unset extra has no key."""
 
     id: SessionId
     runtime_revision: int
@@ -209,6 +209,7 @@ class SessionExportRow:
     auto_archived: int
     pinned: int
     hidden: int
+    project_pinned_at: Optional[float]  # fork carry "pin in project": the pin time, None when unpinned
     last_read_at: Optional[float]
     tool_names: Optional[str]
     transcript_revision: int

@@ -452,6 +452,10 @@ class SessionTitlesConfigMixin:
         scope = self._backend.scope
         return bool(self._set_lineage_flag(scope, session_id, {"hidden": bool(hidden)}))
 
+    def set_project_pinned(self, session_id: SessionId, pinned: bool) -> bool:
+        scope = self._backend.scope
+        return bool(self._set_lineage_flag(scope, session_id, {"project_pinned_at": time.time() if pinned else None}))
+
     def set_read(self, session_id: SessionId, read: bool = True) -> bool:
         scope = self._backend.scope
         return bool(self._set_lineage_flag(scope, session_id, {"last_read_at": time.time() if read else 0.0}))

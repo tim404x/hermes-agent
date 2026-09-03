@@ -148,6 +148,7 @@ RETAG_SOURCE_TO = "kanban"
 RUNTIME_LOCK_KEY = "browser_model_lock"
 
 #: The ``sessions`` columns in table order: the leading keys of every session row dict the store serves.
+#: (Fork: ``project_pinned_at`` rides with the sidebar flags here; the DDL declares it last, as ADD COLUMN placed it.)
 SESSION_ROW_COLUMNS: tuple[str, ...] = (
     "id", "runtime_revision", "runtime_generation", "source", "created_source", "user_id", "session_key", "chat_id",
     "chat_type", "thread_id", "display_name", "origin_json", "expiry_finalized", "model", "model_config",
@@ -159,8 +160,8 @@ SESSION_ROW_COLUMNS: tuple[str, ...] = (
     "last_activity_provenance", "api_call_count", "handoff_state", "handoff_platform", "handoff_error",
     "compression_failure_cooldown_until", "compression_failure_error", "compression_fallback_streak",
     "compression_ineffective_count", "compression_recovery_deadline", "compression_overload_streak", "profile_name",
-    "transport_profile", "rewind_count", "archived", "auto_archived", "pinned", "hidden", "last_read_at",
-    "tool_names", "transcript_revision", "prompt_cache_clock",
+    "transport_profile", "rewind_count", "archived", "auto_archived", "pinned", "hidden", "project_pinned_at",
+    "last_read_at", "tool_names", "transcript_revision", "prompt_cache_clock",
 )
 
 #: The columns a ``compact_rows`` listing does not read.
@@ -466,6 +467,9 @@ class SessionRecord:
     tool_names: Optional[str] = None
     #: The stored prompt-cache clock, the JSON text of the last applied usage delta that carried one (``None`` when none did).
     prompt_cache_clock: Optional[str] = None
+    #: Fork carry "pin in project": the pin time (epoch seconds), ``None`` when unpinned. Orders the chat to the top of
+    #: its project (newest pin first); orthogonal to ``pinned``, the keep flag that moves a chat out to Pinned.
+    project_pinned_at: Optional[float] = None
 
     def as_session_row(self) -> dict[str, JsonValue]:
         return {**self._row_cells(), **self._marker_cells()}
@@ -1017,6 +1021,10 @@ class SessionRepository(Protocol):
 
     def set_hidden(self, session_id: SessionId, hidden: bool) -> bool:
         """Set ``hidden`` across the lineage."""
+        ...
+
+    def set_project_pinned(self, session_id: SessionId, pinned: bool) -> bool:
+        """Fork carry "pin in project": stamp ``project_pinned_at`` (now when pinned, ``None`` when not) across the lineage. An ordering hint inside the project, never the ``pinned`` keep flag, never the auto-archive sweep."""
         ...
 
     def set_read(self, session_id: SessionId, read: bool = True) -> bool:
