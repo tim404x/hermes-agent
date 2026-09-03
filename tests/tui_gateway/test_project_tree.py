@@ -657,3 +657,55 @@ def test_equivalent_windows_spellings_derive_one_lane_key():
     b = pt._place_by_heuristic("C:\\work\\notes\\")
     assert a is not None and b is not None
     assert pt._lane_key(a["lane_key"]) == pt._lane_key(b["lane_key"])
+
+
+# ── "Pin in project" ordering ───────────────────────────────────────────────
+
+
+def _pinned_fixture():
+    # Three sessions in one repo: an OLD pin, a NEWER pin, and a much fresher
+    # unpinned chat. Recency alone would list them fresh -> old-pin -> new-pin.
+    resolve = _resolver({"/repo": ("/repo", "/repo")})
+    old_pin = _session("/repo", branch="main", last_active=10, project_pinned_at=100.0)
+    new_pin = _session("/repo", branch="main", last_active=5, project_pinned_at=200.0)
+    recent = _session("/repo", branch="main", last_active=999)
+    return resolve, old_pin, new_pin, recent
+
+
+def test_project_pinned_rows_lead_previews_newest_pin_first():
+    resolve, old_pin, new_pin, recent = _pinned_fixture()
+
+    tree = pt.build_tree([], [recent, old_pin, new_pin], [], resolve, preview_limit=5, hydrate=False)
+    ids = [s["id"] for s in tree["projects"][0]["previewSessions"]]
+
+    assert ids == [new_pin["id"], old_pin["id"], recent["id"]]
+
+
+def test_project_pinned_rows_lead_hydrated_lanes():
+    resolve, old_pin, new_pin, recent = _pinned_fixture()
+
+    tree = pt.build_tree([], [recent, old_pin, new_pin], [], resolve, hydrate=True)
+    lane_ids = [s["id"] for s in _sessions_of(tree["projects"][0])]
+
+    assert lane_ids == [new_pin["id"], old_pin["id"], recent["id"]]
+
+
+def test_project_pinned_rows_lead_the_home_bucket():
+    pinned = _session(None, last_active=1, project_pinned_at=50.0)
+    fresh = _session(None, last_active=5000)
+
+    tree = pt.build_tree([], [fresh, pinned], [], resolve=None, hydrate=True)
+
+    assert _home_session_ids(tree) == [pinned["id"], fresh["id"]]
+
+
+def test_unpinned_rows_keep_pure_recency_order():
+    # project_pinned_at missing or None must be a no-op on ordering.
+    resolve = _resolver({"/repo": ("/repo", "/repo")})
+    a = _session("/repo", branch="main", last_active=1)
+    b = _session("/repo", branch="main", last_active=3, project_pinned_at=None)
+    c = _session("/repo", branch="main", last_active=2)
+
+    tree = pt.build_tree([], [a, b, c], [], resolve, preview_limit=5, hydrate=False)
+
+    assert [s["id"] for s in tree["projects"][0]["previewSessions"]] == [b["id"], c["id"], a["id"]]
