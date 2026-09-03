@@ -145,7 +145,7 @@ def _session_row(session, entry=None) -> dict[str, Any]:
         "source", "user_id", "model", "title", "started_at", "ended_at", "end_reason", "message_count",
         "tool_call_count", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
         "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd", "api_call_count", "parent_session_id", "pinned",
-        "archived", "hidden", "system_prompt")} | {"id": session.session_id, "model_config": dict(session.model_config)}
+        "archived", "hidden", "project_pinned_at", "system_prompt")} | {"id": session.session_id, "model_config": dict(session.model_config)}
     if entry is not None:
         row.update(last_active=entry.last_active, preview=entry.preview)
         row.update({"_lineage_root_id": entry.lineage_root_id} if entry.lineage_root_id is not None else {})
@@ -2448,7 +2448,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "message_count", "tool_call_count", "input_tokens", "output_tokens",
             "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "estimated_cost_usd",
             "actual_cost_usd", "api_call_count", "parent_session_id", "last_active", "preview",
-            "_lineage_root_id", "pinned", "archived", "hidden")
+            "_lineage_root_id", "pinned", "archived", "hidden", "project_pinned_at")
         payload = {key: session.get(key) for key in safe_keys if key in session}
         # SQLite stores the flags as 0/1.
         payload.update(
@@ -2645,12 +2645,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        # pinned/archived/unread are durable desktop-sidebar flags.
-        unknown = sorted(set(body) - {"title", "end_reason", "pinned", "archived", "hidden", "unread"})
+        # pinned/archived/unread are durable desktop-sidebar flags; project_pinned orders a chat
+        # to the top of its PROJECT (stored as the pin time), it is not a keep flag.
+        unknown = sorted(set(body) - {"title", "end_reason", "pinned", "archived", "hidden", "unread", "project_pinned"})
         if unknown:
             return _error_response(
                 f"Unsupported session fields: {', '.join(unknown)}", 400, code="unsupported_session_field")
-        for flag in ("pinned", "archived", "hidden", "unread"):
+        for flag in ("pinned", "archived", "hidden", "unread", "project_pinned"):
             if flag in body and not isinstance(body[flag], bool):
                 return _error_response(f"'{flag}' must be a boolean", 400, code="invalid_session_field")
         store = self._store_beside(await self._ensure_store_async())
@@ -2669,7 +2670,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             from session_retention import emit_session_deleted
             await asyncio.to_thread(emit_session_deleted, store.scope.profile_dir, change.archived_ids,
                                     reason="archive", primary=session_id)
-        for flag, setter in (("hidden", sessions.set_hidden), ("pinned", sessions.set_pinned)):
+        # project_pinned is an orthogonal ordering stamp (not a keep flag), so its position is free.
+        for flag, setter in (("hidden", sessions.set_hidden), ("pinned", sessions.set_pinned),
+                             ("project_pinned", sessions.set_project_pinned)):
             if flag in body:
                 await setter(session_id, body[flag])
         if "unread" in body:

@@ -217,6 +217,9 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
         ('32 2026-10-18T10:11Z 1fc1999769', (('+', 'transcript_revision', 'tool_names'),)),
         # Last prompt-cache event (agent/prompt_cache_clock.py), JSON; written with the token batch.
         ('33 2026-11-15T12:00Z feat/prompt-cache-clock', (('+', 'prompt_cache_clock', 'transcript_revision'),)),
+        # Fork carry (tim404x, "pin in project", c5d207fc69): the pin time, NULL = unpinned. Fork-only:
+        # when upstream ships its own 34, renumber this one to the end, never reorder upstream's.
+        ('34 2026-09-03T23:21Z fork/1f1dde8220', (('+', 'project_pinned_at', 'prompt_cache_clock'),)),
         ),
     ),
     "messages": _TableHistory(

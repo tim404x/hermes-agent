@@ -190,6 +190,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     tool_names TEXT,
     transcript_revision INTEGER NOT NULL DEFAULT 0,
     prompt_cache_clock TEXT,
+    -- Fork carry "pin in project" (c5d207fc69): the pin time, NULL = unpinned. Declared LAST, where ADD COLUMN
+    -- put it on every upgraded store, so the salvage lane's layout inference stays unambiguous.
+    project_pinned_at REAL,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );

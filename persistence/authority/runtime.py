@@ -63,7 +63,9 @@ __all__ = [
 ]
 
 #: The sidebar metadata fields and their exact value types.
-METADATA_FIELDS: Mapping[str, type] = {"title": str, "archived": bool, "hidden": bool, "pinned": bool, "unread": bool}
+#: ``project_pinned`` is the fork's "pin in project" (stored as ``sessions.project_pinned_at``, the pin time).
+METADATA_FIELDS: Mapping[str, type] = {"title": str, "archived": bool, "hidden": bool, "pinned": bool, "unread": bool,
+                                       "project_pinned": bool}
 
 #: The rewind refusal's ``detail`` for a target compaction summarized; clients match the ``compacted:`` prefix.
 COMPACTED_TARGET_DETAIL = "compacted: target user message was summarized when the session was compressed"
@@ -275,8 +277,9 @@ class Sidebar(_Command):
     hidden: bool | None = None
     pinned: bool | None = None
     unread: bool | None = None
+    project_pinned: bool | None = None
     operation: ClassVar[str] = "sidebar"
-    _keys: ClassVar[tuple[str, ...]] = ("title", "archived", "hidden", "pinned", "unread")
+    _keys: ClassVar[tuple[str, ...]] = ("title", "archived", "hidden", "pinned", "unread", "project_pinned")
 
 
 #: The closed command union of ``mutate`` and ``prepare_mutation``.

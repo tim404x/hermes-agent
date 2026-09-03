@@ -60,6 +60,12 @@ def _metadata(repo: Any, session_id: str, payload: Mapping[str, Any]) -> tuple[s
                         affected.update(store.sessions._write_title(store.scope, SessionId(sid), value, TitleSource.USER))
             result[key] = repo._tables()["sessions"][tip]["title"]
             continue
+        if key == "project_pinned":
+            # Fork carry "pin in project": the pin time, None when unpinned.
+            affected.update(store.sessions._set_lineage_flag(
+                store.scope, SessionId(session_id), {"project_pinned_at": time.time() if value else None}))
+            result[key] = value
+            continue
         column = "last_read_at" if key == "unread" else key
         values: dict[str, Any] = {column: (0.0 if value else time.time()) if key == "unread" else bool(value)}
         if key == "archived":

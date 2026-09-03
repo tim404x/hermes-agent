@@ -86,6 +86,7 @@ SESSION_RECORD_DEFAULTS: dict[str, Any] = {
     "origin_json": None,
     "tool_names": None,
     "prompt_cache_clock": None,
+    "project_pinned_at": None,  # fork carry "pin in project" (c5d207fc69)
 }
 
 
