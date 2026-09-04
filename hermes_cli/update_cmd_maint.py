@@ -37,6 +37,15 @@ _STALE_PURGE_PROTECTED = frozenset(
         "hermes_cli.main",
         "hermes_cli.update_cmd",
         "hermes_cli.hermes_logging",
+        # (#98436, upstream PR #98454) The in-flight update receipt is a module-level
+        # singleton (``_current``) in hermes_cli.update_receipt. Purging the module strands
+        # that state in an orphaned object: the command-boundary safety net's
+        # ``from hermes_cli.update_receipt import ...`` rebuilds a FRESH module with
+        # ``_current is None``, finalize hits its documented no-op, and the run writes NO
+        # receipt. On Linux this bit every "Already up to date" run that took the pending
+        # fleet-restart catch-up: latest.json stayed on a stale failed receipt, so the
+        # NEXT run saw a stale runtime and restarted the whole fleet again, forever.
+        "hermes_cli.update_receipt",
     }
     # The updater's own split modules are executing too.
     | {f"hermes_cli.update_cmd_{c}" for c in (
