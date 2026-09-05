@@ -8100,11 +8100,56 @@ function gatewayFileRequestPath(
     : pathWithGlobalRemoteProfile(requestPath, profile, profileRouteOptions(profile))
 }
 
+// Client-local rung for the download button. When the requested path exists on
+// THIS machine, copy it to a user-chosen destination instead of asking the
+// gateway (which 404s for a client-local path in remote mode). Returns null
+// when the file is not here, so the caller proceeds to the gateway transports.
+async function saveLocalFileIfPresent(filePath: string, payload: GatewayFileSavePayload = {}) {
+  let stats
+
+  try {
+    stats = await fs.promises.stat(filePath)
+  } catch {
+    return null
+  }
+
+  if (!stats.isFile()) {
+    return null
+  }
+
+  const suggested = String(payload.suggestedName || '').trim()
+
+  const result = await dialog.showSaveDialog(mainWindow, {
+    defaultPath: suggested || path.basename(filePath) || 'download',
+    title: 'Save File'
+  })
+
+  if (result.canceled || !result.filePath) {
+    return { canceled: true, saved: false }
+  }
+
+  // Same failure-atomic contract as the gateway transports: never truncate the
+  // destination before the copy completes (#96597).
+  await writeBufferToFile(await fs.promises.readFile(filePath), result.filePath, fsPumpDeps())
+
+  return { path: result.filePath, saved: true }
+}
+
 async function saveGatewayFile(payload: GatewayFileSavePayload = {}) {
   const filePath = gatewayFilePath(payload.path)
 
   if (!filePath) {
     throw new Error('Missing gateway file path')
+  }
+
+  // The file may already be on THIS machine: an agent on a remote gateway
+  // routinely copies a doc into the user's own Downloads and then links it.
+  // Asking the gateway for that path 404s ("Download failed / File not found")
+  // for a file the user is looking at. Copy it locally instead when it is here.
+  const localSaved = await saveLocalFileIfPresent(filePath, payload)
+
+  if (localSaved) {
+    return localSaved
   }
 
   const { connection, connectionId, profile } = await resolveGatewayFileBackend<GatewayFileConnection>(payload, {

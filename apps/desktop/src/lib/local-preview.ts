@@ -151,6 +151,19 @@ export async function openPreviewTargetInBrowser(target: PreviewTarget): Promise
     throw new Error('Desktop preview browser bridge is unavailable')
   }
 
+  // Rung 0: the file may already live on THIS machine. In remote mode every
+  // other rung asks the gateway, which 404s for a client-local path such as a
+  // doc the agent copied into the user's Downloads. Opening a file:// URL is a
+  // main-process `shell.openExternal`, so it resolves on the client and simply
+  // fails when the path is not here, letting the gateway rungs take over.
+  if (
+    target.kind === 'file' &&
+    bridge.openPreviewInBrowser &&
+    (await openLocalFileIfPresent(bridge.openPreviewInBrowser, target))
+  ) {
+    return
+  }
+
   const dataUrl = target.dataUrl && validatedRemoteHtmlDataUrl(target.dataUrl)
 
   if (!dataUrl) {
@@ -189,6 +202,41 @@ export async function openPreviewTargetInBrowser(target: PreviewTarget): Promise
   }
 
   await bridge.openPreviewInBrowser(pathToFileUrl(filePath))
+}
+
+// Try the client's own filesystem first. Returns true when the file was there
+// and opened. Never throws: a miss is the normal case in remote mode and must
+// fall through to the gateway rungs rather than surface as an error.
+async function openLocalFileIfPresent(
+  openInBrowser: (url: string) => Promise<void>,
+  target: PreviewTarget
+): Promise<boolean> {
+  const filePath = target.path || target.source
+
+  if (!filePath || !filePath.startsWith('/')) {
+    return false
+  }
+
+  const localRead = window.hermesDesktop?.readFileText
+
+  if (!localRead) {
+    return false
+  }
+
+  try {
+    // readFileText is the local Electron IPC whenever the path exists on this
+    // machine; it throws for a path that does not. Cheap existence probe that
+    // needs no new bridge method.
+    if (!(await localRead(filePath))) {
+      return false
+    }
+
+    await openInBrowser(pathToFileUrl(filePath))
+
+    return true
+  } catch {
+    return false
+  }
 }
 
 // Second rung for a remote HTML file whose data-URL read failed: fetch it as
