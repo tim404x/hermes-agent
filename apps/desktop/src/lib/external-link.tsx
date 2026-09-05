@@ -227,35 +227,28 @@ export function hudForcesNativeLinks(search = typeof window === 'undefined' ? ''
 /**
  * Where a link the user clicked should open.
  *
- * A web page opens in the in-app browser — that pane exists so reading a doc
- * doesn't cost a context switch out of Hermes, and it is the surface the agent
- * can see. ⌘/Ctrl-click (or middle-click) escapes to the real browser, which is
- * where you go for anything needing your logged-in session or a password.
+ * Everything opens in the user's real default browser. Links are for the
+ * person, not the agent: they get followed into logged-in sessions, printed,
+ * bookmarked, and shared, none of which the embedded webview can do, so the
+ * in-app pane was a dead end that had to be escaped by hand on every click.
+ * `mailto:`, `file:`, and custom schemes were always handed to the OS; web
+ * pages now take the same path, and the HUD (which has no browser pane) is
+ * unchanged.
  *
- * Everything that ISN'T a web page — `mailto:`, `file:`, a custom scheme — has
- * no business in the webview and always hands off to the OS. The HUD has no
- * browser pane, so it always takes the OS path.
+ * The in-app preview pane is still how the AGENT surfaces things it needs to
+ * see, reached through `openPreview` from the preview directive, the file
+ * browser, and tool results. It is simply no longer where a human's click
+ * lands. `options.native` is kept so callers can keep stating the intent
+ * explicitly.
  */
-export function openLink(href: string, options: { native?: boolean } = {}): void {
+export function openLink(href: string, _options: { native?: boolean } = {}): void {
   const target = normalizeExternalUrl(href)
 
   if (!target) {
     return
   }
 
-  if (options.native || hudForcesNativeLinks() || !/^https?:$/i.test(parseUrl(target)?.protocol ?? '')) {
-    openExternalLink(target)
-
-    return
-  }
-
-  // Lazy: this module is a leaf every surface imports, and the preview store
-  // pulls the layout/session graph behind it. A static edge would make one
-  // link helper drag that whole tree into anything that renders a link. The
-  // tab lands a microtask later, which is invisible.
-  void import('@/store/preview').then(({ openPreview }) =>
-    openPreview({ kind: 'url', label: hostPathLabel(target), source: target, url: target }, 'explicit-link')
-  )
+  openExternalLink(target)
 }
 
 interface ExternalLinkProps extends Omit<ComponentProps<'a'>, 'href' | 'target'> {

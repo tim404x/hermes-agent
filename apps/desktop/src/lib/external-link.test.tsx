@@ -108,9 +108,11 @@ describe('external link helpers', () => {
     expect(bridge).toHaveBeenCalledTimes(1)
   })
 
-  // A web link belongs in the in-app browser now; the OS browser is the
-  // ⌘/Ctrl-click escape hatch.
-  it('opens a web link in the in-app browser', async () => {
+  // Every link the user clicks goes to their real browser, including plain web
+  // pages. Links get followed into logged-in sessions, printed, and shared, so
+  // the in-app pane was a dead end. The preview pane stays an AGENT surface,
+  // reached via openPreview, never via a human's click.
+  it('opens a web link in the real browser, not the in-app pane', async () => {
     const openExternal = vi.fn().mockResolvedValue(undefined)
     installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
 
@@ -118,8 +120,8 @@ describe('external link helpers', () => {
 
     fireEvent.click(screen.getByRole('link', { name: 'Example link' }))
 
-    expect(openExternal).not.toHaveBeenCalled()
-    await waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/path/to/resource'))
+    await waitFor(() => expect(openExternal).toHaveBeenCalledWith('https://example.com/path/to/resource'))
+    expect($previewTabs.get()).toHaveLength(0)
   })
 
   // Platform-specific on purpose (same rule as terminal links / middle-click):
