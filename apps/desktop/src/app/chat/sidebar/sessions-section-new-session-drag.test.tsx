@@ -82,8 +82,11 @@ vi.mock('@/i18n', () => ({
 
 vi.mock('./projects/model', () => ({
   PROJECT_PREVIEW_COUNT: 3,
+  // Carried scrollable-preview constant (custom/main); upstream's mock predates it.
+  PROJECT_PREVIEW_LOADED: 10,
   SIDEBAR_GROUP_PAGE: 20,
   latestProjectSessions: () => [],
+  previewWindowMaxHeight: () => '86px',
   useWorkspaceNodeOpen: () => [false, vi.fn()]
 }))
 

@@ -371,19 +371,27 @@ export function SidebarSessionsSection({
     [dividerLabels, dividerToggle, renderRow]
   )
 
-  // Sessions inside repos/worktrees are date-ordered and static.
+  // Sessions inside repos/worktrees arrive already ranked (pin-in-project
+  // first, then recency — the backend's `_session_rank` / the overlay's
+  // `compareProjectRank`). preserveOrder keeps that rank: the default path
+  // re-sorts roots by recency and would quietly drop a pinned chat back into
+  // its chronological slot, which is exactly how "Pin in project" shipped
+  // dead the first time. Branch children still nest under their parent.
   const renderRows = useCallback(
     (items: SessionInfo[]) =>
-      flattenSessionsWithBranches(items).map(({ branchStem, session }) => renderRow(session, false, branchStem)),
+      flattenSessionsWithBranches(items, { preserveOrder: true }).map(({ branchStem, session }) =>
+        renderRow(session, false, branchStem)
+      ),
     [renderRow]
   )
 
   // Same as `renderRows`, but with date dividers folded in — used for
   // entered-project lanes so a lane spanning multiple days reads
-  // chronologically, matching the flat recents list.
+  // chronologically, matching the flat recents list. Same preserveOrder
+  // reason: a project-pinned row leads its lane regardless of date.
   const renderRowsDated = useCallback(
     (items: SessionInfo[]) => {
-      const entries = flattenSessionsWithBranches(items)
+      const entries = flattenSessionsWithBranches(items, { preserveOrder: true })
 
       const rows = grouping === 'date' ? groupEntriesByRecency(entries) : toSessionRows(entries)
 
