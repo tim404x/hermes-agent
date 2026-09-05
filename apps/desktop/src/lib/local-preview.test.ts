@@ -1,11 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { readDesktopFileDataUrl } = vi.hoisted(() => ({ readDesktopFileDataUrl: vi.fn() }))
+const { readDesktopFileDataUrl, readDesktopFileText } = vi.hoisted(() => ({
+  readDesktopFileDataUrl: vi.fn(),
+  readDesktopFileText: vi.fn()
+}))
 
 vi.mock('@/lib/desktop-fs', () => ({
   isDesktopFsRemoteMode: () => true,
   readDesktopFileDataUrl,
-  readDesktopFileText: vi.fn()
+  readDesktopFileText
 }))
 
 import {
@@ -145,6 +148,37 @@ describe('remote HTML previews', () => {
     await openPreviewTargetInBrowser({ ...remoteTarget, dataUrl })
 
     expect(openPreviewInBrowser).toHaveBeenCalledWith('blob:http://127.0.0.1:9119/preview')
+  })
+
+  // When the data-URL rung failed upstream (the target arrived `transient`), the
+  // in-app pane still shows the file as source. Opening in the browser must be
+  // at least as resilient: fall to the read-text rung and stage that. This was
+  // the "Remote HTML preview could not be loaded" dead end on a real doc.
+  it('falls back to the read-text rung for a transient remote HTML target', async () => {
+    const saveImageBuffer = vi.fn(async (_data: ArrayBuffer | Uint8Array, _ext: string) => '/tmp/staged.html')
+    const openPreviewInBrowser = vi.fn(async () => undefined)
+    window.hermesDesktop = { openPreviewInBrowser, saveImageBuffer } as never
+    readDesktopFileText.mockResolvedValue({ path: '/srv/report.html', text: '<h1>via text</h1>' })
+
+    await openPreviewTargetInBrowser({ ...remoteTarget, renderMode: 'source', transient: true })
+
+    expect(readDesktopFileText).toHaveBeenCalledWith('/srv/report.html')
+    expect(new TextDecoder().decode(saveImageBuffer.mock.calls[0]?.[0])).toBe('<h1>via text</h1>')
+    expect(openPreviewInBrowser).toHaveBeenCalledWith('file:///tmp/staged.html')
+  })
+
+  it('refuses to stage a truncated read rather than open half a document', async () => {
+    const saveImageBuffer = vi.fn(async () => '/tmp/staged.html')
+    const openPreviewInBrowser = vi.fn(async () => undefined)
+    window.hermesDesktop = { openPreviewInBrowser, saveImageBuffer } as never
+    readDesktopFileText.mockResolvedValue({ path: '/srv/report.html', text: '<h1>half', truncated: true })
+
+    await expect(
+      openPreviewTargetInBrowser({ ...remoteTarget, renderMode: 'source', transient: true })
+    ).rejects.toThrow('Remote HTML preview could not be loaded')
+
+    expect(saveImageBuffer).not.toHaveBeenCalled()
+    expect(openPreviewInBrowser).not.toHaveBeenCalled()
   })
 
   it('serializes UNC staging paths as file URLs', async () => {
