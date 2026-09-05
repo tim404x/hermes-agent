@@ -67,4 +67,19 @@ describe('flattenSessionsWithBranches', () => {
       { id: 'background', stem: undefined }
     ])
   })
+
+  it('project rows: a pinned-in-project root stays first even when an unpinned sibling is fresher', () => {
+    // The project surfaces hand rows in already ranked by compareProjectRank
+    // (pin time, then recency). Re-sorting roots by recency here is exactly
+    // what silently undid "Pin in project" on first ship: the pinned chat
+    // sorted to the top upstream and this helper dropped it back into its
+    // chronological slot before render.
+    const pinned = session('pinned', { last_active: 10, project_pinned_at: 100 })
+    const fresh = session('fresh', { last_active: 999 })
+
+    expect(flattenSessionsWithBranches([pinned, fresh], { preserveOrder: true }).map(e => e.session.id)).toEqual([
+      'pinned',
+      'fresh'
+    ])
+  })
 })
