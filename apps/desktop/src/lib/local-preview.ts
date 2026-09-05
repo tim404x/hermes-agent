@@ -154,11 +154,24 @@ export async function openPreviewTargetInBrowser(target: PreviewTarget): Promise
   const dataUrl = target.dataUrl && validatedRemoteHtmlDataUrl(target.dataUrl)
 
   if (!dataUrl) {
-    if (target.transient) {
+    if (!target.transient) {
+      await bridge.openPreviewInBrowser(target.url)
+
+      return
+    }
+
+    // `transient` means the remote data-URL rung failed in enrichPreviewTarget
+    // (gateway 404/413, auth hiccup, unreadable path). The in-app pane survives
+    // that by rendering SOURCE text, so the browser path must be at least as
+    // resilient: fall to the separate read-text rung and stage that instead of
+    // dead-ending on a file the pane could still have shown.
+    const staged = await stageRemoteHtmlAsText(target)
+
+    if (!staged) {
       throw new Error('Remote HTML preview could not be loaded')
     }
 
-    await bridge.openPreviewInBrowser(target.url)
+    await bridge.openPreviewInBrowser(pathToFileUrl(staged))
 
     return
   }
@@ -176,6 +189,31 @@ export async function openPreviewTargetInBrowser(target: PreviewTarget): Promise
   }
 
   await bridge.openPreviewInBrowser(pathToFileUrl(filePath))
+}
+
+// Second rung for a remote HTML file whose data-URL read failed: fetch it as
+// UTF-8 text over /api/fs/read-text and stage the bytes locally. Returns the
+// staged path, or null when this rung fails too (caller reports the real error).
+async function stageRemoteHtmlAsText(target: PreviewTarget): Promise<string | null> {
+  const bridge = window.hermesDesktop
+
+  if (!bridge?.saveImageBuffer || target.kind !== 'file') {
+    return null
+  }
+
+  try {
+    const result = await readDesktopFileText(target.path || target.source)
+
+    // A truncated read (512 KiB preview cap) would stage half a page and open
+    // it as if whole. Refuse rather than ship a silently broken document.
+    if (!result?.text || result.binary || result.truncated) {
+      return null
+    }
+
+    return (await bridge.saveImageBuffer(new TextEncoder().encode(result.text), '.html')) || null
+  } catch {
+    return null
+  }
 }
 
 export function localPreviewTarget(rawTarget: string, cwd?: string | null): PreviewTarget | null {
