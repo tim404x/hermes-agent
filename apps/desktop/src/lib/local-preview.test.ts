@@ -148,6 +148,49 @@ describe('remote HTML previews', () => {
     expect(openPreviewInBrowser).not.toHaveBeenCalled()
   })
 
+  // The bug Tim hit repeatedly: the agent links a doc it copied to the user's
+  // Mac Downloads, but this session's gateway is a VPS, so every gateway rung
+  // 404s ("Preview unavailable" + "Download failed") for a file sitting right
+  // there on the client. Try the client's own disk FIRST.
+  it('opens a client-local file without asking the gateway', async () => {
+    const readFileText = vi.fn(async () => ({ path: '/Users/sosa/Downloads/x.html', text: '<h1>local</h1>' }))
+    const openPreviewInBrowser = vi.fn(async () => undefined)
+    const saveImageBuffer = vi.fn(async () => '/tmp/should-not-be-used.html')
+    window.hermesDesktop = { openPreviewInBrowser, readFileText, saveImageBuffer } as never
+
+    await openPreviewTargetInBrowser({
+      kind: 'file',
+      label: 'x.html',
+      path: '/Users/sosa/Downloads/x.html',
+      previewKind: 'html',
+      renderMode: 'source',
+      source: '/Users/sosa/Downloads/x.html',
+      transient: true,
+      url: 'file:///Users/sosa/Downloads/x.html'
+    })
+
+    expect(openPreviewInBrowser).toHaveBeenCalledWith('file:///Users/sosa/Downloads/x.html')
+    // No gateway round-trip, no staging: the file was already on this machine.
+    expect(readDesktopFileText).not.toHaveBeenCalled()
+    expect(saveImageBuffer).not.toHaveBeenCalled()
+  })
+
+  it('falls through to the gateway rungs when the path is not on this machine', async () => {
+    const readFileText = vi.fn(async () => {
+      throw new Error('ENOENT')
+    })
+
+    const saveImageBuffer = vi.fn(async (_d: ArrayBuffer | Uint8Array, _e: string) => '/tmp/staged.html')
+    const openPreviewInBrowser = vi.fn(async () => undefined)
+    window.hermesDesktop = { openPreviewInBrowser, readFileText, saveImageBuffer } as never
+    readDesktopFileText.mockResolvedValue({ path: '/srv/report.html', text: '<h1>from gateway</h1>' })
+
+    await openPreviewTargetInBrowser({ ...remoteTarget, renderMode: 'source', transient: true })
+
+    expect(readDesktopFileText).toHaveBeenCalledWith('/srv/report.html')
+    expect(openPreviewInBrowser).toHaveBeenCalledWith('file:///tmp/staged.html')
+  })
+
   it('serializes UNC staging paths as file URLs', async () => {
     const dataUrl = `data:text/html;base64,${btoa('<h1>remote</h1>')}`
     const saveImageBuffer = vi.fn(async () => '\\\\server\\share\\report #1.html')
