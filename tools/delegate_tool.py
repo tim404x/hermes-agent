@@ -278,8 +278,11 @@ def _build_child_agent(
             override_acp_args=override_acp_args,
             routing_cfg=routing_cfg, override_reasoning_effort=override_reasoning_effort,
         )
-        if override_service_tier:
-            rt["service_tier"] = override_service_tier
+        # No route tier (None) inherits the parent's; agent.fast_mode re-gates it against the CHILD's route.
+        # A route that pinned normal arrives as "" and stays normal.
+        tier = getattr(parent_agent, "service_tier", None) if override_service_tier is None else override_service_tier
+        if tier and isinstance(tier, str):
+            rt["service_tier"] = tier
         if override_request_overrides is not None:
             # honored whenever set, incl. the inherit branch where
             # _resolve_delegation_credentials already merged OVER the parent's
@@ -433,7 +436,8 @@ def _credential_overrides(creds: dict[str, Any], routing_cfg: dict[str, Any]) ->
         "override_request_overrides": creds.get("request_overrides"),
         "override_acp_command": creds.get("command"),
         "override_acp_args": creds.get("args"),
-        "override_service_tier": creds.get("service_tier"),
+        # "" = the route pinned normal (task_service_tier ran), None = no route tier: inherit the parent's.
+        "override_service_tier": creds.get("service_tier") or ("" if "task_tier_overrides" in creds else None),
         "routing_cfg": routing_cfg,
     }
 
