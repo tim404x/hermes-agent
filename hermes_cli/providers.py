@@ -143,6 +143,7 @@ ALIASES: Dict[str, str] = {alias: canon for canon, aliases in _ALIAS_GROUPS.item
 
 _LABEL_OVERRIDES: Dict[str, str] = {
     "moa": "Mixture of Agents", "nous": "Nous Portal", "openai-codex": "ChatGPT or Codex Subscription",
+    "openai-api": "OpenAI API",
     "copilot-acp": "GitHub Copilot ACP", "stepfun": "StepFun Step Plan", "xiaomi": "Xiaomi MiMo", "gmi": "GMI Cloud",
     "upstage": "Upstage Solar", "actual": "Actual Computer", "tencent-tokenhub": "Tencent TokenHub",
     "nebius-token-factory": "Nebius Token Factory", "tencent-tokenplan": "Tencent TokenPlan", "lmstudio": "LM Studio",
