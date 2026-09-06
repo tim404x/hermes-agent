@@ -95,7 +95,7 @@ def is_astra_model(model: Optional[str]) -> bool:
 
 
 def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
-    """Supported effort set for an OpenAI/Codex Responses model."""
+    """Supported effort set for an OpenAI/Codex Responses model (``max``: gpt-5.6 and gpt-6, live-verified)."""
     if is_astra_model(model):
         return CODEX_ASTRA_EFFORTS
     bare = (model or "").strip().lower().rsplit("/", 1)[-1]
