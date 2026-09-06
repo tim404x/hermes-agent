@@ -36,9 +36,15 @@ def begin_turn(agent: Any, conversation_history: Any) -> None:
 
 
 def effective_request_overrides(agent: Any) -> dict[str, Any]:
-    """``agent.request_overrides`` plus the fast override while the window is open."""
+    """``agent.request_overrides`` plus the fast override while the window is open.
+
+    ``"priority"`` is an always-open window: surfaces that pin the override at build time (CLI,
+    gateway) get the same dict back, and surfaces that only pass ``service_tier`` (desktop
+    ``_make_agent``, subagents) reach the wire too. Route-gated, so proxies never see the params.
+    """
     overrides = dict(getattr(agent, "request_overrides", None) or {})
-    if getattr(agent, "service_tier", None) not in BOUNDED_MODES or time.monotonic() >= getattr(agent, "_fast_until", 0.0):
+    mode = getattr(agent, "service_tier", None)
+    if mode != "priority" and (mode not in BOUNDED_MODES or time.monotonic() >= getattr(agent, "_fast_until", 0.0)):
         return overrides
     from hermes_cli.models import resolve_fast_mode_overrides
     base_url = getattr(agent, "base_url", None)
