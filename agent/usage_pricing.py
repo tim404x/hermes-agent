@@ -152,6 +152,12 @@ _GOOGLE_URL = "https://ai.google.dev/pricing"
 _OPUS = ("5.00", "25.00", "0.50", "6.25")
 _SONNET = ("3.00", "15.00", "0.30", "3.75")
 _SNAPSHOTS: tuple[tuple[str, Optional[str], str, dict], ...] = (
+    # OpenAI GPT-6 Astra (released 2026-09-04): $10/$50, cache read $1, cache write $12.50
+    # (1.25x input). "-pro" bills the same per-token rates (aliased below); prompts above 272K
+    # input bill a separate long-context tier (2x input/cache, 1.5x output), not covered.
+    ("openai", "https://openai.com/index/gpt-6-astra/", "openai-gpt-6-2026-09", {
+        "gpt-6-astra": ("10.00", "50.00", "1.00", "12.50"),
+    }),
     # OpenAI GPT-5.6 (Sol/Terra/Luna). Cache write = 1.25x input, cache read =
     # 0.10x input. "-pro" high-effort modes bill at the same per-token rates
     # (aliased below); "Sol Fast mode" is a separate tier, not covered.
@@ -261,6 +267,7 @@ del _BEDROCK_URL, _ANTHROPIC_URL, _GOOGLE_URL, _OPUS, _SONNET
 # The direct Gemini provider emits preview IDs for two models; key the snapshot
 # by both the documented stable name and the emitted ID.
 for _provider, _alias, _canonical in (
+    ("openai", "gpt-6-astra-pro", "gpt-6-astra"),
     *((("openai", f"{m}-{suffix}", m) for m in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna") for suffix in ("pro", "900k"))),
     ("google", "gemini-3.1-pro-preview", "gemini-3.1-pro"),
     ("google", "gemini-3.1-flash-lite-preview", "gemini-3.1-flash-lite"),
