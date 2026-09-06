@@ -244,6 +244,8 @@ def _build_child_agent(
                     if child_progress_cb else None
                 ),
                 session_db=child_session_db, parent_session_id=parent_sid, request_overrides=request_overrides,
+                # Inherit the parent's tier; agent.fast_mode re-gates it against the CHILD's route.
+                service_tier=getattr(parent_agent, "service_tier", None),
                 tool_progress_callback=child_progress_cb,
                 iteration_budget=None,  # fresh budget per subagent
             )
