@@ -31,27 +31,14 @@ _STALE_PURGE_PREFIXES = "hermes_cli", "gateway", "tools", "tui_gateway", "agent"
 
 #: Modules EXECUTING the update survive the purge: evicting them buys nothing (running frames
 #: keep them alive) and reloading them mid-flight is the one genuinely unsafe move.
-_STALE_PURGE_PROTECTED = frozenset(
-    {
-        "hermes_cli",
-        "hermes_cli.main",
-        "hermes_cli.update_cmd",
-        "hermes_cli.hermes_logging",
-        # (#98436, upstream PR #98454) The in-flight update receipt is a module-level
-        # singleton (``_current``) in hermes_cli.update_receipt. Purging the module strands
-        # that state in an orphaned object: the command-boundary safety net's
-        # ``from hermes_cli.update_receipt import ...`` rebuilds a FRESH module with
-        # ``_current is None``, finalize hits its documented no-op, and the run writes NO
-        # receipt. On Linux this bit every "Already up to date" run that took the pending
-        # fleet-restart catch-up: latest.json stayed on a stale failed receipt, so the
-        # NEXT run saw a stale runtime and restarted the whole fleet again, forever.
-        "hermes_cli.update_receipt",
-    }
-    # The updater's own split modules are executing too.
-    | {f"hermes_cli.update_cmd_{c}" for c in (
-        "config", "deps", "fleet", "git", "maint", "stash", "windows", "zip",
-    )}
-)
+_STALE_PURGE_PROTECTED = frozenset({"hermes_cli", "hermes_cli.main", "hermes_cli.hermes_logging"})
+
+#: The updater's own module family (``update_cmd*``, ``update_receipt``, ``update_inventory``,
+#: ``update_lock``, ...) is protected as a prefix: these hold per-run state — the open receipt
+#: singleton, the pre-update plan's ``RuntimeRecord`` class identity, the lock — and evicting
+#: one swaps in a fresh module whose ``_current`` is None (receipt silently never written) or
+#: whose dataclass fails every ``isinstance`` against the plan built before the purge.
+_STALE_PURGE_PROTECTED_PREFIX = "hermes_cli.update_"
 
 _PRE_UPDATE_SNAPSHOT_KEEP = 1
 
@@ -98,6 +85,7 @@ def _purge_stale_hermes_modules() -> None:
         purged = [
             name for name in list(modules)
             if name not in _STALE_PURGE_PROTECTED
+            and not name.startswith(_STALE_PURGE_PROTECTED_PREFIX)
             # Root-package check: startswith() alone also matches unrelated ``gateway_foo``.
             and name.split(".", 1)[0] in _STALE_PURGE_PREFIXES
             and modules.pop(name, None) is not None
