@@ -3344,7 +3344,6 @@ export const zh = defineLocale({
     review: '审查',
     logs: '日志',
     cronJobs: '定时任务',
-    ungrouped: '未分组',
     groupAriaGrouped: '以单一列表显示会话',
     groupAriaUngrouped: '按工作区分组会话',
     showProjects: '显示项目',
