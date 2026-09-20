@@ -2983,7 +2983,6 @@ export interface Translations {
     review: string
     logs: string
     cronJobs: string
-    ungrouped: string
     groupAriaGrouped: string
     groupAriaUngrouped: string
     showProjects: string
