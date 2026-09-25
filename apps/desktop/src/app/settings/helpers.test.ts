@@ -296,6 +296,16 @@ describe('settings helpers', () => {
       expect(field?.options).toEqual(['honcho'])
     })
 
+    it('exposes the code-execution run limits in Advanced when they are set in config', () => {
+      // Tim raised these (200 calls / 900 s); a limit that only lives in YAML is invisible to him.
+      const config: HermesConfigRecord = { code_execution: { max_tool_calls: 200, timeout: 900 } }
+
+      const fields = new Map(sectionFieldEntries({}, config).get('advanced') ?? [])
+
+      expect(fields.get('code_execution.max_tool_calls')?.type).toBe('number')
+      expect(fields.get('code_execution.timeout')?.type).toBe('number')
+    })
+
     it('hides declared keys absent from both schema and config', () => {
       expect(sectionFieldEntries({}, {}).get('memory') ?? []).toHaveLength(0)
     })
