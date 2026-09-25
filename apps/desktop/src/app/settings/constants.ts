@@ -444,7 +444,9 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
     maxLineLength: 'Line Length Limit'
   },
   codeExecution: {
-    mode: 'Code Execution Mode'
+    mode: 'Code Execution Mode',
+    maxToolCalls: 'Code Run Tool Call Limit',
+    timeout: 'Code Run Timeout (seconds)'
   },
   approvals: {
     mode: 'Approval Mode',
@@ -616,7 +618,9 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
     daytonaImage: 'Image used when the execution backend is Daytona.'
   },
   codeExecution: {
-    mode: 'How strictly code execution is scoped to the current project.'
+    mode: 'How strictly code execution is scoped to the current project.',
+    maxToolCalls: 'Maximum tool calls one code-execution run may make before it stops.',
+    timeout: 'Maximum seconds one code-execution run may take before it is stopped.'
   },
   fileReadMaxChars: 'Maximum characters Hermes can read from one file request.',
   approvals: {
@@ -825,6 +829,8 @@ export const SECTIONS: DesktopConfigSection[] = [
       'tool_output.max_line_length',
       'checkpoints.max_snapshots',
       'agent.max_turns',
+      'code_execution.max_tool_calls',
+      'code_execution.timeout',
       'agent.api_max_retries',
       'agent.service_tier',
       'agent.tool_use_enforcement',
