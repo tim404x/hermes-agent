@@ -73,4 +73,19 @@ describe('a sent reference renders as the chip the composer showed', () => {
     expect(fence?.className).toContain('whitespace-pre-wrap')
     expect(fence?.className).not.toContain('overflow-x-auto')
   })
+
+  // The bubble, not just DirectiveContent: user messages render a deliberately
+  // minimal markdown subset, so an OS-drop's `![alt](blob:…)` ref used to land
+  // in a plain-text segment and paint as literal markdown.
+  it('paints a dropped image (object-URL preview) in the in-flight bubble, not its URL as text', () => {
+    const blobUrl = 'blob:file:///c933bd57-d79b-4953-a90e-d283df810a6b'
+
+    render(<UserMessageText text={`look at this\n![Lattice.png](${blobUrl})`} />)
+
+    const img = document.querySelector('span[data-slot="aui_directive-image"] img')
+
+    expect(img?.getAttribute('src')).toBe(blobUrl)
+    expect(document.body.textContent).not.toContain('blob:')
+    expect(document.body.textContent).toContain('look at this')
+  })
 })
