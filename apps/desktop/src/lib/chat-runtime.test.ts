@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
+import { textWithoutReferenceLines } from '@/components/assistant-ui/reference-kinds'
 import type { ChatMessage, ChatMessagePart } from '@/lib/chat-messages'
 import type { ComposerAttachment } from '@/store/composer'
 
@@ -88,14 +89,18 @@ describe('optimisticAttachmentRef', () => {
     expect(optimisticAttachmentRef(attachment({ kind: 'image', previewUrl: 'https://example.com/x.png' }))).toBeNull()
   })
 
-  it('renders an OS-drop blob: preview as a markdown image (no IPC data URL)', () => {
-    const blobUrl = 'blob:https://desktop/preview-1'
+  it('renders an OS-drop blob: preview as an @image ref the user bubble paints (no IPC data URL)', () => {
+    const blobUrl = 'blob:file:///c933bd57-d79b-4953-a90e-d283df810a6b'
 
     const ref = optimisticAttachmentRef(
       attachment({ kind: 'image', label: 'Lattice.png', detail: 'C:\\shot.png', previewUrl: blobUrl })
     )
 
-    expect(ref).toBe(`![Lattice.png](${blobUrl})`)
+    // The blob wins over the path (a path ref would IPC-read the whole file,
+    // #63682), and it must be a reference, not markdown: user bubbles do not
+    // render markdown, so `![..](blob:)` showed up as literal text.
+    expect(ref).toBe(`@image:${blobUrl}`)
+    expect(textWithoutReferenceLines(`hello\n${ref}`)).toBe('hello')
   })
 
   it('passes non-image attachments straight through to attachmentDisplayText', () => {

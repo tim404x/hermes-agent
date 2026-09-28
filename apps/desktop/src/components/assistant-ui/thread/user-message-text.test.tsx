@@ -58,4 +58,16 @@ describe('a sent reference renders as the chip the composer showed', () => {
 
     expect(document.querySelector('[data-slot="aui_user-fence"]')?.textContent).toBe('const x = 1\n')
   })
+
+  it('paints a dropped image (object-URL preview) in the in-flight bubble, not its URL as text', () => {
+    const blobUrl = 'blob:file:///c933bd57-d79b-4953-a90e-d283df810a6b'
+
+    render(<UserMessageText text={`look at this\n@image:${blobUrl}`} />)
+
+    const img = document.querySelector('[data-slot="aui_directive-image"] img, img[src^="blob:"]')
+
+    expect(img?.getAttribute('src')).toBe(blobUrl)
+    expect(document.body.textContent).not.toContain('blob:')
+    expect(document.body.textContent).toContain('look at this')
+  })
 })

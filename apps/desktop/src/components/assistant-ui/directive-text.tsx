@@ -401,7 +401,9 @@ export const DirectiveText: TextMessagePartComponent = ({ text }: TextMessagePar
  * messages render after the backend embeds the data URL, so the UX is stable
  * across initial send and refresh. */
 const DirectiveImage: FC<{ id: string; label: string }> = ({ id, label }) => {
-  const isUrl = /^(?:https?|data):/i.test(id)
+  // `blob:` is the in-flight bubble's object-URL preview for an OS image drop
+  // (#63682): already in memory, so paint it as-is rather than via IPC.
+  const isUrl = /^(?:https?|data|blob):/i.test(id)
   // `src` is the bounded thumbnail painted inline; `zoomSrc` is the full-
   // resolution source the lightbox and download use. Keeping inline bounded is
   // what lets the in-flight bubble render an `@image:<path>` ref without the
@@ -448,7 +450,7 @@ const DirectiveImage: FC<{ id: string; label: string }> = ({ id, label }) => {
   }, [id, isUrl])
 
   if (failed) {
-    return <DirectiveChip id={id} label={label} type="image" />
+    return <DirectiveChip id={id} label={id.startsWith('blob:') ? 'image' : label} type="image" />
   }
 
   if (!src) {
@@ -465,6 +467,9 @@ const DirectiveImage: FC<{ id: string; label: string }> = ({ id, label }) => {
       alt={label}
       className="max-h-48 max-w-full rounded-lg border border-(--ui-stroke-tertiary) object-contain"
       draggable={false}
+      // A revoked object URL (the bubble outlived its blob: preview) degrades
+      // to the chip instead of a broken-image glyph.
+      onError={id.startsWith('blob:') ? () => setFailed(true) : undefined}
       slot="aui_directive-image"
       src={src}
       zoomSrc={zoomSrc ?? undefined}
