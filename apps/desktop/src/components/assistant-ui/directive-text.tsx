@@ -451,7 +451,7 @@ const DirectiveImage: FC<{ id: string; label: string }> = ({ id, label }) => {
   }, [id, isUrl])
 
   if (failed) {
-    return <DirectiveChip id={id} label={label} type="image" />
+    return <DirectiveChip id={id} label={id.startsWith('blob:') ? 'image' : label} type="image" />
   }
 
   if (!src) {
@@ -468,6 +468,9 @@ const DirectiveImage: FC<{ id: string; label: string }> = ({ id, label }) => {
       alt={label}
       className="max-h-48 max-w-full rounded-lg border border-(--ui-stroke-tertiary) object-contain"
       draggable={false}
+      // A revoked object URL (the bubble outlived its blob: preview) degrades
+      // to the chip instead of a broken-image glyph.
+      onError={id.startsWith('blob:') ? () => setFailed(true) : undefined}
       slot="aui_directive-image"
       src={src}
       zoomSrc={zoomSrc ?? undefined}

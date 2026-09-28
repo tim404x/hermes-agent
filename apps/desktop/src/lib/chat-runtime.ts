@@ -234,9 +234,12 @@ export function optimisticAttachmentRef(attachment: ComposerAttachment): string 
   }
 
   if (attachment.kind === 'image') {
-    // Object-URL previews from OS drops take precedence over the path ref:
-    // markdown image keeps them out of the data-URL extract path while still
-    // rendering inline in the optimistic bubble (#63682).
+    // Object-URL previews from OS drops take precedence over the path ref: a
+    // path ref would make DirectiveImage base64-read the whole file over IPC,
+    // the Windows drop freeze (#63682). The markdown-image form keeps them out
+    // of the data-URL extract path; `BLOB_MARKDOWN_IMAGE_RE` in directive-text
+    // recognizes exactly this string, so the sent bubble paints the object URL
+    // directly (no IPC read) instead of leaking raw markdown as text.
     if (attachment.previewUrl?.startsWith('blob:')) {
       // Percent-encode the alt text: a filename with `]` or parens in it would
       // otherwise break the Markdown-image form the directive parser matches
