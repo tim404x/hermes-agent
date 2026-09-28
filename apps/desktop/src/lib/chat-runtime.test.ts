@@ -98,6 +98,8 @@ describe('optimisticAttachmentRef', () => {
       attachment({ kind: 'image', label: 'Lattice.png', detail: 'C:\\shot.png', previewUrl: blobUrl })
     )
 
+    // The blob wins over the path: a path ref would make DirectiveImage
+    // base64-read the whole file over IPC (#63682).
     expect(ref).toBe(`![Lattice.png](${blobUrl})`)
   })
 
