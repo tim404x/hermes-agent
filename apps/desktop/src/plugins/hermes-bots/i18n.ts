@@ -225,6 +225,8 @@ const en: BotsMessages = {
   },
   avatar: {
     classicShapes: 'Classic shapes',
+    customColor: 'Custom color',
+    tabGrok: 'Grok Bot',
     blobFromName: 'Blob face — drawn from the bot’s name',
     unlockFollowsName: 'Unlock — the face follows the bot’s name again',
     randomize: 'Randomize',
@@ -668,6 +670,8 @@ const ja: BotsMessages = {
   },
   avatar: {
     classicShapes: 'クラシックシェイプ',
+    customColor: 'カスタムカラー',
+    tabGrok: 'Grok Bot',
     blobFromName: 'ブロブ顔 — ボットの名前から描画',
     unlockFollowsName: 'ロック解除 — 顔がボットの名前に再び追従します',
     randomize: 'ランダム',
@@ -1104,6 +1108,8 @@ const zh: BotsMessages = {
   },
   avatar: {
     classicShapes: '经典形状',
+    customColor: '自定义颜色',
+    tabGrok: 'Grok Bot',
     blobFromName: '斑点脸 — 根据机器人名称绘制',
     unlockFollowsName: '解锁 — 面孔再次跟随机器人名称',
     randomize: '随机',
@@ -1533,6 +1539,8 @@ const zhHant: BotsMessages = {
   },
   avatar: {
     classicShapes: '經典形狀',
+    customColor: '自訂顏色',
+    tabGrok: 'Grok Bot',
     blobFromName: '斑點臉 — 依機器人名稱繪製',
     unlockFollowsName: '解鎖 — 面孔再次跟隨機器人名稱',
     randomize: '隨機',
