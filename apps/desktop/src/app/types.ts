@@ -93,8 +93,12 @@ export interface SessionSteerResponse {
 }
 
 export interface SessionRedirectResponse {
-  status?: 'redirected' | 'queued' | 'rejected'
+  /** `duplicate`: this send action's client_message_id was already accepted
+   *  (by prompt.submit or an earlier redirect); nothing new runs. */
+  status?: 'duplicate' | 'redirected' | 'queued' | 'rejected'
   text?: string
+  /** With `duplicate`: whether the session is running right now. */
+  running?: boolean
 }
 
 export interface SessionTitleResponse {

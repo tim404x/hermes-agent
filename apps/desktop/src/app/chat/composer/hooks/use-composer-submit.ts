@@ -14,7 +14,7 @@ import {
   isFreshDraftScope
 } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
-import { enqueueQueuedPrompt, type QueuedPromptEntry } from '@/store/composer-queue'
+import { enqueueQueuedPrompt, newClientMessageId, type QueuedPromptEntry } from '@/store/composer-queue'
 import { hasConnectionRequest, skipConnectionRequest } from '@/store/connection-request'
 import { notify } from '@/store/notifications'
 import { hasBlockingPromptRequest } from '@/store/prompts'
@@ -98,7 +98,16 @@ export function useComposerSubmit({
   // === false) or throws, re-stash the draft so the words survive. Repaint it
   // only while the same session still owns the visible composer; a late reject
   // must not publish an old session's text into the newly focused one.
-  const dispatchSubmit = (text: string, attachments?: ComposerAttachment[], displayKind?: 'hidden') => {
+  //
+  // `clientMessageId` names the user's send action (one per Enter / external
+  // request). It rides prompt.submit, so the gateway runs this action at most
+  // once even when it also reaches the gateway another way.
+  const dispatchSubmit = (
+    text: string,
+    attachments?: ComposerAttachment[],
+    displayKind?: 'hidden',
+    clientMessageId: string = newClientMessageId()
+  ) => {
     // A fresh chat's composer is keyed by its per-lifecycle fresh-draft key
     // (`__new__:<uuid>`), but the submit contract spells "no session yet" as
     // null: the create handoff below and the composer drift prong both key off
@@ -134,11 +143,17 @@ export function useComposerSubmit({
       attachments
         ? onSubmit(text, {
             attachments,
+            clientMessageId,
             composerScope: submittedScope,
             ...assignment,
             ...(displayKind ? { displayKind } : {})
           })
-        : onSubmit(text, { composerScope: submittedScope, ...assignment, ...(displayKind ? { displayKind } : {}) })
+        : onSubmit(text, {
+            clientMessageId,
+            composerScope: submittedScope,
+            ...assignment,
+            ...(displayKind ? { displayKind } : {})
+          })
     )
       .then(accepted => void (accepted === false ? rejected() : clearSessionDraft(submittedScope)))
       .catch(rejected)
@@ -169,9 +184,13 @@ export function useComposerSubmit({
           !inputDisabled
         ) {
           const current = externalSubmitRef.current
+          // One request = one send action: the steer, the direct submit and
+          // any queue fallback all carry this id, so the gateway runs it once
+          // even when a steer reached it but its answer did not reach us.
+          const clientMessageId = newClientMessageId()
 
           if (!current.busy) {
-            current.dispatchSubmit(text, undefined, displayKind)
+            current.dispatchSubmit(text, undefined, displayKind, clientMessageId)
 
             return
           }
@@ -180,13 +199,18 @@ export function useComposerSubmit({
 
           // External requests contain only text; the unsent draft and its attachments stay in the composer.
           const enqueue = () =>
-            void enqueueQueuedPrompt(queueKey, { text, attachments: [], ...(displayKind ? { displayKind } : {}) })
+            void enqueueQueuedPrompt(queueKey, {
+              text,
+              attachments: [],
+              clientMessageId,
+              ...(displayKind ? { displayKind } : {})
+            })
 
           // A hidden note never becomes a user turn: it rides session.steer into
           // the model's next tool result, and keeps its kind if it has to queue.
           if (displayKind) {
             if (current.onSteerHidden) {
-              void Promise.resolve(current.onSteerHidden(text))
+              void Promise.resolve(current.onSteerHidden(text, { clientMessageId }))
                 .then(accepted => {
                   if (!accepted) {
                     enqueue()
@@ -206,7 +230,7 @@ export function useComposerSubmit({
             text.trim() &&
             !SLASH_COMMAND_RE.test(text.trim())
           ) {
-            void Promise.resolve(current.onSteer(text))
+            void Promise.resolve(current.onSteer(text, { clientMessageId }))
               .then(accepted => {
                 if (!accepted) {
                   enqueue()
@@ -419,12 +443,18 @@ export function useComposerSubmit({
     // frozen transport for the queue; restoring to the composer keeps the chip
     // form so the user can re-send it as-is.
     const hasTerminalTransport = frozen.displayText !== frozen.transportText
+    // This Enter's send action id. The redirect carries it, and so does the
+    // local copy `keep` queues when the redirect errors: a redirect that timed
+    // out on our side may already be queued by the gateway, and the copy's
+    // drain must then come back `duplicate`, not run the words a second time.
+    const clientMessageId = newClientMessageId()
 
     const keep = () => {
       if (activeQueueSessionKey) {
         enqueueQueuedPrompt(activeQueueSessionKey, {
           text: frozen.displayText,
           attachments: [],
+          clientMessageId,
           ...(hasTerminalTransport ? { displayText: frozen.displayText, frozenTransport: frozen.transportText } : {})
         })
       } else {
@@ -432,7 +462,7 @@ export function useComposerSubmit({
       }
     }
 
-    void Promise.resolve(onSteer(frozen.transportText))
+    void Promise.resolve(onSteer(frozen.transportText, { clientMessageId }))
       .then(accepted => {
         if (!accepted) {
           keep()

@@ -622,15 +622,19 @@ class CorrectionStatus(WireEnum):
     queued = "queued"
     redirected = "redirected"
     rejected = "rejected"
+    duplicate = "duplicate"  # this client_message_id was already accepted; nothing new runs
 
 
 class SessionCorrectionParams(SessionParams):
     text: str
+    # The send action's id, shared with prompt.submit (see PromptSubmitParams.client_message_id).
+    client_message_id: str | None = None
 
 
 class SessionCorrectionResult(Result):
     status: CorrectionStatus
     text: str
+    running: bool | None = None  # with ``duplicate``: whether the session is running right now
 
 
 method("session.steer", params=SessionCorrectionParams, result=SessionCorrectionResult,

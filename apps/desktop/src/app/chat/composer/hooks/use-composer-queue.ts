@@ -10,13 +10,18 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  $queuedPromptSendsInFlight,
+  beginQueuedPromptSend,
   clearQueuedPromptDrainFailures,
+  endQueuedPromptSend,
   enqueueQueuedPrompt,
   getQueuedPrompts,
+  isQueuedPromptSending,
   isSteerableEntry,
   MAX_AUTO_DRAIN_ATTEMPTS,
   migrateQueuedPrompts,
   promoteQueuedPrompt,
+  queuedPromptClientMessageId,
   type QueuedPromptEntry,
   removeQueuedPrompt,
   resolveQueuedPromptTransport,
@@ -325,49 +330,62 @@ export function useComposerQueue({
         return await withQueueDrainClaim(drainQueueSessionKey, async queue => {
           const entry = pickEntry(queue)
 
-          if (!entry) {
+          // In flight elsewhere (a drain on this entry's previous key, or a
+          // composer that unmounted mid-submit): not a failure, and never a
+          // second send. The in-flight set is renderer-wide because the claim
+          // above is per key and a re-key moves the entry out from under it.
+          if (!entry || !beginQueuedPromptSend(entry.id)) {
             return null
           }
 
-          const resolved = resolveQueuedPromptTransport(entry)
+          try {
+            const resolved = resolveQueuedPromptTransport(entry)
 
-          if (!resolved.ok) {
-            notify({
-              kind: 'warning',
-              title: t.composer.terminalSelectionMissingTitle,
-              message: t.composer.queuedTerminalSelectionExpiredBody
-            })
-            drainFailuresRef.current.set(entry.id, MAX_AUTO_DRAIN_ATTEMPTS)
+            if (!resolved.ok) {
+              notify({
+                kind: 'warning',
+                title: t.composer.terminalSelectionMissingTitle,
+                message: t.composer.queuedTerminalSelectionExpiredBody
+              })
+              drainFailuresRef.current.set(entry.id, MAX_AUTO_DRAIN_ATTEMPTS)
 
-            return false
+              return false
+            }
+
+            const accepted = await Promise.resolve(
+              onSubmit(resolved.transportText, {
+                attachments: entry.attachments,
+                // One id per send action: the gateway runs it at most once, so
+                // a repeat from any path comes back `duplicate`, not a turn.
+                clientMessageId: queuedPromptClientMessageId(entry),
+                ...(resolved.displayText ? { displayText: resolved.displayText } : {}),
+                ...(entry.displayKind ? { displayKind: entry.displayKind } : {}),
+                fromQueue: true,
+                sessionId: drainRuntimeSessionId,
+                storedSessionId: drainQueueSessionKey
+              })
+            )
+
+            if (accepted === false) {
+              return false
+            }
+
+            drainFailuresRef.current.delete(entry.id)
+            // Submit now owns the blob: previews (optimistic bubble); do not revoke.
+            // By id: the store finds the entry under whatever key it lives now —
+            // a re-key during the submit must not leave the sent entry behind.
+            removeQueuedPrompt(drainQueueSessionKey, entry.id, { retainPreviewUrls: true })
+            resetBrowseState(drainRuntimeSessionId)
+            // A successful drain means the queue is flowing again — lift any park
+            // so the remaining entries follow. Manual drains (Enter on an empty
+            // composer, the per-row send arrow) are exactly the resume gestures a
+            // parked queue waits for; the auto path only reaches here unparked.
+            unparkQueuedPrompts(drainQueueSessionKey)
+
+            return true
+          } finally {
+            endQueuedPromptSend(entry.id)
           }
-
-          const accepted = await Promise.resolve(
-            onSubmit(resolved.transportText, {
-              attachments: entry.attachments,
-              ...(resolved.displayText ? { displayText: resolved.displayText } : {}),
-              ...(entry.displayKind ? { displayKind: entry.displayKind } : {}),
-              fromQueue: true,
-              sessionId: drainRuntimeSessionId,
-              storedSessionId: drainQueueSessionKey
-            })
-          )
-
-          if (accepted === false) {
-            return false
-          }
-
-          drainFailuresRef.current.delete(entry.id)
-          // Submit now owns the blob: previews (optimistic bubble); do not revoke.
-          removeQueuedPrompt(drainQueueSessionKey, entry.id, { retainPreviewUrls: true })
-          resetBrowseState(drainRuntimeSessionId)
-          // A successful drain means the queue is flowing again — lift any park
-          // so the remaining entries follow. Manual drains (Enter on an empty
-          // composer, the per-row send arrow) are exactly the resume gestures a
-          // parked queue waits for; the auto path only reaches here unparked.
-          unparkQueuedPrompts(drainQueueSessionKey)
-
-          return true
         })
       } finally {
         drainingQueueRef.current = false
@@ -449,9 +467,26 @@ export function useComposerQueue({
         return false
       }
 
+      // A drain already sending this entry owns it; a redirect on top would
+      // deliver the same words twice.
+      if (!beginQueuedPromptSend(id)) {
+        return false
+      }
+
       triggerHaptic('submit')
 
-      const accepted = await Promise.resolve(onSteer(resolved.transportText))
+      let accepted: boolean
+
+      try {
+        // Same id as the drain would send: if the redirect reaches the
+        // gateway but its answer is lost, the settle drain's repeat comes back
+        // `duplicate` instead of running the words as a second turn.
+        accepted = await Promise.resolve(
+          onSteer(resolved.transportText, { clientMessageId: queuedPromptClientMessageId(entry) })
+        )
+      } finally {
+        endQueuedPromptSend(id)
+      }
 
       // Rejected (turn already settling, gateway said no): leave the entry
       // queued exactly where it was — the settle drain picks it up, so the
@@ -518,6 +553,21 @@ export function useComposerQueue({
 
     if (!entry || (drainFailuresRef.current.get(entry.id) ?? 0) >= MAX_AUTO_DRAIN_ATTEMPTS) {
       return
+    }
+
+    // Another drain (a composer that unmounted mid-submit, the drain on this
+    // entry's previous key) is sending the head. Wait for that send to settle
+    // rather than skip ahead (reorders the queue) or send it again (a second
+    // turn). If it failed, the entry is still here and this drain retries it.
+    if (isQueuedPromptSending(entry.id)) {
+      const unlisten = $queuedPromptSendsInFlight.listen(inFlight => {
+        if (!inFlight.has(entry.id)) {
+          unlisten()
+          setDrainRetryTick(tick => tick + 1)
+        }
+      })
+
+      return unlisten
     }
 
     let cancelled = false
