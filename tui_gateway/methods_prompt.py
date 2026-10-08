@@ -678,8 +678,86 @@ def _lock_in_submit_turn(
 _CLIENT_SURFACES = frozenset({"hud", "voice-live"})
 
 
+# ── one turn per user send action (``client_message_id``) ─────────────────────────────────────
+# A client sends one id per user SEND ACTION on every path that action takes: prompt.submit,
+# session.redirect / session.steer, and every queue drain of a local copy. A repeat of an ACCEPTED id
+# answers ``duplicate`` (no enqueue, no turn). Without this, a client-side duplicate became an extra
+# turn: a re-keyed queue drained twice (seven busy accepts of one message in eight seconds), and a
+# redirect the gateway queued but whose answer was lost was also drained from the client's safety
+# copy (two accepts, two turns). Bounded and per live session; ids are recorded only on acceptance,
+# so a rejected (4009 / refused) send stays retryable under the same id.
+_CLIENT_MESSAGE_ID_LIMIT = 512
+_CLIENT_MESSAGE_ID_MAX_LEN = 200
+
+
+def _client_message_id(params: dict):
+    """The send action's id, or None: absent or not a usable string means no dedupe (older clients)."""
+    raw = params.get("client_message_id")
+    if not isinstance(raw, str):
+        return None
+    cmid = raw.strip()
+    return cmid if 0 < len(cmid) <= _CLIENT_MESSAGE_ID_MAX_LEN else None
+
+
+def _claim_client_message_id(session: dict, cmid: str) -> str:
+    """``duplicate`` (already accepted), ``pending`` (a concurrent send of it is undecided) or ``new``
+    (claimed: the caller must ``_settle_client_message_id`` it)."""
+    with session["history_lock"]:
+        if cmid in session.setdefault("_client_message_ids", {}):
+            return "duplicate"
+        pending = session.setdefault("_client_message_ids_pending", set())
+        if cmid in pending:
+            return "pending"
+        pending.add(cmid)
+        return "new"
+
+
+def _settle_client_message_id(session: dict, cmid: str, accepted: bool) -> None:
+    with session["history_lock"]:
+        session.setdefault("_client_message_ids_pending", set()).discard(cmid)
+        if not accepted:
+            return
+        seen = session.setdefault("_client_message_ids", {})
+        seen[cmid] = time.time()
+        while len(seen) > _CLIENT_MESSAGE_ID_LIMIT:
+            seen.pop(next(iter(seen)))  # insertion order: oldest first
+
+
+def _run_once_per_client_message_id(rid, session, params: dict, body, accepted, duplicate_extra=None) -> dict:
+    """Run ``body()`` unless this send action was already accepted. ``accepted(response)`` decides
+    whether the response records the id. A concurrent repeat answers retryable 4009 (session busy):
+    claiming ``duplicate`` before the first send is decided would lose a send that is then rejected."""
+    cmid = _client_message_id(params) if isinstance(session, dict) else None
+    if cmid is None:
+        return body()
+    claim = _claim_client_message_id(session, cmid)
+    if claim == "duplicate":
+        logger.info("dropping repeat of accepted client_message_id=%s (session=%s)",
+                    cmid, params.get("session_id"))
+        return _ok(rid, {"status": "duplicate", **(duplicate_extra or {}),
+                         "running": bool(session.get("running"))})
+    if claim == "pending":
+        return _err(rid, 4009, "session busy")
+    response = None
+    try:
+        response = body()
+        return response
+    finally:
+        _settle_client_message_id(session, cmid, bool(response) and accepted(response))
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
+    # A plain lookup (no not-found log): the body does the real one and owns its errors.
+    session = _sessions.get(params.get("session_id") or "")
+    return _run_once_per_client_message_id(
+        rid, session, params, lambda: _submit_prompt_body(rid, params),
+        accepted=lambda response: "result" in response)
+
+
+def _submit_prompt_body(rid, params: dict) -> dict:
+    """prompt.submit proper. Every OK return is an accepted send (busy-queued / steered / redirected,
+    or a turn locked in); every error return left nothing running for it."""
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
