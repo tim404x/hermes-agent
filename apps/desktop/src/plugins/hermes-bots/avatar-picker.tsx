@@ -38,6 +38,16 @@ import {
   pickImageFromDevice,
   probeImagen
 } from './avatar-image'
+import {
+  formatGrokShape,
+  GROK_EXPRESSIONS,
+  GROK_PALETTE,
+  GROK_SHAPES,
+  type GrokExpressionId,
+  type GrokShapeId,
+  isGrokShape,
+  parseGrokShape
+} from './grok-face'
 import { useBots } from './i18n'
 import { PetTab } from './pet'
 
@@ -58,7 +68,8 @@ export function AvatarPicker({ shape, color, image, onShape, onColor, onImage, g
   const b = useBots()
   const pickerName = generateSeed?.name || 'agent'
   const imagen = useValue($imagenAvailable)
-  const [tab, setTab] = useState('bot')
+  // A Grok Bot face opens on its own tab, so editing it starts where it lives.
+  const [tab, setTab] = useState(isGrokShape(shape) ? 'grok' : 'bot')
   const [describe, setDescribe] = useState('')
   const [genBusy, setGenBusy] = useState(false)
 
@@ -126,6 +137,7 @@ export function AvatarPicker({ shape, color, image, onShape, onColor, onImage, g
         onChange={goTab}
         options={[
           { id: 'bot', label: b.avatar.tabBot },
+          { id: 'grok', label: b.avatar.tabGrok },
           { id: 'generate', label: b.avatar.tabGenerate },
           { id: 'upload', label: b.avatar.upload },
           { id: 'pet', label: b.avatar.tabPet }
@@ -242,6 +254,19 @@ export function AvatarPicker({ shape, color, image, onShape, onColor, onImage, g
           </div>
         )
       ) : null}
+      {tab === 'grok' ? (
+        <GrokTab
+          color={color}
+          customLabel={b.avatar.customColor}
+          image={image}
+          matchLabel={b.avatar.matchTheName}
+          name={pickerName}
+          onColor={onColor}
+          onImage={onImage}
+          onShape={onShape}
+          shape={shape}
+        />
+      ) : null}
       {tab === 'generate' ? (
         imagen ? (
           <div className="grid w-full gap-2">
@@ -282,6 +307,87 @@ export function AvatarPicker({ shape, color, image, onShape, onColor, onImage, g
         </Button>
       ) : null}
       {tab === 'pet' ? <PetTab image={image} onImage={onImage} /> : null}
+    </div>
+  )
+}
+
+const GROK_SHAPE_IDS = Object.keys(GROK_SHAPES) as GrokShapeId[]
+const GROK_EXPRESSION_IDS = Object.keys(GROK_EXPRESSIONS) as GrokExpressionId[]
+
+/** `<input type="color">` only speaks #rrggbb; anything else starts it on the xAI violet. */
+function colorInputValue(color: string) {
+  return /^#[0-9a-f]{6}$/i.test(color) ? color : '#8b5cf6'
+}
+
+interface GrokTabProps {
+  color: null | string
+  customLabel: string
+  image: null | string
+  matchLabel: string
+  name: string
+  onColor: (color: null | string) => void
+  onImage: (image: null | string) => void
+  onShape: (shape: string) => void
+  shape: string
+}
+
+/** Grok Bot faces: 8 bodies, 16 rest expressions, any colour (xAI palette or custom). */
+function GrokTab({ color, customLabel, image, matchLabel, name, onColor, onImage, onShape, shape }: GrokTabProps) {
+  const current = parseGrokShape(shape)
+  const body = current?.shape ?? 'circle'
+  const mood = current?.expression ?? 'neutral'
+  const ink = avatarColor(color, name)
+
+  const pick = (next: string) => {
+    onImage(null)
+    onShape(next)
+  }
+
+  return (
+    <div className="grid justify-items-center gap-3">
+      <div className="grid grid-cols-4 justify-items-center gap-1.5">
+        {GROK_SHAPE_IDS.map(id => (
+          <Tip key={id} label={id}>
+            <RowButton
+              aria-label={id}
+              className={cn(
+                'flex size-11 items-center justify-center rounded-md transition-colors hover:bg-(--chrome-action-hover)',
+                current?.shape === id && !image && 'ring-1 ring-(--ui-accent)'
+              )}
+              onClick={() => pick(formatGrokShape(id, mood))}
+            >
+              <BotFace color={ink} name={name} shape={formatGrokShape(id, mood)} size={32} />
+            </RowButton>
+          </Tip>
+        ))}
+      </div>
+      <div className="grid grid-cols-8 justify-items-center gap-1">
+        {GROK_EXPRESSION_IDS.map(id => (
+          <Tip key={id} label={id}>
+            <RowButton
+              aria-label={id}
+              className={cn(
+                'flex size-8 items-center justify-center rounded-md transition-colors hover:bg-(--chrome-action-hover)',
+                current && current.expression === id && !image && 'ring-1 ring-(--ui-accent)'
+              )}
+              onClick={() => pick(formatGrokShape(body, id))}
+            >
+              <BotFace color={ink} name={name} shape={formatGrokShape(body, id)} size={24} />
+            </RowButton>
+          </Tip>
+        ))}
+      </div>
+      <ColorSwatches clearLabel={matchLabel} onChange={onColor} swatches={GROK_PALETTE} value={color} />
+      <label className="flex items-center gap-2 text-[0.65rem] text-(--ui-text-tertiary)">
+        {customLabel}
+        <input
+          aria-label={customLabel}
+          className="h-5 w-8 cursor-pointer rounded border-0 bg-transparent p-0"
+          onChange={event => onColor(event.target.value)}
+          type="color"
+          value={colorInputValue(ink)}
+        />
+      </label>
     </div>
   )
 }
