@@ -205,6 +205,9 @@ export type BotsMessages = {
     tabGenerate: string
     upload: string
     tabPet: string
+    /** Grok Bot faces tab and its custom-colour swatch label (fork carry: live Grok Bot faces). */
+    tabGrok: string
+    customColor: string
     removeImage: string
     removeBackToShape: string
     describePlaceholder: string
