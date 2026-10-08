@@ -34,6 +34,13 @@ export interface QueuedPromptEntry {
    *  A user gesture — manual send, redirect, queueing a fresh prompt — clears
    *  it, exactly like the composer's in-process counter. */
   drainFailures?: number
+  /** Id of the user SEND ACTION this entry came from, when that action may
+   *  already have reached the gateway another way (a redirect that errored
+   *  after the gateway queued it, an external submit whose steer failed). The
+   *  drain sends it as `client_message_id`, so the gateway recognises the
+   *  repeat and answers `duplicate` instead of running a second turn.
+   *  Persisted with the entry; absent = the entry id is the action id. */
+  clientMessageId?: string
   attachments: ComposerAttachment[]
   queuedAt: number
 }
@@ -43,9 +50,21 @@ export interface EnqueueQueuedPromptPayload {
   attachments: ComposerAttachment[]
   displayText?: string
   displayKind?: 'hidden'
+  /** The send action id when another path may already have delivered it. */
+  clientMessageId?: string
   /** Fenced `@terminal` transport. Runtime-only; never written to localStorage. */
   frozenTransport?: string
 }
+
+/** One id per user send action (Enter, an external submit request). Every path
+ *  that action takes — direct submit, redirect/steer, a local queue copy —
+ *  carries it, and the gateway runs each id at most once. */
+export const newClientMessageId = (): string => `send-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+
+/** The id a drain sends for this entry: the originating send action's id when
+ *  it has one, else the entry id (globally unique, stable across reloads). */
+export const queuedPromptClientMessageId = (entry: Pick<QueuedPromptEntry, 'clientMessageId' | 'id'>): string =>
+  entry.clientMessageId || entry.id
 
 export type ResolvedQueuedPromptTransport =
   { ok: true; transportText: string; displayText?: string } | { ok: false; reason: 'missing-terminal-payload' }
@@ -295,6 +314,49 @@ const queueFor = (sid: string) => $queuedPromptsBySession.get()[sid] ?? []
 
 const nextId = () => `queued-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
+/**
+ * Entry ids a drain is sending right now, across EVERY queue key. The drain
+ * claim (`withQueueDrainClaim`) is per key, and a re-key (compaction rotation,
+ * runtime bounce) moves an entry to a new key while its submit is still in
+ * flight — a second drain on the new key then picked the SAME entry and sent
+ * it again (seven accepts of one message in eight seconds). Entry ids are
+ * globally unique, so one renderer-wide set closes that. An atom (not a bare
+ * Set) so a drain that skipped an in-flight entry re-checks when it settles —
+ * a failed send must stay drainable.
+ */
+export const $queuedPromptSendsInFlight = atom<ReadonlySet<string>>(new Set())
+
+/** Claim `id` for one send. False when another drain already holds it. */
+export const beginQueuedPromptSend = (id: string): boolean => {
+  const inFlight = $queuedPromptSendsInFlight.get()
+
+  if (inFlight.has(id)) {
+    return false
+  }
+
+  $queuedPromptSendsInFlight.set(new Set([...inFlight, id]))
+
+  return true
+}
+
+export const endQueuedPromptSend = (id: string): void => {
+  const inFlight = $queuedPromptSendsInFlight.get()
+
+  if (!inFlight.has(id)) {
+    return
+  }
+
+  const next = new Set(inFlight)
+  next.delete(id)
+  $queuedPromptSendsInFlight.set(next)
+}
+
+export const isQueuedPromptSending = (id: string): boolean => $queuedPromptSendsInFlight.get().has(id)
+
+export const resetQueuedPromptSendsForTests = (): void => {
+  $queuedPromptSendsInFlight.set(new Set())
+}
+
 const cloneAttachments = (attachments: ComposerAttachment[]) => attachments.map(a => ({ ...a }))
 
 export const getQueuedPrompts = (key: string | null | undefined): QueuedPromptEntry[] => {
@@ -334,6 +396,7 @@ export const enqueueQueuedPrompt = (
     text: payload.text,
     ...(payload.displayText ? { displayText: payload.displayText } : {}),
     ...(payload.displayKind ? { displayKind: payload.displayKind } : {}),
+    ...(payload.clientMessageId ? { clientMessageId: payload.clientMessageId } : {}),
     attachments: cloneAttachments(payload.attachments),
     queuedAt: Date.now()
   }
@@ -389,11 +452,27 @@ export const removeQueuedPrompt = (
 
   let removed: QueuedPromptEntry | undefined
 
-  mutateSession(sid, queue => {
-    removed = queue.find(e => e.id === id)
+  const removeFrom = (key: string) =>
+    mutateSession(key, queue => {
+      removed = queue.find(e => e.id === id)
 
-    return removed ? queue.filter(e => e.id !== id) : null
-  })
+      return removed ? queue.filter(e => e.id !== id) : null
+    })
+
+  removeFrom(sid)
+
+  if (!removed) {
+    // Entry ids are globally unique, so an id missing under `key` was re-keyed
+    // (migrateQueuedPrompts) while the caller held the old key — typically a
+    // drain whose submit was in flight across a compaction rotation. Removing
+    // it where it lives now is the only way the sent entry does not get sent
+    // again when the session next goes idle.
+    const owner = Object.entries(current()).find(([, queue]) => queue.some(e => e.id === id))?.[0]
+
+    if (owner) {
+      removeFrom(owner)
+    }
+  }
 
   if (!removed) {
     return false

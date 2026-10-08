@@ -4,17 +4,23 @@ import { $composerAttachments, addComposerAttachment, type ComposerAttachment, m
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  $queuedPromptSendsInFlight,
+  beginQueuedPromptSend,
   clearQueuedPrompts,
   dequeueQueuedPrompt,
+  endQueuedPromptSend,
   enqueueQueuedPrompt,
   getFrozenQueuedTransport,
   getQueuedPrompts,
+  isQueuedPromptSending,
   isQueueParked,
   migrateQueuedPrompts,
   parkQueuedPrompts,
   promoteQueuedPrompt,
+  queuedPromptClientMessageId,
   removeQueuedPrompt,
   resetFrozenQueuedTransportsForTests,
+  resetQueuedPromptSendsForTests,
   resolveQueuedPromptTransport,
   shouldAutoDrain,
   simulateComposerQueueReloadForTests,
@@ -230,6 +236,87 @@ describe('migrateQueuedPrompts', () => {
   it('is a no-op when source is empty or keys match', () => {
     expect(migrateQueuedPrompts('rt-old', 'rt-new')).toBe(false)
     expect(migrateQueuedPrompts('rt-x', 'rt-x')).toBe(false)
+  })
+
+  // A drain captures its queue key, awaits the submit, then removes the entry.
+  // A re-key (compaction rotation, runtime bounce) landing while that submit is
+  // in flight moved the entry to the new key, so the remove looked under the
+  // old one, found nothing, and the already-sent entry was sent AGAIN the next
+  // time the session went idle.
+  it('removes an entry by id after it was migrated to another key', () => {
+    const entry = enqueueQueuedPrompt('rt-old', { attachments: [], text: 'sent once' })!
+
+    migrateQueuedPrompts('rt-old', 'rt-new')
+
+    expect(removeQueuedPrompt('rt-old', entry.id)).toBe(true)
+    expect(getQueuedPrompts('rt-new')).toEqual([])
+    expect(getQueuedPrompts('rt-old')).toEqual([])
+  })
+
+  it('removing an unknown id under any key stays a no-op', () => {
+    enqueueQueuedPrompt('rt-new', { attachments: [], text: 'keep me' })
+
+    expect(removeQueuedPrompt('rt-old', 'queued-missing')).toBe(false)
+    expect(getQueuedPrompts('rt-new').map(e => e.text)).toEqual(['keep me'])
+  })
+})
+
+describe('queued prompt in-flight registry', () => {
+  beforeEach(() => {
+    resetQueuedPromptSendsForTests()
+  })
+
+  it('lets exactly one drain claim an entry until that send ends', () => {
+    expect(isQueuedPromptSending('queued-1')).toBe(false)
+    expect(beginQueuedPromptSend('queued-1')).toBe(true)
+    expect(beginQueuedPromptSend('queued-1')).toBe(false)
+    expect(isQueuedPromptSending('queued-1')).toBe(true)
+    // Another entry is independent.
+    expect(beginQueuedPromptSend('queued-2')).toBe(true)
+
+    endQueuedPromptSend('queued-1')
+
+    expect(isQueuedPromptSending('queued-1')).toBe(false)
+    expect(beginQueuedPromptSend('queued-1')).toBe(true)
+  })
+
+  it('publishes the in-flight set so idle drains re-check when a send ends', () => {
+    beginQueuedPromptSend('queued-1')
+    expect($queuedPromptSendsInFlight.get().has('queued-1')).toBe(true)
+
+    endQueuedPromptSend('queued-1')
+    expect($queuedPromptSendsInFlight.get().has('queued-1')).toBe(false)
+  })
+})
+
+describe('queued prompt client message id', () => {
+  beforeEach(() => {
+    window.localStorage.removeItem(QUEUE_STORAGE_KEY)
+    $queuedPromptsBySession.set({})
+  })
+
+  // One user send can take two paths (a redirect that errored after the
+  // gateway already queued it, plus the local copy kept for safety). The
+  // local copy must carry the SAME id the first path sent, across a reload,
+  // so the gateway can recognise the repeat.
+  it('keeps the send action id on the entry, persisted, and drains with it', () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, {
+      attachments: [],
+      clientMessageId: 'send-action-1',
+      text: 'one action'
+    })!
+
+    expect(queuedPromptClientMessageId(entry)).toBe('send-action-1')
+
+    simulateComposerQueueReloadForTests()
+
+    expect(queuedPromptClientMessageId(getQueuedPrompts(SESSION_KEY)[0]!)).toBe('send-action-1')
+  })
+
+  it('falls back to the entry id when the entry was queued on its own', () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'plain queue' })!
+
+    expect(queuedPromptClientMessageId(entry)).toBe(entry.id)
   })
 })
 

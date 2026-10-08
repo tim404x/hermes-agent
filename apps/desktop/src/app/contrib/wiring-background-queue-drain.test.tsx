@@ -210,8 +210,9 @@ describe('ContribWiring background queue: independent remote owner', () => {
     })
     fixture.remoteRequest.mockClear()
 
+    let entryId = ''
     await act(async () => {
-      enqueueQueuedPrompt('stored-remote', { text: 'continue remotely', attachments: [] })
+      entryId = enqueueQueuedPrompt('stored-remote', { text: 'continue remotely', attachments: [] })!.id
     })
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000)
@@ -222,6 +223,8 @@ describe('ContribWiring background queue: independent remote owner', () => {
     expect($activeConnectionId.get()).toBe('local')
     expect.soft(fixture.submitText).toHaveBeenCalledExactlyOnceWith('continue remotely', {
       attachments: [],
+      // The queue entry id is the send-action id the gateway dedupes on.
+      clientMessageId: entryId,
       fromQueue: true,
       sessionId: 'rt-remote',
       storedSessionId: 'stored-remote'
