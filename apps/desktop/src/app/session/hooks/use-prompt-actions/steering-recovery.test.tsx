@@ -228,6 +228,7 @@ it.each(steeringActions)(
     })
 
     expect(requestGatewayForAgent).toHaveBeenLastCalledWith('connection-B', 'default', method, {
+      client_message_id: expect.any(String),
       session_id: 'rt-B',
       text: 'rotated chat correction'
     })
@@ -274,6 +275,7 @@ it.each(steeringActions)(
     })
 
     expect(requestGatewayForAgent).toHaveBeenLastCalledWith('connection-B', 'default', method, {
+      client_message_id: expect.any(String),
       session_id: 'rt-B',
       text: 'evicted tip correction'
     })
@@ -359,6 +361,7 @@ it.each(recoveryCases)(
     })
     await waitFor(() =>
       expect(requestGatewayForAgent).toHaveBeenCalledWith('connection-B', 'default', method, {
+        client_message_id: expect.any(String),
         session_id: 'rt-B',
         text: 'B correction'
       })
@@ -382,6 +385,7 @@ it.each(recoveryCases)(
 
     if (expiredRecovery) {
       expect(requestGatewayForAgent).toHaveBeenCalledWith('connection-B', 'default', method, {
+        client_message_id: expect.any(String),
         session_id: 'rt-B-cached',
         text: 'B correction'
       })
@@ -398,6 +402,7 @@ it.each(recoveryCases)(
     })
 
     expect(requestGatewayForAgent).toHaveBeenCalledWith('connection-B', 'default', method, {
+      client_message_id: expect.any(String),
       session_id: 'rt-B2',
       text: 'B correction'
     })
@@ -516,6 +521,7 @@ it.each(rebuiltRuntimeCases)(
 
     const runtimeId = recover ? 'rt-B2' : 'rt-B-rebuilt'
     expect(requestGatewayForAgent).toHaveBeenLastCalledWith('connection-B', 'default', method, {
+      client_message_id: expect.any(String),
       session_id: runtimeId,
       text: 'same chat correction'
     })
