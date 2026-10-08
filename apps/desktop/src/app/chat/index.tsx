@@ -5,7 +5,7 @@ import type * as React from 'react'
 import { memo, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
-import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
+import type { SteerOptions, SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { sessionShouldHaveTranscript } from '@/app/session/hooks/use-session-actions/utils'
 import { Thread } from '@/components/assistant-ui/thread'
 import { TranscriptWindowProvider } from '@/components/assistant-ui/thread/transcript-window'
@@ -113,8 +113,8 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onPickFolders: () => void
   onPickImages: () => void
   onRemoveAttachment: (id: string) => void
-  onSteer: (text: string) => Promise<boolean> | boolean
-  onSteerHidden?: (text: string) => Promise<boolean> | boolean
+  onSteer: (text: string, options?: SteerOptions) => Promise<boolean> | boolean
+  onSteerHidden?: (text: string, options?: SteerOptions) => Promise<boolean> | boolean
   onSubmit: (text: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
   onThreadMessagesChange: (messages: readonly ThreadMessage[]) => void
   onEdit: (message: AppendMessage) => Promise<void>
