@@ -1198,6 +1198,26 @@ export function mentionNameForms(value: null | string | undefined): string[] {
   )
 }
 
+/** The name half of a "Name | Role" title ("Atlas | Growth Lead" → "Atlas").
+ *  Also splits on a spaced "·", "•", "—" or "–". Null when the title has no
+ *  role half: a plain "Research Buddy" is all name. */
+export function friendlyNamePart(value: null | string | undefined): null | string {
+  const name = String(value || '').trim()
+  const part = /^(.+?)\s*(?:\||\s[·•—–]\s)\s*\S/.exec(name)?.[1]?.trim()
+
+  return part && part !== name ? part : null
+}
+
+/** Taggable forms of a title's name half: a bot titled "Atlas | Growth Lead"
+ *  tags as @atlas, not @atlas-growth-lead. The role is display copy, not part
+ *  of the address. Same reserved-token rules as `mentionNameForms`, so
+ *  "Hermes | …" still cannot claim @hermes. */
+export function mentionShortForms(value: null | string | undefined): string[] {
+  const part = friendlyNamePart(value)
+
+  return part ? mentionNameForms(part) : []
+}
+
 /** Every friendly (renameable) name a roster row carries: the Bot Mode title
  *  (server-synced via ui_meta, locally stored, or persisted on a durable
  *  group descriptor) and the core profile display_name — in displayName's
@@ -1227,6 +1247,22 @@ export function botFriendlyNames(bot: Partial<RosterRow> | null | undefined): Ar
  *  resolvers accept both, so older muscle memory keeps working. */
 export function botMentionTag(bot: GroupMember | RosterRow): string {
   for (const friendly of botFriendlyNames(bot)) {
+    // "Atlas | Growth Lead" inserts @atlas: the name half when the title has
+    // one, the whole-title slug otherwise. Both stay resolvable.
+    const forms = [...mentionShortForms(friendly), ...mentionNameForms(friendly)]
+
+    if (forms.length) {
+      return forms[0]
+    }
+  }
+
+  return botHandle(bot?.name, bot)
+}
+
+/** The whole-title tag ("@atlas-growth-lead"): the fallback when a short tag
+ *  is ambiguous, and what older messages and muscle memory still use. */
+export function botFullMentionTag(bot: GroupMember | RosterRow): string {
+  for (const friendly of botFriendlyNames(bot)) {
     const forms = mentionNameForms(friendly)
 
     if (forms.length) {
@@ -1235,6 +1271,50 @@ export function botMentionTag(bot: GroupMember | RosterRow): string {
   }
 
   return botHandle(bot?.name, bot)
+}
+
+/** The tag to SHOW for `bot` next to `others` (the rest of the room or the
+ *  picker list): the short tag unless another bot claims it, else the
+ *  whole-title tag, exactly as before short tags existed (so the picker's
+ *  `@tag@connection` pinning for same-titled twins, #103731, still applies).
+ *  Two "Atlas | …" bots in one room must never share @atlas, which would
+ *  resolve to neither, or to the wrong one. */
+export function botMentionTagAmong(
+  bot: GroupMember | RosterRow,
+  others: ReadonlyArray<GroupMember | RosterRow | null | undefined>
+): string {
+  const short = botMentionTag(bot)
+  const full = botFullMentionTag(bot)
+
+  if (short === full) {
+    return full
+  }
+
+  const claimed = new Set<string>()
+
+  for (const other of others) {
+    if (!other || other === bot) {
+      continue
+    }
+
+    const firstWord = String(other.title || '')
+      .trim()
+      .split(/\s+/)[0]
+
+    for (const form of [
+      botMentionTag(other),
+      botFullMentionTag(other),
+      botHandle(other.name, other),
+      other.name,
+      ...mentionNameForms(firstWord)
+    ]) {
+      if (form) {
+        claimed.add(String(form).toLowerCase())
+      }
+    }
+  }
+
+  return claimed.has(short.toLowerCase()) ? full : short
 }
 
 /** Who a roster row is being compared against: a profile name plus the
@@ -1383,6 +1463,32 @@ export function resolveRosterMentions(
         byForm.set(form, bot)
       }
     }
+  }
+
+  // Short names ("@dr-foo" for "Dr Foo | Research") fill gaps only: the tag the
+  // picker inserts must resolve, but any exact name, handle or whole title
+  // wins, and a short name two bots share resolves to neither.
+  const shortClaims = new Map<string, RosterRow | null>()
+
+  for (const bot of members) {
+    if (!bot?.name || isActiveRosterBot(bot, active)) {
+      continue
+    }
+
+    for (const friendly of botFriendlyNames(bot)) {
+      for (const form of mentionShortForms(friendly)) {
+        if (!form || byForm.has(form)) {
+          continue
+        }
+
+        const prior = shortClaims.get(form)
+        shortClaims.set(form, prior === undefined || prior === bot ? bot : null)
+      }
+    }
+  }
+
+  for (const [form, bot] of shortClaims) {
+    byForm.set(form, bot)
   }
 
   // Previous profile names fill gaps only: a bot renamed after a handle was

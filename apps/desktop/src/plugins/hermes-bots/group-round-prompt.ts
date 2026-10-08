@@ -1,4 +1,4 @@
-import { botMentionTag } from './data'
+import { botMentionTagAmong } from './data'
 import {
   compactGroupChatSyncText,
   GROUP_CHAT_HISTORY_CHARS,
@@ -222,16 +222,24 @@ export function buildGroupChatTurnPrompt({ groupName, members, viewer, deltaLine
   const viewerKey = groupMemberKey(viewer)
   const peers = members.filter(m => groupMemberKey(m) !== viewerKey)
 
+  // Each tag is the short "@atlas" unless another member claims it, so the
+  // room never teaches a bot an ambiguous address.
+  const tagOf = (member: GroupMember) =>
+    botMentionTagAmong(
+      member,
+      members.filter(m => groupMemberKey(m) !== groupMemberKey(member))
+    )
+
   const peerNames = peers
     .map(m => {
-      const handle = m.title ? `${m.title} (@${botMentionTag(m)})` : `@${botMentionTag(m)}`
+      const handle = m.title ? `${m.title} (@${tagOf(m)})` : `@${tagOf(m)}`
 
       return m.remoteSource ? `${handle} [on ${m.connectionLabel || m.connectionId}]` : handle
     })
     .join(', ')
 
   return [
-    `${GROUP_PROMPT_HEADER_PREFIX}${groupName}"] You are @${botMentionTag(viewer)}, one participant in a group chat with ${peerNames || 'no one else yet'} and the user.`,
+    `${GROUP_PROMPT_HEADER_PREFIX}${groupName}"] You are @${tagOf(viewer)}, one participant in a group chat with ${peerNames || 'no one else yet'} and the user.`,
     '',
     GROUP_DELTA_HEADER,
     ...deltaLines.map(line => `  ${line}`),

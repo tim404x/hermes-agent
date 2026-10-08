@@ -44,7 +44,7 @@ import {
   $botMeta,
   $lastRoster,
   botHandle,
-  botMentionTag,
+  botMentionTagAmong,
   botSelectionKey,
   cachedUnionRoster,
   isActiveRosterBot,
@@ -163,13 +163,22 @@ export default {
           }
 
           const offered = profiles.filter(profile => profile?.name && !isActiveRosterBot(profile, live))
+
+          // Short "@atlas" for an "Atlas | Growth Lead" title, unless another
+          // offered bot claims it — then the whole-title tag.
+          const tagOf = (profile: (typeof offered)[number]) =>
+            botMentionTagAmong(
+              profile,
+              offered.filter(other => other !== profile)
+            )
+
           // Two rows tagging alike (two remote defaults both titled "CoS Bot")
           // cannot share a bare tag — it would resolve to neither. Pin the
           // ambiguous ones to their connection (#103731).
           const tagCounts = new Map<string, number>()
 
           for (const profile of offered) {
-            const tag = botMentionTag(profile).toLowerCase()
+            const tag = tagOf(profile).toLowerCase()
             tagCounts.set(tag, (tagCounts.get(tag) || 0) + 1)
           }
 
@@ -178,7 +187,7 @@ export default {
             const display = displayName(profile, botRosterMeta(profile, $botMeta.get()))
             // Renamed bots complete on their friendly name — the tag is the
             // renamed slug when one exists, the profile handle otherwise.
-            const tag = botMentionTag(profile)
+            const tag = tagOf(profile)
 
             if (
               q &&
