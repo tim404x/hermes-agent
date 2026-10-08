@@ -45,6 +45,9 @@ interface SubmitHarnessOptions {
   visible?: boolean
 }
 
+// Every send action carries its own id (one per Enter / external request).
+const SEND_ID = { clientMessageId: expect.stringMatching(/^send-/) as unknown as string }
+
 let surfaceSequence = 0
 
 function renderSubmitHook({
@@ -153,6 +156,10 @@ function renderSubmitHook({
     onSubmit,
     queueCurrentDraft,
     composerSurfaceId: resolvedSurfaceId,
+    setText(next: string) {
+      draftRef.current = next
+      editorRef.current!.textContent = next
+    },
     setPaneVisible(nextVisible: boolean) {
       if (!updatePaneVisible) {
         throw new Error('Pane visibility setter was not initialized')
@@ -177,7 +184,7 @@ describe('useComposerSubmit external request routing', () => {
       h.onSteer.mockRejectedValue(new Error('correction unsupported'))
       act(() => h.hook.result.current.submitDraft())
       await waitFor(() => expect(getQueuedPrompts('stored-session').map(({ text }) => text)).toEqual(['keep guidance']))
-      expect(h.onSteer).toHaveBeenCalledWith('keep guidance', mode)
+      expect(h.onSteer).toHaveBeenCalledWith('keep guidance', mode, SEND_ID)
       expect(h.onSubmit).not.toHaveBeenCalled()
       expect(h.queueCurrentDraft).not.toHaveBeenCalled()
       clearQueuedPrompts('stored-session')
@@ -213,7 +220,7 @@ describe('useComposerSubmit external request routing', () => {
       expect(requestComposerSubmit('Start without connections.', { target: 'main' })).toBe(true)
     })
 
-    expect(onSteer).toHaveBeenCalledExactlyOnceWith('Start without connections.')
+    expect(onSteer).toHaveBeenCalledExactlyOnceWith('Start without connections.', undefined, SEND_ID)
     expect(onSubmit).not.toHaveBeenCalled()
     expect(clearDraft).not.toHaveBeenCalled()
     expect(getQueuedPrompts('stored-session').map(({ text, attachments }) => ({ text, attachments }))).toEqual(
@@ -228,6 +235,21 @@ describe('useComposerSubmit external request routing', () => {
     expect(onSubmit).not.toHaveBeenCalled()
   })
 
+  it('a busy external request that falls back to the queue keeps the steer send id', async () => {
+    const { onSteer } = renderSubmitHook({ busy: true })
+    onSteer.mockRejectedValueOnce(new Error('request timed out: session.redirect'))
+
+    await act(async () => {
+      requestComposerSubmit('Start without connections.', { target: 'main' })
+    })
+
+    await waitFor(() => expect(getQueuedPrompts('stored-session')).toHaveLength(1))
+    const steerOptions = (onSteer.mock.calls[0] as unknown[])[2] as { clientMessageId?: string }
+
+    expect(steerOptions?.clientMessageId).toEqual(expect.any(String))
+    expect(getQueuedPrompts('stored-session')[0]!.clientMessageId).toBe(steerOptions.clientMessageId)
+  })
+
   it.each([true, false])(
     'delivers a busy hidden request as a steer with no user turn and queues it hidden on refusal (%s)',
     async accepted => {
@@ -238,7 +260,7 @@ describe('useComposerSubmit external request routing', () => {
         requestComposerSubmit('[setup] links opened', { target: 'main', displayKind: 'hidden' })
       })
 
-      expect(onSteerHidden).toHaveBeenCalledExactlyOnceWith('[setup] links opened')
+      expect(onSteerHidden).toHaveBeenCalledExactlyOnceWith('[setup] links opened', SEND_ID)
       expect(onSteer).not.toHaveBeenCalled()
       expect(onSubmit).not.toHaveBeenCalled()
       expect(getQueuedPrompts('stored-session').map(({ text, displayKind }) => ({ text, displayKind }))).toEqual(
@@ -260,6 +282,7 @@ describe('useComposerSubmit external request routing', () => {
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith('[setup] links opened', {
       submission_id: expect.any(String),
       attachments: [],
+      clientMessageId: SEND_ID.clientMessageId,
       composerScope: 'stored-session',
       displayKind: 'hidden'
     })
@@ -344,6 +367,7 @@ describe('useComposerSubmit external request routing', () => {
       expect(visibleMain.onSubmit).toHaveBeenCalledWith('ship this branch', {
         submission_id: expect.any(String),
         attachments: [],
+        clientMessageId: SEND_ID.clientMessageId,
         composerScope: 'session-a'
       })
     )
@@ -363,6 +387,7 @@ describe('useComposerSubmit external request routing', () => {
       expect(tile.onSubmit).toHaveBeenCalledWith('ship project B', {
         submission_id: expect.any(String),
         attachments: [],
+        clientMessageId: SEND_ID.clientMessageId,
         composerScope: 'tile-session'
       })
     )
@@ -379,6 +404,7 @@ describe('useComposerSubmit external request routing', () => {
       expect(second.onSubmit).toHaveBeenCalledWith('ship exactly one session', {
         submission_id: expect.any(String),
         attachments: [],
+        clientMessageId: SEND_ID.clientMessageId,
         composerScope: 'session-second'
       })
     )
@@ -399,6 +425,7 @@ describe('useComposerSubmit external request routing', () => {
       expect(visibleB.onSubmit).toHaveBeenCalledWith('ship session B', {
         submission_id: expect.any(String),
         attachments: [],
+        clientMessageId: SEND_ID.clientMessageId,
         composerScope: 'session-b'
       })
     )
@@ -470,14 +497,14 @@ describe('useComposerSubmit busy-turn routing', () => {
           expect(ordinary.onSteer).not.toHaveBeenCalled()
           expect(ordinary.queueCurrentDraft).not.toHaveBeenCalled()
         } else {
-          await waitFor(() => expect(ordinary.onSteer).toHaveBeenCalledWith('change course', mode))
+          await waitFor(() => expect(ordinary.onSteer).toHaveBeenCalledWith('change course', mode, SEND_ID))
           expect(ordinary.queueCurrentDraft).not.toHaveBeenCalled()
         }
 
         ordinary.hook.unmount()
         const explicit = renderSubmitHook({ busy: true, busyInputMode: mode, scopeTarget, text: 'explicit guidance' })
         act(() => explicit.hook.result.current.steerDraft('steer'))
-        await waitFor(() => expect(explicit.onSteer).toHaveBeenCalledWith('explicit guidance', 'steer'))
+        await waitFor(() => expect(explicit.onSteer).toHaveBeenCalledWith('explicit guidance', 'steer', SEND_ID))
         act(() => explicit.hook.result.current.queueDraft())
         expect(explicit.queueCurrentDraft).toHaveBeenCalledOnce()
         explicit.hook.unmount()
@@ -501,7 +528,7 @@ describe('useComposerSubmit busy-turn routing', () => {
       hook.result.current.submitDraft()
     })
 
-    await waitFor(() => expect(onSteer).toHaveBeenCalledWith('change course', 'interrupt'))
+    await waitFor(() => expect(onSteer).toHaveBeenCalledWith('change course', 'interrupt', SEND_ID))
     expect(queueCurrentDraft).not.toHaveBeenCalled()
     expect(onCancel).not.toHaveBeenCalled()
     expect(onSubmit).not.toHaveBeenCalled()
@@ -533,6 +560,52 @@ describe('useComposerSubmit busy-turn routing', () => {
     clearQueuedPrompts('stored-session')
   })
 
+  // One Enter = one send action = one id, on every path that action takes.
+  // A redirect whose answer is lost (timeout) may already be queued by the
+  // gateway; the local safety copy must carry the SAME id so its later drain
+  // comes back `duplicate` instead of a second turn (Tim, 8 Oct 2026:
+  // "no emoji in agent name tag on notion is ok" accepted twice, ran twice).
+  it.each([
+    ['errors', () => Promise.reject(new Error('request timed out: session.redirect'))],
+    ['is refused', () => Promise.resolve(false)]
+  ])('a steer that %s keeps its local copy under the same send id', async (_label, outcome) => {
+    const { hook, onSteer } = renderSubmitHook({ busy: true, text: 'one action' })
+    onSteer.mockImplementationOnce(outcome as () => Promise<boolean>)
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() => expect(getQueuedPrompts('stored-session')).toHaveLength(1))
+    const steerOptions = (onSteer.mock.calls[0] as unknown[])[2] as { clientMessageId?: string }
+
+    expect(steerOptions?.clientMessageId).toEqual(expect.any(String))
+    expect(getQueuedPrompts('stored-session')[0]!.clientMessageId).toBe(steerOptions.clientMessageId)
+    clearQueuedPrompts('stored-session')
+  })
+
+  it('gives every Enter its own send id', async () => {
+    const { hook, onSubmit, setText } = renderSubmitHook({ text: 'first' })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+    setText('second')
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2))
+
+    const ids = (onSubmit.mock.calls as unknown[][]).map(
+      call => (call[1] as { clientMessageId?: string }).clientMessageId
+    )
+
+    expect(ids[0]).toEqual(expect.any(String))
+    expect(ids[1]).toEqual(expect.any(String))
+    expect(ids[0]).not.toBe(ids[1])
+  })
+
   it('runs slash commands immediately while busy', async () => {
     const { clearDraft, hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
       busy: true,
@@ -546,6 +619,7 @@ describe('useComposerSubmit busy-turn routing', () => {
     await waitFor(() =>
       expect(onSubmit).toHaveBeenCalledWith('/compress preserve context', {
         submission_id: expect.any(String),
+        clientMessageId: SEND_ID.clientMessageId,
         composerScope: 'stored-session'
       })
     )
@@ -597,6 +671,7 @@ describe('useComposerSubmit busy-turn routing', () => {
     await waitFor(() =>
       expect(onSubmit).toHaveBeenCalledWith('ordinary question', {
         submission_id: expect.any(String),
+        clientMessageId: SEND_ID.clientMessageId,
         attachments: [],
         composerScope: 'stored-session'
       })
@@ -632,6 +707,7 @@ describe('useComposerSubmit busy-turn routing', () => {
     await waitFor(() =>
       expect(onSubmit).toHaveBeenCalledWith('look at @terminal:`zsh:23-58`', {
         submission_id: expect.any(String),
+        clientMessageId: SEND_ID.clientMessageId,
         attachments: [],
         composerScope: 'stored-session'
       })
@@ -653,7 +729,7 @@ describe('useComposerSubmit busy-turn routing', () => {
     })
 
     await waitFor(() =>
-      expect(onSteer).toHaveBeenCalledWith('```terminal\nselected terminal lines\n```\n\nlook at', 'interrupt')
+      expect(onSteer).toHaveBeenCalledWith('```terminal\nselected terminal lines\n```\n\nlook at', 'interrupt', SEND_ID)
     )
     expect(queueCurrentDraft).not.toHaveBeenCalled()
   })
@@ -963,7 +1039,7 @@ describe('useComposerSubmit with a connection card parked on the session', () =>
       hook.result.current.submitDraft()
     })
 
-    await waitFor(() => expect(onSteer).toHaveBeenCalledWith('continue without connecting', 'interrupt'))
+    await waitFor(() => expect(onSteer).toHaveBeenCalledWith('continue without connecting', 'interrupt', SEND_ID))
     await waitFor(() =>
       expect(gatewayRequest).toHaveBeenCalledWith(
         'connection.respond',
@@ -1042,6 +1118,7 @@ describe('useComposerSubmit with a blocking prompt parked on the session', () =>
     await waitFor(() =>
       expect(onSubmit).toHaveBeenCalledWith('/status', {
         submission_id: expect.any(String),
+        clientMessageId: SEND_ID.clientMessageId,
         composerScope: 'stored-session'
       })
     )
@@ -1058,7 +1135,7 @@ describe('useComposerSubmit with a blocking prompt parked on the session', () =>
       hook.result.current.submitDraft()
     })
 
-    await waitFor(() => expect(onSteer).toHaveBeenCalledWith('change course', 'interrupt'))
+    await waitFor(() => expect(onSteer).toHaveBeenCalledWith('change course', 'interrupt', SEND_ID))
     expect(queueCurrentDraft).not.toHaveBeenCalled()
   })
 

@@ -193,7 +193,7 @@ export function rebindPaneToResumedRuntime({
 
 /** The prompt submit pipeline, extracted from usePromptActions. */
 /** Canonical admission receipt; `user_row_id` binds the optimistic bubble to its durable row. */
-type SubmitReceipt = Pick<PromptSubmitResult, 'forwarded' | 'user_row_id'> & {
+type SubmitReceipt = Pick<PromptSubmitResult, 'forwarded' | 'running' | 'user_row_id'> & {
   admission_id?: string
   submission_id?: string
   session_id?: string
@@ -577,6 +577,11 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       }
 
       const optimisticId = `user-${submissionId}`
+      // The gateway runs each client_message_id at most once. Fixed for this
+      // whole send — the busy and stale-runtime retries below re-send the same
+      // id — and the caller's send-action id when it has one (a queue drain,
+      // a redirect fallback), so one user action never becomes two turns.
+      const clientMessageId = options?.clientMessageId ?? optimisticId
 
       // What the bubble shows. A `/skill` send carries the whole expanded
       // skill body as its text — model-facing scaffolding — so the dispatcher
@@ -710,6 +715,31 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           }),
           targetStoredSessionId
         )
+      }
+
+      // The gateway answered `duplicate`: drop this send's bubble and restore
+      // busy from whether the session is actually running (the accepted
+      // original may be mid-turn, queued behind one, or long finished).
+      const settleDuplicateSubmit = (sid: string, running: boolean) => {
+        revokeDiscardedAttachmentPreviews(attachments, usingComposerAttachments ? $composerAttachments.get() : [])
+        updateSessionState(
+          sid,
+          state => ({
+            ...state,
+            messages: state.messages.filter(m => m.id !== optimisticId),
+            busy: running,
+            awaitingResponse: running,
+            pendingBranchGroup: running ? state.pendingBranchGroup : null,
+            turnStartedAt: running || state.streamId || state.sawAssistantPayload ? state.turnStartedAt : null
+          }),
+          targetStoredSessionId
+        )
+
+        if (targetIsCurrentView()) {
+          setMutableRef(busyRef, running)
+          scope.setBusy(running)
+          scope.setAwaitingResponse(running)
+        }
       }
 
       const abortForSessionSwitch = (optimisticSessionId: null | string): false => {
@@ -1085,6 +1115,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           session_id: targetId,
           text,
           submission_id: submissionId,
+          client_message_id: clientMessageId,
           ...(imageAttachments.length && { attachments: imageAttachments }),
           ...(interrupted && { interrupted }),
           // Off-screen widget intent: the gateway types the persisted user
@@ -1176,7 +1207,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
                   prepared.legacyAttempted = true
                   await writePreparedSubmission(retryKey, prepared)
-                  const { submission_id: _id, ...legacyParams } = params
+                  // The legacy contract knows neither identity key.
+                  const { submission_id: _id, client_message_id: _clientId, ...legacyParams } = params
 
                   const result = await requestGateway<SubmitReceipt>(
                     'prompt.submit',
@@ -1225,6 +1257,17 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
               // turn holds the bubble, so it goes, and nothing is tracked as pending.
               dropOptimistic(receiptSessionId)
               releaseBusy()
+
+              return true
+            }
+
+            if (result?.status === 'duplicate') {
+              // Already accepted under this client_message_id (a re-keyed queue
+              // entry, a local copy of a redirect the gateway queued): no new
+              // turn exists, so this send's optimistic bubble would be a phantom
+              // second copy of one message. The busy flags this send armed must
+              // follow the gateway's truth, not this non-turn.
+              settleDuplicateSubmit(receiptSessionId, result.running === true)
 
               return true
             }
