@@ -12,6 +12,7 @@ import {
   MAX_AUTO_DRAIN_ATTEMPTS,
   parkQueuedPrompts,
   resetFrozenQueuedTransportsForTests,
+  resetQueuedPromptSendsForTests,
   simulateComposerQueueReloadForTests
 } from '@/store/composer-queue'
 import { $notifications, clearNotifications } from '@/store/notifications'
@@ -72,6 +73,7 @@ describe('useComposerQueue park integration', () => {
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
     resetFrozenQueuedTransportsForTests()
+    resetQueuedPromptSendsForTests()
     clearNotifications()
     clearComposerTerminalSelections()
     clearNotifications()
@@ -222,7 +224,7 @@ describe('useComposerQueue park integration', () => {
       expect(await hook.result.current.steerQueuedNow(entry!.id)).toBe(true)
     })
 
-    expect(onSteer).toHaveBeenCalledWith('steer me')
+    expect(onSteer).toHaveBeenCalledWith('steer me', { clientMessageId: entry!.id })
     // A redirect rides the live turn: no interrupt, no submit.
     expect(onCancel).not.toHaveBeenCalled()
     expect(onSubmit).not.toHaveBeenCalled()
@@ -321,7 +323,7 @@ describe('useComposerQueue park integration', () => {
         expect(await hook.result.current.deliverQueuedNow(entry.id)).toBe(true)
       })
 
-      expect(onSteer).toHaveBeenCalledWith('fix the header too')
+      expect(onSteer).toHaveBeenCalledWith('fix the header too', { clientMessageId: entry.id })
       expect(onCancel).not.toHaveBeenCalled()
       expect(onSubmit).not.toHaveBeenCalled()
       expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
@@ -441,5 +443,169 @@ describe('useComposerQueue park integration', () => {
     expect(onSubmit).not.toHaveBeenCalled()
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(1)
     expect($notifications.get().some(n => n.message.includes('Re-select the lines'))).toBe(true)
+  })
+})
+
+// Tim, 8 Oct 2026: "its an old msg that is resent why". A drain captured its
+// queue key, awaited the submit, then removed the entry under that key. A
+// compaction rotation re-keyed the queue while the submit was in flight, so
+// the remove missed, the entry survived under the new key and was sent AGAIN
+// when the session next went idle — and a composer remounted on the new key
+// could pick the same in-flight entry and send it concurrently.
+describe('useComposerQueue re-key while a drain is in flight', () => {
+  const pending: Array<(accepted: boolean) => void> = []
+
+  const renderOnKey = (onSubmit: ChatBarProps['onSubmit'], key: string, busy = false) =>
+    renderHook(
+      ({ busy: isBusy, queueKey }: { busy: boolean; queueKey: string }) =>
+        useComposerQueue({
+          activeQueueSessionKey: queueKey,
+          attachments: [],
+          busy: isBusy,
+          clearDraft: () => undefined,
+          draftRef: { current: '' },
+          focusInput: () => undefined,
+          loadIntoComposer: () => undefined,
+          onCancel: vi.fn(),
+          onSteer: undefined,
+          onSubmit,
+          queueEditRef: { current: null },
+          // Runtime-keyed composer: the key churns on a backend bounce/rotation.
+          queueSessionKey: null,
+          sessionId: queueKey
+        }),
+      { initialProps: { busy, queueKey: key } }
+    )
+
+  beforeEach(() => {
+    window.localStorage.clear()
+    $queuedPromptsBySession.set({})
+    $parkedQueueSessions.set({})
+    resetFrozenQueuedTransportsForTests()
+    resetQueuedPromptSendsForTests()
+    clearNotifications()
+    setSessionsLoading(false)
+    pending.length = 0
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+    $queuedPromptsBySession.set({})
+    $parkedQueueSessions.set({})
+    resetQueuedPromptSendsForTests()
+    setSessionsLoading(true)
+  })
+
+  it('sends a migrated entry once, with its id, and removes it when the submit lands', async () => {
+    const entry = enqueueQueuedPrompt('rt-old', { attachments: [], text: 'sent once' })!
+
+    const onSubmit = vi.fn<ChatBarProps['onSubmit']>(
+      () =>
+        new Promise<boolean>(resolve => {
+          pending.push(resolve)
+        })
+    )
+
+    const first = renderOnKey(onSubmit, 'rt-old')
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+
+    // Rotation lands mid-submit: the same composer re-keys its queue...
+    first.rerender({ busy: false, queueKey: 'rt-new' })
+    expect(getQueuedPrompts('rt-new').map(e => e.id)).toEqual([entry.id])
+
+    // ...and a composer mounted on the new key sees an idle, non-empty queue.
+    renderOnKey(onSubmit, 'rt-new')
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      pending.splice(0).forEach(resolve => resolve(true))
+      await Promise.resolve()
+    })
+
+    await waitFor(() => expect(getQueuedPrompts('rt-new')).toEqual([]))
+    expect(getQueuedPrompts('rt-old')).toEqual([])
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+    expect(onSubmit.mock.calls[0]![1]).toMatchObject({ clientMessageId: entry.id, fromQueue: true })
+  })
+
+  it('does not re-send a migrated entry when the session next goes idle', async () => {
+    enqueueQueuedPrompt('rt-old', { attachments: [], text: 'answered already' })
+
+    const onSubmit = vi.fn<ChatBarProps['onSubmit']>(
+      () =>
+        new Promise<boolean>(resolve => {
+          pending.push(resolve)
+        })
+    )
+
+    const hook = renderOnKey(onSubmit, 'rt-old')
+    await act(async () => {
+      await Promise.resolve()
+    })
+    hook.rerender({ busy: false, queueKey: 'rt-new' })
+
+    await act(async () => {
+      pending.splice(0).forEach(resolve => resolve(true))
+      await Promise.resolve()
+    })
+
+    // The agent answers it (busy), then settles (idle) — the drain re-arms.
+    hook.rerender({ busy: true, queueKey: 'rt-new' })
+    hook.rerender({ busy: false, queueKey: 'rt-new' })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+    expect(getQueuedPrompts('rt-new')).toEqual([])
+  })
+
+  it('a send-action id on the entry rides the drain instead of the entry id', async () => {
+    enqueueQueuedPrompt('rt-old', { attachments: [], clientMessageId: 'send-action-7', text: 'redirect fell back' })
+
+    const onSubmit = vi.fn<ChatBarProps['onSubmit']>(async () => true)
+    renderOnKey(onSubmit, 'rt-old')
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(onSubmit.mock.calls[0]![1]).toMatchObject({ clientMessageId: 'send-action-7' })
+  })
+
+  it('an entry whose in-flight send failed stays drainable once that send ends', async () => {
+    const entry = enqueueQueuedPrompt('rt-old', { attachments: [], text: 'retry me' })!
+
+    const onSubmit = vi.fn<ChatBarProps['onSubmit']>(
+      () =>
+        new Promise<boolean>(resolve => {
+          pending.push(resolve)
+        })
+    )
+
+    const first = renderOnKey(onSubmit, 'rt-old')
+    await act(async () => {
+      await Promise.resolve()
+    })
+    first.unmount()
+    // Remounted composer on the same key: the entry is in flight, so it waits.
+    renderOnKey(onSubmit, 'rt-old')
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+
+    // The first send is refused: the waiting composer must pick it up.
+    await act(async () => {
+      pending.splice(0).forEach(resolve => resolve(false))
+      await Promise.resolve()
+    })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2))
+    expect(getQueuedPrompts('rt-old').map(e => e.id)).toEqual([entry.id])
   })
 })

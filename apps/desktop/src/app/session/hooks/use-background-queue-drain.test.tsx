@@ -6,11 +6,16 @@ import { createClientSessionState } from '@/lib/chat-runtime'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  beginQueuedPromptSend,
+  endQueuedPromptSend,
   enqueueQueuedPrompt,
   getQueuedPrompts,
   MAX_AUTO_DRAIN_ATTEMPTS,
+  migrateQueuedPrompts,
   parkQueuedPrompts,
-  resetFrozenQueuedTransportsForTests
+  removeQueuedPrompt,
+  resetFrozenQueuedTransportsForTests,
+  resetQueuedPromptSendsForTests
 } from '@/store/composer-queue'
 import { $notifications, clearNotifications } from '@/store/notifications'
 import {
@@ -78,6 +83,7 @@ describe('useBackgroundQueueDrain', () => {
     // into the atom and drained here as if they were fresh queue state.
     window.localStorage.removeItem('hermes.desktop.composerQueue.v1')
     resetFrozenQueuedTransportsForTests()
+    resetQueuedPromptSendsForTests()
     // Production drain waits for the sidebar list. Tests that assert drain
     // behavior are post-load unless they opt into the loading gate.
     setSessionsLoading(false)
@@ -108,6 +114,7 @@ describe('useBackgroundQueueDrain', () => {
     await waitFor(() => {
       expect(submitText).toHaveBeenCalledWith('continue in the background', {
         attachments: [],
+        clientMessageId: expect.stringMatching(/^queued-/),
         fromQueue: true,
         sessionId: 'rt-session-a',
         storedSessionId: 'stored-session-a'
@@ -180,6 +187,7 @@ describe('useBackgroundQueueDrain', () => {
       expect(submitText).toHaveBeenCalledWith('```terminal\nselection A\n```\n\nlook at', {
         attachments: [],
         displayText: 'look at @terminal:`zsh:23-58`',
+        clientMessageId: expect.stringMatching(/^queued-/),
         fromQueue: true,
         sessionId: 'rt-session-a',
         storedSessionId: 'stored-session-a'
@@ -282,6 +290,7 @@ describe('useBackgroundQueueDrain', () => {
     await waitFor(() => {
       expect(submitText).toHaveBeenCalledWith('resume then send', {
         attachments: [],
+        clientMessageId: expect.stringMatching(/^queued-/),
         fromQueue: true,
         sessionId: null,
         storedSessionId: 'stored-session-a'
@@ -354,6 +363,7 @@ describe('useBackgroundQueueDrain', () => {
     await waitFor(() => {
       expect(submitText).toHaveBeenCalledWith('send after load', {
         attachments: [],
+        clientMessageId: expect.stringMatching(/^queued-/),
         fromQueue: true,
         sessionId: 'rt-session-a',
         storedSessionId: 'stored-session-a'
@@ -521,5 +531,90 @@ describe('useBackgroundQueueDrain', () => {
     expect(submitText).not.toHaveBeenCalled()
     expect(getQueuedPrompts('stored-session-a').map(e => e.id)).toEqual(['queued-restored'])
     expect($notifications.get()).toHaveLength(0)
+  })
+
+  // A re-key (compaction rotation) while the background submit is in flight
+  // moved the entry to a new key: the drain's remove under the captured key
+  // missed and a drain on the new key sent the same entry again.
+  it('sends a re-keyed entry once and removes it where it lives now', async () => {
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const resolvers: Array<(accepted: boolean) => void> = []
+
+    const submitText = vi.fn(
+      () =>
+        new Promise<boolean>(resolve => {
+          resolvers.push(resolve)
+        })
+    )
+
+    const entry = enqueueQueuedPrompt('stored-session-a', { text: 'rotate under me', attachments: [] })!
+    clearAllSessionStates()
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+    await waitFor(() => expect(submitText).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      migrateQueuedPrompts('stored-session-a', 'stored-session-c')
+    })
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 20))
+    })
+    expect(submitText).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      resolvers.splice(0).forEach(resolve => resolve(true))
+      await new Promise(resolve => setTimeout(resolve, 20))
+    })
+
+    expect(getQueuedPrompts('stored-session-c')).toEqual([])
+    expect(getQueuedPrompts('stored-session-a')).toEqual([])
+    expect(submitText).toHaveBeenCalledTimes(1)
+    expect(submitText.mock.calls[0]).toEqual([
+      'rotate under me',
+      expect.objectContaining({ clientMessageId: entry.id, fromQueue: true })
+    ])
+  })
+
+  it('leaves an entry another drain is sending alone, and retries it if that send fails', async () => {
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn(async () => true)
+    const entry = enqueueQueuedPrompt('stored-session-a', { text: 'held elsewhere', attachments: [] })!
+    clearAllSessionStates()
+    beginQueuedPromptSend(entry.id)
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 20))
+    })
+    expect(submitText).not.toHaveBeenCalled()
+
+    // The other send failed: the entry is still queued and now free.
+    act(() => endQueuedPromptSend(entry.id))
+
+    await waitFor(() => expect(submitText).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(getQueuedPrompts('stored-session-a')).toHaveLength(0))
+  })
+
+  it('does not send an entry another drain sent and removed meanwhile', async () => {
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn(async () => true)
+    const entry = enqueueQueuedPrompt('stored-session-a', { text: 'sent elsewhere', attachments: [] })!
+    clearAllSessionStates()
+    beginQueuedPromptSend(entry.id)
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 20))
+    })
+
+    act(() => {
+      removeQueuedPrompt('stored-session-a', entry.id)
+      endQueuedPromptSend(entry.id)
+    })
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 20))
+    })
+
+    expect(submitText).not.toHaveBeenCalled()
   })
 })
