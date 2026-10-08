@@ -2759,6 +2759,7 @@ export interface PromptSubmitParams {
   voice_context?: string | null
   voice_turn?: boolean | null
   title_preview?: string | null
+  client_message_id?: string | null
   truncate_before_user_ordinal?: number | null
   truncate_before_row_id?: number | null
   truncate_before_message_id?: string | null
@@ -2777,8 +2778,9 @@ export interface PromptSubmitResult {
   turn_isolation?: boolean | null
   admission_id?: string | null
   forwarded?: boolean | null
+  running?: boolean | null
 }
-export type PromptSubmitStatus = 'streaming' | 'queued' | 'steered' | 'redirected'
+export type PromptSubmitStatus = 'streaming' | 'queued' | 'steered' | 'redirected' | 'duplicate'
 export interface ClipboardPasteParams {
   session_id: string
   profile?: string | null
@@ -3598,12 +3600,14 @@ export interface SessionCorrectionParams {
   session_id: string
   profile?: string | null
   text: string
+  client_message_id?: string | null
 }
 export interface SessionCorrectionResult {
   status: CorrectionStatus
   text: string
+  running?: boolean | null
 }
-export type CorrectionStatus = 'queued' | 'redirected' | 'rejected'
+export type CorrectionStatus = 'queued' | 'redirected' | 'rejected' | 'duplicate'
 export interface SpawnTreeSaveParams {
   profile?: string | null
   subagents: Record<string, unknown>[]
