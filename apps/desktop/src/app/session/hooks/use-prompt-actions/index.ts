@@ -23,6 +23,7 @@ import {
   setComposerAttachmentUploadState,
   updateComposerAttachment
 } from '@/store/composer'
+import { newClientMessageId } from '@/store/composer-queue'
 import { resetSessionBackground } from '@/store/composer-status'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
@@ -82,6 +83,7 @@ import {
   readFileDataUrlForAttach,
   readImageForRemoteAttach,
   shouldInterruptBeforeRewind,
+  type SteerOptions,
   type SubmitTextOptions,
   withSessionNotFoundResume
 } from './utils'
@@ -773,8 +775,12 @@ export function usePromptActions({
   // completed work intact. During a tool it waits for the safe result boundary.
   // Returns false when the turn raced to completion so the composer can queue.
   const redirectPrompt = useCallback(
-    async (rawText: string): Promise<boolean> => {
+    async (rawText: string, options?: SteerOptions): Promise<boolean> => {
       const text = sanitizeComposerInput(rawText).trim()
+      // One id for this send action, kept across the stale-runtime retry
+      // below and shared with any queue copy the caller keeps on failure: the
+      // gateway runs it once and answers a repeat `duplicate`.
+      const clientMessageId = options?.clientMessageId ?? newClientMessageId()
 
       // Ref, not the closure-captured prop — see cancelRun above. A redirect
       // reaches the live model mid-turn, so a stale target delivers the user's
@@ -841,9 +847,20 @@ export function usePromptActions({
 
         try {
           const result = await target.requestGateway<SessionRedirectResponse>('session.redirect', {
+            client_message_id: clientMessageId,
             session_id: id,
             text
           })
+
+          if (result?.status === 'duplicate') {
+            // An earlier path of this same send action (a submit, a redirect
+            // whose answer we lost) already delivered these words and painted
+            // their bubble. Delivered, so the caller keeps no copy — but this
+            // attempt's echo is a second bubble for one message.
+            discardOptimisticMessage()
+
+            return true
+          }
 
           if (result?.status === 'redirected') {
             triggerHaptic('submit')
@@ -899,8 +916,9 @@ export function usePromptActions({
   // records nothing in the transcript; a redirect would paint it as the user's
   // own bubble and store it as one.
   const injectHiddenPrompt = useCallback(
-    async (rawText: string): Promise<boolean> => {
+    async (rawText: string, options?: SteerOptions): Promise<boolean> => {
       const text = sanitizeComposerInput(rawText).trim()
+      const clientMessageId = options?.clientMessageId ?? newClientMessageId()
 
       const target = captureSteeringSession({
         activeSessionIdRef,
@@ -916,9 +934,14 @@ export function usePromptActions({
       }
 
       const send = async (id: string): Promise<boolean> => {
-        const response = await target.requestGateway<SessionRedirectResponse>('session.steer', { session_id: id, text })
+        const response = await target.requestGateway<SessionRedirectResponse>('session.steer', {
+          client_message_id: clientMessageId,
+          session_id: id,
+          text
+        })
 
-        return response?.status === 'queued'
+        // `duplicate`: this note was already delivered by another path.
+        return response?.status === 'queued' || response?.status === 'duplicate'
       }
 
       try {
