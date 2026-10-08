@@ -794,6 +794,12 @@ export function visibleUserIndexAtOrdinal(messages: readonly ChatMessage[], targ
   return targetOrdinal >= 0 && targetOrdinal < indices.length ? indices[targetOrdinal] : -1
 }
 
+/** Options for a mid-turn correction (session.redirect / session.steer). */
+export interface SteerOptions {
+  /** The send action's id, shared with any queue copy of the same action. */
+  clientMessageId?: string
+}
+
 export interface SubmitTextOptions {
   /** Original slash invocation: retries must not re-expand a prepared prompt. */
   retryText?: string
@@ -832,6 +838,12 @@ export interface SubmitTextOptions {
    *  `auxiliary.voice_chat` (the session model when that slot is on auto). */
   voiceTurn?: boolean
   fromQueue?: boolean
+  /** Id of the user send action, sent as `client_message_id`. The gateway runs
+   *  each id at most once and answers a repeat `duplicate`, so one action that
+   *  reaches prompt.submit by two paths (a queue drain after a redirect whose
+   *  answer was lost, a re-keyed queue entry) never becomes two turns. Queue
+   *  drains pass the entry's action id; omitted = this send's own id. */
+  clientMessageId?: string
   /** Called once with the EXACT session identity the backend accepted the
    *  prompt into — the live runtime id after any stale-runtime recovery, plus
    *  the durable stored id when the caller knows it. A caller that must prove

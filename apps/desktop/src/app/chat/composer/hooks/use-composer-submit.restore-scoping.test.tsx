@@ -38,6 +38,9 @@ import type { ChatBarProps } from '../types'
 import { useComposerDraft } from './use-composer-draft'
 import { useComposerSubmit } from './use-composer-submit'
 
+// Every send action carries its own id (one per Enter / external request).
+const SEND_ID = { clientMessageId: expect.stringMatching(/^send-/) as unknown as string }
+
 // Substitute the assistant-ui adapter and transport, not the draft DOM,
 // subscription, persistence, creation, submit actions, cache or dispatcher.
 // One test injects onSubmit to exercise a direct rejected promise too.
@@ -353,6 +356,7 @@ it('restores text and attachments by the loaded draft owner, not an uncommitted 
   act(() => handles.submit.submitDraft())
   expect(onSubmit).toHaveBeenCalledWith(expect.stringContaining('draft B'), {
     submission_id: expect.any(String),
+    clientMessageId: SEND_ID.clientMessageId,
     attachments: [attachmentB],
     composerScope: 'stored-B'
   })
@@ -391,6 +395,7 @@ it('restores text and attachments by the loaded draft owner, not an uncommitted 
   await act(async () => handles.submit.submitDraft())
   expect(onSubmit).toHaveBeenLastCalledWith(expect.stringContaining('draft B'), {
     submission_id: expect.any(String),
+    clientMessageId: SEND_ID.clientMessageId,
     attachments: [attachmentB],
     composerScope: 'stored-B'
   })
