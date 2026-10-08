@@ -174,7 +174,10 @@ export function pullServerAvatars(roster: RosterRow[]) {
       continue
     }
 
-    if ($botMeta.get()[key]?.image) {
+    // A face (shape) avatar never displays the server image: it is at most the
+    // 160px notice raster. Fetching it only to discard it would cost a request
+    // per roster tick, and a stale photo asset must not resurrect itself here.
+    if ($botMeta.get()[key]?.image || $botMeta.get()[key]?.imageKind === 'shape') {
       continue
     }
 
@@ -296,8 +299,14 @@ export function mergeServerMeta(roster: RosterRow[], fetchedAt = 0) {
         delete merged.title
       }
 
-      // Local-only fields survive the server overlay.
-      if (mine.image) {
+      // Local-only fields survive the server overlay, except a photo the
+      // server has explicitly superseded. Every Edit Profile save writes
+      // `imageKind` ('photo' with an image, 'shape' without), so a desktop
+      // that switched back to a face must clear the photo cached here too, or
+      // this desktop keeps showing (and re-pushing) the old picture forever.
+      if (server?.imageKind === 'shape') {
+        delete merged.image
+      } else if (mine.image) {
         merged.image = mine.image
       }
 

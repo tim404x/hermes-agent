@@ -9,6 +9,7 @@
 import * as sdk from '@hermes/plugin-sdk'
 import { profileColor } from '@hermes/plugin-sdk'
 
+import { GrokFace, paintGrokFace, parseGrokShape } from './grok-face'
 import type { AvatarAppearance, AvatarShape, BotMeta, FaceMood } from './types'
 
 // Deterministic blob avatars (name → face). Feature-detected: older SDKs
@@ -689,6 +690,13 @@ function settlePose(svg: SVGSVGElement, mood: string, target: FacePose, t: numbe
 }
 
 function paintMathFace(svg: SVGSVGElement, t: number) {
+  // Grok Bot faces carry their own engine; same clock, same visibility budget.
+  if (svg.hasAttribute('data-hb-grok')) {
+    paintGrokFace(svg, t)
+
+    return
+  }
+
   const mood = svg.getAttribute('data-hb-mood') || 'idle'
   const shape = svg.getAttribute('data-hb-shape') || 'circle'
   const pose = settlePose(svg, mood, facePose(mood, t), t)
@@ -1017,6 +1025,14 @@ export function BotFace({ shape, color, image, size = 36, name = 'agent', mood =
         }}
       />
     )
+  }
+
+  // Grok Bot faces: live vector in the bot's own colour, animated by mood
+  // through the same face clock (see grok-face.tsx).
+  const grok = parseGrokShape(shape)
+
+  if (grok) {
+    return <GrokFace color={color} mood={mood} name={name} size={size} spec={grok} />
   }
 
   // Blobatar shapes: the library draws the whole face (body + eyes + its own
