@@ -231,3 +231,44 @@ describe('roster avatar sync (#102978)', () => {
     expect($botMeta.get()['local::secretary']?.image).toBeUndefined()
   })
 })
+
+describe('photo -> face switch across desktops', () => {
+  const row = (imageKind: 'photo' | 'shape') =>
+    ({
+      connectionId: 'local',
+      has_avatar: false,
+      name: 'delta',
+      route: { connectionId: 'local', mode: 'local', profile: 'delta', targetProfile: 'delta' },
+      sourceScoped: true,
+      ui_meta: { 'hermes-bots': { color: '#f0b429', imageKind, shape: 'grok:triangle' } }
+    }) as unknown as RosterRow
+
+  it('drops a cached photo once the server says the bot wears a face', async () => {
+    const { mergeServerMeta } = await import('./profile-ops')
+    $botMeta.set({ 'local::delta': { image: 'data:image/png;base64,OLD', imageKind: 'photo' } })
+
+    mergeServerMeta([row('shape')])
+
+    expect($botMeta.get()['local::delta']?.image).toBeUndefined()
+    expect($botMeta.get()['local::delta']?.shape).toBe('grok:triangle')
+  })
+
+  it('keeps the cached photo while the server still says photo', async () => {
+    const { mergeServerMeta } = await import('./profile-ops')
+    $botMeta.set({ 'local::delta': { image: 'data:image/png;base64,KEEP', imageKind: 'photo' } })
+
+    mergeServerMeta([row('photo')])
+
+    expect($botMeta.get()['local::delta']?.image).toBe('data:image/png;base64,KEEP')
+  })
+
+  it('never fetches server art for a face avatar', async () => {
+    const { pullServerAvatars } = await import('./profile-ops')
+    $botMeta.set({ 'local::delta': { imageKind: 'shape', shape: 'grok:triangle' } })
+
+    pullServerAvatars([{ ...row('shape'), has_avatar: true } as RosterRow])
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(hostMock.request).not.toHaveBeenCalledWith('profiles.get_asset', expect.anything())
+  })
+})
