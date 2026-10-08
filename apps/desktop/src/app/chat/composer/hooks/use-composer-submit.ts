@@ -18,7 +18,12 @@ import {
 import { type ComposerDraftRetry, draftRetry } from '@/store/composer-draft-retry'
 import { resetBrowseState } from '@/store/composer-input-history'
 import { journalOutgoingSend, type OutgoingSend } from '@/store/composer-outbox'
-import { enqueueQueuedPrompt, type QueuedPromptEntry, serverOwnsComposerQueue } from '@/store/composer-queue'
+import {
+  enqueueQueuedPrompt,
+  newClientMessageId,
+  type QueuedPromptEntry,
+  serverOwnsComposerQueue
+} from '@/store/composer-queue'
 import { hasConnectionRequest, skipConnectionRequest } from '@/store/connection-request'
 import { notify } from '@/store/notifications'
 import { isOnboardingChat } from '@/store/onboarding-session'
@@ -128,6 +133,11 @@ export function useComposerSubmit({
   // only while the same session still owns the visible composer; a late reject
   // must not publish an old session's text into the newly focused one.
   // `target` carries an explicit destination (a canonical queue admission).
+  //
+  // `target.clientMessageId` names the user's send action (one per Enter /
+  // external request; minted here when absent). It rides prompt.submit, so the
+  // gateway runs this action at most once even when it also reaches the gateway
+  // another way.
   const dispatchSubmit = (
     text: string,
     attachments?: ComposerAttachment[],
@@ -195,6 +205,7 @@ export function useComposerSubmit({
         onSubmit(text, {
           ...target,
           submission_id: submissionId,
+          clientMessageId: target?.clientMessageId ?? newClientMessageId(),
           ...(attachments ? { attachments } : {}),
           composerScope: submittedScope,
           ...assignment,
@@ -241,12 +252,17 @@ export function useComposerSubmit({
         ) {
           const current = externalSubmitRef.current
           const queueKey = activeQueueSessionKeyRef.current
+          // One request = one send action: the steer, the direct submit and
+          // any queue fallback all carry this id, so the gateway runs it once
+          // even when a steer reached it but its answer did not reach us.
+          const clientMessageId = newClientMessageId()
 
           // External requests contain only text; the unsent draft and its attachments stay in the composer.
           const enqueue = (key: string | null = queueKey, id?: string) =>
             void enqueueQueuedPrompt(key, {
               text,
               attachments: [],
+              clientMessageId,
               ...(id ? { id } : {}),
               ...(displayKind ? { displayKind } : {})
             })
@@ -260,7 +276,7 @@ export function useComposerSubmit({
               text,
               [],
               displayKind,
-              undefined,
+              { clientMessageId },
               displayKind ? () => {} : (scope, id) => enqueue(scope ?? queueKey, id)
             )
 
@@ -271,7 +287,7 @@ export function useComposerSubmit({
           // the model's next tool result, and keeps its kind if it has to queue.
           if (displayKind) {
             if (current.onSteerHidden) {
-              void Promise.resolve(current.onSteerHidden(text))
+              void Promise.resolve(current.onSteerHidden(text, { clientMessageId }))
                 .then(accepted => {
                   if (!accepted) {
                     enqueue()
@@ -291,7 +307,7 @@ export function useComposerSubmit({
             text.trim() &&
             !SLASH_COMMAND_RE.test(text.trim())
           ) {
-            void Promise.resolve(current.onSteer(text))
+            void Promise.resolve(current.onSteer(text, undefined, { clientMessageId }))
               .then(accepted => {
                 if (!accepted) {
                   enqueue()
@@ -596,6 +612,11 @@ export function useComposerSubmit({
     // form so the user can re-send it as-is.
     const hasTerminalTransport = frozen.displayText !== frozen.transportText
     const canonical = serverOwnsComposerQueue(sessionId ?? activeQueueSessionKey)
+    // This Enter's send action id. The redirect carries it, and so does the
+    // copy `keep` queues when the redirect errors: a redirect that timed
+    // out on our side may already be queued by the gateway, and the copy's
+    // drain must then come back `duplicate`, not run the words a second time.
+    const clientMessageId = newClientMessageId()
 
     const keep = () => {
       if (!activeQueueSessionKey) {
@@ -604,6 +625,7 @@ export function useComposerSubmit({
       } else if (canonical) {
         // `fromQueue` skips the submit-side freeze, so hand it the frozen transport.
         dispatchSubmit(frozen.transportText, [], undefined, {
+          clientMessageId,
           ...(hasTerminalTransport ? { displayText: frozen.displayText } : {}),
           fromQueue: true,
           sessionId: sessionId ?? null,
@@ -613,13 +635,14 @@ export function useComposerSubmit({
         enqueueQueuedPrompt(activeQueueSessionKey, {
           text: frozen.displayText,
           attachments: [],
+          clientMessageId,
           ...(hasTerminalTransport ? { displayText: frozen.displayText, frozenTransport: frozen.transportText } : {})
         })
       }
     }
 
     void Promise.resolve()
-      .then(() => onSteer(frozen.transportText, mode))
+      .then(() => onSteer(frozen.transportText, mode, { clientMessageId }))
       .then(accepted => {
         if (!accepted) {
           keep()

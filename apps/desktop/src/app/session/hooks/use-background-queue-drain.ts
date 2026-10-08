@@ -7,8 +7,12 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  $queuedPromptSendsInFlight,
+  beginQueuedPromptSend,
+  endQueuedPromptSend,
   MAX_AUTO_DRAIN_ATTEMPTS,
   noteQueuedPromptDrainFailure,
+  queuedPromptClientMessageId,
   type QueuedPromptEntry,
   queuedSubmissionId,
   removeQueuedPrompt,
@@ -60,6 +64,10 @@ export function useBackgroundQueueDrain({
   const parkedQueueSessions = useStore($parkedQueueSessions)
   const sessionsLoading = useStore($sessionsLoading)
   const workingSessionIds = useStore($workingSessionIds)
+  // Entries any drain is sending (renderer-wide, across queue keys). The drain
+  // effect re-runs when a send settles, so an entry skipped because another
+  // drain held it is picked up if that send failed.
+  const sendsInFlight = useStore($queuedPromptSendsInFlight)
   const submitTextRef = useRef(submitText)
   const drainingSessionIdsRef = useRef(new Set<string>())
   const drainFailuresRef = useRef(new Map<string, number>())
@@ -170,50 +178,61 @@ export function useBackgroundQueueDrain({
       void withQueueDrainClaim(sessionKey, async queue => {
         const liveEntry = queue.find(candidate => candidate.id === entry.id)
 
-        // Server-owned rows are already admitted to the gateway FIFO.
-        if (!liveEntry || liveEntry.serverStatus) {
+        // Gone (another window sent it), server-owned (already admitted to the
+        // gateway FIFO) or being sent by another drain — a composer, or this
+        // drain under the entry's previous key. None is a failure, and a
+        // second send would be a second turn.
+        if (!liveEntry || liveEntry.serverStatus || !beginQueuedPromptSend(liveEntry.id)) {
+          return null
+        }
+
+        try {
+          const resolved = resolveQueuedPromptTransport(liveEntry)
+
+          if (!resolved.ok) {
+            notify({
+              kind: 'warning',
+              title: t.composer.terminalSelectionMissingTitle,
+              message: t.composer.queuedTerminalSelectionExpiredBody
+            })
+            drainFailuresRef.current.set(liveEntry.id, MAX_AUTO_DRAIN_ATTEMPTS)
+
+            return null
+          }
+
+          const runtimeSessionId = runtimeIdByStoredSessionIdRef.current.get(sessionKey) ?? null
+
+          const accepted = await Promise.resolve(
+            submitTextRef.current(resolved.transportText, {
+              attachments: liveEntry.attachments,
+              // The gateway runs each send action id once: a repeat of this
+              // entry from any path answers `duplicate`, never a second turn.
+              clientMessageId: queuedPromptClientMessageId(liveEntry),
+              ...(resolved.displayText ? { displayText: resolved.displayText } : {}),
+              fromQueue: true,
+              submission_id: queuedSubmissionId(liveEntry),
+              sessionId: runtimeSessionId,
+              storedSessionId: sessionKey
+            })
+          )
+
+          if (accepted !== true) {
+            return false
+          }
+
+          drainFailuresRef.current.delete(liveEntry.id)
+          // Submit owns blob: previews after a successful drain handoff. By id,
+          // wherever the entry lives now: a re-key mid-submit moved it.
+          removeQueuedPrompt(sessionKey, liveEntry.id, { retainPreviewUrls: true })
+          resetBrowseState(runtimeSessionId)
+
           return true
+        } finally {
+          endQueuedPromptSend(liveEntry.id)
         }
-
-        const resolved = resolveQueuedPromptTransport(liveEntry)
-
-        if (!resolved.ok) {
-          notify({
-            kind: 'warning',
-            title: t.composer.terminalSelectionMissingTitle,
-            message: t.composer.queuedTerminalSelectionExpiredBody
-          })
-          drainFailuresRef.current.set(liveEntry.id, MAX_AUTO_DRAIN_ATTEMPTS)
-
-          return true
-        }
-
-        const runtimeSessionId = runtimeIdByStoredSessionIdRef.current.get(sessionKey) ?? null
-
-        const accepted = await Promise.resolve(
-          submitTextRef.current(resolved.transportText, {
-            attachments: liveEntry.attachments,
-            ...(resolved.displayText ? { displayText: resolved.displayText } : {}),
-            fromQueue: true,
-            submission_id: queuedSubmissionId(liveEntry),
-            sessionId: runtimeSessionId,
-            storedSessionId: sessionKey
-          })
-        )
-
-        if (accepted !== true) {
-          return false
-        }
-
-        drainFailuresRef.current.delete(liveEntry.id)
-        // Submit owns blob: previews after a successful drain handoff.
-        removeQueuedPrompt(sessionKey, liveEntry.id, { retainPreviewUrls: true })
-        resetBrowseState(runtimeSessionId)
-
-        return true
       })
         .then(accepted => {
-          if (!accepted) {
+          if (accepted === false) {
             onFail()
           }
         })
@@ -266,7 +285,12 @@ export function useBackgroundQueueDrain({
 
       const entry = entries.find(candidate => !candidate.serverStatus)
 
-      if (!entry || (drainFailuresRef.current.get(entry.id) ?? entry.drainFailures ?? 0) >= MAX_AUTO_DRAIN_ATTEMPTS) {
+      // An in-flight head waits for its send (sendsInFlight re-runs this).
+      if (
+        !entry ||
+        sendsInFlight.has(entry.id) ||
+        (drainFailuresRef.current.get(entry.id) ?? entry.drainFailures ?? 0) >= MAX_AUTO_DRAIN_ATTEMPTS
+      ) {
         continue
       }
 
@@ -279,6 +303,7 @@ export function useBackgroundQueueDrain({
     queuedPromptsBySession,
     retryTick,
     selectedStoredSessionId,
+    sendsInFlight,
     sessionsLoading,
     workingSessionIds
   ])
