@@ -13,7 +13,7 @@ import type { ClipboardEvent } from 'react'
 import { useRef, useState } from 'react'
 
 import { $imagenAvailable, normalizeAvatarImage, pickImageFromDevice, probeImagen } from './avatar-image'
-import { $botMeta, botHandle, botMentionTag } from './data'
+import { $botMeta, botHandle, botMentionTagAmong } from './data'
 import { appendGroupChatEntry } from './group-chat'
 import { groupMemberKey } from './group-membership'
 import { answerGroupClarify } from './group-turns'
@@ -195,8 +195,15 @@ export function GroupMentionInput({ members, onChange, onSubmitDraft, value, ...
     for (const member of members) {
       const handle = String(botHandle(member.name, member) || '').trim()
       const display = displayName(member, botRosterMeta(member, allMeta))
+
       // Renamed members complete on their friendly tag; parser resolves both.
-      const tag = String(botMentionTag(member) || handle).trim()
+      // Short "@atlas" unless another member claims it (then the full tag).
+      const tag = String(
+        botMentionTagAmong(
+          member,
+          members.filter(m => groupMemberKey(m) !== groupMemberKey(member))
+        ) || handle
+      ).trim()
 
       if (!tag) {
         continue
