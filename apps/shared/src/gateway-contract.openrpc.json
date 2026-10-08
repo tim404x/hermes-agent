@@ -16175,7 +16175,8 @@
         "enum": [
           "queued",
           "redirected",
-          "rejected"
+          "rejected",
+          "duplicate"
         ],
         "title": "CorrectionStatus",
         "type": "string"
@@ -34112,6 +34113,18 @@
             "default": null,
             "title": "Title Preview"
           },
+          "client_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Client Message Id"
+          },
           "truncate_before_user_ordinal": {
             "anyOf": [
               {
@@ -34324,6 +34337,18 @@
             ],
             "default": null,
             "title": "Forwarded"
+          },
+          "running": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Running"
           }
         },
         "title": "PromptSubmitResult",
@@ -34334,7 +34359,8 @@
           "streaming",
           "queued",
           "steered",
-          "redirected"
+          "redirected",
+          "duplicate"
         ],
         "title": "PromptSubmitStatus",
         "type": "string"
@@ -38437,6 +38463,18 @@
           "text": {
             "title": "Text",
             "type": "string"
+          },
+          "client_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Client Message Id"
           }
         },
         "required": [
@@ -38455,6 +38493,18 @@
           "text": {
             "title": "Text",
             "type": "string"
+          },
+          "running": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Running"
           }
         },
         "required": [
