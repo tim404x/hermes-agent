@@ -38,6 +38,10 @@ class PromptSubmitParams(SessionParams):
     voice_turn: bool | None = None  # a spoken voice-conversation turn: runs on auxiliary.voice_chat
     # Desktop-generated large-paste preview (first ~1000 chars); TITLE input only, never the model turn.
     title_preview: str | None = None
+    # One id per user send action, shared by every path that action takes (direct submit, redirect,
+    # a local queue copy). The gateway runs each accepted id once per live session; a repeat answers
+    # ``duplicate`` with no enqueue and no turn. Absent: no dedupe (older clients).
+    client_message_id: str | None = None
     truncate_before_user_ordinal: int | None = None
     truncate_before_row_id: int | None = None
     truncate_before_message_id: str | None = None
@@ -59,6 +63,7 @@ class PromptSubmitStatus(WireEnum):
     queued = "queued"
     steered = "steered"
     redirected = "redirected"
+    duplicate = "duplicate"  # this client_message_id was already accepted; nothing new runs
 
 
 class PromptSubmitResult(Result):
@@ -78,6 +83,8 @@ class PromptSubmitResult(Result):
     # the OWNER's FIFO (``status: queued``) and runs there after the current turn; nothing runs here.
     admission_id: str | None = None
     forwarded: bool | None = None
+    # With ``duplicate``: whether the session is running right now (the client restores busy from it).
+    running: bool | None = None
 
 
 method("prompt.submit", params=PromptSubmitParams, result=PromptSubmitResult,
