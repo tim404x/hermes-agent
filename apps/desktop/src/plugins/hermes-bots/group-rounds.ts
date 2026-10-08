@@ -5,7 +5,14 @@
  */
 import { host } from '@hermes/plugin-sdk'
 
-import { botFriendlyNames, botHandle, botMentionTag, mentionNameForms } from './data'
+import {
+  botFriendlyNames,
+  botFullMentionTag,
+  botHandle,
+  botMentionTag,
+  mentionNameForms,
+  mentionShortForms
+} from './data'
 import { groupFailureReason, recordGroupActivity } from './group-activity'
 import {
   $groupChats,
@@ -104,6 +111,32 @@ export function parseGroupChatMentions(text: unknown, members: GroupMember[]) {
     }
   }
 
+  // Short names ("@dr-foo" for a "Dr Foo | Research" title) fill gaps only,
+  // like the variants above: an exact live name always wins, and a short name
+  // two members share stays unresolved rather than picking one of them.
+  const shortClaims = new Map<string, null | string>()
+
+  for (const member of members) {
+    const key = groupMemberKey(member)
+
+    for (const friendly of [member.title, ...botFriendlyNames(member)]) {
+      for (const form of mentionShortForms(friendly)) {
+        if (!form || handles.has(form)) {
+          continue
+        }
+
+        const prior = shortClaims.get(form)
+        shortClaims.set(form, prior === undefined || prior === key ? key : null)
+      }
+    }
+  }
+
+  for (const [form, key] of shortClaims) {
+    if (key) {
+      handles.set(form, key)
+    }
+  }
+
   // Renamed members answer to previous handles, gap-fill only — every live identity's variants are claimed first, so a live name always wins (#110200).
   for (const member of members) {
     const key = groupMemberKey(member)
@@ -152,7 +185,12 @@ export function parseGroupChatMentions(text: unknown, members: GroupMember[]) {
 export function groupReplyMentionTag(member: GroupMember, members: GroupMember[]): string {
   const key = groupMemberKey(member)
 
-  const candidates = [botMentionTag(member), botHandle(member.name, member), `${member.name}-local`]
+  const candidates = [
+    botMentionTag(member),
+    botFullMentionTag(member),
+    botHandle(member.name, member),
+    `${member.name}-local`
+  ]
     .map(tag => String(tag || '').trim())
     .filter(Boolean)
 
