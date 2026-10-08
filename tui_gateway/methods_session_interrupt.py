@@ -108,6 +108,14 @@ def _correction_method(name: str, verb: str, accepted_status: str, supported, un
         session, err = _sess_nowait(params, rid)
         if err:
             return err
+        # One send action runs once: an id prompt.submit (or an earlier correction) already accepted
+        # answers ``duplicate``; this correction records its id when it redirects, steers OR enqueues.
+        return _run_once_per_client_message_id(
+            rid, session, params, lambda: _apply_correction_request(rid, session, text),
+            accepted=lambda response: (response.get("result") or {}).get("status") in ("queued", accepted_status),
+            duplicate_extra={"text": text})
+
+    def _apply_correction_request(rid, session: dict, text: str) -> dict:
         _note_user_input(session)
         agent = session.get("agent")
         # Redirect during the turn-build window (running=True, agent None): queue for the next turn instead of
