@@ -1,7 +1,7 @@
 import type { ReadableAtom } from 'nanostores'
 import type { ReactNode } from 'react'
 
-import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
+import type { SteerOptions, SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import type { HermesGateway, ResolvedOwner } from '@/hermes'
 
 import type { DroppedFile } from '../hooks/use-composer-actions'
@@ -64,9 +64,9 @@ export interface ChatBarProps {
   onPickFolders?: () => void
   onPickImages?: () => void
   onRemoveAttachment?: (id: string) => void
-  onSteer?: (text: string, mode?: 'interrupt' | 'steer') => Promise<boolean> | boolean
+  onSteer?: (text: string, mode?: 'interrupt' | 'steer', options?: SteerOptions) => Promise<boolean> | boolean
   /** Delivers a hidden note to the model mid-turn with no user turn (gateway session.steer). */
-  onSteerHidden?: (text: string) => Promise<boolean> | boolean
+  onSteerHidden?: (text: string, options?: SteerOptions) => Promise<boolean> | boolean
   onSubmit: (value: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
   onTranscribeAudio?: (audio: Blob, owner?: ResolvedOwner) => Promise<string>
 }
