@@ -93,8 +93,8 @@ def message_agent_tool_schema() -> dict:
                 "(e.g. 'spark/researcher', or just '<peer>' for the peer's main agent), "
                 "or an agent on another connected machine from your roster (use "
                 "'<handle>@<connection>' if the same handle exists on several). "
-                "If the teammate is mid-turn, the message opens in a side window titled `topic` "
-                "instead of waiting on their main chat."
+                "The message usually opens in a side window (a tab under that teammate) titled `topic`; "
+                "reuse the same topic to keep one conversation in one tab."
             ),
             "parameters": {
                 "type": "object",
@@ -118,8 +118,8 @@ def message_agent_tool_schema() -> dict:
                     "topic": {
                         "type": "string",
                         "description": (
-                            "Short window title used if the teammate is busy "
-                            "(e.g. 'micro1 | Pricing + Volume'). Optional."
+                            "Short tab title for this conversation (e.g. 'micro1 | Pricing + Volume'); "
+                            "the same topic continues in the same tab. Optional."
                         ),
                     },
                 },
@@ -211,9 +211,10 @@ def _err(message: str, *, roster: list[str] | None = None, peers: list[str] | No
 
 def message_agent_tool(target: str = "", message: str = "", task_id: Optional[str] = None, agent: Any = None,
                        topic: str = "") -> str:
-    """Deliver ``message`` to ``target``'s Bot Chat. Returns a JSON ack/error.
+    """Deliver ``message`` to ``target``. Returns a JSON ack/error.
     ``agent`` is the calling AIAgent — used for the Bot Chat gate and sender identity.
-    A busy local teammate gets it in a side window titled ``topic`` instead."""
+    A local teammate gets it in a side window titled ``topic`` or in its Bot Chat, per
+    ``bot_mode.dm_route`` (``_deliver_local``)."""
     home = _agent_home(agent)
     try:
         from tools.bot_mode_probe import (
@@ -306,14 +307,8 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
         return _roster_err(f"No teammate named '{raw_target}' on this install, on a connected "
                            "machine, or on a registered peer. Pick a name from the roster "
                            "(roles are listed in your system prompt).")
-    side_window = _start_side_window_if_busy(resolved, roster_homes[resolved], content, author=author,
-                                             topic=topic, sender=sender, body=body, roster=roster, **delivery)
-    if side_window is not None:
-        return side_window
-    # Local teammates are admitted through the profile authority; the argv only names the
-    # profile for the runner's lock/home lookups and is never executed.
-    return _start_delivery([_hermes_cli(), "-p", resolved], content, f"@{_handle(resolved, roster)}",
-                           stdin_file=False, profile_home=roster_homes[resolved], author=author, **delivery)
+    return _deliver_local(resolved, roster_homes[resolved], content, author=author, topic=topic, sender=sender,
+                          body=body, roster=roster, **delivery)
 
 
 def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
@@ -365,29 +360,89 @@ def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
         return None
 
 
+def _deliver_local(profile: str, profile_home: Path, content: str, *, author: dict, topic: str, sender: str,
+                   body: str, roster: list[str], task_id: Optional[str], agent: Any) -> str:
+    """A local teammate's DM, routed by ``bot_mode.dm_route`` (read per delivery from the receiver's
+    config, then the machine root's): ``side_window`` opens it in that conversation's own tab, busy
+    or idle; ``auto`` opens a side window only while the Bot Chat is busy; ``main`` always uses
+    the Bot Chat. A side-window plan that fails falls back to ``auto``: a DM is never dropped."""
+    from tools.bot_mode_dm_side_window import ROUTE_MAIN, ROUTE_SIDE_WINDOW, dm_route
+    from tools.bot_mode_probe import _display_name, _handle
+    from tools.bot_relay import _hermes_cli
+
+    delivery = dict(author=author, roster=roster, task_id=task_id, agent=agent)
+    route = dm_route(profile_home)
+    if route == ROUTE_SIDE_WINDOW:
+        plan = _plan_side_window(profile, profile_home, topic=topic, sender=sender, body=body, author=author,
+                                 agent=agent)
+        if plan is not None:
+            window, key, reused = plan
+            lead = (f"This opened in its own side window '{window}' (a tab under "
+                    f"{_display_name(profile, profile_home, roster)} in the app"
+                    +(", continuing that conversation)." if reused else ")."))
+            return _launch_side_window(profile, profile_home, content, window, key=key, lead=lead, **delivery)
+    if route != ROUTE_MAIN:
+        side_window = _start_side_window_if_busy(profile, profile_home, content, topic=topic, sender=sender,
+                                                 body=body, **delivery)
+        if side_window is not None:
+            return side_window
+    # Local teammates are admitted through the profile authority; the argv only names the
+    # profile for the runner's lock/home lookups and is never executed.
+    return _start_delivery([_hermes_cli(), "-p", profile], content, f"@{_handle(profile, roster)}",
+                           stdin_file=False, profile_home=profile_home, author=author, task_id=task_id, agent=agent)
+
+
+def _plan_side_window(profile: str, profile_home: Path, *, topic: str, sender: str, body: str, author: dict,
+                      agent: Any) -> Optional[tuple[str, str, bool]]:
+    """``(window title, conversation key, reused)`` for the ``side_window`` route. The key is the
+    sender plus the topic, or the sender's originating session without one. None, with a warning,
+    when anything here fails: the caller falls back to the ``auto`` route."""
+    try:
+        from tools import bot_mode_dm_side_window as side
+
+        key = side.side_window_key(str(author["id"]), profile, topic, str(getattr(agent, "session_id", "") or ""))
+        window, reused = side.resolve_window(profile_home, profile, key, side.side_window_title(topic, sender, body))
+        return window, key, reused
+    except Exception:
+        logger.warning("message_agent: side-window routing to %s failed; falling back to the auto route",
+                       profile, exc_info=True)
+        return None
+
+
 def _start_side_window_if_busy(profile: str, profile_home: Path, content: str, *, author: dict, topic: str,
                                sender: str, body: str, roster: list[str], task_id: Optional[str],
                                agent: Any) -> Optional[str]:
-    """A busy local teammate gets the DM in a side window: its own titled session, never queued
-    into (or racing) the main Bot Chat. None when the teammate is idle (the normal Bot Chat path).
-    The ``hermes chat -c <title>`` transport is a gateway client (``hermes_cli/gateway_chat.py``),
-    so the side window runs in the profile authority too, never a competing runtime."""
+    """The ``auto`` route: a busy local teammate gets the DM in a side window, its own titled
+    session, never queued into (or racing) the main Bot Chat. None when the teammate is idle."""
     from tools.bot_mode_dm_side_window import bot_chat_busy, side_window_title
     from tools.bot_mode_probe import _display_name, _handle
-    from tools.bot_relay import _hermes_cli
 
     busy, why = bot_chat_busy(profile_home)
     if not busy:
         return None
     window = side_window_title(topic, sender, body)
+    lead = (f"@{_handle(profile, roster)} was busy ({why}), so this opened in a side window '{window}' (it shows "
+            f"under {_display_name(profile, profile_home, roster)} in the app).")
+    return _launch_side_window(profile, profile_home, content, window, key=None, lead=lead, author=author,
+                               roster=roster, task_id=task_id, agent=agent)
+
+
+def _launch_side_window(profile: str, profile_home: Path, content: str, window: str, *, key: Optional[str],
+                        lead: str, author: dict, roster: list[str], task_id: Optional[str], agent: Any) -> str:
+    """Start the side-window delivery runner (``chat -c <window> --create-if-missing``, never live
+    admission) and decorate its ack with ``routed``/``window`` and a detail opening with ``lead``.
+    The ``hermes chat -c <title>`` transport is a gateway client (``hermes_cli/gateway_chat.py``),
+    so the side window runs in the profile authority too, never a competing runtime."""
+    from tools.bot_mode_probe import _handle
+    from tools.bot_relay import _hermes_cli
+
     label = f"@{_handle(profile, roster)}"
     argv = [_hermes_cli(), "-p", profile, "chat", "--in", "~", "-c", window, "--create-if-missing", "-Q"]
     ack = json.loads(_start_delivery(argv, content, label, stdin_file=False, task_id=task_id, agent=agent,
-                                     profile_home=profile_home, author=author, side_window=True))
+                                     profile_home=profile_home, author=author, side_window=True, window_key=key))
     if ack.get("error"):
         return json.dumps(ack)
-    detail = (f"{label} was busy ({why}), so this opened in a side window '{window}' (it shows under "
-              f"{_display_name(profile, profile_home, roster)} in the app).")
+    detail = lead
     if ack.get("reply_delivery") == "poll":
         detail += f" Do NOT resend. {ack['detail']}"
     else:
@@ -480,11 +535,12 @@ def _delivery_lock(argv: list[str], *, stdin_file: bool, side_window: bool = Fal
 
 def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None,
                     retried: bool = False, profile_home: Path | None = None,
-                    author: Optional[dict] = None) -> int:
+                    author: Optional[dict] = None, window_key: Optional[str] = None) -> int:
     """One side-window turn via ``--query-file`` through the gateway-routed ``hermes chat``
     one-shot; re-emits the transport's streams and returns its exit code. Never the Bot Chat:
     that is admitted only through the profile authority (``_admit_live_dm``). No transient
-    re-run here: the resumed-user-row adoption a re-run relied on retired with the cutover."""
+    re-run here: the resumed-user-row adoption a re-run relied on retired with the cutover.
+    ``window_key`` (the window's conversation) rides along to the ``(2)`` retry's stamp."""
     proc = subprocess.run([*argv, "--query-file", dm_file], check=False, stdin=subprocess.DEVNULL,
                           capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
     stderr_text = proc.stderr or ""
@@ -497,7 +553,8 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
                          else "already has a live owner" in stderr_text)
     if proc.returncode != 0 and refused_not_owned:
         if not retried:
-            return _retry_side_window(argv, dm_file, env=env, profile_home=profile_home, author=author)
+            return _retry_side_window(argv, dm_file, env=env, profile_home=profile_home, author=author,
+                                      window_key=window_key)
         # The window is held live by another surface (Desktop); the turn never ran —
         # tell the sender plainly instead of leaking a raw lease error. See #100523.
         from tools.bot_mode_dm_side_window import window_title
@@ -526,24 +583,28 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
 
 
 def _retry_side_window(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]],
-                       profile_home: Path | None = None, author: Optional[dict] = None) -> int:
+                       profile_home: Path | None = None, author: Optional[dict] = None,
+                       window_key: Optional[str] = None) -> int:
     """The titled side window is open live on another surface: one more try in '<title> (2)'."""
     from tools.bot_mode_dm_side_window import retitled
 
     retry = retitled(argv)
     with _delivery_lock(retry, stdin_file=False, side_window=True):
-        _stamp_side_window(retry, profile_home, author)
-        return _run_local_turn(retry, dm_file, env=env, retried=True, profile_home=profile_home, author=author)
+        _stamp_side_window(retry, profile_home, author, window_key)
+        return _run_local_turn(retry, dm_file, env=env, retried=True, profile_home=profile_home, author=author,
+                               window_key=window_key)
 
 
-def _stamp_side_window(argv: list[str], profile_home: Path | None, author: Optional[dict]) -> None:
+def _stamp_side_window(argv: list[str], profile_home: Path | None, author: Optional[dict],
+                       window_key: Optional[str] = None) -> None:
     """Stamp the window a side-window turn is about to run (inside its turn lock, before the
-    transport starts) so the desktop opens it as a tab; every DM turn restamps."""
+    transport starts) so the desktop opens it as a tab; every DM turn restamps. ``window_key``
+    (its conversation, ``side_window_key``) lets that conversation's next DM find the tab."""
     from tools.bot_mode_dm_side_window import stamp_side_window, window_title
 
     home = profile_home or _local_delivery_home(argv)
     if home is not None:
-        stamp_side_window(home, window_title(argv), author=author)
+        stamp_side_window(home, window_title(argv), author=author, key=window_key)
 
 
 def _live_intent_file(dm_file: str | os.PathLike) -> str:
@@ -751,15 +812,17 @@ def _runner_argv(args: list[str]) -> tuple[Optional[str], str, str, list[str]] |
 
 
 def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
-                  profile_home: Path | None = None, author: Optional[dict] = None, side_window: bool = False) -> int:
+                  profile_home: Path | None = None, author: Optional[dict] = None, side_window: bool = False,
+                  window_key: Optional[str] = None) -> int:
     """Admit local DMs only through the profile authority; retain uncertain intent.
 
     The optional peer stdin transport remains an explicit remote route, never a
     fallback after local admission. Background processes wait for delivery only.
 
-    A ``side_window`` delivery (the teammate's Bot Chat was busy) runs its own titled session
+    A ``side_window`` delivery (``bot_mode.dm_route``, or a busy Bot Chat) runs its own titled session
     through the gateway-routed ``hermes chat`` one-shot: never live admission into the Bot Chat,
-    and its lock is keyed per window title.
+    and its lock is keyed per window title. ``window_key`` (the ``side_window`` route's
+    conversation key) is stamped on the window.
     """
     # The live consumer owns turn admission; never compete for its CLI lease.
     if not stdin_file and not side_window:
@@ -787,8 +850,9 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
         env = delivery_env(author, profile_home if not stdin_file else None)
         with _delivery_lock(argv, stdin_file=stdin_file, side_window=side_window):
             if side_window:
-                _stamp_side_window(argv, profile_home, author)
-                return _run_local_turn(argv, dm_file, env=env, profile_home=profile_home, author=author)
+                _stamp_side_window(argv, profile_home, author, window_key)
+                return _run_local_turn(argv, dm_file, env=env, profile_home=profile_home, author=author,
+                                       window_key=window_key)
             # Keep the file open until the transport exits; cleanup occurs
             # after subprocess.run returns, not merely after stdin reaches EOF.
             with open(dm_file, "r", encoding="utf-8-sig") as stream:
@@ -800,15 +864,18 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
 
 def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
                       profile_home: Path | None = None, author: Optional[dict] = None,
-                      side_window: bool = False) -> str:
-    """Build an argv-safe command for the cleanup-owning background runner:
-    ``--run-delivery [--author <json>] <mode> <dm_file> [--profile-home <path>] [--side-window] <argv...>``."""
+                      side_window: bool = False, window_key: Optional[str] = None) -> str:
+    """Build an argv-safe command for the cleanup-owning background runner: ``--run-delivery
+    [--author <json>] <mode> <dm_file> [--profile-home <path>] [--side-window [--side-window-key <key>]]
+    <argv...>``."""
     runner_argv = [sys.executable, str(Path(__file__).resolve()), "--run-delivery",
                    "stdin" if stdin_file else "query-file", dm_file]
     if profile_home is not None:
         runner_argv.extend(["--profile-home", str(Path(profile_home).resolve())])
     if side_window:
         runner_argv.append("--side-window")
+        if window_key:
+            runner_argv.extend(["--side-window-key", window_key])
     runner_argv.extend(argv)
     if sys.platform == "win32":
         # The tracked local backend uses Git Bash on native Windows: forward slashes keep drive
@@ -822,7 +889,8 @@ def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
 
 def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bool,
                     task_id: Optional[str], agent: Any, profile_home: Path | None = None,
-                    author: Optional[dict] = None, side_window: bool = False) -> str:
+                    author: Optional[dict] = None, side_window: bool = False,
+                    window_key: Optional[str] = None) -> str:
     """Create a DM file and transfer its cleanup ownership to the runner."""
     dm_file = _write_dm_file(content)
     if profile_home is not None and not side_window:
@@ -851,7 +919,7 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
             return json.dumps(result)
     try:
         command = _delivery_command(argv, dm_file, stdin_file=stdin_file, profile_home=profile_home, author=author,
-                                    side_window=side_window)
+                                    side_window=side_window, window_key=window_key)
     except BaseException:
         _unlink_dm_file(dm_file)
         raise
@@ -1014,8 +1082,11 @@ def _delivery_main(args: list[str]) -> int:
         side_window = argv[:1] == ["--side-window"]
         if side_window:
             argv = argv[1:]
+        window_key = None
+        if side_window and len(argv) >= 2 and argv[0] == "--side-window-key":
+            window_key, argv = argv[1], argv[2:]
         return _run_delivery(argv, dm_file, stdin_file=mode == "stdin", profile_home=profile_home,
-                             author=author, side_window=side_window)
+                             author=author, side_window=side_window, window_key=window_key)
     except Exception as exc:
         # Every refusal ships a typed reason on stdout so the completion notification carries it
         # back to the sender (#93091): 'target_busy' from the queue's bounded wait, otherwise the
