@@ -79,22 +79,6 @@ export function botCanonicalSessionId(bot: null | RosterRow | undefined): null |
   return bot?.canonical_session?.resolved_id ?? bot?.canonical_session?.id ?? null
 }
 
-/** Worker liveness window: kanban/tool workers heartbeat last_activity_at
- *  at least every 60s while running (agent/session_activity.py), so a
- *  worker whose stamp is older than this is finished or stalled. Wider
- *  than ACTIVE_WINDOW_S to bridge one missed heartbeat. */
-const WORKER_ACTIVE_WINDOW_S = 150
-
-/** True while this bot's freshest kanban/tool worker looks alive. Workers
- *  never surface in conversation lists, so without this a profile grinding
- *  through a 30-minute kanban task reads idle ("3 hr ago") the whole time
- *  (hermes-agent#90268). Older gateways omit worker_session — always false. */
-export function workerActiveAt(bot: null | RosterRow | undefined, now = Date.now()): boolean {
-  const ts = bot?.worker_session?.last_active || 0
-
-  return Boolean(ts && now / 1000 - ts < WORKER_ACTIVE_WINDOW_S)
-}
-
 /** Older shells without the live-turn atom remain idle rather than reading socket state. */
 const $idleTurn = atom(false)
 
@@ -108,7 +92,13 @@ interface WorkingOwner {
   name: string
 }
 
-/** The busy atom follows tile focus, not the gateway socket or row selection. */
+/** The face's mood. `think` = this bot's group turn, or the focused tile's live
+ *  turn (the busy atom follows tile focus, not the gateway socket or row
+ *  selection). `work` = the server reports the bot ITSELF mid-turn somewhere
+ *  else (its unfocused Bot Chat, a message_agent side window). Background
+ *  workers (oneshot / kanban / tool) never animate a face: they once kept Neo
+ *  orbiting all evening while its chat sat idle. An older server without
+ *  `turn_active` reads idle, never the old worker rule. */
 export function botWorkingMood(
   bot: RosterRow,
   owner: WorkingOwner | null,
@@ -133,10 +123,10 @@ export function botWorkingMood(
     return 'think'
   }
 
-  return workerActiveAt(bot, now) ? 'work' : 'idle'
+  return bot.turn_active === true ? 'work' : 'idle'
 }
 
-/** Focused turns, recent messages and live workers, preserving roster order. */
+/** Live turns (focused, group or server-reported) and recent messages, preserving roster order. */
 export function activeBots(
   roster: null | RosterRow[] | undefined,
   owner: WorkingOwner | null,
