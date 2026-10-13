@@ -176,6 +176,9 @@ class ProfileRow(Result):
     worker_session: ProfileWorkerSession | None = None
     canonical_session: ProfileCanonicalSession | None = None
     side_windows: list[ProfileSideWindow] = Field(default_factory=list)
+    # The bot itself is mid-turn (Bot Chat or a side window; never a background worker) and where.
+    turn_active: bool = False
+    turn_active_session: str | None = None
     ui_meta_revisions: dict[str, int] = Field(default_factory=dict)
     ui_meta: dict[str, JsonValue] | None = None
     has_avatar: bool = False
