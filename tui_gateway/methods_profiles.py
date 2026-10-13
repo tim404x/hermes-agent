@@ -220,8 +220,22 @@ def _latest_profile_session_rows(persistence):
         return None, None
 
 
+def _side_window_rows(persistence) -> list:
+    """The profile's ``message_agent`` side windows, newest stamp first (``sessions.list_side_windows``);
+    the desktop opens each as a tab beside the bot's Bot Chat. Best-effort: ``[]`` on any failure."""
+    from dataclasses import asdict
+
+    if persistence is None:
+        return []
+    return _try(lambda: [asdict(w) for w in persistence.sessions.list_side_windows()], [])
+
+
+# Bot face mood (fork PR #6): the roster row's server ``turn_active`` is derived beside this listing by
+# ``def _open_turn_rows``, so a face animates only while the bot itself is mid-turn (a side window included).
+
+
 def _profile_session_fields(row, profile_path):
-    """Attach last_session / worker_session / canonical_session to a roster row. The DB is a
+    """Attach last_session / worker_session / canonical_session / side_windows to a roster row. The DB is a
     read-only attach (a writable ``SessionDB()`` waits up to 20s for the write lock + runs DDL
     and stalled the 5s roster poll); no/unreadable DB -> every field None (the readers swallow)."""
     def _read() -> dict:
@@ -234,9 +248,10 @@ def _profile_session_fields(row, profile_path):
             last, worker = _latest_profile_session_rows(persistence)
             # Resolved server-side on every listing so no client carries a session pointer.
             return {"last_session": last, "worker_session": worker,
-                    "canonical_session": _canonical_session_row(persistence, profile_path)}
+                    "canonical_session": _canonical_session_row(persistence, profile_path),
+                    "side_windows": _side_window_rows(persistence)}
 
-    # These three are a pure function of the profile's session store, and the roster re-asks every
+    # These four are a pure function of the profile's session store, and the roster re-asks every
     # 5s per connection — so they are reused while that store has not moved (#117257).
     from tui_gateway.profile_roster_cache import cached_session_fields
 
