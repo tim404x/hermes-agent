@@ -74,8 +74,7 @@ import {
   botRowOwnsWorkspace,
   botWorkingMood,
   previewKind,
-  useTurnBusy,
-  workerActiveAt
+  useTurnBusy
 } from './row-helpers'
 import { openBotScreen } from './screen-open'
 import type { GroupMember, RosterRow, SidebarRowLabels } from './types'
@@ -154,12 +153,11 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, onNewSection, showHandl
   // last_session alone shows "6d ago" on a bot you just messaged.
   const previewSession = bot.canonical_session || last
   const activitySession = botActivitySession(bot)
-  // A live kanban/tool worker gates only the pulse/mood (#90268). The age is
-  // the last time the bot did ANYTHING — chat or delegated worker run — so a
-  // delegate-only specialist that ran all day no longer snaps back to "11d"
-  // the moment the 150 s liveness window lapses (#105874). An absent
-  // worker_session (past the gateway's 20-row window) degrades to chat age.
-  const workerActive = workerActiveAt(bot)
+  // The age is the last time the bot did ANYTHING — chat or delegated worker
+  // run — so a delegate-only specialist that ran all day no longer snaps back
+  // to "11d" (#105874). Workers never drive the face's mood, only this age.
+  // An absent worker_session (past the gateway's 20-row window) degrades to
+  // chat age.
   const rowAgeTs = Math.max(activitySession?.last_active || 0, bot.worker_session?.last_active || 0)
 
   const groupKeys = useValue($activeGroupMemberKeys)

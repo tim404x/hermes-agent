@@ -98,6 +98,31 @@ describe('group-turn presence', () => {
   })
 })
 
+describe('server turn presence', () => {
+  it('animates only the bot the server reports mid-turn, never one whose worker is merely running', () => {
+    const now = Date.now() / 1000
+
+    const worker: RosterRow = {
+      name: 'default',
+      turn_active: false,
+      worker_session: { last_active: now - 10 }
+    }
+
+    const answering: RosterRow = { name: 'apex', turn_active: true, turn_active_session: 'side' }
+
+    const { container } = render(
+      <>
+        {[worker, answering].map(bot => (
+          <BotRow bot={bot} key={bot.name} onDelete={noop} onEdit={noop} onGroup={noop} onNewSection={noop} />
+        ))}
+      </>
+    )
+
+    const moods = [...container.querySelectorAll('[data-hb-mood]')].map(el => el.getAttribute('data-hb-mood'))
+    expect(moods).toEqual(['idle', 'work'])
+  })
+})
+
 describe('pre-warm is hover-scoped, never roster-wide', () => {
   it('warms nothing on paint and exactly the hovered bot on pointer entry', async () => {
     const row = renderRow({ name: 'alpha' } as RosterRow)
