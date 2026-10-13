@@ -402,3 +402,10 @@ def test_real_side_window_runner_round_trip(tmp_path):
     assert json.loads(observed.read_text(encoding="utf-8")) == ["-c", "micro1", "--query-file", str(dm_file)]
     assert not dm_file.exists()
     assert not Path(bot_mode_dm._live_intent_file(dm_file)).exists()
+
+
+def test_fallback_title_uses_short_bot_name_and_skips_self_intro():
+    from tools import bot_mode_dm_side_window as side
+    assert side.side_window_title("", "Neo | Chief of Staff", "Neo here: template batches and --gap are LIVE now") \
+        == "Neo: template batches and --gap are LIVE"
+    assert side.side_window_title("", "Atlas", "check the micro1 call") == "Atlas: check the micro1 call"
