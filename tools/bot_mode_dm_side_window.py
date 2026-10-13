@@ -116,6 +116,54 @@ def retitled(argv: Sequence[str]) -> list[str]:
     return out
 
 
+def stamp_side_window(profile_home: Path | str, title: str, *, author: dict | None = None) -> str | None:
+    """Mark the session a side-window turn is about to run, so the desktop opens it as a tab.
+
+    Resolves ``title`` exactly as the transport's ``chat -c <title>`` will (id, then title with its
+    ``#N`` continuation, then the compression tip) and creates the titled CLI session when it is
+    new, the same row ``--create-if-missing`` would mint, so the tab can appear before the turn
+    starts. Runs inside the window's turn lock. Returns the stamped id; a failure is logged and
+    answers None, because a missing tab must never cost the DM."""
+    db = None
+    try:
+        from hermes_state_registry import acquire
+
+        db = acquire(Path(profile_home) / "state.db")
+        session_id = _resolve_window(db, title) or _create_window(db, title)
+        if session_id and db.mark_side_window(session_id, by=str((author or {}).get("id") or "")):
+            return session_id
+        return None
+    except Exception:
+        logger.warning("message_agent: could not stamp side window %r in %s", title, profile_home, exc_info=True)
+        return None
+    finally:
+        if db is not None:
+            from hermes_state_registry import release_or_close
+
+            release_or_close(db)
+
+
+def _resolve_window(db, title: str) -> str | None:
+    """``hermes_cli.main._resolve_session_by_name_or_id`` against the target's own store."""
+    row = db.get_session(title)
+    session_id = row["id"] if row else db.resolve_session_by_title(title)
+    return (db.get_compression_tip(session_id) or session_id) if session_id else None
+
+
+def _create_window(db, title: str) -> str | None:
+    from hermes_state_ids import new_session_id
+
+    session_id = new_session_id()
+    db.create_session(session_id, source="cli")
+    try:
+        db.set_session_title(session_id, title)
+    except ValueError:
+        # Another writer took the title first: drop our empty row and use theirs.
+        db.delete_session_if_empty(session_id)
+        return _resolve_window(db, title)
+    return session_id
+
+
 def side_window_lock_name(profile: str, title: str) -> str:
     """Turn-lock key for one (profile, title) window: same title serializes, others run in
     parallel, and none waits behind the profile's own Bot Chat lock (keyed by the bare name)."""

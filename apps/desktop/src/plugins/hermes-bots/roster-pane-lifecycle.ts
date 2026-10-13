@@ -7,6 +7,7 @@ import { displayName } from './labels'
 import { pullServerAvatars } from './profile-ops'
 import { trackInboundActivity } from './roster-actions'
 import { botRosterMeta, botWorkspaceOwnerKey } from './routing'
+import { trackSideWindows } from './side-window-tabs'
 import { backfillMessagingProtocol } from './soul'
 import type { GatewaySource } from './types'
 import type { BotMeta, RosterRow } from './types'
@@ -47,6 +48,7 @@ export function usePublishRosterSnapshot({ data, live, roster, allMeta, activeSo
     // (data.ts::fetchRosterSnapshot), for every reader, pane open or not.
     pullServerAvatars(activeSourceRoster)
     trackInboundActivity(roster)
+    trackSideWindows(roster)
     backfillMessagingProtocol(activeSourceRoster)
     // React Query owns the stable server snapshot; derived arrays intentionally
     // follow that snapshot rather than retriggering on their own atom writes.
