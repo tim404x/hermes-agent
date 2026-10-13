@@ -479,7 +479,8 @@ def _delivery_lock(argv: list[str], *, stdin_file: bool, side_window: bool = Fal
 
 
 def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None,
-                    retried: bool = False) -> int:
+                    retried: bool = False, profile_home: Path | None = None,
+                    author: Optional[dict] = None) -> int:
     """One side-window turn via ``--query-file`` through the gateway-routed ``hermes chat``
     one-shot; re-emits the transport's streams and returns its exit code. Never the Bot Chat:
     that is admitted only through the profile authority (``_admit_live_dm``). No transient
@@ -496,7 +497,7 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
                          else "already has a live owner" in stderr_text)
     if proc.returncode != 0 and refused_not_owned:
         if not retried:
-            return _retry_side_window(argv, dm_file, env=env)
+            return _retry_side_window(argv, dm_file, env=env, profile_home=profile_home, author=author)
         # The window is held live by another surface (Desktop); the turn never ran —
         # tell the sender plainly instead of leaking a raw lease error. See #100523.
         from tools.bot_mode_dm_side_window import window_title
@@ -524,13 +525,25 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
     return proc.returncode
 
 
-def _retry_side_window(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]]) -> int:
+def _retry_side_window(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]],
+                       profile_home: Path | None = None, author: Optional[dict] = None) -> int:
     """The titled side window is open live on another surface: one more try in '<title> (2)'."""
     from tools.bot_mode_dm_side_window import retitled
 
     retry = retitled(argv)
     with _delivery_lock(retry, stdin_file=False, side_window=True):
-        return _run_local_turn(retry, dm_file, env=env, retried=True)
+        _stamp_side_window(retry, profile_home, author)
+        return _run_local_turn(retry, dm_file, env=env, retried=True, profile_home=profile_home, author=author)
+
+
+def _stamp_side_window(argv: list[str], profile_home: Path | None, author: Optional[dict]) -> None:
+    """Stamp the window a side-window turn is about to run (inside its turn lock, before the
+    transport starts) so the desktop opens it as a tab; every DM turn restamps."""
+    from tools.bot_mode_dm_side_window import stamp_side_window, window_title
+
+    home = profile_home or _local_delivery_home(argv)
+    if home is not None:
+        stamp_side_window(home, window_title(argv), author=author)
 
 
 def _live_intent_file(dm_file: str | os.PathLike) -> str:
@@ -774,7 +787,8 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
         env = delivery_env(author, profile_home if not stdin_file else None)
         with _delivery_lock(argv, stdin_file=stdin_file, side_window=side_window):
             if side_window:
-                return _run_local_turn(argv, dm_file, env=env)
+                _stamp_side_window(argv, profile_home, author)
+                return _run_local_turn(argv, dm_file, env=env, profile_home=profile_home, author=author)
             # Keep the file open until the transport exits; cleanup occurs
             # after subprocess.run returns, not merely after stdin reaches EOF.
             with open(dm_file, "r", encoding="utf-8-sig") as stream:
