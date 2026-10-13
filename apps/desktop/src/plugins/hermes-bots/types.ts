@@ -49,6 +49,15 @@ export interface CanonicalSession {
   title?: string
 }
 
+/** A teammate's `message_agent` side window (profiles.list `side_windows`):
+ *  `id` is the live compression tip, `at` the newest DM stamp in unix seconds. */
+export interface SideWindowPreview {
+  at?: number
+  by?: string
+  id?: string
+  title?: string
+}
+
 export interface SessionPreview {
   /** Stored session id — what `host.openSession` takes. */
   id?: string
@@ -123,6 +132,8 @@ export interface RosterRow {
   sourceMissing?: boolean
   sourceReachable?: boolean | null
   sourceScoped?: boolean
+  /** Side windows newest stamp first; opened as tabs by `side-window-tabs.ts`. */
+  side_windows?: SideWindowPreview[] | null
   targetProfile?: string
   /** Its source lists this profile but does not serve it (the Webapp's gateway
    *  lists every installed profile and reaches only those it serves). */
