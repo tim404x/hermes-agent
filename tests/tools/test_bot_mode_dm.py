@@ -27,7 +27,10 @@ def _fresh_probe_cache():
     bot_mode_probe._reset_cache_for_tests()
 
 
-def _managed_home(tmp_path, *, teammates=("researcher",), peers=()) -> Path:
+def _managed_home(tmp_path, *, teammates=("researcher",), peers=(), dm_route: str | None = "auto") -> Path:
+    """A Bot-Mode-managed install. ``dm_route`` defaults to ``auto``: these suites pin the main
+    Bot Chat delivery mechanics (side window only when the target is busy); pass None for the
+    shipped default (every DM opens a side window, ``tests/tools/test_bot_mode_dm_route.py``)."""
     home = tmp_path / ".hermes"
     home.mkdir(exist_ok=True)
     for name in teammates:
@@ -44,10 +47,14 @@ def _managed_home(tmp_path, *, teammates=("researcher",), peers=()) -> Path:
             ),
             encoding="utf-8",
         )
+    lines = []
     if peers:
         lines = ["bot_peers:"]
         for peer in peers:
             lines += [f"  {peer}:", f"    url: http://{peer}.lan:8377"]
+    if dm_route is not None:
+        lines += ["bot_mode:", f"  dm_route: {dm_route}"]
+    if lines:
         (home / "config.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return home
 
