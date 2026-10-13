@@ -1939,17 +1939,17 @@ DEFAULT_CONFIG = {
         # activity for this many days so stale rows aren't scanned forever. 0 = off.
         "done_sub_retention_days": 30,
     },
-    # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
-    # agents on other connections wait in an on-disk outbox until the Desktop drains them.
+    # Bot Mode message_agent delivery: local DM routing + the cross-connection relay (tools/bot_relay.py).
     "bot_mode": {
-        # Drain-time TTL (seconds): older envelopes are NOT delivered on drain; the sender gets an
-        # error reply (reason 'queued_expired') so a DM can't land hours late as a zombie. 0 = no
-        # drain-time expiry (the 6h stale-artifact sweep still applies).
+        # Drain-time TTL (s) of relay envelopes queued for the Desktop: older ones are NOT delivered, the sender
+        # gets reason 'queued_expired' instead of a zombie DM hours late. 0 = off (the 6h artifact sweep stays).
         "envelope_ttl_seconds": 900,
-        # How long a second delivery into a busy target profile queues behind the current turn
-        # before failing with a structured 'target_busy' error. Deliveries are serialized per
-        # profile with a cross-process file lock.
+        # How long a delivery into a busy target profile queues behind its current turn (serialized per
+        # profile by a cross-process file lock) before failing with a structured 'target_busy' error.
         "turn_wait_seconds": 120,
+        # Where a local teammate's DM lands (RECEIVER's config, then this one): side_window = its own tab, one
+        # per conversation (tools/bot_mode_dm_side_window.py); auto = only while its Bot Chat is busy; main = no tabs.
+        "dm_route": "side_window",
     },
     "code_execution": {  # execute_code settings (programmatic tool calls).
         # project = run in the session cwd with the active venv/conda python so project deps and
