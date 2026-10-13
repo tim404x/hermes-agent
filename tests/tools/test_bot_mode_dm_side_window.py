@@ -104,32 +104,38 @@ def test_no_bot_chat_is_idle(tmp_path):
     assert side.bot_chat_busy(target) == (False, "")
 
 
-@pytest.mark.parametrize("claim", [False, True], ids=["queued", "claimed"])
-def test_pending_live_mailbox_delivery_is_busy(tmp_path, claim):
+def _authority_receipt(target, key, status):
+    """The receipt the profile authority's mailbox writes for one admitted Bot Chat delivery
+    (``gateway/session_bot_mailbox.write_receipt``): the busy probe reads these files."""
     from tools import bot_live_delivery as live
 
+    root = live._root(target)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / f"{key}.json").write_text(json.dumps(dict(
+        delivery_id=key, profile_home=str(target.resolve()), session_id="chat", principal_id="uid:1",
+        admission_id="adm-" + key[:4], message="first", status=status)), encoding="utf-8")
+
+
+@pytest.mark.parametrize("status", ["canonical", "queued", "claimed"])
+def test_pending_live_mailbox_delivery_is_busy(tmp_path, status):
     _, target = _target(tmp_path)
-    owner = dict(profile_home=str(target.resolve()), session_id="chat", lease_id="lease", live_session_id="live")
-    live.deliver_to_live_owner(target, owner, "first", delivery_id="a" * 32)
-    if claim:
-        assert live.claim_pending_delivery(target, owner) is not None
+    _authority_receipt(target, "a" * 32, status)
     busy, why = side.bot_chat_busy(target)
     assert busy is True
     assert "waiting" in why
 
 
-def test_settled_or_abandoned_mailbox_delivery_is_idle(tmp_path, monkeypatch):
-    from tools import bot_live_delivery as live
-
+@pytest.mark.parametrize("status", ["settled", "failed", "cancelled", "ambiguous"])
+def test_settled_or_abandoned_mailbox_delivery_is_idle(tmp_path, status):
     _, target = _target(tmp_path)
-    owner = dict(profile_home=str(target.resolve()), session_id="chat", lease_id="lease", live_session_id="live")
-    live.deliver_to_live_owner(target, owner, "done", delivery_id="b" * 32)
-    live.claim_pending_delivery(target, owner)
-    live.complete_delivery(target, "b" * 32, status="settled", reply="ok")
+    _authority_receipt(target, "b" * 32, status)
     assert side.bot_chat_busy(target) == (False, "")
 
+
+def test_a_pending_receipt_older_than_the_runner_wait_is_idle(tmp_path, monkeypatch):
     # A receipt older than the live runner's wait has nobody waiting on it (claims never expire).
-    live.deliver_to_live_owner(target, owner, "stale", delivery_id="c" * 32)
+    _, target = _target(tmp_path)
+    _authority_receipt(target, "c" * 32, "queued")
     monkeypatch.setattr(bot_mode_dm, "_LIVE_WAIT_MAX_SECONDS", 0)
     assert side.bot_chat_busy(target) == (False, "")
 
@@ -227,8 +233,9 @@ def test_idle_teammate_keeps_the_exact_bot_chat_path(tmp_path, monkeypatch):
     calls = _capture_spawn(monkeypatch)
     monkeypatch.setattr(bot_relay, "_hermes_cli", lambda: "hermes")
     admitted = []
-    real_admit = bot_mode_dm._admit_live_dm
-    monkeypatch.setattr(bot_mode_dm, "_admit_live_dm", lambda *a, **k: admitted.append(a) or real_admit(*a, **k))
+    # The Bot Chat is admitted through the profile authority; the spawned runner only waits for the reply.
+    monkeypatch.setattr(bot_mode_dm, "_admit_live_dm", lambda *a, **k: admitted.append(a)
+                        or {"status": "queued", "delivery_id": "c" * 64})
     home, target = _target(tmp_path)
     _bot_chat(target, ("user", None, 30), ("assistant", None, 20))
 
@@ -239,7 +246,7 @@ def test_idle_teammate_keeps_the_exact_bot_chat_path(tmp_path, monkeypatch):
     assert len(admitted) == 1
     flags, argv = _runner(calls[0]["command"])
     assert flags == ["--profile-home"]
-    assert argv == ["hermes", "-p", "researcher", *bot_relay.BOT_CHAT_TURN_ARGS]
+    assert argv == ["hermes", "-p", "researcher"]
 
 
 def test_peer_and_relay_targets_never_take_a_side_window(tmp_path, monkeypatch):
@@ -320,7 +327,7 @@ def test_side_window_lock_is_keyed_per_title(tmp_path, monkeypatch):
     lock = bot_mode_dm._delivery_lock
 
     # The busy Bot Chat's CLI turn never blocks a side window, and different titles run in parallel.
-    with lock(["hermes", "-p", "researcher", *bot_relay.BOT_CHAT_TURN_ARGS], stdin_file=False):
+    with lock(["hermes", "-p", "researcher"], stdin_file=False):
         with lock(_side_argv("alpha"), stdin_file=False, side_window=True):
             with lock(_side_argv("beta"), stdin_file=False, side_window=True):
                 # The same title serializes.
@@ -363,20 +370,9 @@ def test_session_not_owned_side_window_refuses_after_its_one_retry(tmp_path, mon
     assert "micro1 (2)" in payload["error"]
 
 
-def test_session_not_owned_bot_chat_still_refuses_without_retry(tmp_path, monkeypatch, capsys):
-    not_owned = subprocess.CompletedProcess([], 1, stdout="", stderr="hermes-refusal-reason: SESSION_NOT_OWNED\n")
-    calls = _fake_run(monkeypatch, not_owned)
-    dm_file = tmp_path / "dm.txt"
-    dm_file.write_text("hi", encoding="utf-8")
-
-    assert bot_mode_dm._run_local_turn(["hermes", "-p", "ops", *bot_relay.BOT_CHAT_TURN_ARGS], str(dm_file)) == 1
-
-    assert len(calls) == 1
-    assert json.loads(capsys.readouterr().out) == {
-        "error": "Delivery failed: @ops's Bot Chat is open on another surface right now, "
-                 "so your message was NOT delivered. Try again later.",
-        "reason": "target_busy",
-    }
+# The Bot Chat CLI-lane refusal test (``_run_local_turn`` on a Bot Chat argv) retired with upstream's
+# authority cutover: a Bot Chat DM is admitted only through the profile authority (``_admit_live_dm``,
+# test_idle_teammate_keeps_the_exact_bot_chat_path); ``_run_local_turn`` runs side windows only.
 
 
 def test_real_side_window_runner_round_trip(tmp_path):
@@ -402,3 +398,10 @@ def test_real_side_window_runner_round_trip(tmp_path):
     assert json.loads(observed.read_text(encoding="utf-8")) == ["-c", "micro1", "--query-file", str(dm_file)]
     assert not dm_file.exists()
     assert not Path(bot_mode_dm._live_intent_file(dm_file)).exists()
+
+
+def test_fallback_title_uses_short_bot_name_and_skips_self_intro():
+    from tools import bot_mode_dm_side_window as side
+    assert side.side_window_title("", "Neo | Chief of Staff", "Neo here: template batches and --gap are LIVE now") \
+        == "Neo: template batches and --gap are LIVE"
+    assert side.side_window_title("", "Atlas", "check the micro1 call") == "Atlas: check the micro1 call"
