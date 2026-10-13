@@ -4,8 +4,10 @@ When the target's canonical Bot Chat is mid-turn, queueing behind it (live mailb
 lock) makes the sender wait up to 30 minutes, and the DM lands in the middle of whatever the
 teammate is doing with the user. Instead the DM opens a side window: ``hermes -p <bot> chat
 -c <title> --create-if-missing``, a normal titled session that shows under that bot in the app.
-An idle teammate keeps the main Bot Chat. Stdlib-only at import: the delivery runner imports
-this after its own bootstrap.
+Where a DM lands is ``bot_mode.dm_route`` (``dm_route``): ``side_window`` (the default) opens
+every DM in a side window, busy or idle, one tab per conversation (``resolve_window``); ``auto``
+opens one only while the Bot Chat is busy; ``main`` always uses the Bot Chat. Stdlib-only at
+import: the delivery runner imports this after its own bootstrap.
 """
 
 from __future__ import annotations
@@ -25,6 +27,15 @@ TITLE_MAX_CHARS = 60
 # The second try when the titled window is open live on another surface (SESSION_NOT_OWNED).
 RETRY_SUFFIX = " (2)"
 _FALLBACK_WORDS = 6
+# A side window idle this long is a finished conversation: the next DM on its key opens a new tab.
+REUSE_MAX_IDLE_SECONDS = 6 * 60 * 60
+# Numbered tabs tried before giving up on a free title ("<title> (2)" ... "<title> (N)").
+_MAX_NUMBERED_TABS = 50
+_NUMBERED_RE = re.compile(r" \((\d{1,2})\)$")
+
+ROUTE_SIDE_WINDOW, ROUTE_AUTO, ROUTE_MAIN = "side_window", "auto", "main"
+DEFAULT_DM_ROUTE = ROUTE_SIDE_WINDOW
+_ROUTES = (ROUTE_SIDE_WINDOW, ROUTE_AUTO, ROUTE_MAIN)
 _QUOTES_RE = re.compile(r"[\"'`\u2018\u2019\u201c\u201d]")
 
 
@@ -104,13 +115,102 @@ def _turn_locked(home: Path) -> str:
     return ""
 
 
+def dm_route(profile_home: Path | str) -> str:
+    """``bot_mode.dm_route`` for a DM into ``profile_home``: the receiver's own config.yaml, else the
+    machine-root config.yaml, else ``DEFAULT_DM_ROUTE``. A missing, unreadable or unknown value
+    falls through to the next source. Read once per delivery; never raises."""
+    try:
+        from tools.bot_mode_probe import _hermes_root
+
+        home = Path(profile_home)
+        sources = [home / "config.yaml", _hermes_root(home) / "config.yaml"]
+    except Exception:
+        logger.debug("message_agent: dm_route sources unresolvable for %s", profile_home, exc_info=True)
+        return DEFAULT_DM_ROUTE
+    for path in dict.fromkeys(sources):
+        route = _configured_route(path)
+        if route:
+            return route
+    return DEFAULT_DM_ROUTE
+
+
+def _configured_route(path: Path) -> str:
+    try:
+        from tools.bot_mode_probe import _read_yaml_dict
+
+        section = (_read_yaml_dict(path, "dm_route") or {}).get("bot_mode")
+        value = str((section if isinstance(section, dict) else {}).get("dm_route") or "")
+    except Exception:
+        logger.debug("message_agent: could not read bot_mode.dm_route from %s", path, exc_info=True)
+        return ""
+    value = value.strip().lower().replace("-", "_")
+    if value and value not in _ROUTES:
+        logger.warning("message_agent: ignoring unknown bot_mode.dm_route %r in %s", value, path)
+    return value if value in _ROUTES else ""
+
+
+def side_window_key(sender_id: str, target: str, topic: str, origin_session: str) -> str:
+    """The conversation a side window belongs to: the sender, the target, and the normalized topic,
+    or (without a topic) the sender's originating session, so one back-and-forth stays in one tab."""
+    norm = _clean(topic).casefold()
+    tail = f"topic:{norm}" if norm else f"session:{origin_session or '-'}"
+    return f"{sender_id}>{target}|{tail}"
+
+
+def resolve_window(profile_home: Path | str, profile: str, key: str, title: str,
+                   now: float | None = None) -> tuple[str, bool]:
+    """``(title, reused)`` for a DM on conversation ``key`` into ``profile``'s side windows.
+
+    Reuses the newest window stamped with ``key`` that was active within ``REUSE_MAX_IDLE_SECONDS``
+    and is not busy (mid-turn, or its window turn lock held). Otherwise a free title: ``title``,
+    or, when that conversation's live tab is busy, ``"<its title> (2)"``; a title another session
+    already holds gets the next free number, so a new conversation never lands in an old tab.
+    Raises on a store error: the caller falls back to the ``auto`` route."""
+    now = time.time() if now is None else now
+    home = Path(profile_home)
+    if not (home / "state.db").is_file():
+        return title, False
+    from hermes_state import SessionDB
+    from tools.bot_mode_probe import _hermes_root
+    from tools.bot_relay import turn_lock_held
+
+    root = _hermes_root(home)
+    db = SessionDB(db_path=home / "state.db", read_only=True)
+    try:
+        busy_tab = ""
+        for window in db.find_side_windows(key):
+            if not window["title"] or now - window["last_active"] > REUSE_MAX_IDLE_SECONDS:
+                continue
+            if session_mid_turn(db, window["id"], now) or turn_lock_held(
+                    root, side_window_lock_name(profile, window["title"])):
+                busy_tab = busy_tab or window["title"]
+                continue
+            return window["title"], True
+        return _free_title(db, busy_tab or title, numbered=bool(busy_tab)), False
+    finally:
+        db.close()
+
+
+def _free_title(db, title: str, *, numbered: bool) -> str:
+    """``title`` when no session holds it (``numbered``: start at ``(2)``), else the next free
+    ``"<stem> (N)"``."""
+    match = _NUMBERED_RE.search(title) if numbered else None
+    stem = title[:match.start()] if match else title
+    first = int(match.group(1)) + 1 if match else 2
+    candidates = ([] if numbered else [title]) + [f"{stem} ({n})" for n in range(first, _MAX_NUMBERED_TABS + 1)]
+    for candidate in candidates:
+        if db.resolve_session_by_title(candidate) is None:
+            return candidate
+    return candidates[-1]
+
+
 def side_window_title(topic: str, sender: str, message: str) -> str:
     """The window title: the sender's ``topic``, else ``"<sender>: <first words>"``. One line,
     no quotes, at most ``TITLE_MAX_CHARS``, never an option-looking or the canonical Bot Chat."""
     # "Neo | Chief of Staff" -> "Neo": a bot title is "Name | Role"; the role only bloats a tab title.
     short = re.split(r"\s+[|\u00b7\u2022\u2014\u2013]\s+", str(sender or "").strip())[0] or str(sender or "")
     # Drop a leading self-introduction ("Neo here:") so the title starts with the subject.
-    body = re.sub(rf"^\s*{re.escape(short)}\s+here\s*[:,.\u2014-]?\s*", "", str(message or ""), flags=re.I)
+    body = re.sub(rf"^\s*{re.escape(short)}\s+here\s*[:,.\u2014-]?\s*", "", str(message or ""), flags=re.IGNORECASE)
     words = " ".join(body.split()[:_FALLBACK_WORDS])
     title = _clean(topic) or _clean(f"{short}: {words}")
     from tools.bot_mode_probe import BOT_CHAT_TITLE
@@ -138,13 +238,15 @@ def retitled(argv: Sequence[str]) -> list[str]:
     return out
 
 
-def stamp_side_window(profile_home: Path | str, title: str, *, author: dict | None = None) -> str | None:
+def stamp_side_window(profile_home: Path | str, title: str, *, author: dict | None = None,
+                      key: str | None = None) -> str | None:
     """Mark the session a side-window turn is about to run, so the desktop opens it as a tab.
 
     Resolves ``title`` exactly as the transport's ``chat -c <title>`` will (id, then title with its
     ``#N`` continuation, then the compression tip) and creates the titled CLI session when it is
     new, the same row ``--create-if-missing`` would mint, so the tab can appear before the turn
-    starts. Runs inside the window's turn lock. Returns the stamped id; a failure is logged and
+    starts. ``key`` records the conversation (``side_window_key``) so its next DM finds this tab.
+    Runs inside the window's turn lock. Returns the stamped id; a failure is logged and
     answers None, because a missing tab must never cost the DM."""
     db = None
     try:
@@ -152,7 +254,7 @@ def stamp_side_window(profile_home: Path | str, title: str, *, author: dict | No
 
         db = acquire(Path(profile_home) / "state.db")
         session_id = _resolve_window(db, title) or _create_window(db, title)
-        if session_id and db.mark_side_window(session_id, by=str((author or {}).get("id") or "")):
+        if session_id and db.mark_side_window(session_id, by=str((author or {}).get("id") or ""), key=key):
             return session_id
         return None
     except Exception:
