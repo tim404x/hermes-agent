@@ -41,8 +41,33 @@ def bot_chat_busy(profile_home: Path | str) -> tuple[bool, str]:
     return bool(why), why
 
 
+def unfinished_turn_at(db, session_id: str) -> float | None:
+    """When *session_id*'s newest row was written, if that row leaves a turn open: role user or
+    tool, or an assistant row still carrying tool_calls. None when the session is empty or ends on
+    a finished assistant reply. Clock-free, so a caller may memoise it per store state."""
+    newest = db.get_messages(session_id, latest=True, limit=1)
+    if not newest:
+        return None
+    last = newest[-1]
+    if last.get("role") == "assistant" and not last.get("tool_calls"):
+        return None
+    return float(last.get("timestamp") or 0)
+
+
+def turn_is_fresh(started_at: float | None, now: float | None = None) -> bool:
+    """An open turn older than ``BUSY_TURN_MAX_AGE_SECONDS`` is a crashed turn, not a busy one."""
+    if started_at is None:
+        return False
+    return (time.time() if now is None else now) - started_at <= BUSY_TURN_MAX_AGE_SECONDS
+
+
+def session_mid_turn(db, session_id: str, now: float | None = None) -> bool:
+    """*session_id* is mid-turn right now: its newest row leaves a turn open, and it is fresh."""
+    return turn_is_fresh(unfinished_turn_at(db, session_id), now)
+
+
 def _mid_turn(home: Path) -> str:
-    """The tip's newest row is not a finished assistant reply, and it is fresh."""
+    """The Bot Chat tip is mid-turn (``session_mid_turn``)."""
     if not (home / "state.db").is_file():
         return ""
     from hermes_state import SessionDB
@@ -52,17 +77,10 @@ def _mid_turn(home: Path) -> str:
     try:
         row = db.get_session_by_title(BOT_CHAT_TITLE)
         tip = db.get_compression_tip(row["id"]) if row else None
-        newest = db.get_messages(tip, latest=True, limit=1) if tip else []
+        busy = bool(tip) and session_mid_turn(db, tip)
     finally:
         db.close()
-    if not newest:
-        return ""
-    last = newest[-1]
-    if last.get("role") == "assistant" and not last.get("tool_calls"):
-        return ""
-    if time.time() - float(last.get("timestamp") or 0) > BUSY_TURN_MAX_AGE_SECONDS:
-        return ""
-    return "mid-turn in its Bot Chat"
+    return "mid-turn in its Bot Chat" if busy else ""
 
 
 def _mailbox_waiting(home: Path) -> str:

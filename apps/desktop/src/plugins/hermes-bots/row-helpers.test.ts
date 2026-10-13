@@ -7,9 +7,10 @@
  *    the primary profile surfaced as @default instead of @hermes;
  *  - the "6d ago" class — canonical Bot Chats are hidden from session lists,
  *    so a bot DM'd all day read as a week idle because its newest VISIBLE
- *    session was a week old. Liveness keys off `botActivitySession`, and
- *    kanban/tool workers count too (hermes-agent#90268): a profile grinding
- *    through a 30-minute task must not read "3 hr ago" the whole time.
+ *    session was a week old. Liveness keys off `botActivitySession`;
+ *  - the always-orbiting face — a background worker (oneshot / kanban / tool)
+ *    under the profile animated the face while the bot's own chat sat idle.
+ *    Only the server's `turn_active` (the bot itself mid-turn) animates it.
  */
 
 import { describe, expect, it, vi } from 'vitest'
@@ -21,8 +22,7 @@ import {
   botRowOwnsWorkspace,
   botWorkingMood,
   previewKind,
-  rosterActivityMatches,
-  workerActiveAt
+  rosterActivityMatches
 } from './row-helpers'
 import type { RosterRow } from './types'
 
@@ -151,29 +151,49 @@ describe('which bots are working right now', () => {
     expect(activeBots(bots, null, false, NOW).map(bot => bot.name)).toContain('default')
   })
 
-  it('counts a live kanban/tool worker heartbeat (#90268)', () => {
-    // The reported shape: last chat hours ago while the bot is mid-task.
+  it('never animates or counts a background worker while the chat idles', () => {
+    // The reported shape: Outbox / kanban workers running under the profile all
+    // evening while its chat sat idle, and the face orbited the whole time.
     const working = row({
       last_session: { id: 'chat', last_active: secondsAgo(3 * 3600) },
+      name: 'default',
+      turn_active: false,
+      worker_session: { id: 'w1', last_active: secondsAgo(30), source: 'oneshot' }
+    })
+
+    expect(botWorkingMood(working, null, false, 'local', NOW)).toBe('idle')
+    expect(activeBots([working], null, false, NOW)).toEqual([])
+  })
+
+  it('orbits while the server reports the bot itself mid-turn outside the focused tile', () => {
+    // A side window or an unfocused Bot Chat: the focused-tile busy atom cannot see it.
+    const answering = row({
+      last_session: { id: 'chat', last_active: secondsAgo(3 * 3600) },
+      name: 'apex',
+      turn_active: true,
+      turn_active_session: 'side'
+    })
+
+    expect(botWorkingMood(answering, null, false, 'local', NOW)).toBe('work')
+    expect(activeBots([answering], null, false, NOW)).toEqual([answering])
+  })
+
+  it('keeps the focused live turn as think, ahead of the server turn signal', () => {
+    const bot = row({ name: 'apex', connectionId: 'local', turn_active: true })
+    const owner = { name: 'apex', connectionId: 'local', authoritative: true }
+
+    expect(botWorkingMood(bot, owner, true, 'local', NOW)).toBe('think')
+    expect(botWorkingMood({ ...bot, turn_active: false }, owner, false, 'local', NOW)).toBe('idle')
+  })
+
+  it('stays idle against an older server that sends no turn_active, even with a live worker', () => {
+    const legacy = row({
       name: 'coding',
       worker_session: { id: 'w1', last_active: secondsAgo(30), source: 'kanban' }
     })
 
-    expect(activeBots([working], null, false, NOW).map(bot => bot.name)).toContain('coding')
-    expect(workerActiveAt(working, NOW)).toBe(true)
-  })
-
-  it('ignores a finished worker outside the liveness window', () => {
-    const finished = row({
-      last_session: { id: 'chat', last_active: secondsAgo(3 * 3600) },
-      name: 'coding',
-      worker_session: { id: 'w1', last_active: secondsAgo(3600), source: 'kanban' }
-    })
-
-    expect(activeBots([finished], null, false, NOW)).toEqual([])
-    // Workers get a wider window than chat activity to bridge one missed
-    // heartbeat — but not an hour's worth.
-    expect(workerActiveAt(finished, NOW)).toBe(false)
+    expect(botWorkingMood(legacy, null, false, 'local', NOW)).toBe('idle')
+    expect(activeBots([legacy], null, false, NOW)).toEqual([])
     expect(ACTIVE_WINDOW_S).toBeGreaterThan(0)
   })
 })
