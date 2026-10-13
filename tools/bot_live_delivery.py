@@ -464,6 +464,28 @@ def _poll_receipt(profile_home: Path | str, delivery_id: str) -> dict[str, Any] 
     return record
 
 
+def pending_deliveries(profile_home: Path | str) -> list[dict[str, Any]]:
+    """Queued or claimed receipts, read without the mailbox lock: a busy probe, never a claim.
+
+    Authority receipts carry no ``created_at`` (nor the legacy ticket shape ``_scan_read``
+    insists on); their last write stands in for it. An unreadable receipt is skipped quietly:
+    the probe then answers not busy, which is today's path."""
+    root = _root(profile_home)
+    if not root.is_dir():
+        return []
+    pending = []
+    for path in root.glob("*.json"):
+        try:
+            record, written = _read(path), path.stat().st_mtime_ns
+        except (OSError, ValueError):
+            continue
+        status = record and record.get("status")
+        if status in (*_PENDING, "canonical"):
+            pending.append({**record, "status": "queued" if status == "canonical" else status,
+                            "created_at": record.get("created_at", written)})
+    return pending
+
+
 def await_delivery(
     profile_home: Path | str, delivery_id: str, timeout: float | None,
     *, should_stop: Callable[[], bool] | None = None,
