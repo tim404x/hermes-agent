@@ -2037,6 +2037,7 @@ export interface ProfileRow {
   last_session?: ProfileSessionPreview | null
   worker_session?: ProfileWorkerSession | null
   canonical_session?: ProfileCanonicalSession | null
+  side_windows?: ProfileSideWindow[]
   ui_meta_revisions?: Record<string, number>
   ui_meta?: Record<string, unknown> | null
   has_avatar?: boolean
@@ -2069,6 +2070,15 @@ export interface ProfileCanonicalSession {
   last_active?: number
   message_count?: number
   live_message_count?: number | null
+}
+/** A ``message_agent`` side window (``SessionDB.list_side_windows``): ``id`` is the live tip, ``at`` the newest DM stamp, ``by`` the sending bot's author id. */
+export interface ProfileSideWindow {
+  id: string
+  title?: string
+  at?: number
+  by?: string
+  last_active?: number
+  message_count?: number
 }
 /** ``clone_from`` omitted = fresh profile + bundled skills; ``mirror_credentials`` defaults on so a headless bot has a provider. */
 export interface ProfilesCreateParams {
