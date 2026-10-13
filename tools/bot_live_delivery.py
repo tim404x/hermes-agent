@@ -326,6 +326,15 @@ _PENDING = ("queued", "claimed")
 _POLL_SECONDS = 0.5
 
 
+def pending_deliveries(profile_home: Path | str) -> list[dict[str, Any]]:
+    """Queued or claimed receipts, read without the mailbox lock: a busy probe, never a claim."""
+    root = _root(profile_home)
+    if not root.is_dir():
+        return []
+    return [record for path in root.glob("*.json")
+            if (record := _scan_read(path)) is not None and record["status"] in _PENDING]
+
+
 def await_delivery(
     profile_home: Path | str, delivery_id: str, timeout: float | None,
     *, should_stop: Callable[[], bool] | None = None,
