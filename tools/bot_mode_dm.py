@@ -83,7 +83,9 @@ def message_agent_tool_schema() -> dict:
                 "then follow its process(action=\"wait\") instruction first. COMPOSE the message yourself "
                 "(lead with the point and the concrete ask); never paste the user's words verbatim or share "
                 "private 1:1 content. Targets: a roster name ('researcher'), '<peer>/<agent>' or '<peer>' for "
-                "a peer gateway, '<handle>@<connection>' when a handle exists on several machines."
+                "a peer gateway, '<handle>@<connection>' when a handle exists on several machines. "
+                "If the teammate is mid-turn, the message opens in a side window titled `topic` "
+                "instead of waiting on their main chat."
             ),
             "parameters": {
                 "type": "object",
@@ -116,6 +118,13 @@ def message_agent_tool_schema() -> dict:
                     "cancel": {
                         "type": "string",
                         "description": "A delivery_id from your own ack: withdraw that queued request or stop the turn it started.",
+                    },
+                    "topic": {
+                        "type": "string",
+                        "description": (
+                            "Short window title used if the teammate is busy "
+                            "(e.g. 'micro1 | Pricing + Volume'). Optional."
+                        ),
                     },
                 },
                 "required": ["target"],
@@ -218,6 +227,11 @@ class Sender:
     agent: Any
     # The chain gate's author-envelope fields for this call (``tools/bot_mode_dm_chain.py``).
     chain: dict = field(default_factory=dict)
+    # Side-window inputs for a busy local teammate: the requested title, the sender's friendly
+    # name and its raw message (the fallback title's first words).
+    topic: str = ""
+    display: str = ""
+    message: str = ""
 
     def roster_err(self, msg: str) -> str:
         return _err(msg, roster=self.teammates, peers=self.peers)
@@ -237,10 +251,12 @@ def _wants_reply(value: Any) -> bool:
 
 
 def message_agent_tool(target: str = "", message: str = "", task_id: Optional[str] = None, agent: Any = None,
-                       expects_reply: Any = True, cancel: str = "", constraints: str = "", expecting: str = "") -> str:
+                       expects_reply: Any = True, cancel: str = "", constraints: str = "", expecting: str = "",
+                       topic: str = "") -> str:
     """Deliver ``message`` to ``target``'s Bot Chat (several comma-separated targets fan out),
     or withdraw the caller's own request ``cancel``. Returns a JSON ack/error.
-    ``agent`` is the calling AIAgent — used for the Bot Chat gate and sender identity."""
+    ``agent`` is the calling AIAgent — used for the Bot Chat gate and sender identity.
+    A busy local teammate gets it in a side window titled ``topic`` instead."""
     home = _agent_home(agent)
     try:
         from tools.bot_mode_probe import (
@@ -262,8 +278,10 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
     root, me = _hermes_root(Path(home)), _self_profile_name(Path(home))
     roster_homes = dict(_roster(root))
     peers = _peers(root)
+    display = _display_name(me, roster_homes.get(me, Path(home)), list(roster_homes))
     sender = Sender(home=home, root=root, me=me, roster_homes=roster_homes, peers=peers,
-                    teammates=[_handle(n, list(roster_homes)) for n in roster_homes if n != me], task_id=task_id, agent=agent)
+                    teammates=[_handle(n, list(roster_homes)) for n in roster_homes if n != me], task_id=task_id, agent=agent,
+                    topic=str(topic or ""), display=display, message=str(message or ""))
     if str(cancel or "").strip():
         from tools.bot_mode_dm_coordination import cancel_own_delivery
 
@@ -285,7 +303,7 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
         return _err(f"Too many targets ({len(targets)} > {FAN_OUT_MAX}); message the ones the task needs.")
     reply = _wants_reply(expects_reply)
     # Sender signature: the friendly name when the bot has one (#89720); the @handle stays the routing alias.
-    signature = f"Message from 🤖 {_display_name(me, roster_homes.get(me, Path(home)), list(roster_homes))} (@{_handle(me, list(roster_homes))}): "
+    signature = f"Message from 🤖 {display} (@{_handle(me, list(roster_homes))}): "
     from tools.bot_mode_dm_chain import send_gated
 
     # The runtime's chain rules run before any transport (hop cap, repeated ask, reply to a bot: #137027).
@@ -358,6 +376,11 @@ def _dispatch(raw_target: str, content: str, sender: Sender, *, wake: Any) -> st
         # final response back. A second DM races it and lands in their chat as a separate turn.
         return _err(f"@{_handle(resolved, roster)} messaged you this turn and your final response already goes back "
                     "to them: put your reply in it instead of messaging them. Do not retry.")
+    side_window = _start_side_window_if_busy(resolved, roster_homes[resolved], content, author=author,
+                                             topic=sender.topic, sender=sender.display, body=sender.message,
+                                             roster=roster, **delivery)
+    if side_window is not None:
+        return side_window
     # Local teammates are admitted through the profile authority; the argv only names the
     # profile for the runner's home lookup and is never executed.
     return _start_delivery([_hermes_cli(), "-p", resolved], content, f"@{_handle(resolved, roster)}",
@@ -418,6 +441,39 @@ def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
         return None
 
 
+def _start_side_window_if_busy(profile: str, profile_home: Path, content: str, *, author: dict, topic: str,
+                               sender: str, body: str, roster: list[str], task_id: Optional[str],
+                               agent: Any, wake: Any = "notify") -> Optional[str]:
+    """A busy local teammate gets the DM in a side window: its own titled session, never queued
+    into (or racing) the main Bot Chat. None when the teammate is idle (the normal Bot Chat path).
+    The ``hermes chat -c <title>`` transport is a gateway client (``hermes_cli/gateway_chat.py``),
+    so the side window runs in the profile authority too, never a competing runtime."""
+    from tools.bot_mode_dm_side_window import bot_chat_busy, side_window_title
+    from tools.bot_mode_probe import _display_name, _handle
+    from tools.bot_relay import _hermes_cli
+
+    busy, why = bot_chat_busy(profile_home)
+    if not busy:
+        return None
+    window = side_window_title(topic, sender, body)
+    label = f"@{_handle(profile, roster)}"
+    argv = [_hermes_cli(), "-p", profile, "chat", "--in", "~", "-c", window, "--create-if-missing", "-Q"]
+    ack = json.loads(_start_delivery(argv, content, label, stdin_file=False, task_id=task_id, agent=agent,
+                                     profile_home=profile_home, author=author, wake=wake, side_window=True))
+    if ack.get("error"):
+        return json.dumps(ack)
+    detail = (f"{label} was busy ({why}), so this opened in a side window '{window}' (it shows under "
+              f"{_display_name(profile, profile_home, roster)} in the app).")
+    if ack.get("expects_reply") is False:
+        detail += f" {_NOTIFY_ONLY_DETAIL}"
+    elif ack.get("reply_delivery") == "poll":
+        detail += f" Do NOT resend. {ack['detail']}"
+    else:
+        detail += " The reply arrives as a notification. Do NOT resend."
+    ack.update(routed="side_window", window=window, detail=detail)
+    return json.dumps(ack)
+
+
 def _dm_dir() -> Path:
     uid_getter = getattr(os, "getuid", None)
     uid = uid_getter() if callable(uid_getter) else None
@@ -473,6 +529,87 @@ def _write_dm_file(content: str) -> str:
         _unlink_dm_file(path)
         raise
     return path
+
+
+def _delivery_lock(argv: list[str], *, stdin_file: bool, side_window: bool = False):
+    """Per-profile turn lock for a LOCAL teammate delivery: local and relay deliveries
+    into one profile both run a Bot Chat turn here, so the turn window is serialized on
+    ``tools.bot_relay``'s cross-process lock. Peer transports (stdin mode) are locked
+    on the remote gateway by its own deliver path. A side window locks per (profile, title):
+    it never waits behind the busy Bot Chat, and only the same window serializes.
+
+    See #93091.
+    """
+    # Match the CLI element by basename: argv[0] may be an absolute venv path
+    # (service contexts lack PATH) and carries .exe on Windows; split on both separators.
+    # Split on both separators so the shape matches regardless of which platform built the argv. See #93590.
+    cli = (argv[0] if argv else "").rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+    if stdin_file or len(argv) < 3 or cli not in ("hermes", "hermes.exe") or argv[1] != "-p":
+        return contextlib.nullcontext()
+    from tools.bot_mode_probe import _hermes_root
+    from tools.bot_relay import acquire_turn_lock
+
+    key = argv[2]
+    if side_window:
+        from tools.bot_mode_dm_side_window import side_window_lock_name, window_title
+
+        key = side_window_lock_name(argv[2], window_title(argv))
+    return acquire_turn_lock(_hermes_root(Path(_default_home())), key)
+
+
+def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None,
+                    retried: bool = False) -> int:
+    """One side-window turn via ``--query-file`` through the gateway-routed ``hermes chat``
+    one-shot; re-emits the transport's streams and returns its exit code. Never the Bot Chat:
+    that is admitted only through the profile authority (``_admit_live_dm``). No transient
+    re-run here: the resumed-user-row adoption a re-run relied on retired with the cutover."""
+    proc = subprocess.run([*argv, "--query-file", dm_file], check=False, stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
+    stderr_text = proc.stderr or ""
+    reason = next((line.removeprefix("hermes-refusal-reason: ").strip()
+                   for line in stderr_text.splitlines()
+                   if line.startswith("hermes-refusal-reason: ")), None)
+    # A code wins over prose, including unknown codes from newer CLIs.
+    # Only older CLIs without a marker need the historical wording fallback.
+    refused_not_owned = (reason == "SESSION_NOT_OWNED" if reason is not None
+                         else "already has a live owner" in stderr_text)
+    if proc.returncode != 0 and refused_not_owned:
+        if not retried:
+            return _retry_side_window(argv, dm_file, env=env)
+        # The window is held live by another surface (Desktop); the turn never ran —
+        # tell the sender plainly instead of leaking a raw lease error. See #100523.
+        from tools.bot_mode_dm_side_window import window_title
+
+        who = argv[argv.index("-p") + 1] if "-p" in argv[:-1] else "the teammate"
+        print(json.dumps({
+            "error": f"Delivery failed: @{who}'s side window '{window_title(argv)}' is open on another "
+                     "surface right now, so your message was NOT delivered. Try again later.",
+            "reason": "target_busy",
+        }))
+        return 1
+    # Re-emit the transport's streams: stdout is the reply text the
+    # completion notification carries back to the sending agent. A successful bare
+    # silence marker is a delivery decision (same rule as the gateway and the live
+    # Bot Chat completion): the turn stays in the target's transcript, the sender
+    # never sees the marker as prose.
+    from gateway.response_filters import is_intentional_silence_response
+    reply = proc.stdout or ""
+    if proc.returncode == 0 and is_intentional_silence_response(reply):
+        reply = ""
+    for stream, text in ((sys.stdout, reply), (sys.stderr, proc.stderr)):
+        if text:
+            stream.write(text)
+            stream.flush()
+    return proc.returncode
+
+
+def _retry_side_window(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]]) -> int:
+    """The titled side window is open live on another surface: one more try in '<title> (2)'."""
+    from tools.bot_mode_dm_side_window import retitled
+
+    retry = retitled(argv)
+    with _delivery_lock(retry, stdin_file=False, side_window=True):
+        return _run_local_turn(retry, dm_file, env=env, retried=True)
 
 
 def _live_intent_file(dm_file: str | os.PathLike) -> str:
@@ -701,14 +838,18 @@ def _runner_argv(args: list[str]) -> tuple[Optional[str], str, str, list[str]] |
 
 
 def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
-                  profile_home: Path | None = None, author: Optional[dict] = None) -> int:
+                  profile_home: Path | None = None, author: Optional[dict] = None, side_window: bool = False) -> int:
     """Admit local DMs only through the profile authority; retain uncertain intent.
 
     The optional peer stdin transport remains an explicit remote route, never a
     fallback after local admission. Background processes wait for delivery only.
+
+    A ``side_window`` delivery (the teammate's Bot Chat was busy) runs its own titled session
+    through the gateway-routed ``hermes chat`` one-shot: never live admission into the Bot Chat,
+    and its lock is keyed per window title.
     """
     # The live consumer owns turn admission; never compete for its CLI lease.
-    if not stdin_file:
+    if not stdin_file and not side_window:
         home = profile_home or _local_delivery_home(argv)
         if home is not None or os.path.exists(_live_intent_file(dm_file)):
             try:
@@ -724,30 +865,36 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
                 return 1
             if record is not None:
                 return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file)
-    if not stdin_file:
+    if not stdin_file and not side_window:
         print(json.dumps({"reason": "runtime_unavailable", "error": "No canonical Bot Chat authority; payload retained."}))
         return 1
     try:
         from tools.bot_relay import delivery_env
 
         env = delivery_env(author, profile_home if not stdin_file else None)
-        # Keep the file open until the transport exits; cleanup occurs
-        # after subprocess.run returns, not merely after stdin reaches EOF.
-        with open(dm_file, "r", encoding="utf-8-sig") as stream:
-            # Passing the file descriptor as stdin bypasses the BOM-aware decoder.
-            return subprocess.run(argv, input=stream.read().encode("utf-8"), check=False, env=env).returncode
+        with _delivery_lock(argv, stdin_file=stdin_file, side_window=side_window):
+            if side_window:
+                return _run_local_turn(argv, dm_file, env=env)
+            # Keep the file open until the transport exits; cleanup occurs
+            # after subprocess.run returns, not merely after stdin reaches EOF.
+            with open(dm_file, "r", encoding="utf-8-sig") as stream:
+                # Passing the file descriptor as stdin bypasses the BOM-aware decoder.
+                return subprocess.run(argv, input=stream.read().encode("utf-8"), check=False, env=env).returncode
     finally:
         _unlink_dm_file(dm_file)
 
 
 def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
-                      profile_home: Path | None = None, author: Optional[dict] = None) -> str:
+                      profile_home: Path | None = None, author: Optional[dict] = None,
+                      side_window: bool = False) -> str:
     """Build an argv-safe command for the cleanup-owning background runner:
-    ``--run-delivery [--author <json>] <mode> <dm_file> [--profile-home <path>] <argv...>``."""
+    ``--run-delivery [--author <json>] <mode> <dm_file> [--profile-home <path>] [--side-window] <argv...>``."""
     runner_argv = [sys.executable, str(Path(__file__).resolve()), "--run-delivery",
                    "stdin" if stdin_file else "query-file", dm_file]
     if profile_home is not None:
         runner_argv.extend(["--profile-home", str(Path(profile_home).resolve())])
+    if side_window:
+        runner_argv.append("--side-window")
     runner_argv.extend(argv)
     if sys.platform == "win32":
         # The tracked local backend uses Git Bash on native Windows: forward slashes keep drive
@@ -761,10 +908,10 @@ def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
 
 def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bool,
                     task_id: Optional[str], agent: Any, profile_home: Path | None = None,
-                    author: Optional[dict] = None, wake: Any = "notify") -> str:
+                    author: Optional[dict] = None, wake: Any = "notify", side_window: bool = False) -> str:
     """Create a DM file and transfer its cleanup ownership to the runner."""
     dm_file = _write_dm_file(content)
-    if profile_home is not None:
+    if profile_home is not None and not side_window:
         try:
             record = _admit_live_dm(profile_home, dm_file, author)
         except LiveTargetUnavailableError as exc:
@@ -798,7 +945,8 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
                     result["detail"] = f"Durably queued for the live Bot Chat owner. Do NOT resend. {notification['detail']}"
             return json.dumps(_with_target_state(result, record, label))
     try:
-        command = _delivery_command(argv, dm_file, stdin_file=stdin_file, profile_home=profile_home, author=author)
+        command = _delivery_command(argv, dm_file, stdin_file=stdin_file, profile_home=profile_home, author=author,
+                                    side_window=side_window)
     except BaseException:
         _unlink_dm_file(dm_file)
         raise
@@ -991,7 +1139,11 @@ def _delivery_main(args: list[str]) -> int:
         profile_home = None
         if len(argv) >= 2 and argv[0] == "--profile-home":
             profile_home, argv = Path(argv[1]), argv[2:]
-        return _run_delivery(argv, dm_file, stdin_file=mode == "stdin", profile_home=profile_home, author=author)
+        side_window = argv[:1] == ["--side-window"]
+        if side_window:
+            argv = argv[1:]
+        return _run_delivery(argv, dm_file, stdin_file=mode == "stdin", profile_home=profile_home,
+                             author=author, side_window=side_window)
     except Exception as exc:
         # Every refusal ships a typed reason on stdout so the completion notification carries it
         # back to the sender (#93091), with the same vocabulary-guarded classification the relay

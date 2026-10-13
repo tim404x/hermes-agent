@@ -629,6 +629,28 @@ def turn_lock_path(root: Path | str, profile: str) -> Path:
     return relay_root(root) / LOCKS_DIR / f"{safe}.lock"
 
 
+def turn_lock_held(root: Path | str, profile: str) -> bool:
+    """Non-blocking probe: whether a delivery turn holds ``profile``'s turn lock right now.
+    Never creates the lockfile; False without ``fcntl`` (the lock is a no-op there)."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover — Windows
+        return False
+    try:
+        fd = os.open(turn_lock_path(root, profile), os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 @contextlib.contextmanager
 def acquire_turn_lock(root: Path | str, profile: str, timeout_seconds: float | None = None) -> Iterator[Path]:
     """Hold ``profile``'s cross-process turn lock for the ``with`` body: non-blocking
