@@ -29415,6 +29415,13 @@
             ],
             "default": null
           },
+          "side_windows": {
+            "items": {
+              "$ref": "#/components/schemas/ProfileSideWindow"
+            },
+            "title": "Side Windows",
+            "type": "array"
+          },
           "ui_meta_revisions": {
             "additionalProperties": {
               "type": "integer"
@@ -29512,6 +29519,60 @@
           "id"
         ],
         "title": "ProfileSessionPreview",
+        "type": "object"
+      },
+      "ProfileSideWindow": {
+        "additionalProperties": false,
+        "description": "A ``message_agent`` side window (``SessionDB.list_side_windows``): ``id`` is the live tip,\n``at`` the newest DM stamp, ``by`` the sending bot's author id.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "title": {
+            "default": "",
+            "title": "Title",
+            "type": "string"
+          },
+          "at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "default": 0,
+            "title": "At"
+          },
+          "by": {
+            "default": "",
+            "title": "By",
+            "type": "string"
+          },
+          "last_active": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "default": 0,
+            "title": "Last Active"
+          },
+          "message_count": {
+            "default": 0,
+            "title": "Message Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "ProfileSideWindow",
         "type": "object"
       },
       "ProfileWorkerSession": {

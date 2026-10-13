@@ -148,6 +148,18 @@ class ProfileCanonicalSession(Result):
     live_message_count: int | None = None
 
 
+class ProfileSideWindow(Result):
+    """A ``message_agent`` side window (``SessionDB.list_side_windows``): ``id`` is the live tip,
+    ``at`` the newest DM stamp, ``by`` the sending bot's author id."""
+
+    id: str
+    title: str = ""
+    at: float | int = 0
+    by: str = ""
+    last_active: float | int = 0
+    message_count: int = 0
+
+
 class ProfileRow(Result):
     """One roster row; the session fields are present only with ``include_sessions``."""
 
@@ -163,6 +175,7 @@ class ProfileRow(Result):
     last_session: ProfileSessionPreview | None = None
     worker_session: ProfileWorkerSession | None = None
     canonical_session: ProfileCanonicalSession | None = None
+    side_windows: list[ProfileSideWindow] = Field(default_factory=list)
     ui_meta_revisions: dict[str, int] = Field(default_factory=dict)
     ui_meta: dict[str, JsonValue] | None = None
     has_avatar: bool = False
