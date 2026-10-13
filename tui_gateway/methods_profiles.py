@@ -235,10 +235,59 @@ def _side_window_rows(db) -> list:
     return _try(lambda: db.list_side_windows(), []) if db is not None else []
 
 
+# Besides the deny-listed workers (INTERNAL_LISTING_SOURCES), scheduled cron runs are background
+# work too, not the bot itself talking: their activity never animates a roster face.
+_BACKGROUND_TURN_EXTRA_SOURCES = ("cron",)
+# Human-facing sessions scanned for an open turn besides the Bot Chat (side windows run in parallel).
+_TURN_SCAN_LIMIT = 8
+
+
+def _open_turn_rows(db, canonical) -> list:
+    """``[(session id, newest-row timestamp)]`` for this profile's conversations whose newest row
+    leaves a turn open (``unfinished_turn_at``): the canonical Bot Chat tip, plus human-facing
+    sessions active within the turn window (``message_agent`` side windows, CLI/TUI chats).
+
+    Memoised with the other session fields, i.e. reused only while the store has not moved: a turn
+    that starts or ends writes a row and so re-derives this. The age gate is NOT applied here but
+    per poll in ``_turn_fields``, so a crashed turn still ages out with no store write."""
+    if db is None:
+        return []
+    import time
+
+    from hermes_state_sessions import INTERNAL_LISTING_SOURCES
+    from tools.bot_mode_dm_side_window import BUSY_TURN_MAX_AGE_SECONDS, unfinished_turn_at
+    try:
+        ids = [canonical["resolved_id"]] if canonical else []
+        cutoff = time.time() - BUSY_TURN_MAX_AGE_SECONDS
+        background = [*INTERNAL_LISTING_SOURCES, *_BACKGROUND_TURN_EXTRA_SOURCES]
+        for s in db.list_sessions_rich(exclude_sources=background, limit=_TURN_SCAN_LIMIT,
+                                       order_by_last_active=True, compact_rows=True):
+            if (s.get("last_active") or s.get("started_at") or 0) < cutoff:
+                break
+            ids.append(_try(lambda sid=s["id"]: db.get_compression_tip(sid), None) or s["id"])
+        open_rows = ((sid, unfinished_turn_at(db, sid)) for sid in dict.fromkeys(ids))
+        return [(sid, at) for sid, at in open_rows if at is not None]
+    except Exception:  # read-only roster hint: any failure means "not mid-turn", never a failed listing
+        logger.debug("profiles.list: open-turn probe failed", exc_info=True)
+        return []
+
+
+def _turn_fields(open_rows) -> dict:
+    """``turn_active`` / ``turn_active_session``: the bot itself is mid-turn in one of its own
+    conversations right now (the newest fresh open turn), so a roster animates its face only then."""
+    from tools.bot_mode_dm_side_window import turn_is_fresh
+    import time
+
+    now = time.time()
+    fresh = [(at, sid) for sid, at in open_rows if turn_is_fresh(at, now)]
+    return {"turn_active": bool(fresh), "turn_active_session": max(fresh)[1] if fresh else None}
+
+
 def _profile_session_fields(row, profile_path):
-    """Attach last_session / worker_session / canonical_session / side_windows to a roster row. The DB is a
-    read-only attach (a writable ``SessionDB()`` waits up to 20s for the write lock + runs DDL
-    and stalled the 5s roster poll); no/unreadable DB -> every field None (the readers swallow)."""
+    """Attach last_session / worker_session / canonical_session / side_windows / turn_active(_session)
+    to a roster row. The DB is a read-only attach (a writable ``SessionDB()`` waits up to 20s for the
+    write lock + runs DDL and stalled the 5s roster poll); no/unreadable DB -> every field None/False
+    (the readers swallow)."""
     def _read() -> dict:
         db_path = Path(profile_path) / "state.db"
         db = None
@@ -246,19 +295,22 @@ def _profile_session_fields(row, profile_path):
             db = _try(lambda: _lazy("hermes_state", "SessionDB")(db_path=db_path, read_only=True), None)
         try:
             last, worker = _latest_profile_session_rows(db)
+            canonical = _canonical_session_row(db, profile_path)
             # Resolved server-side on every listing so no client carries a session pointer.
-            return {"last_session": last, "worker_session": worker,
-                    "canonical_session": _canonical_session_row(db, profile_path),
-                    "side_windows": _side_window_rows(db)}
+            return {"last_session": last, "worker_session": worker, "canonical_session": canonical,
+                    "side_windows": _side_window_rows(db), "_open_turns": _open_turn_rows(db, canonical)}
         finally:
             if db is not None:
                 _best_effort(db.close)
 
-    # These four are a pure function of the profile's session store, and the roster re-asks every
+    # These are a pure function of the profile's session store, and the roster re-asks every
     # 5s per connection — so they are reused while that store has not moved (#117257).
     from tui_gateway.profile_roster_cache import cached_session_fields
 
-    row.update(cached_session_fields(profile_path, _read))
+    fields = cached_session_fields(profile_path, _read)
+    open_rows = fields.pop("_open_turns", None) or []
+    row.update(fields)
+    row.update(_turn_fields(open_rows))
 
 
 def _profile_ui_meta_fields(row: dict, profile_dir) -> None:
