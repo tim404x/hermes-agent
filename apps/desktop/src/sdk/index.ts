@@ -107,8 +107,10 @@ import {
 import { runGatewayRestart } from '@/store/system-actions'
 import type { PaginatedSessions, UsageStats } from '@/types/hermes'
 
+import { openBackgroundSession } from './background-session'
 import { pluginDecisions, profiles, skills, toolsets } from './bridge'
 import { composerHost } from './composer'
+import { beginHydrationBackgroundSync } from './hydration-sync-badge'
 import { i18nHost } from './i18n'
 import { planPluginOpenSession } from './plugin-open-session-plan'
 import { sessionsHost } from './sessions'
@@ -116,6 +118,7 @@ import { desktopSettings } from './settings'
 
 /** Pane, status bar and titlebar slots; see `./areas` for the mount rules. */
 export { PANES_AREA, STATUSBAR_AREAS, TITLEBAR_AREAS } from './areas'
+export { HYDRATION_SYNC_BADGE_TIMEOUT_MS } from './hydration-sync-badge'
 
 // -- state: readonly views over the app's live atoms -------------------------
 
@@ -369,10 +372,6 @@ export const DEFAULT_SESSION_HYDRATION_TIMEOUT_MS = 20_000
  *  and paint durable history. Bot Mode opts into one retry, so its effective
  *  ceiling is two bounded attempts rather than an unbounded wait. */
 export const BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS = 60_000
-/** Ceiling on the paint-first "Syncing…" badge. The profile gate it waits on is
- *  not guaranteed to ever fire (see beginHydrationBackgroundSync), so the badge
- *  needs a bound of its own or it outlives the wake it describes. */
-export const HYDRATION_SYNC_BADGE_TIMEOUT_MS = 30_000
 let openSessionGeneration = 0
 /** Which generation's wake most recently set $gatewaySwapTarget. Clearing it
  *  keys off this, not off `generation === openSessionGeneration`, so a
@@ -426,50 +425,6 @@ export interface PluginOpenSessionOptions {
 export interface PluginNewChatOptions {
   workspaceMode?: WorkspaceMode
   workspaceOwnerKey?: string
-}
-
-// Raise the "Syncing…" affordance for a paint-first wake (#89843) and tear it
-// down as soon as the active-profile gate catches up. The listener clears ONLY
-// its own profile's badge: a newer wake may have replaced the badge with a
-// different profile, and the stale listener must not wipe the winner's.
-//
-// The gate is not guaranteed to fire. `.listen()` is change-only, and a wake
-// is routed here precisely because $activeGatewayProfile did not match at
-// resolve time. ensureGatewayProfile does publish the target on a
-// shared-primary connection, but when the activation did NOT land it publishes
-// the route the registry actually settled on instead — so on that path the
-// atom may never become this profile and the listener never fires. Without a
-// cap the badge would outlive the wake it describes and strand a permanent
-// "Syncing <profile>…" spinner with no user-reachable dismissal; only a full
-// app restart would clear it. Cap the wait so the badge can never outlive the
-// work.
-function beginHydrationBackgroundSync(profile: string): void {
-  $hydrationSyncProfile.set(profile)
-
-  let timer: number | undefined
-
-  const clearOwnBadge = (): void => {
-    if ($hydrationSyncProfile.get() === profile) {
-      $hydrationSyncProfile.set(null)
-    }
-  }
-
-  const unlisten = $activeGatewayProfile.listen(next => {
-    if (normalizeProfileKey(next) === profile) {
-      clearOwnBadge()
-
-      if (timer !== undefined) {
-        window.clearTimeout(timer)
-      }
-
-      unlisten()
-    }
-  })
-
-  timer = window.setTimeout(() => {
-    clearOwnBadge()
-    unlisten()
-  }, HYDRATION_SYNC_BADGE_TIMEOUT_MS)
 }
 
 function waitForFocusedSessionHydration({
@@ -1401,6 +1356,10 @@ export const host = {
 
     window.location.hash = '#/'
   },
+
+  /** Show a session that arrived on its own (a teammate's side window) as an
+   *  unread tab beside `besideStoredIds`, without focus or navigation. Feature-detect on older desktops. */
+  openBackgroundSession,
 
   /** Front the tab a Bot Mode owner already has open — the tile that owner's
    *  zone last had active, else its most recent — and return that stored id;
