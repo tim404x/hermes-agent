@@ -107,8 +107,12 @@ def _turn_locked(home: Path) -> str:
 def side_window_title(topic: str, sender: str, message: str) -> str:
     """The window title: the sender's ``topic``, else ``"<sender>: <first words>"``. One line,
     no quotes, at most ``TITLE_MAX_CHARS``, never an option-looking or the canonical Bot Chat."""
-    words = " ".join(str(message or "").split()[:_FALLBACK_WORDS])
-    title = _clean(topic) or _clean(f"{sender}: {words}")
+    # "Neo | Chief of Staff" -> "Neo": a bot title is "Name | Role"; the role only bloats a tab title.
+    short = re.split(r"\s+[|\u00b7\u2022\u2014\u2013]\s+", str(sender or "").strip())[0] or str(sender or "")
+    # Drop a leading self-introduction ("Neo here:") so the title starts with the subject.
+    body = re.sub(rf"^\s*{re.escape(short)}\s+here\s*[:,.\u2014-]?\s*", "", str(message or ""), flags=re.I)
+    words = " ".join(body.split()[:_FALLBACK_WORDS])
+    title = _clean(topic) or _clean(f"{short}: {words}")
     from tools.bot_mode_probe import BOT_CHAT_TITLE
 
     if title.casefold() == BOT_CHAT_TITLE.casefold():
