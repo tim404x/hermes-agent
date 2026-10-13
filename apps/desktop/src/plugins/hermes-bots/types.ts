@@ -150,6 +150,11 @@ export interface RosterRow {
   /** Compare-and-swap revisions, per ui_meta key. */
   ui_meta_revisions?: Record<string, number>
   worker_session?: { last_active?: number } | null
+  /** The bot itself is mid-turn (its Bot Chat or a message_agent side window;
+   *  never a background worker), resolved server-side per poll. Absent on
+   *  older servers, which therefore read idle. */
+  turn_active?: boolean
+  turn_active_session?: null | string
 }
 
 /** A roster row reduced to what a group room needs to seat a member. */

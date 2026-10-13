@@ -2038,6 +2038,8 @@ export interface ProfileRow {
   worker_session?: ProfileWorkerSession | null
   canonical_session?: ProfileCanonicalSession | null
   side_windows?: ProfileSideWindow[]
+  turn_active?: boolean
+  turn_active_session?: string | null
   ui_meta_revisions?: Record<string, number>
   ui_meta?: Record<string, unknown> | null
   has_avatar?: boolean
