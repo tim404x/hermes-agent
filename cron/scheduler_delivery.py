@@ -770,6 +770,13 @@ def _format_failure_streams(result) -> str:
     return redact_sensitive_text(" | ".join(parts), force=True, redact_url_credentials=True)
 
 
+def _titled_owner(lookup, home, title: str):
+    """``lookup(home)`` for the canonical Bot Chat (the historical call shape), ``lookup(home, title)``
+    for a dedicated cron chat (``cron.bot_chat_title``)."""
+    from tools.bot_live_delivery import BOT_CHAT_TITLE
+    return lookup(home) if title == BOT_CHAT_TITLE else lookup(home, title)
+
+
 def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Optional[dict] = None,
                          for_failure: bool = False) -> Optional[str]:
     """Hand output to the live Bot Chat owner, or use the legacy unowned CLI lane.
@@ -787,7 +794,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
     from hermes_constants import get_hermes_home
     from hermes_cli.profiles import get_profile_dir
     from tools.bot_live_delivery import (
-        deliver_to_live_owner, find_canonical_live_owner, read_delivery_result,
+        cron_chat_title, deliver_to_live_owner, find_canonical_live_owner, read_delivery_result,
     )
 
     job_id = job.get("id", "?")
@@ -815,6 +822,11 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
             BOT_CHAT_POLICY_PLATFORM, load_user_config_effective(home / "config.yaml"))
         if deferred is not None and not (home / "state.db").is_file():
             return f"bot-chat delivery target no longer exists: {home}; do not resend"
+        # Which titled chat of the target receives cron output (``cron.bot_chat_title``): the
+        # canonical Bot Chat by default, or a dedicated one (e.g. "Crons") that keeps scheduled
+        # output out of the bot's main conversation. Every lane below (live owner, deferred, CLI)
+        # targets this same title.
+        chat_title = cron_chat_title(home)
         # run_one_job/claim_fire attach the durable execution id before delivery. The
         # transient fallback supports direct helper callers, never deduping recurring
         # runs by their (potentially identical) output or previous last_run timestamp.
@@ -838,7 +850,8 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
             # Suppression is a durable disposition, not a send: record it under the producer
             # lock even when a live owner exists, so the deferred lane never replays it.
             if (pending is not None or suppress_notification
-                    or (find_canonical_live_owner(home) is None and find_canonical_owner(home))):
+                    or (_titled_owner(find_canonical_live_owner, home, chat_title) is None
+                        and _titled_owner(find_canonical_owner, home, chat_title))):
                 pending = defer(key, dict(job), content, profile, home,
                                 for_failure=for_failure, suppressed=suppress_notification)
             if pending is not None:
@@ -850,7 +863,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
                     job["_notification_all_targets_suppressed"] = True
                 return None if status in ("settled", "suppressed") else f"{target} {status} (receipt {key}): completion unverified; do not resend"
         if receipt is None:
-            owner = find_canonical_live_owner(home)
+            owner = _titled_owner(find_canonical_live_owner, home, chat_title)
             if owner is not None:
                 receipt = deliver_to_live_owner(home, owner, message, delivery_id=key,
                     **({"notification_category": "diagnostic"} if for_failure else {}))
@@ -928,7 +941,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
             query_file = fh.name
 
         argv += [
-            "chat", "--in", "~", "-c", "Bot Chat", "--create-if-missing",
+            "chat", "--in", "~", "-c", chat_title, "--create-if-missing",
             "-Q", "--query-file", query_file,
         ]
         from hermes_cli.quiet_single_query import TURN_REPORT_FILE_ENV
@@ -945,7 +958,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
                 f"Hermes could not deliver this result to Bot Chat (profile '{profile_label}'). "
                 "The result is saved; run `hermes cron runs` to see it, or `hermes doctor` if this keeps happening"
                 f". Details: {tail}")
-        logger.info("Job '%s': delivered to Bot Chat of profile '%s'", job_id, profile_label)
+        logger.info("Job '%s': delivered to '%s' of profile '%s'", job_id, chat_title, profile_label)
         return None
     except subprocess.TimeoutExpired:
         # Replaying the full payload risks a duplicate (the killed turn may already have

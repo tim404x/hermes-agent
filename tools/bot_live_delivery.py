@@ -27,10 +27,62 @@ DELIVERY_DIR_NAME = "bot_live_delivery"
 _SEQUENCE_FILE = ".sequence"
 _OWNER_KEYS = ("profile_home", "session_id", "lease_id", "live_session_id")
 _TERMINAL = frozenset({"settled", "failed", "cancelled", "ambiguous"})
+BOT_CHAT_TITLE = "Bot Chat"
 
 
-def find_canonical_owner(profile_home: Path | str) -> dict[str, Any] | None:
-    """Return the exact Bot Chat tip's lease, including unsupported CLI owners."""
+def cron_chat_title(profile_home: Path | str) -> str:
+    """The titled chat that receives this profile's ``bot-chat`` cron deliveries.
+
+    ``cron.bot_chat_title`` from the RECEIVING profile's config.yaml, then the machine-root
+    config.yaml, then ``"Bot Chat"`` (the canonical chat). Raw files, not the merged config, so a
+    migrated empty default in a profile inherits the root value instead of masking it. Set it to
+    e.g. ``"Crons"`` to keep scheduled output out of every bot's main conversation. Read once per
+    delivery; never raises.
+    """
+    try:
+        from tools.bot_mode_probe import _hermes_root
+
+        home = Path(profile_home)
+        sources = [home / "config.yaml", _hermes_root(home) / "config.yaml"]
+    except Exception:
+        log.debug("cron_chat_title: sources unresolvable for %s", profile_home, exc_info=True)
+        return BOT_CHAT_TITLE
+    for path in dict.fromkeys(sources):
+        title = _configured_cron_chat_title(path)
+        if title:
+            return title
+    return BOT_CHAT_TITLE
+
+
+# path -> (mtime_ns, title). The desktop mailbox poller asks every few seconds per live session;
+# a stat is cheap, re-parsing a large config.yaml each time is not.
+_cron_title_cache: dict[Path, tuple[int, str]] = {}
+
+
+def _configured_cron_chat_title(path: Path) -> str:
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        return ""
+    cached = _cron_title_cache.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    try:
+        from tools.bot_mode_probe import _read_yaml_dict
+
+        section = (_read_yaml_dict(path, "bot_chat_title") or {}).get("cron")
+        value = (section if isinstance(section, dict) else {}).get("bot_chat_title")
+    except Exception:
+        log.debug("cron_chat_title: could not read %s", path, exc_info=True)
+        return ""
+    title = " ".join(str(value or "").split())
+    _cron_title_cache[path] = (mtime, title)
+    return title
+
+
+def find_canonical_owner(profile_home: Path | str, title: str = BOT_CHAT_TITLE) -> dict[str, Any] | None:
+    """Return the exact tip lease of the session titled ``title`` (default: the Bot Chat),
+    including unsupported CLI owners."""
     from hermes_cli.active_sessions import active_session_registry_snapshot
     from hermes_state import SessionDB
 
@@ -39,7 +91,7 @@ def find_canonical_owner(profile_home: Path | str) -> dict[str, Any] | None:
         return None
     db = SessionDB(db_path=home / "state.db", read_only=True)
     try:
-        row = db.get_session_by_title("Bot Chat")
+        row = db.get_session_by_title(title)
         session_id = db.get_compression_tip(row["id"]) if row else None
     finally:
         db.close()
@@ -51,14 +103,37 @@ def find_canonical_owner(profile_home: Path | str) -> dict[str, Any] | None:
     return None
 
 
-def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None:
+def find_canonical_live_owner(profile_home: Path | str, title: str = BOT_CHAT_TITLE) -> dict[str, Any] | None:
     """Only advertised consumers may receive owner-pinned mailbox deliveries."""
-    entry = find_canonical_owner(profile_home)
+    entry = find_canonical_owner(profile_home, title) if title != BOT_CHAT_TITLE else find_canonical_owner(profile_home)
     meta = (entry or {}).get("metadata") or {}
     if entry and meta.get("bot_live_delivery_consumer") is True and meta.get("live_session_id"):
         return {key: entry[key] for key in ("profile_home", "session_id", "lease_id")} | {
             "live_session_id": meta["live_session_id"]}
     return None
+
+
+# home+title -> (monotonic, owner). Every idle live desktop session of a profile polls the mailbox on
+# the same cadence; one lookup per profile per window is enough, and a stale answer is harmless:
+# a claim still matches each envelope against the claimer's own pinned lease and live session id.
+_CRON_CHAT_OWNER_TTL_S = 4.0
+_cron_chat_owner_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
+
+
+def find_cron_chat_live_owner(profile_home: Path | str) -> dict[str, Any] | None:
+    """Live owner of the profile's dedicated cron chat (``cron.bot_chat_title``), or None when cron
+    output goes to the Bot Chat itself (the default) or nobody holds that chat live."""
+    title = cron_chat_title(profile_home)
+    if title == BOT_CHAT_TITLE:
+        return None
+    key = f"{Path(profile_home).resolve()}\0{title}"
+    now = time.monotonic()
+    cached = _cron_chat_owner_cache.get(key)
+    if cached is not None and now - cached[0] < _CRON_CHAT_OWNER_TTL_S:
+        return cached[1]
+    owner = find_canonical_live_owner(profile_home, title)
+    _cron_chat_owner_cache[key] = (now, owner)
+    return owner
 
 
 def _owner(home: Path | str, owner: dict[str, Any]) -> dict[str, str]:
