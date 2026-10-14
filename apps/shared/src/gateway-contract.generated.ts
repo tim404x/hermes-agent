@@ -5598,6 +5598,9 @@ export interface CanonicalProfileRow {
   last_session?: ProfileCanonicalSession | null
   worker_session?: ProfileWorkerSession | null
   canonical_session?: ProfileCanonicalSession | null
+  side_windows?: ProfileSideWindow[]
+  turn_active?: boolean
+  turn_active_session?: string | null
   ui_meta_revisions?: Record<string, number>
   ui_meta?: Record<string, unknown> | null
   has_avatar?: boolean
@@ -5645,6 +5648,7 @@ export interface CanonicalBotDeliverParams {
   session_id?: string | null
   author?: Record<string, unknown> | null
   notification_category?: string | null
+  title?: string | null
 }
 export interface CanonicalBotCancelParams {
   profile?: string | null
