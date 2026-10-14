@@ -27,28 +27,75 @@ DELIVERY_DIR_NAME = "bot_live_delivery"
 _SEQUENCE_FILE = ".sequence"
 _OWNER_KEYS = ("profile_home", "session_id", "lease_id", "live_session_id")
 _TERMINAL = frozenset({"settled", "failed", "cancelled", "ambiguous"})
+BOT_CHAT_TITLE = "Bot Chat"
 
 
-def _bot_chat_tip(home: Path) -> str | None:
-    """Current Bot Chat tip id, or None when the profile has no store or no Bot Chat yet."""
+def cron_chat_title(profile_home: Path | str) -> str:
+    """The titled chat that receives this profile's ``bot-chat`` cron deliveries.
+
+    ``cron.bot_chat_title`` from the RECEIVING profile's config.yaml, then the machine-root
+    config.yaml, then ``"Bot Chat"`` (the canonical chat). Raw files, not the merged config, so a
+    migrated empty default in a profile inherits the root value instead of masking it. Set it to
+    e.g. ``"Crons"`` to keep scheduled output out of every bot's main conversation. Read once per
+    delivery; never raises.
+    """
+    try:
+        from tools.bot_mode_probe import _hermes_root
+
+        home = Path(profile_home)
+        sources = [home / "config.yaml", _hermes_root(home) / "config.yaml"]
+    except Exception:
+        log.debug("cron_chat_title: sources unresolvable for %s", profile_home, exc_info=True)
+        return BOT_CHAT_TITLE
+    for path in dict.fromkeys(sources):
+        title = _configured_cron_chat_title(path)
+        if title:
+            return title
+    return BOT_CHAT_TITLE
+
+
+def _configured_cron_chat_title(path: Path) -> str:
+    try:
+        from tools.bot_mode_probe import _read_yaml_dict
+
+        section = (_read_yaml_dict(path, "bot_chat_title") or {}).get("cron")
+        value = (section if isinstance(section, dict) else {}).get("bot_chat_title")
+    except Exception:
+        log.debug("cron_chat_title: could not read %s", path, exc_info=True)
+        return ""
+    return " ".join(str(value or "").split())
+
+
+def door_accepts_title(profile_home: Path | str, title: Any) -> bool:
+    """Whether the authority door may admit into ``title``: the Bot Chat, or the receiving
+    profile's own ``cron.bot_chat_title``. Anything else is refused, so a producer can never
+    steer a turn into an arbitrary titled conversation of the profile."""
+    return isinstance(title, str) and title in (BOT_CHAT_TITLE, cron_chat_title(profile_home))
+
+
+def _bot_chat_tip(home: Path, title: str = BOT_CHAT_TITLE) -> str | None:
+    """Current tip id of the chat titled ``title`` (default: the Bot Chat), or None when the
+    profile has no store or no such chat yet."""
     from hermes_state import SessionDB
 
     if not (home / 'state.db').is_file():
         return None
     db = SessionDB(db_path=home / 'state.db', read_only=True)
     try:
-        row = db.get_session_by_title('Bot Chat')
+        row = db.get_session_by_title(title)
         return db.get_compression_tip(row['id']) if row else None
     finally:
         db.close()
 
 
-def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None:
+def find_canonical_live_owner(profile_home: Path | str, title: str = BOT_CHAT_TITLE) -> dict[str, Any] | None:
     """Discover the profile authority and its exact Bot Chat without acquiring a lease.
 
     ``session_id`` is the current Bot Chat tip, or ``''`` when the profile has none yet: the
     authority's deliver door creates it on first delivery (main's ``--create-if-missing``),
-    so a missing chat is not a refusal. None only when the profile has no store at all."""
+    so a missing chat is not a refusal. None only when the profile has no store at all.
+    ``title`` names a dedicated cron chat (``cron.bot_chat_title``) instead; the owner then
+    carries it so the door admits into (and if needed creates) that chat."""
     from hermes_cli.gateway_runtime import discover_gateway_endpoint
 
     home = Path(profile_home).resolve()
@@ -57,9 +104,10 @@ def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None
         raise ValueError('profile authority is not ready')
     if not (home / 'state.db').is_file():
         return None
-    tip = _bot_chat_tip(home)
+    tip = _bot_chat_tip(home, title)
     return dict(profile_home=str(home), session_id=tip or '', canonical=True,
-                lease_id=discovery.endpoint.instance_id, live_session_id=tip or '')
+                lease_id=discovery.endpoint.instance_id, live_session_id=tip or '',
+                **({'title': title} if title != BOT_CHAT_TITLE else {}))
 
 
 class PreDialError(ValueError):
@@ -365,6 +413,8 @@ def _door(call: Callable[[Path, dict], dict], profile_home, owner, message, *, d
     return {**call(home, dict(id=_delivery_id(delivery_id if delivery_id is not None else uuid.uuid4().hex),
         profile=home.name if home.parent.name == "profiles" else "default",
         message=message, **({"session_id": pinned["session_id"]} if pinned["session_id"] else {}),
+        # A dedicated cron chat (``cron.bot_chat_title``): the door admits into that title, not the Bot Chat.
+        **({"title": owner["title"]} if owner.get("title") else {}),
         **({"author": dict(author)} if author else {}), **category)), **category}
 
 

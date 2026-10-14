@@ -1820,6 +1820,10 @@ DEFAULT_CONFIG = {
             # tokens (never an unsigned decode).
             "nas_jwks_url": "",
         },
+        # Titled chat that receives `bot-chat` cron deliveries, read per delivery from the RECEIVING
+        # profile's config.yaml, then the machine-root one. "" = inherit / the canonical "Bot Chat".
+        # Set e.g. "Crons" to keep scheduled output out of every bot's main conversation.
+        "bot_chat_title": "",
         # Wrap delivered cron responses with a task-name header and "The agent cannot see this
         # message" footer. False = clean output.
         "wrap_response": True,

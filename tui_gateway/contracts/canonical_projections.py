@@ -72,6 +72,9 @@ class CanonicalBotDeliverParams(Params):
     session_id: str | None = None
     author: dict[str, JsonValue] | None = None
     notification_category: str | None = None
+    # The target chat when it is not the Bot Chat: a dedicated cron chat the receiving profile
+    # allows (``cron.bot_chat_title`` or a job's ``bot_chat_title``). The door refuses any other.
+    title: str | None = None
 
 
 class CanonicalBotDeliverResult(Result):
