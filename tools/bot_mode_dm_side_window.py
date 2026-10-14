@@ -38,6 +38,51 @@ DEFAULT_DM_ROUTE = ROUTE_SIDE_WINDOW
 _ROUTES = (ROUTE_SIDE_WINDOW, ROUTE_AUTO, ROUTE_MAIN)
 _QUOTES_RE = re.compile(r"[\"'`\u2018\u2019\u201c\u201d]")
 
+# A one-message ``route: "main"`` override is honoured only when the human's own words in the
+# sender's CURRENT turn ask for the main chat: "handoff to Neo in main chat", "drop it in his Bot
+# Chat", "mets-le dans le chat principal". A teammate's DM, a cron or a completion notice never
+# counts, even when it quotes the user, so no bot can promote its own message into a main chat.
+MAIN_CHAT_ASK_RE = re.compile(
+    r"\bmain\s+(?:bot\s+)?(?:chat|thread|session|window|tab|convo|conversation)s?\b"
+    r"|\bbot\s+chat\b"
+    r"|\b(?:chat|conversation|fil|discussion)\s+principale?\b",
+    re.IGNORECASE,
+)
+BOT_DM_PREFIX = "Message from \U0001f916"
+_TURN_TEXTS_ATTR = "_turn_human_texts"
+
+
+def _plain_text(content) -> str:
+    """The text of a user message's content: a string, or the text parts of a multimodal list."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(part.get("text") or "") for part in content
+                         if isinstance(part, dict) and part.get("type") in ("text", "input_text"))
+    return ""
+
+
+def record_turn_human_text(agent, content, *, new_turn: bool = False, synthesized: bool = False) -> None:
+    """Remember what the human said this turn (the turn's user message, then any mid-turn steer)
+    so ``message_agent`` can check a ``route: "main"`` request against it. ``new_turn`` clears the
+    previous turn's texts. Synthesized turns and teammate DMs are not the human. Never raises."""
+    try:
+        texts = [] if new_turn else list(getattr(agent, _TURN_TEXTS_ATTR, None) or [])
+        text = _plain_text(content).strip()
+        if text and not synthesized and not text.startswith(BOT_DM_PREFIX):
+            texts.append(text)
+        setattr(agent, _TURN_TEXTS_ATTR, texts)
+    except Exception:
+        logger.debug("message_agent: could not record the turn's human text", exc_info=True)
+
+
+def human_asked_main_chat(agent) -> bool:
+    """True when the human, in the sender's current turn, explicitly asked for a main chat."""
+    try:
+        return any(MAIN_CHAT_ASK_RE.search(t) for t in (getattr(agent, _TURN_TEXTS_ATTR, None) or []))
+    except Exception:
+        return False
+
 
 def bot_chat_busy(profile_home: Path | str) -> tuple[bool, str]:
     """``(busy, why)`` for a local teammate's canonical Bot Chat. Busy when its tip is mid-turn,
