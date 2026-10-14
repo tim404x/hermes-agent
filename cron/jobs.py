@@ -38,7 +38,8 @@ from cron.jobs_invariants import _validate_job_mode_invariants, validate_schedul
 from cron.jobs_tristate import normalize_catch_up as _normalize_catch_up, normalize_wrap_response
 from cron.jobs_model_pin import _main_model_pin
 from cron.jobs_normalize import (
-    _normalize_base_url, _normalize_context_from, _normalize_failure_deliver, _normalize_job_optional_text,
+    _normalize_base_url, _normalize_bot_chat_title, _normalize_context_from, _normalize_failure_deliver,
+    _normalize_job_optional_text,
 )
 from cron import jobs_time
 from cron.scheduler_ownership import _claim_owner_is_dead
@@ -1732,6 +1733,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
     "wrap_response": normalize_wrap_response,
+    "bot_chat_title": _normalize_bot_chat_title,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1747,6 +1749,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
     "wrap_response": normalize_wrap_response,
+    "bot_chat_title": _normalize_bot_chat_title,
 }
 
 
@@ -1802,6 +1805,7 @@ def create_job(
     timezone: Optional[str] = None,
     grace_minutes: Optional[int] = None,
     wrap_response: Optional[bool] = None,
+    bot_chat_title: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1814,7 +1818,9 @@ def create_job(
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
     (a venv can be rebuilt or moved after creation). timezone: IANA key pinning the schedule's
     wall clock (None/'' = inherit the profile zone). grace_minutes: catch-up window override
-    (0 = never catch up). wrap_response: None inherits cron.wrap_response, a bool overrides it."""
+    (0 = never catch up). wrap_response: None inherits cron.wrap_response, a bool overrides it.
+    bot_chat_title: the titled chat a ``bot-chat`` delivery lands in, overriding
+    ``cron.bot_chat_title`` ("Bot Chat" = the canonical main chat)."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -1906,6 +1912,7 @@ def create_job(
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
         ("timezone", f["timezone"]), ("grace_minutes", f["grace_minutes"]),
         ("catch_up", f["catch_up"]), ("wrap_response", f["wrap_response"]),
+        ("bot_chat_title", f["bot_chat_title"]),
     ):
         if value is not None:
             job[key] = value
