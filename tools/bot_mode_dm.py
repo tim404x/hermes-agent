@@ -28,7 +28,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -85,7 +85,9 @@ def message_agent_tool_schema() -> dict:
                 "private 1:1 content. Targets: a roster name ('researcher'), '<peer>/<agent>' or '<peer>' for "
                 "a peer gateway, '<handle>@<connection>' when a handle exists on several machines. "
                 "The message usually opens in a side window (a tab under that teammate) titled `topic`; "
-                "reuse the same topic to keep one conversation in one tab."
+                "reuse the same topic to keep one conversation in one tab. "
+                "Set route='main' only when the user explicitly told you, in this turn, to put it in the "
+                "teammate's MAIN chat (e.g. 'handoff to Neo in main chat')."
             ),
             "parameters": {
                 "type": "object",
@@ -124,6 +126,16 @@ def message_agent_tool_schema() -> dict:
                         "description": (
                             "Short tab title for this conversation (e.g. 'micro1 | Pricing + Volume'); "
                             "the same topic continues in the same tab. Optional."
+                        ),
+                    },
+                    "route": {
+                        "type": "string",
+                        "enum": ["main"],
+                        "description": (
+                            "'main' delivers THIS message into the local teammate's main Bot Chat instead "
+                            "of a side window. Use it ONLY when the user explicitly asked, in this turn, for "
+                            "the teammate's main chat; otherwise omit it. Without that ask the message is "
+                            "still delivered, on the normal route, and the ack says why."
                         ),
                     },
                 },
@@ -232,6 +244,9 @@ class Sender:
     topic: str = ""
     display: str = ""
     message: str = ""
+    # The sender's one-message ``route="main"`` (``_main_route_override``) and the ack note when refused.
+    route_override: Optional[str] = None
+    route_note: str = ""
 
     def roster_err(self, msg: str) -> str:
         return _err(msg, roster=self.teammates, peers=self.peers)
@@ -252,12 +267,13 @@ def _wants_reply(value: Any) -> bool:
 
 def message_agent_tool(target: str = "", message: str = "", task_id: Optional[str] = None, agent: Any = None,
                        expects_reply: Any = True, cancel: str = "", constraints: str = "", expecting: str = "",
-                       topic: str = "") -> str:
+                       topic: str = "", route: str = "") -> str:
     """Deliver ``message`` to ``target`` (several comma-separated targets fan out), or withdraw
     the caller's own request ``cancel``. Returns a JSON ack/error.
     ``agent`` is the calling AIAgent — used for the Bot Chat gate and sender identity.
     A local teammate gets it in a side window titled ``topic`` or in its Bot Chat, per
-    ``bot_mode.dm_route`` (``_deliver_local``)."""
+    ``bot_mode.dm_route`` (``_deliver_local``); ``route="main"`` sends this one message to the
+    main Bot Chat when the human asked for that in the sender's current turn."""
     home = _agent_home(agent)
     try:
         from tools.bot_mode_probe import (
@@ -294,6 +310,12 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
     if len(body) > MESSAGE_MAX_CHARS:
         return _err(f"message too long ({len(body)} chars > {MESSAGE_MAX_CHARS}). "
                     "Send the essentials; share large content as a file path instead.")
+
+    want_route = str(route or "").strip().lower()
+    if want_route not in ("", ROUTE_OVERRIDE_MAIN):
+        return _err(f"route must be '{ROUTE_OVERRIDE_MAIN}' or omitted, not {route!r}. Nothing was sent.")
+    route_override, route_note = _main_route_override(want_route, agent)
+    sender = replace(sender, route_override=route_override, route_note=route_note)
 
     from tools.bot_mode_dm_coordination import split_targets
 
@@ -378,7 +400,25 @@ def _dispatch(raw_target: str, content: str, sender: Sender, *, wake: Any) -> st
         return _err(f"@{_handle(resolved, roster)} messaged you this turn and your final response already goes back "
                     "to them: put your reply in it instead of messaging them. Do not retry.")
     return _deliver_local(resolved, roster_homes[resolved], content, author=author, topic=sender.topic,
-                          sender=sender.display, body=sender.message, roster=roster, **delivery)
+                          sender=sender.display, body=sender.message, roster=roster,
+                          route_override=sender.route_override, route_note=sender.route_note, **delivery)
+
+
+ROUTE_OVERRIDE_MAIN = "main"
+
+
+def _main_route_override(want_route: str, agent: Any) -> tuple[Optional[str], str]:
+    """``(route override, note for the ack)`` for a ``route`` request. ``main`` is honoured only
+    when the human's own words this turn ask for a main chat (``human_asked_main_chat``); else
+    the message keeps its normal route and the note says why. Local teammates only."""
+    if want_route != ROUTE_OVERRIDE_MAIN:
+        return None, ""
+    from tools.bot_mode_dm_side_window import ROUTE_MAIN, human_asked_main_chat
+
+    if human_asked_main_chat(agent):
+        return ROUTE_MAIN, ""
+    return None, ("route='main' was NOT applied: the user did not explicitly ask for the main chat in this "
+                  "turn, so the message took its normal route. Do not resend.")
 
 
 def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
@@ -436,16 +476,33 @@ def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
 
 
 def _deliver_local(profile: str, profile_home: Path, content: str, *, author: dict, topic: str, sender: str,
-                   body: str, roster: list[str], task_id: Optional[str], agent: Any, wake: Any = "notify") -> str:
+                   body: str, roster: list[str], task_id: Optional[str], agent: Any, wake: Any = "notify",
+                   route_override: Optional[str] = None, route_note: str = "") -> str:
     """A local teammate's DM, routed by ``bot_mode.dm_route`` (read per delivery from the receiver's
     config, then the machine root's): ``side_window`` opens it in that conversation's own tab, busy
     or idle; ``auto`` opens a side window only while the Bot Chat is busy; ``main`` always uses
-    the Bot Chat. A side-window plan that fails falls back to ``auto``: a DM is never dropped."""
+    the Bot Chat. A side-window plan that fails falls back to ``auto``: a DM is never dropped.
+    ``route_override`` (the sender's one-message ``route="main"``) wins over the config for this
+    DM only; ``route_note`` rides on the ack when a requested override was refused."""
+    if route_note:
+        return _with_route_note(_deliver_local(profile, profile_home, content, author=author, topic=topic,
+                                               sender=sender, body=body, roster=roster, task_id=task_id,
+                                               agent=agent, wake=wake, route_override=route_override),
+                                route_note)
     from tools.bot_mode_dm_side_window import ROUTE_MAIN, ROUTE_SIDE_WINDOW, dm_route
     from tools.bot_mode_probe import _display_name, _handle
     from tools.bot_relay import _hermes_cli
 
     delivery = dict(author=author, roster=roster, task_id=task_id, agent=agent, wake=wake)
+    if route_override == ROUTE_MAIN:
+        ack = json.loads(_start_delivery([_hermes_cli(), "-p", profile], content, f"@{_handle(profile, roster)}",
+                                         stdin_file=False, profile_home=profile_home, author=author,
+                                         task_id=task_id, agent=agent, wake=wake))
+        if not ack.get("error"):
+            lead = (f"Delivered into {_display_name(profile, profile_home, roster)}'s main Bot Chat, as the "
+                    "user asked (this message only).")
+            ack.update(routed="main", detail=f"{lead} {ack.get('detail') or ''}".strip())
+        return json.dumps(ack)
     route = dm_route(profile_home)
     if route == ROUTE_SIDE_WINDOW:
         plan = _plan_side_window(profile, profile_home, topic=topic, sender=sender, body=body, author=author,
@@ -466,6 +523,18 @@ def _deliver_local(profile: str, profile_home: Path, content: str, *, author: di
     return _start_delivery([_hermes_cli(), "-p", profile], content, f"@{_handle(profile, roster)}",
                            stdin_file=False, profile_home=profile_home, author=author, task_id=task_id, agent=agent,
                            wake=wake)
+
+
+def _with_route_note(raw_ack: str, note: str) -> str:
+    """``raw_ack`` with ``route_note`` added, unless the delivery itself failed."""
+    try:
+        ack = json.loads(raw_ack)
+    except (TypeError, ValueError):
+        return raw_ack
+    if isinstance(ack, dict) and not ack.get("error"):
+        ack["route_note"] = note
+        return json.dumps(ack)
+    return raw_ack
 
 
 def _plan_side_window(profile: str, profile_home: Path, *, topic: str, sender: str, body: str, author: dict,
