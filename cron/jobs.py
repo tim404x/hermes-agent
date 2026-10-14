@@ -1721,6 +1721,11 @@ def _normalize_failure_deliver(value: Any) -> Optional[str]:
     return _normalize_job_optional_text(value)
 
 
+def _normalize_bot_chat_title(value: Any) -> Optional[str]:
+    """Per-job chat for ``bot-chat`` delivery (beats ``cron.bot_chat_title``); ''/None clears."""
+    return " ".join(str(value or "").split()) or None
+
+
 def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     """Spelling-only validation via the shared parser (cron knob never stricter/looser than
     config.yaml); model capability is deliberately NOT checked (model unknowable at create time,
@@ -1759,6 +1764,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "interpreter": _normalize_job_optional_text,
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
+    "bot_chat_title": _normalize_bot_chat_title,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1772,6 +1778,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # ``in {None, "", False}`` test — ``0 == False`` would silently clear it.
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
+    "bot_chat_title": _normalize_bot_chat_title,
 }
 
 
@@ -1825,6 +1832,7 @@ def create_job(
     interpreter: Optional[str] = None,
     timezone: Optional[str] = None,
     grace_minutes: Optional[int] = None,
+    bot_chat_title: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1837,7 +1845,8 @@ def create_job(
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
     (a venv can be rebuilt or moved after creation). timezone: IANA key pinning the schedule's
     wall clock (None/'' = inherit the profile zone). grace_minutes: catch-up window override
-    (0 = never catch up)."""
+    (0 = never catch up). bot_chat_title: the titled chat a ``bot-chat`` delivery lands in,
+    overriding ``cron.bot_chat_title`` ("Bot Chat" = the canonical main chat)."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -1928,6 +1937,7 @@ def create_job(
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
         ("timezone", f["timezone"]), ("grace_minutes", f["grace_minutes"]),
+        ("bot_chat_title", f["bot_chat_title"]),
     ):
         if value is not None:
             job[key] = value
