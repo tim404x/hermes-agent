@@ -81,6 +81,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Absolute or ~ path to a Python in your own venv (e.g. ~/venvs/report/bin/python) "
             "for a .py --script / --monitor-script, so it can import packages Hermes does not "
             "ship. .sh/.bash still run under bash. Omit to use Hermes' Python.")
+    cron_create.add_argument("--bot-chat-title", dest="bot_chat_title",
+        help="For a bot-chat delivery: the titled chat the output lands in, overriding "
+            "cron.bot_chat_title for this job. \"Bot Chat\" = the bot's main chat. Omit to follow config.")
     cron_create.add_argument(
         "--continuity", dest="continuity", action="store_const", const=True, default=None,
         help="Each run wakes up with the job's own previous output injected "
@@ -151,6 +154,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--interpreter",
         help="Absolute or ~ path to a Python for a .py script / monitor script. "
             "Pass empty string to clear (back to Hermes' Python).")
+    cron_edit.add_argument("--bot-chat-title", dest="bot_chat_title",
+        help="For a bot-chat delivery: the titled chat the output lands in (\"Bot Chat\" = the "
+            "bot's main chat). Pass empty string to clear and follow cron.bot_chat_title.")
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")

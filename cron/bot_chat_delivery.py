@@ -118,7 +118,7 @@ def _drain(root: Path) -> None:
                 atomic_json_write(path, record, fsync_dir=True, mode=0o600)
                 continue
             try:
-                title = cron_chat_title(home)
+                title = cron_chat_title(home, (record.get("job") or {}).get("bot_chat_title"))
                 owner = _titled_owner(find_canonical_owner, home, title)
                 if owner is not None and _titled_owner(find_canonical_live_owner, home, title) is None:
                     continue

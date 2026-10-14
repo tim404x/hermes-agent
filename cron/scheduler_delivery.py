@@ -822,11 +822,11 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
             BOT_CHAT_POLICY_PLATFORM, load_user_config_effective(home / "config.yaml"))
         if deferred is not None and not (home / "state.db").is_file():
             return f"bot-chat delivery target no longer exists: {home}; do not resend"
-        # Which titled chat of the target receives cron output (``cron.bot_chat_title``): the
-        # canonical Bot Chat by default, or a dedicated one (e.g. "Crons") that keeps scheduled
-        # output out of the bot's main conversation. Every lane below (live owner, deferred, CLI)
+        # Which titled chat of the target receives cron output: the job's own ``bot_chat_title``,
+        # else ``cron.bot_chat_title`` (e.g. "Crons", keeping scheduled output out of the bot's main
+        # conversation), else the canonical Bot Chat. Every lane below (live owner, deferred, CLI)
         # targets this same title.
-        chat_title = cron_chat_title(home)
+        chat_title = cron_chat_title(home, job.get("bot_chat_title"))
         # run_one_job/claim_fire attach the durable execution id before delivery. The
         # transient fallback supports direct helper callers, never deduping recurring
         # runs by their (potentially identical) output or previous last_run timestamp.
@@ -865,7 +865,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
         if receipt is None:
             owner = _titled_owner(find_canonical_live_owner, home, chat_title)
             if owner is not None:
-                receipt = deliver_to_live_owner(home, owner, message, delivery_id=key,
+                receipt = deliver_to_live_owner(home, owner, message, delivery_id=key, chat_title=chat_title,
                     **({"notification_category": "diagnostic"} if for_failure else {}))
         if receipt is not None:
             if (receipt["message"] != message
