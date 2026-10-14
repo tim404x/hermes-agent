@@ -30,15 +30,25 @@ _TERMINAL = frozenset({"settled", "failed", "cancelled", "ambiguous"})
 BOT_CHAT_TITLE = "Bot Chat"
 
 
-def cron_chat_title(profile_home: Path | str) -> str:
+def _clean_title(value: Any) -> str:
+    title = " ".join(str(value or "").split())
+    # The canonical chat however it is spelled: it must take the historical, untitled lookup.
+    return BOT_CHAT_TITLE if title.casefold() == BOT_CHAT_TITLE.casefold() else title
+
+
+def cron_chat_title(profile_home: Path | str, job_title: Any = None) -> str:
     """The titled chat that receives this profile's ``bot-chat`` cron deliveries.
 
+    ``job_title`` (a job's own ``bot_chat_title``) wins when set, so one job (a morning brief) can
+    land in the main chat while the rest of the profile's crons go to a dedicated one. Then
     ``cron.bot_chat_title`` from the RECEIVING profile's config.yaml, then the machine-root
     config.yaml, then ``"Bot Chat"`` (the canonical chat). Raw files, not the merged config, so a
     migrated empty default in a profile inherits the root value instead of masking it. Set it to
     e.g. ``"Crons"`` to keep scheduled output out of every bot's main conversation. Read once per
     delivery; never raises.
     """
+    if title := _clean_title(job_title):
+        return title
     try:
         from tools.bot_mode_probe import _hermes_root
 
@@ -63,14 +73,58 @@ def _configured_cron_chat_title(path: Path) -> str:
     except Exception:
         log.debug("cron_chat_title: could not read %s", path, exc_info=True)
         return ""
-    return " ".join(str(value or "").split())
+    return _clean_title(value)
 
 
 def door_accepts_title(profile_home: Path | str, title: Any) -> bool:
-    """Whether the authority door may admit into ``title``: the Bot Chat, or the receiving
-    profile's own ``cron.bot_chat_title``. Anything else is refused, so a producer can never
-    steer a turn into an arbitrary titled conversation of the profile."""
-    return isinstance(title, str) and title in (BOT_CHAT_TITLE, cron_chat_title(profile_home))
+    """Whether the authority door may admit into ``title``: the Bot Chat, the receiving
+    profile's own ``cron.bot_chat_title``, or a title a cron job on this machine pins for its
+    ``bot-chat`` delivery into this profile (the job's ``bot_chat_title``). Anything else is
+    refused, so a producer can never steer a turn into an arbitrary titled conversation of the
+    profile."""
+    return isinstance(title, str) and (title in (BOT_CHAT_TITLE, cron_chat_title(profile_home))
+                                       or title in _job_chat_titles(profile_home))
+
+
+def _job_chat_titles(profile_home: Path | str) -> frozenset[str]:
+    """``bot_chat_title`` pins of the cron jobs (every profile's raw ``cron/jobs.json`` on this
+    machine root) whose ``deliver``/``failure_deliver`` names a ``bot-chat`` target resolving to
+    ``profile_home``. Read from the operator's jobs, never the producer's word; never raises."""
+    try:
+        from cron.scheduler_delivery import _normalize_deliver_value, parse_bot_chat_deliver_token
+        from hermes_cli.profiles import normalize_profile_name
+        from tools.bot_mode_probe import _hermes_root, _roster
+
+        home = Path(profile_home).resolve()
+        root = _hermes_root(home)
+        roster = _roster(root)
+    except Exception:
+        log.debug("job chat titles: roster unresolvable for %s", profile_home, exc_info=True)
+        return frozenset()
+    titles = set()
+    for _, profile_dir in roster:
+        try:
+            data = json.loads((profile_dir / "cron" / "jobs.json").read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        for job in (data.get("jobs", []) if isinstance(data, dict) else data) or []:
+            title = _clean_title(job.get("bot_chat_title")) if isinstance(job, dict) else ""
+            if not title:
+                continue
+            for part in ",".join(_normalize_deliver_value(job.get(key))
+                                 for key in ("deliver", "failure_deliver")).split(","):
+                name = parse_bot_chat_deliver_token(part)
+                if name is None:
+                    continue
+                try:
+                    canon = normalize_profile_name(name) if name else ""
+                except ValueError:
+                    continue
+                # ``bot-chat`` = the job's own profile; ``bot-chat:<name>`` = a named one on this root.
+                target = profile_dir if not canon else root if canon == "default" else root / "profiles" / canon
+                if target.resolve() == home:
+                    titles.add(title)
+    return frozenset(titles)
 
 
 def _bot_chat_tip(home: Path, title: str = BOT_CHAT_TITLE) -> str | None:
@@ -413,7 +467,8 @@ def _door(call: Callable[[Path, dict], dict], profile_home, owner, message, *, d
     return {**call(home, dict(id=_delivery_id(delivery_id if delivery_id is not None else uuid.uuid4().hex),
         profile=home.name if home.parent.name == "profiles" else "default",
         message=message, **({"session_id": pinned["session_id"]} if pinned["session_id"] else {}),
-        # A dedicated cron chat (``cron.bot_chat_title``): the door admits into that title, not the Bot Chat.
+        # A dedicated chat (``cron.bot_chat_title`` or a job's own ``bot_chat_title``): the door
+        # admits into that title, not the Bot Chat.
         **({"title": owner["title"]} if owner.get("title") else {}),
         **({"author": dict(author)} if author else {}), **category)), **category}
 

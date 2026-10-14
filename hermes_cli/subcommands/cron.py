@@ -105,6 +105,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Catch-up window override in minutes (0-1440) for a cron schedule. "
             "Default: half the period, clamped to 2-120 minutes. 0 = never catch up "
             "(a missed occurrence is skipped, not run late).")
+    cron_create.add_argument("--bot-chat-title", dest="bot_chat_title",
+        help="For a bot-chat delivery: the titled chat the output lands in, overriding "
+            "cron.bot_chat_title for this job. \"Bot Chat\" = the bot's main chat. Omit to follow config.")
     cron_create.add_argument(
         "--continuity", dest="continuity", action="store_const", const=True, default=None,
         help="Each run wakes up with the job's own previous output injected "
@@ -182,6 +185,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--grace-minutes", dest="grace_minutes",
         help="Catch-up window override in minutes (0-1440). 0 = never catch up. "
             "Pass empty string to restore the computed window.")
+    cron_edit.add_argument("--bot-chat-title", dest="bot_chat_title",
+        help="For a bot-chat delivery: the titled chat the output lands in (\"Bot Chat\" = the "
+            "bot's main chat). Pass empty string to clear and follow cron.bot_chat_title.")
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
