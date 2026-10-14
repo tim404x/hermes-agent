@@ -250,6 +250,7 @@ def _job_rows(job: dict[str, Any]) -> list[tuple[str, str]]:
         ("Grace", f"{job['grace_minutes']} min" if job.get("grace_minutes") is not None else ""),
         ("Workdir", job.get("workdir")),
         ("Python", job.get("interpreter")),
+        ("Chat", job.get("bot_chat_title")),
         ("Last run", f"{job.get('last_run_at', '?')}  {_last_run_display(job)}"
          if job.get("last_status") else ""),
         ("Dispatch", _dispatch_display(job.get("last_dispatch"))),
@@ -779,7 +780,8 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
                    ("interpreter", "interpreter"), ("timezone", "timezone"),
-                   ("grace_minutes", "grace_minutes"), ("catch_up", "catch_up"))
+                   ("grace_minutes", "grace_minutes"), ("catch_up", "catch_up"),
+                   ("bot_chat_title", "bot_chat_title"))
 
 
 def _job_api_kwargs(args) -> dict[str, Any]:
@@ -795,7 +797,8 @@ _JOB_DETAIL_LINES = (
     ("continuity", "  Continuity: on (each run sees the previous run's output)"),
     ("timezone", "  Timezone: {} (schedule runs on this zone's wall clock)"),
     ("workdir", "  Workdir: {}"),
-    ("interpreter", "  Python: {}"))
+    ("interpreter", "  Python: {}"),
+    ("bot_chat_title", "  Chat: {}"))
 
 
 def _print_job_details(job_data: dict[str, Any]) -> None:
