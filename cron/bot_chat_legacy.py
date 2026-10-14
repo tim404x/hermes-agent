@@ -29,7 +29,9 @@ def defer(key: str, job: dict, content: str, home: Path, *, for_failure: bool) -
     path = root / f"{key}.json"
     if not path.exists():  # an existing record (queued or already transferred) keeps its status
         atomic_json_write(path, dict(
-            id=key, status="queued", job={k: job[k] for k in ("id", "name") if k in job}, content=content,
+            id=key, status="queued", content=content,
+            # ``bot_chat_title``: the job's own target chat, re-resolved when the record drains.
+            job={k: job[k] for k in ("id", "name", "bot_chat_title") if job.get(k) is not None},
             home=str(home), for_failure=for_failure, sequence=time.time_ns()), fsync_dir=True, mode=0o600)
 
 
@@ -66,7 +68,9 @@ def _dispose(path: Path, record: dict) -> bool:
     from cron.scheduler_delivery import BOT_CHAT_POLICY_PLATFORM, bot_chat_message
     from gateway.warning_notifications import warning_notifications_enabled
     from hermes_cli.config_effective import load_user_config_effective
-    from tools.bot_live_delivery import deliver_to_live_owner, find_canonical_live_owner
+    from tools.bot_live_delivery import (
+        BOT_CHAT_TITLE, cron_chat_title, deliver_to_live_owner, find_canonical_live_owner,
+    )
 
     if reason := _malformed(record):
         record.update(status="ambiguous", error=reason)
@@ -79,8 +83,13 @@ def _dispose(path: Path, record: dict) -> bool:
             BOT_CHAT_POLICY_PLATFORM, load_user_config_effective(home / "config.yaml")):
         record.update(status="suppressed", error=None)
     else:
+        # Same chat the producer targeted: the job's own ``bot_chat_title``, else the receiving
+        # profile's ``cron.bot_chat_title`` (e.g. "Crons"), else the Bot Chat. Read now, so a
+        # config change while the target was down applies to the parked output too.
+        title = cron_chat_title(home, (record.get("job") or {}).get("bot_chat_title"))
         try:
-            owner = find_canonical_live_owner(home)
+            owner = (find_canonical_live_owner(home) if title == BOT_CHAT_TITLE
+                     else find_canonical_live_owner(home, title))
         except ValueError:
             return False  # Owner not ready: discovery uncertainty is not a disposition.
         if owner is None:
