@@ -7861,6 +7861,18 @@
             ],
             "default": null,
             "title": "Notification Category"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Title"
           }
         },
         "required": [
@@ -9208,6 +9220,30 @@
               }
             ],
             "default": null
+          },
+          "side_windows": {
+            "items": {
+              "$ref": "#/components/schemas/ProfileSideWindow"
+            },
+            "title": "Side Windows",
+            "type": "array"
+          },
+          "turn_active": {
+            "default": false,
+            "title": "Turn Active",
+            "type": "boolean"
+          },
+          "turn_active_session": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Active Session"
           },
           "ui_meta_revisions": {
             "additionalProperties": {
