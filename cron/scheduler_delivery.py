@@ -745,11 +745,11 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
         from hermes_cli.config_effective import load_user_config_effective
         suppress_notification = for_failure and not warning_notifications_enabled(
             BOT_CHAT_POLICY_PLATFORM, load_user_config_effective(home / "config.yaml"))
-        # Which titled chat of the target receives cron output (``cron.bot_chat_title``): the
-        # canonical Bot Chat by default, or a dedicated one (e.g. "Crons") that keeps scheduled
-        # output out of the bot's main conversation. The authority creates it on first delivery;
-        # a parked delivery (``cron.bot_chat_legacy``) re-reads the same setting when it drains.
-        chat_title = cron_chat_title(home)
+        # Which titled chat of the target receives cron output: the job's own ``bot_chat_title``,
+        # else ``cron.bot_chat_title`` (e.g. "Crons", keeping scheduled output out of the bot's main
+        # conversation), else the canonical Bot Chat. The authority creates it on first delivery;
+        # a parked delivery (``cron.bot_chat_legacy``) re-resolves the same title when it drains.
+        chat_title = cron_chat_title(home, job.get("bot_chat_title"))
         # run_one_job/claim_fire attach the durable execution id before delivery. The
         # transient fallback supports direct helper callers, never deduping recurring
         # runs by their (potentially identical) output or previous last_run timestamp.
