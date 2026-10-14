@@ -96,8 +96,8 @@ def drain(root: Path | None = None) -> None:
 
 def _drain(root: Path) -> None:
     """Claim before execution. Errors/interruptions never authorize another turn."""
-    from cron.scheduler_delivery import _deliver_to_bot_chat
-    from tools.bot_live_delivery import find_canonical_live_owner, find_canonical_owner
+    from cron.scheduler_delivery import _deliver_to_bot_chat, _titled_owner
+    from tools.bot_live_delivery import cron_chat_title, find_canonical_live_owner, find_canonical_owner
 
     with _FileLock(root / ".lock"):
         records = sorted(_records(root), key=lambda item: item[1]["sequence"])
@@ -118,8 +118,9 @@ def _drain(root: Path) -> None:
                 atomic_json_write(path, record, fsync_dir=True, mode=0o600)
                 continue
             try:
-                owner = find_canonical_owner(home)
-                if owner is not None and find_canonical_live_owner(home) is None:
+                title = cron_chat_title(home)
+                owner = _titled_owner(find_canonical_owner, home, title)
+                if owner is not None and _titled_owner(find_canonical_live_owner, home, title) is None:
                     continue
             except Exception:
                 # Discovery uncertainty is not permission to launch.
