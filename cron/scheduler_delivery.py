@@ -708,6 +708,13 @@ def bot_chat_message(job: dict, content: str) -> str:
     )
 
 
+def _titled_owner(lookup, home, title: str):
+    """``lookup(home)`` for the canonical Bot Chat (the historical call shape), ``lookup(home, title)``
+    for a dedicated cron chat (``cron.bot_chat_title``)."""
+    from tools.bot_live_delivery import BOT_CHAT_TITLE
+    return lookup(home) if title == BOT_CHAT_TITLE else lookup(home, title)
+
+
 def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
                          for_failure: bool = False) -> Optional[str]:
     """Admit job output to the target profile's authority as a real inbound Bot Chat turn.
@@ -725,7 +732,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
     from hermes_constants import get_hermes_home
     from hermes_cli.profiles import get_profile_dir
     from tools.bot_live_delivery import (
-        deliver_to_live_owner, find_canonical_live_owner, read_delivery_result,
+        cron_chat_title, deliver_to_live_owner, find_canonical_live_owner, read_delivery_result,
     )
 
     job_id = job.get("id", "?")
@@ -738,6 +745,11 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
         from hermes_cli.config_effective import load_user_config_effective
         suppress_notification = for_failure and not warning_notifications_enabled(
             BOT_CHAT_POLICY_PLATFORM, load_user_config_effective(home / "config.yaml"))
+        # Which titled chat of the target receives cron output (``cron.bot_chat_title``): the
+        # canonical Bot Chat by default, or a dedicated one (e.g. "Crons") that keeps scheduled
+        # output out of the bot's main conversation. The authority creates it on first delivery;
+        # a parked delivery (``cron.bot_chat_legacy``) re-reads the same setting when it drains.
+        chat_title = cron_chat_title(home)
         # run_one_job/claim_fire attach the durable execution id before delivery. The
         # transient fallback supports direct helper callers, never deduping recurring
         # runs by their (potentially identical) output or previous last_run timestamp.
@@ -761,7 +773,7 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
             return None
         if receipt is None:
             try:
-                owner = find_canonical_live_owner(home)
+                owner = _titled_owner(find_canonical_live_owner, home, chat_title)
             except ValueError:  # the target's gateway is down or starting: not a disposition
                 from cron.bot_chat_legacy import defer
                 defer(key, job, content, home, for_failure=for_failure)
@@ -778,8 +790,8 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *,
         status = receipt["status"]
         receipts = job.setdefault("_bot_chat_delivery_receipts", {})
         receipts[target] = {"status": status, "delivery_id": key}
-        logger.info("Job '%s': Bot Chat %s receipt=%s status=%s",
-                    job_id, profile_label, key, status)
+        logger.info("Job '%s': '%s' of %s receipt=%s status=%s",
+                    job_id, chat_title, profile_label, key, status)
         if status == "settled":
             return None
         detail = ("completion unverified; do not resend" if status in ("queued", "claimed")
