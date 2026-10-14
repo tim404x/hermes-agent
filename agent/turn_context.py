@@ -1171,6 +1171,10 @@ def build_turn_context(
         agent, user_message, persist_user_message, persist_user_timestamp,
         persist_user_platform_id, persist_user_display_kind, persist_user_display_metadata,
     )
+    # message_agent's one-message ``route: "main"`` checks the human's own words this turn.
+    from tools.bot_mode_dm_side_window import record_turn_human_text
+    record_turn_human_text(agent, persist_user_message if persist_user_message is not None else user_message,
+                           new_turn=True, synthesized=bool(persist_user_display_kind))
     _hydrate_from_history(agent, conversation_history)
     # Every estimator this turn prices images at the cost learned from this model's real usage.
     bind_image_token_cost(agent)
