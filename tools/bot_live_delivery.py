@@ -30,15 +30,25 @@ _TERMINAL = frozenset({"settled", "failed", "cancelled", "ambiguous"})
 BOT_CHAT_TITLE = "Bot Chat"
 
 
-def cron_chat_title(profile_home: Path | str) -> str:
+def _clean_title(value: Any) -> str:
+    title = " ".join(str(value or "").split())
+    # The canonical chat however it is spelled: it must take the historical, untitled lookup.
+    return BOT_CHAT_TITLE if title.casefold() == BOT_CHAT_TITLE.casefold() else title
+
+
+def cron_chat_title(profile_home: Path | str, job_title: Any = None) -> str:
     """The titled chat that receives this profile's ``bot-chat`` cron deliveries.
 
+    ``job_title`` (a job's own ``bot_chat_title``) wins when set, so one job (a morning brief) can
+    land in the main chat while the rest of the profile's crons go to a dedicated one. Then
     ``cron.bot_chat_title`` from the RECEIVING profile's config.yaml, then the machine-root
     config.yaml, then ``"Bot Chat"`` (the canonical chat). Raw files, not the merged config, so a
     migrated empty default in a profile inherits the root value instead of masking it. Set it to
     e.g. ``"Crons"`` to keep scheduled output out of every bot's main conversation. Read once per
     delivery; never raises.
     """
+    if title := _clean_title(job_title):
+        return title
     try:
         from tools.bot_mode_probe import _hermes_root
 
@@ -75,7 +85,7 @@ def _configured_cron_chat_title(path: Path) -> str:
     except Exception:
         log.debug("cron_chat_title: could not read %s", path, exc_info=True)
         return ""
-    title = " ".join(str(value or "").split())
+    title = _clean_title(value)
     _cron_title_cache[path] = (mtime, title)
     return title
 
@@ -120,12 +130,7 @@ _CRON_CHAT_OWNER_TTL_S = 4.0
 _cron_chat_owner_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
 
-def find_cron_chat_live_owner(profile_home: Path | str) -> dict[str, Any] | None:
-    """Live owner of the profile's dedicated cron chat (``cron.bot_chat_title``), or None when cron
-    output goes to the Bot Chat itself (the default) or nobody holds that chat live."""
-    title = cron_chat_title(profile_home)
-    if title == BOT_CHAT_TITLE:
-        return None
+def _cached_titled_live_owner(profile_home: Path | str, title: str) -> dict[str, Any] | None:
     key = f"{Path(profile_home).resolve()}\0{title}"
     now = time.monotonic()
     cached = _cron_chat_owner_cache.get(key)
@@ -134,6 +139,47 @@ def find_cron_chat_live_owner(profile_home: Path | str) -> dict[str, Any] | None
     owner = find_canonical_live_owner(profile_home, title)
     _cron_chat_owner_cache[key] = (now, owner)
     return owner
+
+
+def find_cron_chat_live_owner(profile_home: Path | str) -> dict[str, Any] | None:
+    """Live owner of the profile's dedicated cron chat (``cron.bot_chat_title``), or None when cron
+    output goes to the Bot Chat itself (the default) or nobody holds that chat live."""
+    title = cron_chat_title(profile_home)
+    return None if title == BOT_CHAT_TITLE else _cached_titled_live_owner(profile_home, title)
+
+
+# home -> (mailbox dir mtime_ns, titles). Queued envelopes only change when the dir does (every
+# write is an atomic rename into it), so an idle poller never rescans the tickets.
+_queued_titles_cache: dict[Path, tuple[int, frozenset[str]]] = {}
+
+
+def _queued_chat_titles(profile_home: Path | str) -> frozenset[str]:
+    root = _root(profile_home)
+    try:
+        mtime = root.stat().st_mtime_ns
+    except OSError:
+        return frozenset()
+    cached = _queued_titles_cache.get(root)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    titles = frozenset(record["chat_title"] for path in root.glob("*.json")
+                       if (record := _scan_read(path)) is not None and record["status"] == "queued"
+                       and isinstance(record.get("chat_title"), str) and record["chat_title"])
+    _queued_titles_cache[root] = (mtime, titles)
+    return titles
+
+
+def live_chat_owners(profile_home: Path | str):
+    """``(title, live owner)`` pairs a live session tests itself against before claiming, cheapest
+    first: the Bot Chat, the profile's cron chat (``cron.bot_chat_title``), then any other titled
+    chat a queued envelope is pinned to (a job's own ``bot_chat_title``). Lazy, so the caller stops
+    at its own chat; the owner is None when nobody holds that title live."""
+    yield BOT_CHAT_TITLE, find_canonical_live_owner(profile_home)
+    cron_title = cron_chat_title(profile_home)
+    if cron_title != BOT_CHAT_TITLE:
+        yield cron_title, _cached_titled_live_owner(profile_home, cron_title)
+    for title in sorted(_queued_chat_titles(profile_home) - {BOT_CHAT_TITLE, cron_title}):
+        yield title, _cached_titled_live_owner(profile_home, title)
 
 
 def _owner(home: Path | str, owner: dict[str, Any]) -> dict[str, str]:
@@ -272,12 +318,14 @@ def _write(path: Path, record: dict[str, Any]) -> None:
 def deliver_to_live_owner(
     profile_home: Path | str, owner: dict[str, Any], message: str,
     *, delivery_id: str | None = None, author: dict[str, Any] | None = None,
-    notification_category: str = "result",
+    notification_category: str = "result", chat_title: str | None = None,
 ) -> dict[str, Any]:
     """Return durable admission immediately, without waiting for the owner.
 
     Retry with the same id AND pinned owner/message to inspect the existing
     state. Reusing an id with a different payload is an error, never an overwrite.
+    ``chat_title`` records which titled chat the owner was found as (cron output can target a
+    dedicated chat); a claim naming another title never takes the envelope.
     """
     pinned = _owner(profile_home, owner)
     if not isinstance(message, str):
@@ -288,7 +336,8 @@ def deliver_to_live_owner(
         existing = _read(path)
         if existing is not None:
             if (existing["owner"] != pinned or existing["message"] != message or existing.get("author") != author
-                    or existing.get("notification_category", "result") != notification_category):
+                    or existing.get("notification_category", "result") != notification_category
+                    or existing.get("chat_title", chat_title) != chat_title):
                 raise ValueError("delivery id already belongs to a different payload")
             return existing
         record = dict(delivery_id=key, id=key, owner=pinned, **pinned,
@@ -296,6 +345,8 @@ def deliver_to_live_owner(
                       sequence=_next_sequence(root), **({"author": dict(author)} if author else {}))
         if notification_category == "diagnostic":
             record["notification_category"] = notification_category
+        if chat_title:
+            record["chat_title"] = chat_title
         _write(path, record)
         return record
 
@@ -322,12 +373,14 @@ def owner_holds_delivery(profile_home: Path | str, record: dict) -> bool:
 
 
 def claim_pending_delivery(
-    profile_home: Path | str, owner: dict[str, Any],
+    profile_home: Path | str, owner: dict[str, Any], *, chat_title: str | None = None,
 ) -> dict[str, Any] | None:
     """Claim oldest matching input exactly once; caller supplies its current lease.
 
     A lease transfer across compression is accepted only along the original
     stored session's compression chain. A new lease/live session cannot steal it.
+    ``chat_title`` is the title the caller holds; an envelope pinned to another title is left
+    alone (envelopes without one keep the pin-only contract).
     Caller must hold its normal turn-admission guard before invoking this.
     """
     current = _owner(profile_home, owner)
@@ -337,7 +390,9 @@ def claim_pending_delivery(
         pending = []
         for path in root.glob("*.json"):
             record = _scan_read(path)
-            if record is not None and record["status"] == "queued" and _matches(profile_home, record, current):
+            if (record is not None and record["status"] == "queued"
+                    and (chat_title is None or record.get("chat_title") in (None, chat_title))
+                    and _matches(profile_home, record, current)):
                 pending.append(record)
         if not pending:
             return None
