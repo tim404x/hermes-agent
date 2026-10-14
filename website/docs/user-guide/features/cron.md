@@ -665,6 +665,13 @@ error. A delivery failure does not count toward the job's `failure_streak`
 - `bot-chat` (bare) targets the job's own profile.
 - `bot-chat:<profile>` targets another profile **on the same machine**. Names are validated against `hermes profile list` when the job is created; profiles on other gateways or machines can never be targeted, so same-named profiles across machines are unambiguous.
 - Each delivery costs the target bot one full agent turn — mind the schedule frequency.
+- **Dedicated cron chat.** `cron.bot_chat_title` names the chat that receives the output instead of the Bot Chat, so scheduled output never lands in the bot's main conversation. It is read per delivery from the **receiving** profile's `config.yaml`, then the machine-root `config.yaml`; empty (the default) means the canonical "Bot Chat". The chat is created on first delivery, and when it is open live in Desktop it receives the output through the same mailbox as the Bot Chat. Existing `bot-chat` jobs need no edit.
+
+  ```yaml
+  # ~/.hermes/config.yaml (applies to every profile on the machine)
+  cron:
+    bot_chat_title: Crons
+  ```
 - Composes with other targets (`bot-chat,telegram`) but is never included in `all`.
 - If the canonical chat is open in a mailbox-capable Desktop/TUI backend, delivery is **durably queued immediately**, whether the bot is idle or busy. Only that live owner runs the incoming turn; cron does not start a competing CLI writer. A profile that has no Bot Chat yet gets one created on first delivery. If the target profile's gateway is not running, the run is recorded `delivery_failed` with the reason (the output stays in `hermes cron runs`; it is not redelivered automatically) and cron never starts its own Bot Chat turn.
 - **Queued is not completed.** Cron records receipt IDs and `queued`/`claimed` statuses in `last_delivery_queued`, with delivery outcome `queued` (neither delivered nor failed). A successful job shows `delivery_queued`; genuine errors on other targets still take precedence as delivery failures. The bot may complete later. The durable receipt in the target profile's `runtime/bot_live_delivery/<receipt-id>.json` is authoritative for the turn itself. For an agent job the send rides the gateway delivery queue, and once the gateway has handed it to the bot the run settles to `ok` (accepted, not answered) while `last_delivery_queued` keeps the receipt; a refused hand-off settles to `delivery_failed`. Script-only (`no_agent`) Bot Chat deliveries stay `delivery_queued`: cron never rewrites that history when the bot's turn later completes.

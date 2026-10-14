@@ -5293,6 +5293,9 @@ export interface CanonicalProfileRow {
   last_session?: ProfileCanonicalSession | null
   worker_session?: ProfileWorkerSession | null
   canonical_session?: ProfileCanonicalSession | null
+  side_windows?: ProfileSideWindow[]
+  turn_active?: boolean
+  turn_active_session?: string | null
   ui_meta_revisions?: Record<string, number>
   ui_meta?: Record<string, unknown> | null
   has_avatar?: boolean
@@ -5340,6 +5343,7 @@ export interface CanonicalBotDeliverParams {
   session_id?: string | null
   author?: Record<string, unknown> | null
   notification_category?: string | null
+  title?: string | null
 }
 /** A delivery's receipt. It names its admission, unless ``refused``: the FIFO refused the delivery before anything was committed (``gateway/session_bot.py``), a terminal ``failed`` receipt with no admission that the relay settles as the sender's answer. */
 export interface CanonicalBotDeliverResult {
