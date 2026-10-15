@@ -592,6 +592,113 @@ def _resolve_profile_db(profile: str, handles: ExitStack):
     return reader
 
 
+# ---------------------------------------------------------------- team scope (every profile's history)
+# A multi-profile install (one agent per profile, e.g. a bot team) keeps one state.db per profile, so by
+# default a profile only recalls ITS OWN conversations: corrections and "how we did X last time" given to
+# one agent stay invisible to the others. ``profile="all"`` (or config ``session_search.default_scope:
+# all``) makes discovery search every profile's history read-only and merge the hits, each tagged with
+# its ``profile`` and linked as ``@session:<profile>/<id>`` so read/scroll resolve in the right store.
+_TEAM_SCOPES = ("all", "team", "*")
+
+
+def _search_config() -> dict[str, Any]:
+    """The ``session_search`` config block (live read-only cache; never mutate)."""
+    def _load():
+        from hermes_cli.config import load_config_readonly
+        return load_config_readonly().get("session_search") or {}
+    cfg = _quiet(_load, {}, "load_config_readonly failed for session_search")
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _default_scope() -> str:
+    """'own' (upstream default) or 'all' from ``session_search.default_scope``."""
+    scope = str(_search_config().get("default_scope") or "own").strip().lower()
+    return "all" if scope in _TEAM_SCOPES else "own"
+
+
+def _team_stores(handles: ExitStack) -> tuple[Optional[str], list[tuple[str, Any]]]:
+    """(active profile, [(name, read-only store)]) for every OTHER profile whose store opens.
+    Profiles listed in ``session_search.exclude_profiles`` are skipped. Opened readers close with
+    *handles*. Active profile None = can't be named (custom HERMES_HOME), or this caller is confined
+    to its own store (``_cross_profile_reads_confined``): the caller falls back to its own store only."""
+    from hermes_cli import profiles as profiles_mod
+    from persistence_assembly import open_persistence_reader
+    active = _quiet(profiles_mod.get_active_profile_name, None, "get_active_profile_name failed")
+    if not active or active == "custom" or _cross_profile_reads_confined():
+        return None, []
+    excluded = {str(p).strip().lower() for p in (_search_config().get("exclude_profiles") or []) if str(p).strip()}
+    homes = [("default", profiles_mod._get_default_hermes_home())]
+    homes += [(d.name, d) for d in _quiet(profiles_mod._iter_named_profile_dirs, [], "profile scan failed")]
+    stores = []
+    for name, home in homes:
+        if name == active or name in excluded:
+            continue
+
+        def _open(home=home):
+            reader = handles.enter_context(open_persistence_reader(home))
+            reader.ready()
+            return reader
+        reader = _quiet(_open, None, "open %s session store failed", name)
+        if reader is not None:
+            stores.append((name, reader))
+    return active, stores
+
+
+def _entry_ts(entry: dict[str, Any]) -> float:
+    """Timestamp of the matched message (0 when unknown) — the merge key for sort=newest/oldest."""
+    for m in entry.get("messages") or []:
+        if m.get("id") == entry.get("match_message_id") and isinstance(m.get("timestamp"), (int, float)):
+            return float(m["timestamp"])
+    return 0.0
+
+
+def _compact_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Adaptive detail after a merge: keep only the anchor message of a non-top result."""
+    anchor = entry.get("match_message_id")
+    msgs = [m for m in entry.get("messages") or [] if m.get("id") == anchor] or (entry.get("messages") or [])[:1]
+    return {**entry, "bookend_start": [], "messages": msgs, "bookend_end": [], "detail": "compact"}
+
+
+def _discover_team(persistence, query: str, role_filter, limit: int, sort: Optional[str], detail: str,
+                   current_session_id: Optional[str], handles: ExitStack, after_ts=None, before_ts=None,
+                   exclude_session_ids=None) -> str:
+    """Discovery across every profile's history. Each store runs the normal discovery (same
+    lineage, cron-demotion and window rules); results are merged by match time for sort=newest/
+    oldest, else interleaved round-robin starting with the caller's own store, then cut to
+    ``limit``. Adaptive detail keeps only the merged top result fully hydrated."""
+    active, others = _team_stores(handles)
+    stores = [(active, persistence, current_session_id)] + [(n, d, None) for n, d in others]
+    per_store, searched, names = [], 0, []
+    for name, store, csid in stores:
+        payload = json.loads(_discover(store, query, role_filter, limit, sort, "full" if detail == "full" else "adaptive",
+                                       current_session_id=csid, link_profile=name, after_ts=after_ts,
+                                       before_ts=before_ts, exclude_session_ids=exclude_session_ids))
+        if payload.get("success") is False:
+            logging.warning("session_search team scope: profile %s failed: %s", name, payload.get("error"))
+            continue
+        names.append(name or "current")
+        searched += int(payload.get("sessions_searched") or 0)
+        per_store.append([{**e, "profile": name} if name else e for e in payload.get("results") or []])
+    if sort in ("newest", "oldest"):
+        merged = sorted((e for ents in per_store for e in ents), key=_entry_ts, reverse=sort == "newest")
+    else:
+        merged = [ents[i] for i in range(max((len(x) for x in per_store), default=0))
+                  for ents in per_store if i < len(ents)]
+    merged = merged[:limit]
+    if detail != "full":
+        merged = merged[:1] + [_compact_entry(e) for e in merged[1:]]
+    if not merged:
+        return _discover_payload(persistence, query, detail, [], scope="all", profiles_searched=names, message=(
+            "No matching sessions in any profile. FTS5 ANDs all terms by default — broaden with OR "
+            "(`alpha OR beta`), exact-match with quoted phrases, or prefix-match with `deploy*`."))
+    return _discover_payload(persistence, query, detail, merged, scope="all", profiles_searched=names,
+                             sessions_searched=searched, link_hint=(
+        "Results come from every profile's history; `profile` names whose chat each one is. When "
+        "two results disagree, the newer one wins (check `when`). Write a result's `link` value "
+        "verbatim inline to cite it; to read more, scroll with session_id + around_message_id AND "
+        "profile=<that result's profile>."))
+
+
 def _read_session(persistence, session_id: str, head: int = 20, tail: int = 10, link_profile: str | None = None) -> str:
     """Read shape: whole session, or ``head`` + ``tail`` messages with a scroll pointer."""
     meta = _get_session_meta(persistence, session_id)
@@ -733,8 +840,9 @@ def _scroll(persistence, session_id: str, around_message_id: int, window: int = 
 
 def _dispatch(query, role_filter, limit, persistence, current_session_id, session_id,
               around_message_id, window, sort, profile, detail,
-              after=None, before=None, exclude_session_ids=None) -> str:
-    """Mode dispatch (see module docstring); scroll wins when an anchor is set."""
+              after=None, before=None, exclude_session_ids=None, team=False, handles=None) -> str:
+    """Mode dispatch (see module docstring); scroll wins when an anchor is set.
+    ``team`` runs discovery across every profile's store; stores it opens close with *handles*."""
     if isinstance(session_id, str) and session_id.strip():
         if around_message_id is not None:
             return _scroll(persistence, session_id.strip(), around_message_id, window, current_session_id)
@@ -749,12 +857,15 @@ def _dispatch(query, role_filter, limit, persistence, current_session_id, sessio
         after_ts, before_ts = _parse_iso_bound(after), _parse_iso_bound(before)
     except ValueError as e:
         return tool_error(str(e), success=False)
-    return _discover(
+    kwargs = dict(
         persistence=persistence, query=query.strip(), limit=limit, sort=sort_norm if sort_norm in ("newest", "oldest") else None,
         role_filter=([r.strip() for r in role_filter.split(",") if r.strip()] or None) if isinstance(role_filter, str) else None,
         detail="full" if isinstance(detail, str) and detail.strip().lower() == "full" else "adaptive",
-        current_session_id=current_session_id, link_profile=profile, after_ts=after_ts, before_ts=before_ts,
+        current_session_id=current_session_id, after_ts=after_ts, before_ts=before_ts,
         exclude_session_ids=_normalize_exclude_session_ids(exclude_session_ids))
+    if team:
+        return _discover_team(handles=handles, **kwargs)
+    return _discover(link_profile=profile, **kwargs)
 
 
 def session_search(query: str = "", role_filter: str | None = None, limit: int | None = None, db=None,
@@ -775,6 +886,14 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int |
             session_id = emb_id
             if emb_profile and (profile is None or not str(profile).strip()):
                 profile = emb_profile
+    has_sid = isinstance(session_id, str) and bool(session_id.strip())
+    named = str(profile).strip().lower() if profile is not None and str(profile).strip() else ""
+    if named in _TEAM_SCOPES:
+        if has_sid:
+            return tool_error("profile='all' is for searching (query). To read or scroll a result, pass "
+                              "that result's own profile (from its `profile` field or link).", success=False)
+        profile = None
+    team = named in _TEAM_SCOPES or (not named and not has_sid and _default_scope() == "all")
     handles = ExitStack()
     try:
         # Cross-profile: swap in the named profile's store (read-only) for every shape;
@@ -802,7 +921,8 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int |
                 return tool_error(format_session_db_unavailable(), success=False)
         return _dispatch(query, role_filter, limit, persistence, current_session_id, session_id,
                          around_message_id, window, sort, profile, detail,
-                         after=after, before=before, exclude_session_ids=exclude_session_ids)
+                         after=after, before=before, exclude_session_ids=exclude_session_ids,
+                         team=team, handles=handles)
     finally:
         _quiet(handles.close, None, "Failed to close the session_search store")
 
@@ -939,7 +1059,10 @@ SESSION_SEARCH_SCHEMA = {
                     "Optional. Read sessions from another Hermes profile's database "
                     "(read-only). Use when resolving an `@session:<profile>/<id>` link: "
                     "pass the profile segment here with session_id as the id segment. "
-                    "Omit to use the current profile."
+                    "'all' searches EVERY profile's history (discovery only); each result "
+                    "carries its `profile`, pass it back here to read or scroll that result. "
+                    "Omit to use the configured default scope (own profile unless "
+                    "session_search.default_scope is 'all')."
                 ),
             },
         },
