@@ -568,6 +568,10 @@ async def _dashboard_health_middleware(request: Request, call_next):
     return response
 
 
+from hermes_cli.web_server_gzip import DashboardGZipMiddleware
+
+app.add_middleware(DashboardGZipMiddleware, minimum_size=4096, compresslevel=5)
+
 def _is_trusted_local_origin(origin: str) -> bool:
     """The dashboard app's :func:`hermes_cli.web_server_boundary.is_trusted_local_origin`."""
     from hermes_cli.web_server_boundary import is_trusted_local_origin
