@@ -334,6 +334,7 @@ import { buildHudWindowUrl } from './hud-url'
 import { linuxOzoneBackend, resolveHudWindowing } from './hud-windowing'
 import { INSTALL_STAMP, installShape } from './install-stamp'
 import type { InstallStamp } from './install-stamp'
+import { decodeJsonResponse, requestJsonResponse } from './json-response'
 import { createKeepAwakeController } from './keep-awake-controller'
 import { launchBuildIdentity } from './launch-build-identity'
 import { applyLaunchProfileOverride, parseLaunchProfile } from './launch-profile'
@@ -5212,7 +5213,8 @@ function fetchJson(url, token, options: any = {}) {
           return
         }
 
-        const req = client.request(
+        const req = requestJsonResponse(
+          client,
           parsed,
           {
             agent,
@@ -5235,9 +5237,7 @@ function fetchJson(url, token, options: any = {}) {
             const chunks = []
             res.on('error', reject)
             res.on('data', chunk => chunks.push(chunk))
-            res.on('end', () => {
-              const text = Buffer.concat(chunks).toString('utf8')
-
+            res.on('end', () => decodeJsonResponse(chunks, res.headers['content-encoding'], reject, text => {
               if ((res.statusCode || 500) >= 400) {
                 reject(httpStatusError(res.statusCode, text, res.statusMessage))
 
@@ -5277,7 +5277,7 @@ function fetchJson(url, token, options: any = {}) {
               } catch {
                 reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
               }
-            })
+            }))
           }
         )
 
@@ -5332,7 +5332,8 @@ function fetchPublicJson(url, options: any = {}) {
           return
         }
 
-        const req = client.request(
+        const req = requestJsonResponse(
+          client,
           parsed,
           {
             agent,
@@ -5347,9 +5348,7 @@ function fetchPublicJson(url, options: any = {}) {
           res => {
             const chunks = []
             res.on('data', chunk => chunks.push(chunk))
-            res.on('end', () => {
-              const text = Buffer.concat(chunks).toString('utf8')
-
+            res.on('end', () => decodeJsonResponse(chunks, res.headers['content-encoding'], reject, text => {
               if ((res.statusCode || 500) >= 400) {
                 reject(httpStatusError(res.statusCode, text, res.statusMessage))
 
@@ -5382,7 +5381,7 @@ function fetchPublicJson(url, options: any = {}) {
               } catch {
                 reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
               }
-            })
+            }))
           }
         )
 
