@@ -152,9 +152,33 @@ def message_agent_authorized(agent: Any) -> bool:
 
         # Managed-install check, NOT section non-emptiness: a SOUL.md carrying the
         # legacy protocol text gets an empty section but must still get the tool.
-        return _session_title(agent) == BOT_CHAT_TITLE and is_bot_mode_managed(_agent_home(agent))
+        if not is_bot_mode_managed(_agent_home(agent)):
+            return False
+        return _session_title(agent) == BOT_CHAT_TITLE or _attended_side_chat(agent)
     except Exception:  # pragma: no cover — must never break a turn
         logger.debug("message_agent_authorized failed", exc_info=True)
+        return False
+
+
+# Titles of sessions that are never a person's own chat with the bot, even when a UI hosts them.
+_NEVER_DM_TITLE_PREFIXES = ("Group:", "handoff-")
+
+
+def _attended_side_chat(agent: Any) -> bool:
+    """Any other chat a person is reading live with this bot (a Desktop/TUI/CLI chat that is not
+    the canonical Bot Chat) may DM teammates too: the user opened it and is watching the turn.
+    Cron, one-shot, kanban workers, subagents and bot-to-bot side windows (finite ``-Q`` turns)
+    are not attended, so they stay tool-free, which keeps bot-to-bot ping-pong impossible.
+    Session-stable (platform + source + title), so prompt-cache safe. Never raises."""
+    try:
+        from agent.session_source import is_attended
+
+        if not is_attended(agent):
+            return False
+        title = _session_title(agent)
+        return not any(title.startswith(p) for p in _NEVER_DM_TITLE_PREFIXES)
+    except Exception:  # pragma: no cover — must never break a turn
+        logger.debug("_attended_side_chat failed", exc_info=True)
         return False
 
 
