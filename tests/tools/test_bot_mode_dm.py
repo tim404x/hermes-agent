@@ -60,9 +60,13 @@ def _managed_home(tmp_path, *, teammates=("researcher",), peers=(), dm_route: st
 
 
 class _FakeDB:
-    def __init__(self, home: Path, title: str):
+    def __init__(self, home: Path, title: str, origin_json: str | None = None):
         self.db_path = str(home / "state.db")
         self._title = title
+        self.origin_json = origin_json
+
+    def get_session(self, sid):
+        return {"id": sid, "origin_json": self.origin_json}
 
     def get_session_title(self, _sid):
         return self._title
@@ -149,7 +153,7 @@ def test_injects_into_attended_side_chat(tmp_path, monkeypatch, platform):
     ("subagent", "child", None),          # delegated child answers its parent
     ("desktop", "Group: room-abc123", None),  # group-room member session
     ("desktop", "handoff-12ab34cd", None),
-    ("desktop", "Sales | side window", True),  # bot-to-bot side window: finite -Q turn
+    ("desktop", "Sales | finite turn", True),  # one-shot -q turn
     ("cron", "Morning brief", None),       # unattended source
 ])
 def test_unattended_or_room_sessions_stay_tool_free(tmp_path, monkeypatch, platform, title, finite):
@@ -160,6 +164,20 @@ def test_unattended_or_room_sessions_stay_tool_free(tmp_path, monkeypatch, platf
     home = _managed_home(tmp_path)
     agent = _FakeAgent(home, title=title)
     agent.platform = platform
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is False
+    assert agent.tools == []
+
+
+def test_side_window_stays_tool_free_even_when_cli_attended(tmp_path, monkeypatch):
+    """Side windows run as CLI-sourced turns; the origin stamp keeps message_agent out (no ping-pong)."""
+    import agent.session_source as ss
+
+    monkeypatch.setattr(ss, "session_source_for", lambda p: p)
+    monkeypatch.setattr("gateway.session_finite.finite_turn_required", lambda: None)
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="Sales | Daily task build")
+    agent.platform = "cli"
+    agent._session_db.origin_json = json.dumps({"side_window": {"at": 1.0, "by": "bot:default"}})
     assert bot_mode_dm.ensure_message_agent_tool(agent) is False
     assert agent.tools == []
 
