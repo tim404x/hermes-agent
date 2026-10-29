@@ -693,6 +693,9 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False, ch
         _check.report_shallow_verdict(git_cmd, root, compare_branch)
     else:
         _check.report_rev_list_verdict(git_cmd, root, compare_branch)
+    # A fork-tracking install is "up to date" with its fork only: say how far NousResearch is.
+    from hermes_cli.fork_integration import print_fork_integration_note
+    print_fork_integration_note(root)
 
 
 def _base_git_cmd() -> list[str]:

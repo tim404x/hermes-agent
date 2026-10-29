@@ -350,6 +350,18 @@ async def check_hermes_update(force: bool = False, profile: Optional[str] = None
                                "runtime its sessions use. It stays on this build until a newer release ships.")
     elif behind == 0:
         payload["message"] = "You're on the latest version."
+        # A fork-tracking install is current with its fork only; when NousResearch is ahead (the
+        # carries' integrator is behind or failing) say so instead of a bare "latest version".
+        try:
+            from hermes_cli.fork_integration import fork_integration_note
+
+            note = await asyncio.to_thread(fork_integration_note, _server_path("PROJECT_ROOT"))
+        except Exception:
+            _log.debug("fork integration note unavailable", exc_info=True)
+            note = None
+        if note:
+            payload["upstream_note"] = note
+            payload["message"] = f"You're on the latest version of your fork. {note}."
     else:
         payload["update_available"] = True
         if status.get("rollback"):
