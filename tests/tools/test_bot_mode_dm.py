@@ -131,6 +131,51 @@ def test_never_injects_outside_bot_chat(tmp_path, title):
     assert agent.valid_tool_names == set()
 
 
+@pytest.mark.parametrize("platform", ["desktop", "tui", "cli"])
+def test_injects_into_attended_side_chat(tmp_path, monkeypatch, platform):
+    """A person's own non-canonical chat with the bot (Desktop/TUI/CLI) gets the tool too."""
+    import agent.session_source as ss
+
+    monkeypatch.setattr(ss, "session_source_for", lambda p: p)
+    monkeypatch.setattr("gateway.session_finite.finite_turn_required", lambda: None)
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="Finance.hub Halo fund VC view")
+    agent.platform = platform
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is True
+    assert bot_mode_dm.MESSAGE_AGENT_TOOL_NAME in agent.valid_tool_names
+
+
+@pytest.mark.parametrize("platform,title,finite", [
+    ("subagent", "child", None),          # delegated child answers its parent
+    ("desktop", "Group: room-abc123", None),  # group-room member session
+    ("desktop", "handoff-12ab34cd", None),
+    ("desktop", "Sales | side window", True),  # bot-to-bot side window: finite -Q turn
+    ("cron", "Morning brief", None),       # unattended source
+])
+def test_unattended_or_room_sessions_stay_tool_free(tmp_path, monkeypatch, platform, title, finite):
+    import agent.session_source as ss
+
+    monkeypatch.setattr(ss, "session_source_for", lambda p: p)
+    monkeypatch.setattr("gateway.session_finite.finite_turn_required", lambda: finite)
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title=title)
+    agent.platform = platform
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is False
+    assert agent.tools == []
+
+
+def test_attended_chat_on_unmanaged_install_stays_tool_free(tmp_path, monkeypatch):
+    import agent.session_source as ss
+
+    monkeypatch.setattr(ss, "session_source_for", lambda p: p)
+    monkeypatch.setattr("gateway.session_finite.finite_turn_required", lambda: None)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    agent = _FakeAgent(home, title="My chat")
+    agent.platform = "desktop"
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is False
+
+
 def test_never_injects_on_unmanaged_install(tmp_path):
     """A 'Bot Chat'-titled session on a plain install stays tool-free."""
     home = tmp_path / ".hermes"
