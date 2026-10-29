@@ -167,19 +167,41 @@ _NEVER_DM_TITLE_PREFIXES = ("Group:", "handoff-")
 def _attended_side_chat(agent: Any) -> bool:
     """Any other chat a person is reading live with this bot (a Desktop/TUI/CLI chat that is not
     the canonical Bot Chat) may DM teammates too: the user opened it and is watching the turn.
-    Cron, one-shot, kanban workers, subagents and bot-to-bot side windows (finite ``-Q`` turns)
-    are not attended, so they stay tool-free, which keeps bot-to-bot ping-pong impossible.
-    Session-stable (platform + source + title), so prompt-cache safe. Never raises."""
+    Cron, one-shot, kanban workers and subagents are not attended; side windows (where teammates'
+    DMs land) and group-room/handoff sessions are excluded explicitly, so bot-to-bot ping-pong stays
+    impossible. Session-stable (platform + source + title + origin stamp), so prompt-cache safe."""
     try:
         from agent.session_source import is_attended
 
         if not is_attended(agent):
             return False
         title = _session_title(agent)
-        return not any(title.startswith(p) for p in _NEVER_DM_TITLE_PREFIXES)
+        if any(title.startswith(p) for p in _NEVER_DM_TITLE_PREFIXES):
+            return False
+        # A side window is where a teammate's DM lands: replying there with message_agent would
+        # bounce bot-to-bot. Side-window turns are CLI-sourced, so is_attended alone can't tell.
+        return not _is_side_window(agent)
     except Exception:  # pragma: no cover — must never break a turn
         logger.debug("_attended_side_chat failed", exc_info=True)
         return False
+
+
+def _is_side_window(agent: Any) -> bool:
+    """True when this session carries the ``side_window`` origin stamp. Unknown = True (fail closed)."""
+    try:
+        from hermes_state_side_windows import _side_window_origin
+
+        sdb, sid = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
+        if not (sdb and sid):
+            return True
+        row = sdb.get_session(sid)
+        if not row:
+            return True
+        raw = row["origin_json"] if "origin_json" in row.keys() else None
+        return _side_window_origin(raw) is not None
+    except Exception:  # pragma: no cover — must never break a turn
+        logger.debug("_is_side_window failed", exc_info=True)
+        return True
 
 
 def ensure_message_agent_tool(agent: Any) -> bool:
