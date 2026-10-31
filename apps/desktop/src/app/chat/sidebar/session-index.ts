@@ -1,3 +1,4 @@
+import { compareIncomingPins } from '@/lib/session-pin-order'
 import type { SessionInfo } from '@/types/hermes'
 
 /**
@@ -33,9 +34,9 @@ export function buildSessionByAnyId(
 }
 
 /**
- * Resolve the Pinned section's rows: the locally stored pin ids first (in the
- * user's hand-picked order), then any row the SERVER flags `pinned` that the
- * local set doesn't know about yet.
+ * Resolve the Pinned section's rows: newly discovered server pins first,
+ * then locally stored pin ids in the user's hand-picked order. This matches
+ * pin-sync adoption, so a background brief never flashes at the bottom.
  *
  * The local set (`$pinnedSessionIds` in localStorage) is a UI-ordering hint,
  * not the source of truth — `sessions.pinned` in the backend's state.db is.
@@ -63,6 +64,7 @@ export function resolvePinnedSessions(
 ): SessionInfo[] {
   const seen = new Set<string>()
   const out: SessionInfo[] = []
+  const incoming: SessionInfo[] = []
 
   for (const pinId of pinnedSessionIds) {
     const session = sessionByAnyId.get(pinId)
@@ -88,8 +90,8 @@ export function resolvePinnedSessions(
     }
 
     seen.add(session.id)
-    out.push(session)
+    incoming.push(session)
   }
 
-  return out
+  return [...incoming.sort(compareIncomingPins), ...out]
 }

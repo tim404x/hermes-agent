@@ -25,6 +25,7 @@ import { atom } from 'nanostores'
 
 import { setSessionPinnedRemote } from '@/hermes'
 import { onConnectionScopeChange } from '@/lib/connection-scoped'
+import { compareIncomingPins } from '@/lib/session-pin-order'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
@@ -229,8 +230,9 @@ function writePin(id: string, pinned: boolean, profile?: null | string): Promise
  */
 function pullRemotePins(): void {
   const local = new Set($pinnedSessionIds.get())
+  let incomingIndex = 0
 
-  for (const row of rowsByPinId(loadedSessionRows()).values()) {
+  for (const row of [...rowsByPinId(loadedSessionRows()).values()].sort(compareIncomingPins)) {
     // A backend without the flag has no opinion; never act on `undefined`.
     if (typeof row.pinned !== 'boolean') {
       continue
@@ -277,7 +279,9 @@ function pullRemotePins(): void {
       // Mark mirrored first: pinSession fires the pin listener synchronously,
       // and the nested reconcile must not see this as a new pin to PATCH.
       mirrored.add(pinId)
-      pinSession(pinId)
+      // Insert only newly discovered pins before the existing manual order.
+      // Advancing the index preserves newest-first order for an offline batch.
+      pinSession(pinId, incomingIndex++)
     } else if (!row.pinned && heldLocally) {
       // Same discipline on the way down: forget the mirror before the nested
       // reconcile runs, or it re-PATCHes pinned=false the server already has.
