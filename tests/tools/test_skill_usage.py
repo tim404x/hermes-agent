@@ -615,6 +615,31 @@ def test_skill_file_lock_is_reentrant_in_thread_and_exclusive_across_threads(tmp
     assert entered.is_set() and other_done.is_set()
 
 
+def test_skill_file_lock_reenters_through_a_symlinked_alias_of_the_same_lock(tmp_path):
+    """Every bot profile's ``skills`` dir is a symlink to the shared root, so one lock file can be
+    reached under two path strings. A nested acquire through the alias on the SAME thread must
+    re-enter, not flock the inode a second time and block the thread on itself forever (the
+    7-minute skill_manage hang). Run in a daemon thread so a regression fails instead of hanging."""
+    import threading
+    from tools.skill_usage import skill_file_lock
+
+    real = tmp_path / "skills"
+    (real / ".locks").mkdir(parents=True)
+    alias = tmp_path / "profile-skills"
+    alias.symlink_to(real, target_is_directory=True)
+    done = threading.Event()
+
+    def nested():
+        with skill_file_lock(real / ".locks" / "demo.lock"):
+            with skill_file_lock(alias / ".locks" / "demo.lock"):
+                done.set()
+
+    t = threading.Thread(target=nested, daemon=True)
+    t.start()
+    t.join(timeout=5)
+    assert done.is_set(), "same-thread re-acquire through a symlink alias deadlocked"
+
+
 # ---------------------------------------------------------------------------
 # Content lock (#25083): `locked` beside `pinned`; set_locked is not curation-gated and
 # is_locked is strict so the write guard can fail closed on a corrupt sidecar.
