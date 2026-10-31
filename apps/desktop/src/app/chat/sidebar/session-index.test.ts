@@ -83,13 +83,21 @@ describe('resolvePinnedSessions', () => {
     expect(resolvePinnedSessions(['root'], index, sessions, settled).map(s => s.id)).toEqual(['tip'])
   })
 
-  it('keeps locally pinned rows ahead of server-only fallback pins', () => {
-    const sessions = [row('server-pin', { pinned: true }), row('local-pin')]
+  it('prepends server-only pins newest first while retaining the local hand-picked order', () => {
+    const sessions = [
+      row('server-older', { pinned: true, started_at: 10 }),
+      row('local-a'),
+      row('server-newer', { pinned: true, started_at: 20 }),
+      row('local-b')
+    ]
+
     const index = buildSessionByAnyId(sessions, [], [])
 
-    expect(resolvePinnedSessions(['local-pin'], index, sessions, settled).map(s => s.id)).toEqual([
-      'local-pin',
-      'server-pin'
+    expect(resolvePinnedSessions(['local-b', 'local-a'], index, sessions, settled).map(s => s.id)).toEqual([
+      'server-newer',
+      'server-older',
+      'local-b',
+      'local-a'
     ])
   })
 

@@ -122,6 +122,32 @@ describe('watchSessionPins', () => {
 })
 
 describe('watchSessionPins remote pull', () => {
+  it('prepends newly discovered server pins without reordering existing manual pins', async () => {
+    const existing = [row('a', { pinned: true }), row('b', { pinned: true })]
+    $sessions.set(existing)
+    await flush()
+    $pinnedSessionIds.set(['b', 'a'])
+    await flush()
+    patch.mockClear()
+
+    const incoming = [
+      row('older-new', { pinned: true, started_at: 10 }),
+      ...existing,
+      row('newest', { pinned: true, started_at: 20 })
+    ]
+
+    $sessions.set(incoming)
+    await flush()
+
+    expect($pinnedSessionIds.get()).toEqual(['newest', 'older-new', 'b', 'a'])
+    expect(patch).not.toHaveBeenCalled()
+
+    $pinnedSessionIds.set(['a', 'newest', 'older-new', 'b'])
+    $sessions.set([...incoming].reverse())
+    await flush()
+    expect($pinnedSessionIds.get()).toEqual(['a', 'newest', 'older-new', 'b'])
+  })
+
   it('adopts and durably unpins a backend-only messaging pin', async () => {
     $messagingSessions.set([row('photon-pin', { pinned: true, profile: 'messages', source: 'photon' })])
     await flush()
