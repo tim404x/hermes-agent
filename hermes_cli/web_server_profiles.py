@@ -213,6 +213,14 @@ def _profile_scope(profile: Optional[str]):
     ``load_config``/``save_config`` read-modify-write without ``CONFIG_MUTATION_LOCK`` (MCP catalog
     install, platform toggles, the raw config editor, credential mirror scrubs), and the lock is
     what keeps them from losing a concurrent ``config_write_scope`` update.
+
+    Never retarget those modules' ``SKILLS_DIR`` / ``HERMES_HOME`` globals here (fork carry #16):
+    skill resolution rides on the task-local HERMES_HOME override alone (``_skills_dir()`` resolves
+    at call time). The globals are process-wide, so a swap leaks into every other thread of this
+    process: an agent turn mid ``skill_manage`` batch re-acquired its skill lock under another
+    profile's path, and because profile ``skills`` dirs are symlinks to the shared root the same lock
+    inode had two path strings and the thread blocked on its own flock (7-minute hang, 31 Oct 2026).
+    ``test_scope_never_retargets_process_global_skill_dirs`` guards it.
     """
     with _config_profile_scope(profile) as scoped, _SKILLS_PROFILE_LOCK:
         yield scoped
