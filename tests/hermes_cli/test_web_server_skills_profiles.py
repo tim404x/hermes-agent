@@ -92,6 +92,22 @@ class TestProfileScopedSkills:
         client.get("/api/skills", params={"profile": "worker_alpha"})
         assert skills_tool.SKILLS_DIR == before
 
+    def test_scope_never_retargets_process_global_skill_dirs(self, isolated_profiles):
+        """``_profile_scope`` must not swap the skill modules' ``SKILLS_DIR`` globals: the swap
+        is process-wide, so an agent turn on another thread (a running skill_manage batch) sees
+        another profile's path mid-operation. Through a symlinked profile ``skills`` dir that
+        is one inode under two path strings, which deadlocked the skill lock. The task-local
+        HERMES_HOME override alone must route skill resolution to the requested profile."""
+        from tools import skill_manager_tool, skills_tool
+
+        before = (skills_tool.SKILLS_DIR, skill_manager_tool.SKILLS_DIR)
+        with _web_server_profiles._profile_scope("worker_alpha"):
+            assert (skills_tool.SKILLS_DIR, skill_manager_tool.SKILLS_DIR) == before
+            worker_skills = isolated_profiles["worker_alpha"] / "skills"
+            assert skills_tool._skills_dir() == worker_skills
+            assert skill_manager_tool._skills_dir() == worker_skills
+        assert (skills_tool.SKILLS_DIR, skill_manager_tool.SKILLS_DIR) == before
+
     @pytest.mark.parametrize("method,path,body", [
         ("PUT", "/api/learning/node", {"id": "shared-skill", "content": "EDITED"}),
         ("DELETE", "/api/learning/node", {"id": "shared-skill"}),

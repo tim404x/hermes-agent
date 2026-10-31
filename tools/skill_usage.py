@@ -66,12 +66,24 @@ def _flock(fd, lock: bool) -> None:
 _held_locks = threading.local()  # per thread: flock is NOT re-entrant across separate fds
 
 
+def _resolved_lock_path(lock_path: Path) -> Path:
+    """One canonical path per lock file (symlinked roots collapse to their target)."""
+    lock_path = Path(lock_path)
+    try:
+        return lock_path.resolve()
+    except (OSError, RuntimeError):  # unreadable link / symlink loop: keep the given path
+        return lock_path
+
+
 @contextmanager
 def skill_file_lock(lock_path: Path):
     """Exclusive cross-process lock on ``lock_path`` held across a read-modify-write cycle.
-    Re-entrant within one thread (a nested acquire of the same path just runs); a no-op
-    where neither fcntl nor msvcrt exists."""
-    lock_path = Path(lock_path)
+    Re-entrant within one thread (a nested acquire of the same lock file just runs); a no-op
+    where neither fcntl nor msvcrt exists. Keyed on the RESOLVED path: every bot profile's
+    ``skills`` dir is a symlink to the shared root, so one lock file has several path
+    strings, and a re-entry check on the raw string would flock the same inode twice and
+    block the thread on itself."""
+    lock_path = _resolved_lock_path(lock_path)
     held = getattr(_held_locks, "paths", None)
     if held is None:
         held = _held_locks.paths = set()
