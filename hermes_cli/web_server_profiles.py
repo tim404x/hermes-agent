@@ -243,34 +243,25 @@ _SKILLS_PROFILE_LOCK = threading.RLock()
 def _profile_scope(profile: Optional[str]):
     """Scope config + skill-directory resolution to ``profile`` for one request.
 
-    Two seams: (1) ``load_config``/``save_config`` resolve ``get_hermes_home()`` at call
-    time, so the contextvar override reaches them; (2) ``tools.skills_tool`` /
-    ``tools.skill_manager_tool`` bind ``SKILLS_DIR`` at import time, so both are retargeted
-    under a lock and restored after. For the dashboard's own profile config resolution is
-    untouched, but the skill-module globals are still retargeted to the *current*
-    ``get_hermes_home()`` so writes land in the live home even when the import-time binding
-    is stale (test isolation, late HERMES_HOME override). Yields the profile dir for a named
-    profile, None for the current one.
+    Everything rides on the task-local HERMES_HOME override ``_config_profile_scope`` sets:
+    ``load_config``/``save_config`` resolve ``get_hermes_home()`` at call time, and
+    ``tools.skills_tool`` / ``tools.skill_manager_tool`` resolve their skills dir at call
+    time through ``_skills_dir()`` (an explicitly patched ``SKILLS_DIR`` still wins).
+
+    Never retarget those modules' ``SKILLS_DIR`` / ``HERMES_HOME`` globals here: they are
+    process-wide, so the swap leaked into every other thread of the dashboard process. An
+    agent turn mid-``skill_manage`` batch then re-acquired its skill lock under another
+    profile's path, and because profile ``skills`` dirs are symlinks to the shared root the
+    same lock inode had two path strings and the thread blocked on its own flock (7-minute
+    hang, 31 Oct 2026). ``_SKILLS_PROFILE_LOCK`` still serializes scoped requests as before.
+    Yields the profile dir for a named profile, None for the current one.
 
     ``tools.skills_sync`` (reset/diff/list-modified/opt-in/opt-out/ repair-official) needs NO retargeting:
-    since #65828 its directory lookups resolve at call time through the same contextvar override set in step
-    1.
+    since #65828 its directory lookups resolve at call time through the same contextvar override.
     """
-    from hermes_constants import get_hermes_home
-    from tools import skills_tool as _skills_tool
-    from tools import skill_manager_tool as _skill_mgr
     with _config_profile_scope(profile) as scoped:
-        profile_dir = get_hermes_home() if scoped is None else scoped
-        modules = (_skills_tool, _skill_mgr)
         with _SKILLS_PROFILE_LOCK:
-            saved = [(m.HERMES_HOME, m.SKILLS_DIR) for m in modules]
-            for m in modules:
-                m.HERMES_HOME, m.SKILLS_DIR = profile_dir, profile_dir / "skills"
-            try:
-                yield scoped
-            finally:
-                for m, (home, skills_dir) in zip(modules, saved):
-                    m.HERMES_HOME, m.SKILLS_DIR = home, skills_dir
+            yield scoped
 
 
 @contextmanager

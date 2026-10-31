@@ -557,6 +557,44 @@ class TestSkillMutationLock:
             assert lock.parent == tmp_path / ".locks"
 
 
+class TestBatchLockAcrossSkillsDirAliases:
+    def test_batch_survives_skills_dir_retargeted_to_a_symlinked_alias_mid_batch(self, tmp_path, monkeypatch):
+        """Regression for the dashboard hang: an atomic batch holds the skill lock, then a
+        concurrent request retargets ``SKILLS_DIR`` to a profile's ``skills`` symlink (same
+        inode, other path string) before the per-op call re-acquires. The per-op acquire must
+        re-enter instead of blocking the thread on its own flock."""
+        import tools.skill_manager_tool as smt
+
+        real = tmp_path / "skills"
+        real.mkdir()
+        alias = tmp_path / "profiles" / "neo" / "skills"
+        alias.parent.mkdir(parents=True)
+        alias.symlink_to(real, target_is_directory=True)
+        orig = smt._skill_manage_from
+
+        def retargeted(payload, **kw):
+            smt.SKILLS_DIR = alias
+            return orig(payload, **kw)
+
+        result = {}
+        with _skill_dir(real):
+            _create_skill("demo", VALID_SKILL_CONTENT)
+            monkeypatch.setattr(smt, "_skill_manage_from", retargeted)
+
+            def run():
+                result["raw"] = skill_manage(action="", name="", operations=[
+                    {"action": "patch", "name": "demo", "old_string": "Do the thing.",
+                     "new_string": "Do the other thing."}])
+
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+            t.join(timeout=10)
+
+        assert not t.is_alive(), "skill_manage batch deadlocked on its own lock (same inode, two paths)"
+        assert json.loads(result["raw"])["success"] is True
+        assert "Do the other thing." in (real / "demo" / "SKILL.md").read_text()
+
+
 class TestDeleteSkill:
     def test_delete_cleans_empty_category_dir(self, tmp_path):
         with _skill_dir(tmp_path):
