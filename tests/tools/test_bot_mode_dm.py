@@ -5,6 +5,7 @@ canonical Bot Chat session on a Bot-Mode-managed install, and must refuse to
 deliver from anywhere else even if a schema leaks.
 """
 
+import contextlib
 import json
 import os
 import shlex
@@ -58,6 +59,36 @@ def _managed_home(tmp_path, *, teammates=("researcher",), peers=(), dm_route: st
     if lines:
         (home / "config.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return home
+
+
+@contextlib.contextmanager
+def _profile_store(profile_home: Path):
+    """A writable storage-interface handle on one tmp profile's own ``state.db`` (never a real profile)."""
+    from persistence_assembly import open_persistence, profile_scope
+
+    home = Path(profile_home)
+    home.mkdir(parents=True, exist_ok=True)
+    with open_persistence(profile_scope(home=home), eager=True) as store:
+        yield store
+
+
+def _new_session(store, session_id: str, *, source: str, title: str | None = None, origin: dict | None = None) -> None:
+    """Seed one session row (and its title) through the storage interface."""
+    from persistence import SessionId
+    from persistence.conversation.sessions import NewSession
+
+    store.sessions.create(NewSession(session_id=SessionId(session_id), source=source, origin=origin))
+    if title is not None:
+        store.sessions.set_title(SessionId(session_id), title)
+
+
+def _append(store, session_id: str, role: str, content, *, tool_calls=None, **fields) -> int:
+    """Append one transcript row through the storage interface."""
+    from persistence import SessionId
+    from persistence.conversation.messages import NewMessage
+
+    return store.messages.append(SessionId(session_id),
+                                 NewMessage(role=role, content=content, tool_calls=tuple(tool_calls or ()), **fields))
 
 
 class _FakeSessions:

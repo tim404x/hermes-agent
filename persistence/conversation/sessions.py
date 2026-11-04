@@ -43,6 +43,7 @@ __all__ = [
     "RETAG_SOURCE_TO",
     "RUNTIME_LOCK_KEY",
     "SESSION_ROW_COLUMNS",
+    "SIDE_WINDOW_KEY",
     "SKILL_SCAFFOLD_PREFIX",
     "YOLO_KEY",
     "ArchiveChange",
@@ -84,6 +85,8 @@ __all__ = [
     "SessionRecord",
     "SessionRepository",
     "SessionWindow",
+    "SideWindow",
+    "SideWindowMatch",
     "SkillScaffoldedSession",
     "TitleConflict",
     "TitleSource",
@@ -92,9 +95,11 @@ __all__ = [
     "is_corrupt_model_config",
     "is_explicit_close_reason",
     "normalize_activity_provenance",
+    "origin_is_side_window_only",
     "parse_model_config",
     "sanitize_title",
     "session_yolo_enabled",
+    "side_window_stamp",
     "workspace_key",
 ]
 
@@ -169,6 +174,12 @@ COMPACT_EXCLUDED_COLUMNS: frozenset[str] = frozenset({"system_prompt", "system_p
 
 #: The ``model_config`` key of the YOLO flag.
 YOLO_KEY = "yolo_mode"
+
+#: Fork carry (bot mode): the ``origin_json`` key of the stamp ``message_agent`` puts on a teammate's side window
+#: (``tools/bot_mode_dm_side_window.py``), ``{"side_window": {"at": <epoch>, "by": <author id>, "key": <conversation
+#: key>}}``. A CLI side window has no other origin, and a compression continuation inherits its parent's origin, so
+#: the stamp follows the live tip without a schema change.
+SIDE_WINDOW_KEY = "side_window"
 
 #: The ``model_config`` key holding a chat's first-run onboarding run (``session_rules.onboarding_flow``'s record).
 ONBOARDING_RUN_KEY = "onboarding_run"
@@ -251,6 +262,32 @@ def is_corrupt_model_config(raw: Any) -> bool:
 def session_yolo_enabled(model_config: Any) -> bool:
     """The persisted YOLO flag of a session's ``model_config``; ``False`` on any parse failure."""
     return bool(parse_model_config(model_config).get(YOLO_KEY))
+
+
+def _decoded_origin(origin: Any) -> Any:
+    """A session origin as a value: the parsed ``origin_json`` text (``None`` when blank, ``ValueError`` when not JSON), else as given."""
+    if isinstance(origin, str):
+        return json.loads(origin) if origin else None
+    return origin
+
+
+def side_window_stamp(origin: Any) -> Optional[dict[str, Any]]:
+    """The side-window stamp (:data:`SIDE_WINDOW_KEY`) inside a session origin, the parsed mapping or the stored ``origin_json`` text; ``None`` when it carries none or does not decode."""
+    try:
+        value = _decoded_origin(origin)
+    except (TypeError, ValueError):
+        return None
+    stamp = value.get(SIDE_WINDOW_KEY) if isinstance(value, Mapping) else None
+    return dict(stamp) if isinstance(stamp, Mapping) else None
+
+
+def origin_is_side_window_only(origin: Any) -> bool:
+    """Whether a session origin (mapping or ``origin_json`` text) holds exactly a side-window stamp and nothing else: the only non-empty origin ``mark_side_window`` writes over (a gateway routing peer or an import record is load-bearing for other readers)."""
+    try:
+        value = _decoded_origin(origin)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(value, Mapping) and set(value) == {SIDE_WINDOW_KEY}
 
 
 _TITLE_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
@@ -857,6 +894,28 @@ class PickerFacts:
     last_replies: Mapping[SessionId, Optional[str]]
 
 
+@dataclass(frozen=True, slots=True)
+class SideWindow:
+    """Fork carry (bot mode): one stamped ``message_agent`` side window as ``list_side_windows`` serves it, one per compression lineage. ``id`` is the lineage's live tip, ``title`` the tip's title (else the stamped row's), ``at`` the newest DM stamp, ``by`` the sending bot's author id, ``last_active`` the tip's activity stamp else its ``started_at``, ``message_count`` the tip's."""
+
+    id: SessionId
+    title: str
+    at: float
+    by: str
+    last_active: float
+    message_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class SideWindowMatch:
+    """Fork carry (bot mode): one side window stamped with a conversation key, as ``find_side_windows`` serves it, one per compression lineage. ``id`` is the live tip; ``title`` the lineage root's, the name a ``chat -c <title>`` transport resolves to that tip (a continuation is titled ``"<title> #N"``); ``at`` the stamp; ``last_active`` the freshest of the stamp, the tip's activity stamp and ``started_at`` and its newest message."""
+
+    id: SessionId
+    title: str
+    at: float
+    last_active: float
+
+
 #: One of ``session_rules.onboarding_flow``'s event classes; ``advance_onboarding_run`` hands it to that module's ``apply`` without reading it.
 OnboardingEvent: TypeAlias = Any
 
@@ -1029,6 +1088,12 @@ class SessionRepository(Protocol):
 
     def set_read(self, session_id: SessionId, read: bool = True) -> bool:
         """Set the ``last_read_at`` watermark across the lineage: now when read, 0 when unread."""
+        ...
+
+    def mark_side_window(
+        self, session_id: SessionId, *, by: Optional[str] = None, at: Optional[float] = None, key: Optional[str] = None
+    ) -> bool:
+        """Fork carry (bot mode): stamp the row as a ``message_agent`` side window that just received a DM, writing ``origin`` as ``{SIDE_WINDOW_KEY: {"at", "by", "key"}}`` (``at`` defaults to now, ``by`` to ``""``). ``key`` names the conversation; a stamp without one keeps the key already there. False with nothing written when the row is missing or its origin is anything but empty or an earlier side-window stamp (:func:`origin_is_side_window_only`): a gateway routing peer or an import record is never overwritten."""
         ...
 
     def unarchive_recoverable(self, session_id: SessionId) -> bool:
@@ -1308,4 +1373,12 @@ class SessionRepository(Protocol):
 
     def subagent_session_ids(self, subagent_id: str, marker_key: str) -> tuple[SessionId, ...]:
         """Ids of the ``subagent``-sourced sessions whose ``model_config`` holds ``subagent_id`` under ``marker_key``, newest ``started_at`` first (ties: id descending). Proves no ownership."""
+        ...
+
+    def list_side_windows(self, limit: int = 8) -> tuple[SideWindow, ...]:
+        """Fork carry (bot mode): the stamped side windows (``mark_side_window``), newest stamp first, one per compression lineage keyed by its live tip, at most ``limit`` (at least 1). Archived rows are left out. A lineage's root and tip both carry the stamp; the store reads ``limit * 4`` stamped rows, newest stamp first, before folding them by tip."""
+        ...
+
+    def find_side_windows(self, key: str, limit: int = 8) -> tuple[SideWindowMatch, ...]:
+        """Fork carry (bot mode): the side windows stamped with conversation ``key``, newest stamp first, one per compression lineage keyed by its live tip, at most ``limit`` (at least 1), read like ``list_side_windows``. Archived rows are left out."""
         ...

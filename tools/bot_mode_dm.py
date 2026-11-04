@@ -193,16 +193,15 @@ def _attended_side_chat(agent: Any) -> bool:
 def _is_side_window(agent: Any) -> bool:
     """True when this session carries the ``side_window`` origin stamp. Unknown = True (fail closed)."""
     try:
-        from hermes_state_side_windows import _side_window_origin
+        from persistence.conversation.sessions import side_window_stamp
 
-        sdb, sid = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
-        if not (sdb and sid):
+        persistence, sid = getattr(agent, "persistence", None), getattr(agent, "session_id", None)
+        if persistence is None or not sid:
             return True
-        row = sdb.get_session(sid)
-        if not row:
+        record = persistence.sessions.get(sid)
+        if record is None:
             return True
-        raw = row["origin_json"] if "origin_json" in row.keys() else None
-        return _side_window_origin(raw) is not None
+        return side_window_stamp(record.origin) is not None
     except Exception:  # pragma: no cover — must never break a turn
         logger.debug("_is_side_window failed", exc_info=True)
         return True
@@ -341,9 +340,12 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
             _profile_name as _self_profile_name, _roster, is_bot_mode_managed,
         )
 
-        if _session_title(agent) != BOT_CHAT_TITLE:
-            return _err("message_agent is only available in a Bot Mode 'Bot Chat' session. "
-                        "This session is not one; do not retry.")
+        # Same gate that advertises the tool (message_agent_authorized): the canonical Bot Chat OR an
+        # attended Desktop/TUI/CLI chat (#13). Checking the title alone here refused every call from
+        # an attended chat the tool had just been offered in (Tim, 4 Nov 2026).
+        if _session_title(agent) != BOT_CHAT_TITLE and not message_agent_authorized(agent):
+            return _err("message_agent is only available in a Bot Mode 'Bot Chat' session or a chat "
+                        "you are attending live. This session is neither; do not retry.")
         if not is_bot_mode_managed(home):
             return _err("This install is not Bot-Mode-managed (no bot roster); "
                         "message_agent is unavailable. Do not retry.")
@@ -814,8 +816,10 @@ def _retry_side_window(argv: list[str], dm_file: str, *, env: Optional[dict[str,
     retry = retitled(argv)
     with _delivery_lock(retry, stdin_file=False, side_window=True):
         _stamp_side_window(retry, profile_home, author, window_key)
-        return _run_local_turn(retry, dm_file, env=env, retried=True, profile_home=profile_home, author=author,
-                               window_key=window_key)
+        rc = _run_local_turn(retry, dm_file, env=env, retried=True, profile_home=profile_home, author=author,
+                             window_key=window_key)
+        _stamp_side_window(retry, profile_home, author, window_key)  # a new '(2)' row exists only now
+        return rc
 
 
 def _stamp_side_window(argv: list[str], profile_home: Path | None, author: Optional[dict],
@@ -1094,9 +1098,15 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
         env = delivery_env(author, profile_home if not stdin_file else None)
         with _delivery_lock(argv, stdin_file=stdin_file, side_window=side_window):
             if side_window:
+                # Stamp an EXISTING window before the turn (the tab shows early). A new window's row is
+                # minted by the gateway (the single writer) through the transport's --create-if-missing
+                # and stamped right after the turn: a row written here directly is not gateway-owned,
+                # and every turn into it failed with permission_denied (Tim, 4 Nov 2026).
                 _stamp_side_window(argv, profile_home, author, window_key)
-                return _run_local_turn(argv, dm_file, env=env, profile_home=profile_home, author=author,
-                                       window_key=window_key)
+                rc = _run_local_turn(argv, dm_file, env=env, profile_home=profile_home, author=author,
+                                     window_key=window_key)
+                _stamp_side_window(argv, profile_home, author, window_key)
+                return rc
             # Keep the file open until the transport exits; cleanup occurs
             # after subprocess.run returns, not merely after stdin reaches EOF.
             with open(dm_file, "r", encoding="utf-8-sig") as stream:
