@@ -119,6 +119,7 @@ import { pinnedOwnerCount, pinnedStoredSessionIdsForOwner, releaseStoredSessionP
 import { applySessionInfoStatePatch, sessionInfoStatePatch } from './use-message-stream/utils'
 import { captureSteeringSession } from './use-prompt-actions/steering-session'
 import { useSessionActions } from './use-session-actions'
+import { markSessionCreatedThisRun } from './use-session-actions/created-this-run'
 import {
   createPersistedDisplayTranscriptProvenance,
   suppressTranscriptForView,
@@ -7574,5 +7575,119 @@ describe('resumeSession warm switch keeps unchanged rows by identity', () => {
     // The settled history is the very same objects: nothing above the live
     // turn re-normalizes or repaints.
     expect(shown.slice(0, history.length).every((message, index) => message === history[index])).toBe(true)
+  })
+})
+
+// A chat made in this window has never been hydrated, so its warm cache has no
+// persisted-display provenance, and the warm switch hid it until the REST
+// page came back: every first return to a new chat flashed blank, then
+// repainted. Its cache was built only from this window's own stream (there is
+// no earlier history a compressed runtime tail could stand in for, #73646),
+// so it paints at entry like a proven cache; the REST refresh still runs.
+describe('resumeSession warm switch back to a chat created in this window', () => {
+  const firstTurn = [
+    { id: 'user-first', role: 'user' as const, parts: [{ type: 'text' as const, text: 'new chat question' }] },
+    {
+      id: 'assistant-stream-first',
+      role: 'assistant' as const,
+      parts: [{ type: 'text' as const, text: 'new chat answer' }]
+    }
+  ]
+
+  beforeEach(() => {
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback: FrameRequestCallback) => {
+      callback(0)
+
+      return null as unknown as number
+    })
+    vi.mocked(ensureGatewayProfile).mockReset().mockResolvedValue(undefined)
+    vi.mocked(getLatestSessionMessages)
+      .mockReset()
+      .mockResolvedValue({
+        messages: [
+          { id: 1, row_id: 1, role: 'user', content: 'new chat question', timestamp: 1 },
+          { id: 2, row_id: 2, role: 'assistant', content: 'new chat answer', timestamp: 2 }
+        ],
+        session_id: 'stored-new-chat'
+      } as never)
+    setSessions([
+      storedSession({ id: 'stored-other', message_count: 1, profile: 'default' }),
+      storedSession({ id: 'stored-new-chat', message_count: 2, profile: 'default' })
+    ])
+  })
+
+  afterEach(() => {
+    cleanup()
+    setActiveSessionId(null)
+    setSelectedStoredSessionId(null)
+    setMessages([])
+    setSessions([])
+    vi.mocked(ensureGatewayProfile).mockReset().mockResolvedValue(undefined)
+    vi.mocked(requestGatewayForProfile).mockReset()
+    vi.mocked(getLatestSessionMessages)
+      .mockReset()
+      .mockResolvedValue({ messages: [] } as never)
+    vi.restoreAllMocks()
+  })
+
+  it('paints its own streamed transcript at entry instead of a blank wait', async () => {
+    const requestGateway = vi.fn(async (method: string, _params?: Record<string, unknown>) =>
+      method === 'session.activate'
+        ? ({
+            session_id: 'rt-new-chat',
+            session_key: 'stored-new-chat',
+            resumed: 'stored-new-chat',
+            message_count: 2,
+            messages: [],
+            messages_omitted: true,
+            running: false,
+            info: {}
+          } as never)
+        : ({} as never)
+    )
+
+    let harness!: Parameters<Parameters<typeof WarmSwitchHarness>[0]['onReady']>[0]
+    render(<WarmSwitchHarness onReady={ready => (harness = ready)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(harness).toBeDefined())
+    vi.mocked(requestGatewayForProfile).mockImplementation((_profile, method, params) => requestGateway(method, params))
+
+    act(() => {
+      setSelectedStoredSessionId('stored-other')
+      setActiveSessionId('rt-other')
+    })
+
+    markSessionCreatedThisRun('stored-new-chat')
+
+    act(() => {
+      harness.cache.updateSessionState(
+        'rt-other',
+        state => ({ ...state, messages: [{ id: 'o', role: 'user', parts: [{ type: 'text', text: 'other chat' }] }] }),
+        'stored-other'
+      )
+      harness.cache.updateSessionState('rt-new-chat', state => ({ ...state, messages: firstTurn }), 'stored-new-chat')
+    })
+
+    const gatewayReady = deferred<void>()
+    vi.mocked(ensureGatewayProfile).mockReturnValueOnce(gatewayReady.promise)
+    const shownWhileWaiting: string[] = []
+    const unlisten = PRIMARY_SESSION_VIEW.$messages.listen(messages => shownWhileWaiting.push(JSON.stringify(messages)))
+
+    const pending = harness.resume('stored-new-chat', true)
+
+    // On screen before the gateway swap resolves, the other chat already gone.
+    expect(JSON.stringify(PRIMARY_SESSION_VIEW.$messages.get())).toContain('new chat answer')
+    expect(JSON.stringify(PRIMARY_SESSION_VIEW.$messages.get())).not.toContain('other chat')
+
+    await act(async () => {
+      gatewayReady.resolve()
+      await pending
+    })
+
+    unlisten()
+    expect($activeSessionId.get()).toBe('rt-new-chat')
+    expect(JSON.stringify(PRIMARY_SESSION_VIEW.$messages.get())).toContain('new chat answer')
+    // Never blank once painted: the refresh reconciles in place.
+    const firstPaint = shownWhileWaiting.findIndex(shown => shown.includes('new chat answer'))
+    expect(shownWhileWaiting.slice(firstPaint).every(shown => shown.includes('new chat answer'))).toBe(true)
   })
 })
