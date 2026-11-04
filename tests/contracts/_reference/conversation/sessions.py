@@ -2,7 +2,7 @@
 
 Registered onto the assembled backend as the ``sessions`` attribute per the append-only extension contract in ``backend.py``. Rows live under the ``"sessions"`` key of the owning scope's namespace, so cross-scope isolation is structural. A row keeps its stamps as UTC ``datetime`` (the other reference capabilities read them so); :class:`SessionRecord` is built in one place, ``_record``, which converts them to epoch floats and composes the columns other capabilities own (usage, runtime revision, handoff, compression cooldown, rewind count).
 
-The verbs are split by topic across this module (rows, record, lifecycle, simple reads), ``sessions_titles_config`` (titles, model config, flags), ``sessions_delete`` (deletion, retirement, backfills) and ``sessions_listing`` (listings and counts); the one repository class composes them.
+The verbs are split by topic across this module (rows, record, lifecycle, simple reads), ``sessions_titles_config`` (titles, model config, flags), ``sessions_delete`` (deletion, retirement, backfills), ``sessions_listing`` (listings and counts) and ``sessions_side_windows`` (the fork's bot-mode side-window stamp); the one repository class composes them.
 
 Retirement fencing: the delete verbs commit through the scope's shared :class:`AuthorityState` transaction so row removal, routing-entry drops and the permanent retirement markers publish in one atomic swap. Deletes refuse targets with live ledger work (``AuthorityRefusal('session_busy')``) or unknown ledger work (:class:`persistence.UnknownExecution`; unknown wins per target), read from the authority ``admissions``/``workers`` tables; ``create`` refuses a retired absent id.
 """
@@ -49,6 +49,7 @@ from ..housekeeping.maintenance import newest_imported_timestamp
 from .transcript_store import _messages_namespace, advance_conversation_generation, newest_transcript_timestamp
 from .sessions_delete import SessionDeleteMixin
 from .sessions_listing import SessionListingMixin
+from .sessions_side_windows import SessionSideWindowsMixin
 from .sessions_titles_config import MARKER_BY_KIND as _MARKER_BY_KIND
 from .sessions_titles_config import SessionTitlesConfigMixin, sync_lineage_markers, tool_pin_text
 from .sessions_titles_config import ascii_lower as _ascii_lower
@@ -209,7 +210,7 @@ def _cooldown_columns(cooldown: Any) -> dict[str, Any]:
     return {"compression_failure_cooldown_until": cooldown.until, "compression_failure_error": cooldown.error}
 
 
-class InMemorySessionRepository(SessionTitlesConfigMixin, SessionDeleteMixin, SessionListingMixin):
+class InMemorySessionRepository(SessionTitlesConfigMixin, SessionDeleteMixin, SessionListingMixin, SessionSideWindowsMixin):
     """See module docstring; semantics follow persistence/conversation/sessions.py exactly."""
 
     def __init__(self, backend: InMemoryBackend) -> None:

@@ -18,7 +18,7 @@ import pytest
 
 from tools import bot_mode_dm, bot_mode_dm_side_window as side, bot_mode_probe, bot_relay
 
-from tests.tools.test_bot_mode_dm import _FakeAgent, _capture_spawn, _managed_home
+from tests.tools.test_bot_mode_dm import _FakeAgent, _append, _capture_spawn, _managed_home, _new_session, _profile_store
 
 
 @pytest.fixture(autouse=True)
@@ -30,19 +30,12 @@ def _fresh_probe_cache():
 
 def _bot_chat(profile_home: Path, *rows) -> None:
     """A real state.db whose canonical Bot Chat holds ``rows`` (role, tool_calls, age seconds)."""
-    from hermes_state import SessionDB
-
-    profile_home.mkdir(parents=True, exist_ok=True)
-    db = SessionDB(db_path=profile_home / "state.db")
-    try:
-        db.create_session(session_id="chat", source="desktop")
-        db.set_session_title("chat", "Bot Chat")
+    with _profile_store(profile_home) as store:
+        _new_session(store, "chat", source="desktop", title="Bot Chat")
         for role, tool_calls, age in rows:
-            db.append_message("chat", role, content=f"{role} row", tool_calls=tool_calls,
-                              tool_call_id="call_1" if role == "tool" else None,
-                              timestamp=time.time() - age)
-    finally:
-        db.close()
+            _append(store, "chat", role, f"{role} row", tool_calls=tool_calls,
+                    tool_call_id="call_1" if role == "tool" else None,
+                    timestamp=time.time() - age)
 
 
 _CALL = [{"id": "call_1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}]
@@ -156,13 +149,13 @@ def test_read_errors_read_as_idle(tmp_path, monkeypatch):
     (target / "state.db").write_bytes(b"this is not a sqlite database" * 64)
     assert side.bot_chat_busy(target) == (False, "")
 
-    import hermes_state
+    import persistence_assembly
 
     def boom(*_a, **_k):
         raise OSError("disk gone")
 
     _bot_chat(target.parent / "other")
-    monkeypatch.setattr(hermes_state, "SessionDB", boom)
+    monkeypatch.setattr(persistence_assembly, "open_persistence_reader", boom)
     assert side.bot_chat_busy(target.parent / "other") == (False, "")
 
 

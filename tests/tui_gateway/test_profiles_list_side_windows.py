@@ -25,9 +25,18 @@ def home(tmp_path, monkeypatch):
 
 
 def _db(home):
-    from hermes_state import SessionDB
+    """A writable storage-interface handle on the tmp default profile's own ``state.db``."""
+    from persistence_assembly import open_persistence, profile_scope
 
-    return SessionDB(db_path=home / "state.db")
+    return open_persistence(profile_scope(home=home), eager=True)
+
+
+def _new(store, sid, title=None):
+    from persistence.conversation.sessions import NewSession
+
+    store.sessions.create(NewSession(session_id=sid, source="cli"))
+    if title is not None:
+        store.sessions.set_title(sid, title)
 
 
 def _default_row(params=None):
@@ -36,14 +45,15 @@ def _default_row(params=None):
 
 
 def test_side_windows_lists_only_stamped_sessions_newest_first(home):
+    from persistence.conversation.messages import NewMessage
+
     db = _db(home)
     try:
         for sid, title in (("plain", "a terminal chat"), ("old", "older window"), ("new", "micro1 | Pricing")):
-            db.create_session(sid, source="cli")
-            db.set_session_title(sid, title)
-            db.append_message(sid, "user", "hi")
-        db.mark_side_window("old", by="bot:atlas", at=1000.0)
-        db.mark_side_window("new", by="bot:neo", at=2000.0)
+            _new(db, sid, title)
+            db.messages.append(sid, NewMessage(role="user", content="hi"))
+        db.sessions.mark_side_window("old", by="bot:atlas", at=1000.0)
+        db.sessions.mark_side_window("new", by="bot:neo", at=2000.0)
     finally:
         db.close()
 
@@ -58,7 +68,7 @@ def test_side_windows_lists_only_stamped_sessions_newest_first(home):
 def test_side_windows_is_empty_without_any(home):
     db = _db(home)
     try:
-        db.create_session("plain", source="cli")
+        _new(db, "plain")
     finally:
         db.close()
 
@@ -68,15 +78,14 @@ def test_side_windows_is_empty_without_any(home):
 def test_a_new_stamp_shows_on_the_very_next_poll(home):
     db = _db(home)
     try:
-        db.create_session("w", source="cli")
-        db.set_session_title("w", "micro1")
+        _new(db, "w", "micro1")
     finally:
         db.close()
     assert _default_row()["side_windows"] == []
 
     db = _db(home)
     try:
-        db.mark_side_window("w", by="bot:neo", at=3000.0)
+        db.sessions.mark_side_window("w", by="bot:neo", at=3000.0)
     finally:
         db.close()
 

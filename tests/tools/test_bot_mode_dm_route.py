@@ -21,10 +21,9 @@ from pathlib import Path
 
 import pytest
 
-from hermes_state import SessionDB
 from tools import bot_mode_dm, bot_mode_dm_side_window as side, bot_mode_probe, bot_relay
 
-from tests.tools.test_bot_mode_dm import _FakeAgent, _capture_spawn, _managed_home
+from tests.tools.test_bot_mode_dm import _FakeAgent, _append, _capture_spawn, _managed_home, _new_session, _profile_store
 
 
 @pytest.fixture(autouse=True)
@@ -72,15 +71,10 @@ def _runner(command):
 
 def _bot_chat(profile_home: Path, *rows) -> None:
     """The target's canonical Bot Chat holding ``rows`` (role, age seconds)."""
-    profile_home.mkdir(parents=True, exist_ok=True)
-    db = SessionDB(db_path=profile_home / "state.db")
-    try:
-        db.create_session(session_id="chat", source="desktop")
-        db.set_session_title("chat", "Bot Chat")
+    with _profile_store(profile_home) as store:
+        _new_session(store, "chat", source="desktop", title="Bot Chat")
         for role, age in rows:
-            db.append_message("chat", role, content=f"{role} row", timestamp=time.time() - age)
-    finally:
-        db.close()
+            _append(store, "chat", role, f"{role} row", timestamp=time.time() - age)
 
 
 def _send(home, message="check the micro1 call", *, topic="", session_id="sess-1"):
@@ -89,21 +83,39 @@ def _send(home, message="check the micro1 call", *, topic="", session_id="sess-1
     return json.loads(bot_mode_dm.message_agent_tool("researcher", message, agent=agent, topic=topic))
 
 
+def _mint_window(profile_home: Path, title: str) -> str:
+    """A finished side-window turn's row, as the gateway (the single writer) mints it through the
+    transport's ``chat -c <title> --create-if-missing``: titled, holding the DM and its reply. The
+    runner never pre-mints it (a row it wrote was not gateway-owned: permission_denied, 4 Nov 2026)."""
+    with _profile_store(profile_home) as store:
+        existing = store.sessions.resolve_by_title(title)
+        if existing:
+            return existing
+        session_id = f"gw-{time.time_ns()}"
+        _new_session(store, session_id, source="cli", title=title)
+        _append(store, session_id, "user", "a DM")
+        _append(store, session_id, "assistant", "REPLY")
+        return session_id
+
+
 def _deliver(home, call, monkeypatch):
     """Run the spawned runner in-process against a fake transport, as the background process
-    would: it stamps (and creates) the side window, then runs the turn."""
+    would: it stamps an existing side window, runs the turn (the fake transport mints a new
+    window's row like the gateway's --create-if-missing), then stamps the window."""
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(subprocess, "run",
-                        lambda argv, **_k: subprocess.CompletedProcess(argv, 0, stdout="REPLY", stderr=""))
+
+    def fake_transport(argv, **_k):
+        if "-c" in argv and "-p" in argv:
+            _mint_window(home / "profiles" / argv[argv.index("-p") + 1], argv[argv.index("-c") + 1])
+        return subprocess.CompletedProcess(argv, 0, stdout="REPLY", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_transport)
     assert bot_mode_dm._delivery_main(shlex.split(call["command"])[2:]) == 0
 
 
 def _session_for(profile_home: Path, title: str) -> str | None:
-    db = SessionDB(db_path=profile_home / "state.db")
-    try:
-        return db.resolve_session_by_title(title)
-    finally:
-        db.close()
+    with _profile_store(profile_home) as store:
+        return store.sessions.resolve_by_title(title)
 
 
 # ── routing ──────────────────────────────────────────────────────────────────
@@ -247,8 +259,9 @@ def test_a_different_topic_opens_a_new_tab(tmp_path, spawned, monkeypatch):
 def test_a_new_sender_on_an_existing_title_opens_a_new_tab(tmp_path, spawned, monkeypatch):
     """The key names the sender: another bot's tab with the same title is never reused."""
     home, target = _install(tmp_path)
-    side.stamp_side_window(target, "micro1", author={"id": "bot:atlas", "name": "atlas", "is_bot": True},
-                           key="bot:atlas>researcher|topic:micro1")
+    _mint_window(target, "micro1")
+    assert side.stamp_side_window(target, "micro1", author={"id": "bot:atlas", "name": "atlas", "is_bot": True},
+                                  key="bot:atlas>researcher|topic:micro1")
 
     result = _send(home, topic="micro1")
 
@@ -289,11 +302,8 @@ def test_a_busy_reused_tab_opens_a_numbered_tab(tmp_path, spawned, monkeypatch):
     _send(home, topic="micro1")
     _deliver(home, spawned[0], monkeypatch)
     window_id = _session_for(target, "micro1")
-    db = SessionDB(db_path=target / "state.db")
-    try:
-        db.append_message(window_id, "user", content="mid-turn", timestamp=time.time())
-    finally:
-        db.close()
+    with _profile_store(target) as store:
+        _append(store, window_id, "user", "mid-turn", timestamp=time.time())
 
     result = _send(home, topic="micro1")
 
