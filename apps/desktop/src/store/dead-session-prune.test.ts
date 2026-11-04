@@ -301,6 +301,10 @@ describe('watchDeadSessionPrune', () => {
       $sessions.set([row('a')])
       vi.advanceTimersByTime(1_000)
       $sessions.set([row('a'), row('b')])
+      // Other $sessions listeners persist to localStorage, and jsdom queues each
+      // write's `storage` event on a 0 ms (faked) timer. Flush those so the count
+      // below sees only the sweep timer, which is still 1 s out.
+      vi.advanceTimersByTime(0)
       expect(vi.getTimerCount()).toBe(1)
 
       vi.advanceTimersByTime(1_000)
