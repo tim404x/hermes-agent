@@ -20,6 +20,7 @@ import { isSlashCommandText } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
 import { clearClarifyRequest } from '@/store/clarify'
 import type { ComposerAttachment } from '@/store/composer'
+import { newClientMessageId } from '@/store/composer-queue'
 import { resetSessionBackground } from '@/store/composer-status'
 import { confirm } from '@/store/confirm'
 import { notify, notifyError } from '@/store/notifications'
@@ -70,6 +71,7 @@ import {
   isDeepTruncateRefusal,
   markSessionRecentlyInterrupted,
   shouldInterruptBeforeRewind,
+  type SteerOptions,
   type SubmitTextOptions,
   withSessionNotFoundResume
 } from '../session/hooks/use-prompt-actions/utils'
@@ -400,9 +402,10 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
   // result: no optimistic bubble, no user turn. The main composer has the same
   // primitive in use-prompt-actions.
   const injectHiddenPrompt = useCallback(
-    async (rawText: string): Promise<boolean> => {
+    async (rawText: string, options?: SteerOptions): Promise<boolean> => {
       const text = rawText.trim()
       const sessionId = runtimeIdRef.current
+      const clientMessageId = options?.clientMessageId ?? newClientMessageId()
 
       if (!text || !sessionId) {
         return false
@@ -412,14 +415,20 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
         const { result } = await withSessionNotFoundResume(
           sessionId,
           storedIdRef.current,
-          liveId => requestSessionGateway<{ status?: string }>('session.steer', { session_id: liveId, text }),
+          liveId =>
+            requestSessionGateway<{ status?: string }>('session.steer', {
+              client_message_id: clientMessageId,
+              session_id: liveId,
+              text
+            }),
           {
             requestGateway: requestSessionGateway,
             onRecovered: bindRecoveredRuntime
           }
         )
 
-        return result?.status === 'queued'
+        // `duplicate`: this note was already delivered by another path of the same send.
+        return result?.status === 'queued' || result?.status === 'duplicate'
       } catch {
         return false
       }
@@ -428,7 +437,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
   )
 
   const steerPrompt = useCallback(
-    async (rawText: string, mode: 'interrupt' | 'steer' = 'interrupt'): Promise<boolean> => {
+    async (rawText: string, mode: 'interrupt' | 'steer' = 'interrupt', options?: SteerOptions): Promise<boolean> => {
       const text = rawText.trim()
       const sessionId = runtimeIdRef.current
 
@@ -436,6 +445,10 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
         return false
       }
 
+      // One id for this send action, the same one the composer gives any queue copy it keeps
+      // when the correction fails, so the gateway runs the words once and answers a repeat
+      // `duplicate` (the main chat's redirectPrompt does the same).
+      const clientMessageId = options?.clientMessageId ?? newClientMessageId()
       const messageId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
       const mutate = (updater: (state: ClientSessionState) => ClientSessionState) =>
@@ -470,6 +483,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
           storedIdRef.current,
           liveId =>
             requestSessionGateway<{ status?: string }>(mode === 'steer' ? 'session.steer' : 'session.redirect', {
+              client_message_id: clientMessageId,
               session_id: liveId,
               text
             }),
@@ -478,6 +492,14 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
             onRecovered: bindRecoveredRuntime
           }
         )
+
+        if (result?.status === 'duplicate') {
+          // An earlier path of this same send already delivered these words and painted their
+          // bubble; this attempt's echo would be a second bubble for one message.
+          discardOptimisticMessage()
+
+          return true
+        }
 
         if (result?.status === 'redirected') {
           if (mode === 'interrupt') {
