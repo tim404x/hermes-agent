@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from hermes_state import SessionDB
-from tools import bot_mode_dm, bot_mode_dm_side_window as side, bot_mode_probe, bot_relay
+from tools import bot_mode_dm, bot_mode_dm_side_window as side, bot_mode_probe
 
 from tests.tools.test_bot_mode_dm import _managed_home
 
@@ -55,22 +55,46 @@ def _side_argv(title="micro1"):
 # ── the stamp ────────────────────────────────────────────────────────────────
 
 
-def test_a_new_window_is_created_titled_and_marked(target):
-    session_id = side.stamp_side_window(target, "micro1 | Pricing", author=AUTHOR)
-
-    db = _db(target)
+def _window(profile_home: Path, sid: str, title: str, *, message: bool = True) -> None:
+    """A window row as the gateway mints it on the transport's first turn (with its first DM)."""
+    db = _db(profile_home)
     try:
-        row = db.get_session_by_title("micro1 | Pricing")
-        assert row["id"] == session_id
-        # The same shape `chat -c <title> --create-if-missing` mints, so the CLI simply resumes it.
-        assert row["source"] == "cli"
+        db.create_session(sid, source="cli")
+        db.set_session_title(sid, title)
+        if message:
+            db.append_message(sid, "user", "a DM")
     finally:
         db.close()
+
+
+def test_a_new_window_is_not_pre_minted(target):
+    # The gateway (single writer) mints a new window through --create-if-missing; a row written
+    # here directly is not gateway-owned and its turn fails with permission_denied (4 Nov 2026).
+    assert side.stamp_side_window(target, "micro1 | Pricing", author=AUTHOR) is None
+    db = _db(target)
+    try:
+        assert db.get_session_by_title("micro1 | Pricing") is None
+    finally:
+        db.close()
+    assert _windows(target) == []
+
+
+def test_an_existing_window_is_marked(target):
+    _window(target, "w1", "micro1 | Pricing")
+    assert side.stamp_side_window(target, "micro1 | Pricing", author=AUTHOR) == "w1"
     [window] = _windows(target)
-    assert window["id"] == session_id
-    assert window["title"] == "micro1 | Pricing"
-    assert window["by"] == "bot:neo"
+    assert (window["id"], window["title"], window["by"]) == ("w1", "micro1 | Pricing", "bot:neo")
     assert window["at"] > 0
+
+
+def test_an_empty_premint_from_an_older_runner_is_dropped(target):
+    _window(target, "old", "micro1", message=False)
+    assert side.stamp_side_window(target, "micro1", author=AUTHOR) is None
+    db = _db(target)
+    try:
+        assert db.get_session("old") is None
+    finally:
+        db.close()
 
 
 def test_a_new_dm_into_an_existing_window_restamps_it(target, monkeypatch):
@@ -109,6 +133,7 @@ def test_the_stamp_lands_on_the_compression_tip_the_cli_resumes(target):
 
 
 def test_a_marked_lineage_lists_once_under_its_tip(target):
+    _window(target, "w1", "micro1")
     side.stamp_side_window(target, "micro1", author=AUTHOR)
     db = _db(target)
     try:
@@ -132,6 +157,7 @@ def test_plain_cli_chats_never_list(target):
         db.create_session("cron1", source="cron")
     finally:
         db.close()
+    _window(target, "w1", "micro1")
     side.stamp_side_window(target, "micro1", author=AUTHOR)
 
     assert [w["title"] for w in _windows(target)] == ["micro1"]
@@ -167,12 +193,24 @@ def test_a_stamp_failure_never_raises(tmp_path):
 
 
 def _fake_run(monkeypatch, target, *responses):
-    """subprocess.run stand-in that records, per call, the windows already stamped AT that moment."""
+    """subprocess.run stand-in that records, per call, the windows already stamped AT that moment,
+    then mints the transport's titled row the way the gateway's --create-if-missing does."""
     seen = []
     queue = list(responses)
 
     def fake_run(argv, **kwargs):
         seen.append(sorted(w["title"] for w in _windows(target)))
+        title = argv[argv.index("-c") + 1] if "-c" in argv else None
+        if title:
+            db = _db(target)
+            try:
+                if db.get_session_by_title(title) is None:
+                    sid = "gw-" + str(len(seen))
+                    db.create_session(sid, source="cli")
+                    db.set_session_title(sid, title)
+                    db.append_message(sid, "user", "hi")
+            finally:
+                db.close()
         return queue.pop(0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -185,8 +223,9 @@ def _dm(tmp_path):
     return str(dm_file)
 
 
-def test_a_side_window_turn_is_stamped_before_its_transport_runs(tmp_path, target, monkeypatch):
+def test_an_existing_window_is_stamped_before_its_transport_runs(tmp_path, target, monkeypatch):
     monkeypatch.setattr(bot_mode_dm, "_default_home", lambda: str(target.parent.parent))
+    _window(target, "w1", "micro1")
     seen = _fake_run(monkeypatch, target, subprocess.CompletedProcess([], 0, stdout="REPLY", stderr=""))
 
     code = bot_mode_dm._run_delivery(_side_argv("micro1"), _dm(tmp_path), stdin_file=False,
@@ -197,15 +236,29 @@ def test_a_side_window_turn_is_stamped_before_its_transport_runs(tmp_path, targe
     assert _windows(target)[0]["by"] == "bot:neo"
 
 
+def test_a_new_window_is_stamped_right_after_the_gateway_mints_it(tmp_path, target, monkeypatch):
+    monkeypatch.setattr(bot_mode_dm, "_default_home", lambda: str(target.parent.parent))
+    seen = _fake_run(monkeypatch, target, subprocess.CompletedProcess([], 0, stdout="REPLY", stderr=""))
+
+    code = bot_mode_dm._run_delivery(_side_argv("micro1"), _dm(tmp_path), stdin_file=False,
+                                     profile_home=target, author=AUTHOR, side_window=True)
+
+    assert code == 0
+    assert seen == [[]]
+    assert [w["title"] for w in _windows(target)] == ["micro1"]
+
+
 def test_the_numbered_retry_window_gets_its_own_stamp(tmp_path, target, monkeypatch):
     monkeypatch.setattr(bot_mode_dm, "_default_home", lambda: str(target.parent.parent))
+    _window(target, "w1", "micro1")
     not_owned = subprocess.CompletedProcess([], 1, stdout="", stderr="hermes-refusal-reason: SESSION_NOT_OWNED\n")
     seen = _fake_run(monkeypatch, target, not_owned, subprocess.CompletedProcess([], 0, stdout="R", stderr=""))
 
     bot_mode_dm._run_delivery(_side_argv("micro1"), _dm(tmp_path), stdin_file=False,
                               profile_home=target, author=AUTHOR, side_window=True)
 
-    assert seen == [["micro1"], ["micro1", "micro1 (2)"]]
+    assert seen == [["micro1"], ["micro1"]]
+    assert sorted(w["title"] for w in _windows(target)) == ["micro1", "micro1 (2)"]
 
 
 def test_a_bot_chat_turn_is_never_stamped(tmp_path, target, monkeypatch):
@@ -213,7 +266,9 @@ def test_a_bot_chat_turn_is_never_stamped(tmp_path, target, monkeypatch):
     monkeypatch.setattr(bot_mode_dm, "_admit_live_dm", lambda *a, **k: None)
     seen = _fake_run(monkeypatch, target, subprocess.CompletedProcess([], 0, stdout="REPLY", stderr=""))
 
-    bot_mode_dm._run_local_turn(["hermes", "-p", "researcher", *bot_relay.BOT_CHAT_TURN_ARGS], _dm(tmp_path),
+    # The canonical Bot Chat turn argv (upstream retired its BOT_CHAT_TURN_ARGS constant in 8c46622dbb).
+    bot_chat_turn = ("chat", "--in", "~", "-c", "Bot Chat", "--create-if-missing", "-Q")
+    bot_mode_dm._run_local_turn(["hermes", "-p", "researcher", *bot_chat_turn], _dm(tmp_path),
                                 profile_home=target, author=AUTHOR)
 
     assert seen == [[]]
