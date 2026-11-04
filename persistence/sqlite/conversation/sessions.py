@@ -20,7 +20,8 @@ from persistence.conversation.sessions import (
     RecentSessionEntry, ReplaceSessionConfig, RosterSession, RosterSessions, RosterWorker, RuntimeLock,
     SessionCountQuery, SessionCwdUsage, SessionEdge, SessionExists, SessionFacetEntry, SessionLifecycleStatus,
     SessionLineageKind, SessionListEntry, SessionListRow, SessionOrder, SessionQuery, SessionRecencyEntry,
-    SessionRecord, SessionWindow, SkillScaffoldedSession, TitleConflict, TitleSource, is_corrupt_model_config,
+    SessionRecord, SessionWindow, SideWindow, SideWindowMatch, SkillScaffoldedSession, TitleConflict, TitleSource,
+    is_corrupt_model_config,
 )
 from session_rules import onboarding_flow
 from session_rules.legacy_local import same_owner
@@ -42,6 +43,7 @@ from ._store.portability import (
 )
 from ._store.prompt_refresh import count_sessions_with_stored_prompt, prompt_refresh_epoch, request_prompt_refresh
 from ._store.search import search_sessions_by_id
+from ._store.side_windows import find_side_windows, list_side_windows, mark_side_window
 from ._store.sql_common import _sql_session_last_active
 from ._store.sessions import (
     INTERNAL_LISTING_SOURCES, _own_profile_name, _parse_model_config,
@@ -634,6 +636,12 @@ class SQLiteSessionRepository:
         with refusals(holder, session_id):
             return bool(set_session_read(holder, session_id, read))
 
+    def mark_side_window(self, session_id: SessionId, *, by: Optional[str] = None, at: Optional[float] = None,
+                         key: Optional[str] = None) -> bool:
+        holder = self._store.holder()
+        with refusals(holder, session_id):
+            return mark_side_window(holder, session_id, by=by, at=at, key=key)
+
     def unarchive_recoverable(self, session_id: SessionId) -> bool:
         holder = self._store.holder()
         with refusals(holder, session_id):
@@ -839,6 +847,18 @@ class SQLiteSessionRepository:
         holder = self._store.holder()
         with refusals(holder):
             return tuple(SessionId(sid) for sid in stored_reads.subagent_session_ids(holder, subagent_id, marker_key))
+
+    def list_side_windows(self, limit: int = 8) -> tuple[SideWindow, ...]:
+        holder = self._store.holder()
+        with refusals(holder):
+            rows = list_side_windows(holder, limit)
+        return tuple(SideWindow(**{**row, "id": SessionId(row["id"])}) for row in rows)
+
+    def find_side_windows(self, key: str, limit: int = 8) -> tuple[SideWindowMatch, ...]:
+        holder = self._store.holder()
+        with refusals(holder):
+            rows = find_side_windows(holder, key, limit)
+        return tuple(SideWindowMatch(**{**row, "id": SessionId(row["id"])}) for row in rows)
 
     def records_created_surface(self) -> bool:
         holder = self._store.holder()
