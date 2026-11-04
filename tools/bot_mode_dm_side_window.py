@@ -13,6 +13,7 @@ import: the delivery runner imports this after its own bootstrap.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import time
@@ -298,7 +299,17 @@ def stamp_side_window(profile_home: Path | str, title: str, *, author: dict | No
         from hermes_state_registry import acquire
 
         db = acquire(Path(profile_home) / "state.db")
-        session_id = _resolve_window(db, title) or _create_window(db, title)
+        session_id = _resolve_window(db, title)
+        if session_id and _is_stale_premint(db, session_id):
+            # An empty CLI row carrying only our stamp is a pre-mint left by an older runner (not
+            # gateway-owned, so resuming it fails with permission_denied). Drop it so the transport's
+            # --create-if-missing mints a gateway row (Tim, 4 Nov 2026).
+            try:
+                db.set_session_title(session_id, "")  # empty clears it; the delete needs an untitled row
+                db.delete_session_if_empty(session_id)
+            except Exception:
+                logger.warning("message_agent: could not drop pre-minted window %s", session_id, exc_info=True)
+            return None
         if session_id and db.mark_side_window(session_id, by=str((author or {}).get("id") or ""), key=key):
             return session_id
         return None
@@ -317,6 +328,24 @@ def _resolve_window(db, title: str) -> str | None:
     row = db.get_session(title)
     session_id = row["id"] if row else db.resolve_session_by_title(title)
     return (db.get_compression_tip(session_id) or session_id) if session_id else None
+
+
+def _is_stale_premint(db, session_id: str) -> bool:
+    """An empty ``cli`` row whose origin is empty or only our own side-window stamp: what the old
+    runner minted directly. A gateway routing origin (telegram, local, ...) is never touched."""
+    row = db.get_session(session_id)
+    if not row or row["source"] != "cli" or db.message_count(session_id) != 0:
+        return False
+    raw = row["origin_json"] if "origin_json" in row.keys() else None
+    if not raw:
+        return True
+    try:
+        origin = json.loads(raw)
+    except (TypeError, ValueError):
+        return False
+    from hermes_state_side_windows import SIDE_WINDOW_KEY
+
+    return isinstance(origin, dict) and set(origin) == {SIDE_WINDOW_KEY}
 
 
 def _create_window(db, title: str) -> str | None:
