@@ -7,6 +7,7 @@ vi.mock('@/hermes', () => ({
 
 import { saveHermesConfig } from '@/hermes'
 import { isVoiceStopCommand } from '@/lib/voice-stop-word'
+import { pageStorage } from '@/test/page-storage'
 
 import {
   $bargeInEnabled,
@@ -20,13 +21,16 @@ import {
   applyVoiceStopPhraseFromConfig
 } from './voice-prefs'
 
+// Spy where the page's storage methods actually live (upstream's pageStorage helper): jsdom's
+// Storage.prototype on Node 22, the setup's in-memory storage itself on Node >= 25. Spying the
+// jsdom instance defines a stored ITEM called "setItem" and the real write still lands.
 it('keeps the desktop toggle local across config refreshes', async () => {
   for (const fails of [false, true]) {
     for (const enabled of [false, true]) {
       localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(localStorage, 'setItem')
+      const write = vi.spyOn(pageStorage(), 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
@@ -55,7 +59,7 @@ it('migrates the legacy preference once, not on every refresh', async () => {
       localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(localStorage, 'setItem')
+      const write = vi.spyOn(pageStorage(), 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
