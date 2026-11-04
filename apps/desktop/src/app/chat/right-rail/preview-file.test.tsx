@@ -45,22 +45,31 @@ describe('MarkdownPreview', () => {
     expect(img?.getAttribute('src')).toBe('https://example.com/chart.png')
   })
 
-  it('opens an https link in the in-app browser instead of a blank window', async () => {
-    $previewTabs.set([])
-    setAlwaysExternalLinks(false)
-    render(<MarkdownPreview text={'[docs](https://example.com/docs)'} />)
+  // Fork carry "clicked links open in the real browser": a user click goes to
+  // the OS browser even with the always-external setting off, never to a blank
+  // window and never to an in-app tab.
+  it('opens an https link in the OS browser instead of a blank window', async () => {
+    const previousDesktop = window.hermesDesktop
+    const openExternal = vi.fn()
 
-    const anchor = screen.getByRole('link', { name: 'docs' })
-    const click = new MouseEvent('click', { bubbles: true, cancelable: true })
+    window.hermesDesktop = { openExternal } as never
 
-    anchor.dispatchEvent(click)
-    expect(click.defaultPrevented).toBe(true)
+    try {
+      $previewTabs.set([])
+      setAlwaysExternalLinks(false)
+      render(<MarkdownPreview text={'[docs](https://example.com/docs)'} />)
 
-    await waitFor(() => {
-      expect(
-        $previewTabs.get().some(tab => tab.target.kind === 'url' && tab.target.url === 'https://example.com/docs')
-      ).toBe(true)
-    })
+      const anchor = screen.getByRole('link', { name: 'docs' })
+      const click = new MouseEvent('click', { bubbles: true, cancelable: true })
+
+      anchor.dispatchEvent(click)
+      expect(click.defaultPrevented).toBe(true)
+
+      await waitFor(() => expect(openExternal).toHaveBeenCalledWith('https://example.com/docs'))
+      expect($previewTabs.get()).toEqual([])
+    } finally {
+      window.hermesDesktop = previousDesktop
+    }
   })
 
   it('scrolls a table-of-contents link to its heading without changing the app route', () => {
