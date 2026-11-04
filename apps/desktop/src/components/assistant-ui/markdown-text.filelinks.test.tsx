@@ -47,7 +47,7 @@ describe('MarkdownLink filesystem hrefs', () => {
     render(<MarkdownTextContent isRunning={false} text={'See [notes](<~/My Notes/todo with spaces.md>)'} />)
 
     await screen.findByText('todo with spaces.md')
-    expect(screen.getByRole('button', { name: 'Open preview' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Open in browser' })).toBeTruthy()
     expect(screen.queryByText(/blocked/)).toBeNull()
   })
 
@@ -58,7 +58,7 @@ describe('MarkdownLink filesystem hrefs', () => {
     render(<MarkdownTextContent isRunning={false} text={'See [notes](~/My%20Notes/todo%20with%20spaces.md)'} />)
 
     await screen.findByText('todo%20with%20spaces.md')
-    expect(screen.getByRole('button', { name: 'Open preview' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Open in browser' })).toBeTruthy()
   })
 
   it('renders a media player for a media-extension path link', async () => {
