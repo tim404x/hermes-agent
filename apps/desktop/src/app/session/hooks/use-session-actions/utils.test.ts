@@ -1699,6 +1699,54 @@ describe('appendLiveSessionProjection', () => {
     ])
   })
 
+  it('does not re-project the running prompt when a /steer row was persisted after it', () => {
+    // A /steer delivered after a tool batch is written as its own user row
+    // mid-turn, after this turn's committed tool rows. The latest user run is
+    // then just the steer, so the prompt looked unpersisted and switching
+    // sessions and back painted it a second time below the steer.
+    const stored = [
+      msg('prev-user', 'user', 'earlier ask', { timestamp: 50 }),
+      msg('prev-reply', 'assistant', 'earlier answer', { timestamp: 60 }),
+      msg('stored-user', 'user', 'do not say hyped', { timestamp: 100.2 }),
+      msg('stored-tools', 'assistant', 'checking the card', { timestamp: 101 }),
+      msg('stored-steer', 'user', 'use the docsend link', { timestamp: 110 }),
+      msg('stored-after-steer', 'assistant', 'searching sessions', { timestamp: 111 })
+    ]
+
+    const restored = appendLiveSessionProjection(stored, {
+      session_id: 'runtime-1',
+      turn_started_at: 100,
+      inflight: { user: 'do not say hyped', assistant: 'checking the card', streaming: true }
+    })
+
+    expect(restored.filter(message => message.role === 'user').map(message => message.id)).toEqual([
+      'prev-user',
+      'stored-user',
+      'stored-steer'
+    ])
+  })
+
+  it('still projects a repeated prompt whose earlier twin predates the running turn', () => {
+    const stored = [
+      msg('old-user', 'user', 'run it again', { timestamp: 10 }),
+      msg('old-reply', 'assistant', 'done', { timestamp: 20 }),
+      msg('other-user', 'user', 'something else', { timestamp: 30 }),
+      msg('other-reply', 'assistant', 'ok', { timestamp: 40 })
+    ]
+
+    const restored = appendLiveSessionProjection(stored, {
+      session_id: 'runtime-1',
+      turn_started_at: 100,
+      inflight: { user: 'run it again', assistant: '', streaming: true }
+    })
+
+    expect(restored.filter(message => message.role === 'user').map(message => message.id)).toEqual([
+      'old-user',
+      'other-user',
+      'user-inflight-runtime-1'
+    ])
+  })
+
   it('does not duplicate the inflight user when the persisted turn carries @image refs', () => {
     // By the time a stored transcript reaches appendLiveSessionProjection it
     // has already been run through toChatMessages, so the @image directive has

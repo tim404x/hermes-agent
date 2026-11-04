@@ -1,4 +1,3 @@
-
 import { resolveSessionRpcOwner } from '@/app/contrib/wiring-routing'
 import { textWithoutReferenceLines } from '@/components/assistant-ui/reference-kinds'
 import { getSession } from '@/hermes'
@@ -1041,8 +1040,30 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
       message => textWithoutReferenceLines(chatMessageText(message)) === textWithoutReferenceLines(text)
     )
 
+  // A /steer delivered after a tool batch is persisted as its OWN user row in
+  // the middle of the turn, after this turn's committed tool rows. The latest
+  // user run is then just the steer, so the run walk above cannot see the
+  // prompt and a session switch-and-back painted it a second time below the
+  // steer. The prompt row is written at submit (#111868), so a same-text user
+  // row stamped since this turn began is its durable twin. Small slack: the
+  // submit write and the turn-start stamp race by milliseconds either way.
+  const turnStart = projection.turn_started_at
+  const SUBMIT_ROW_SLACK_S = 5
+
+  const persistedSinceTurnStart = (text: string): boolean =>
+    typeof turnStart === 'number' &&
+    turnStart > 0 &&
+    messages.some(
+      message =>
+        message.role === 'user' &&
+        typeof message.timestamp === 'number' &&
+        message.timestamp >= turnStart - SUBMIT_ROW_SLACK_S &&
+        textWithoutReferenceLines(chatMessageText(message)) === textWithoutReferenceLines(text)
+    )
+
   const inflightUserAlreadyPersisted =
-    projection[safelyPersistedInflightUser] === true || (Boolean(inflightUser) && persistedInLatestRun(inflightUser))
+    projection[safelyPersistedInflightUser] === true ||
+    (Boolean(inflightUser) && (persistedInLatestRun(inflightUser) || persistedSinceTurnStart(inflightUser)))
 
   if (inflightUser && !inflightUserAlreadyPersisted) {
     // Project the prompt through the same conversion history uses, so the live
@@ -1157,7 +1178,7 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
   const foldTarget = turnPartiallyCommitted ? committedPartial : null
 
   const pushCorrection = (correction: string, index: number): void => {
-    if (persistedInLatestRun(correction)) {
+    if (persistedInLatestRun(correction) || persistedSinceTurnStart(correction)) {
       return
     }
 
