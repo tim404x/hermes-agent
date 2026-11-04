@@ -155,7 +155,7 @@ import { singleFlightSessionResume } from '../use-prompt-actions/single-flight-r
 import { branchThroughRowId } from './branch-boundary'
 import { branchCreateKey } from './branch-create-key'
 import type { SessionCreateOverrides } from './create-overrides'
-import { markSessionCreatedThisRun, sessionCreatedThisRun } from './created-this-run'
+import { isOwnStreamedTranscript, markSessionCreatedThisRun, sessionCreatedThisRun } from './created-this-run'
 import { captureDisplayHydration } from './display-hydration'
 import { reconcilePersistedLiveTurn } from './persisted-live-turn'
 import { provisionalTranscriptPaint, transcriptRestScope } from './provisional-transcript'
@@ -1326,7 +1326,11 @@ export function useSessionActions({
           storedSessionId
         })
 
-        if (hasPersistedDisplayTranscriptProvenance(warmAtEntry.state, entryProvenance)) {
+        // A chat this window created paints too: its cache is its own stream.
+        if (
+          hasPersistedDisplayTranscriptProvenance(warmAtEntry.state, entryProvenance) ||
+          isOwnStreamedTranscript(storedSessionId, warmAtEntry.state)
+        ) {
           setMessages(warmAtEntry.state.messages)
         }
       }
@@ -1437,8 +1441,14 @@ export function useSessionActions({
           // screen.
           const shouldRefreshPersistedTranscript = !isWatchWindow()
 
+          // A chat created in this window was never hydrated, so it has no
+          // provenance yet, but its cache holds no runtime replay to hide: holding
+          // it blanked every first return to a new chat until the REST page came.
           const suppressUnprovenWarmTranscript =
-            !resumedSameSelectedSession && shouldRefreshPersistedTranscript && !hasValidProvenance
+            !resumedSameSelectedSession &&
+            shouldRefreshPersistedTranscript &&
+            !hasValidProvenance &&
+            !isOwnStreamedTranscript(storedSessionId, cachedViewState)
 
           let releaseHeldTranscriptView = suppressUnprovenWarmTranscript
             ? holdSessionTranscriptView?.(cachedRuntimeId)
