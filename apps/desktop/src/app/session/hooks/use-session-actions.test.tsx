@@ -7244,3 +7244,204 @@ describe('branchStoredSession failure retry', () => {
     })
   })
 })
+
+// Apex chat 20261104_061947_8fad4d: Tim left a turn mid tool batch and came
+// back as the batch ended. The batch persists each result just before its
+// tool.complete fires, so the REST page read on activate can hold the first
+// result row and not the second, while the cache already got both
+// completions. The persisted page used to replace the cached turn verbatim:
+// the second tool lost the result its (never repeated) event delivered and
+// later read "Result unavailable" though its row was in state.db.
+describe('resumeSession warm switch back to a turn whose tool results land mid-read', () => {
+  const persistedRows = [
+    { id: 1, row_id: 1, role: 'user', content: 'do not say hyped', timestamp: 100 },
+    {
+      id: 2,
+      row_id: 2,
+      role: 'assistant',
+      content: '',
+      timestamp: 101,
+      tool_calls: [{ id: 'pm1', function: { name: 'process_manage', arguments: '{"action":"wait"}' } }]
+    },
+    {
+      id: 3,
+      row_id: 3,
+      role: 'tool',
+      tool_call_id: 'pm1',
+      tool_name: 'process_manage',
+      content: '{"status":"exited"}',
+      timestamp: 102
+    },
+    { id: 4, row_id: 4, role: 'user', content: 'use the docsend link', timestamp: 103, display_kind: 'steer' },
+    {
+      id: 5,
+      row_id: 5,
+      role: 'assistant',
+      content: '',
+      timestamp: 104,
+      tool_calls: [
+        { id: 'ss1', function: { name: 'session_search', arguments: '{"query":"docsend"}' } },
+        { id: 'pm2', function: { name: 'process_manage', arguments: '{"action":"wait"}' } }
+      ]
+    },
+    // The read raced the batch: session_search's row is flushed, process_manage's is not yet.
+    {
+      id: 6,
+      row_id: 6,
+      role: 'tool',
+      tool_call_id: 'ss1',
+      tool_name: 'session_search',
+      content: '{"success":true}',
+      timestamp: 105
+    }
+  ]
+
+  const toolCall = (
+    toolCallId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    done?: { at: number; result: unknown }
+  ) => ({
+    type: 'tool-call' as const,
+    toolCallId,
+    toolName,
+    args: args as never,
+    argsText: JSON.stringify(args),
+    timestamp: 104,
+    ...(done ? { completedAt: done.at, result: done.result, isError: false } : {})
+  })
+
+  // The live turn as the stream left it in the cache: both completions arrived.
+  const liveTurn = [
+    {
+      id: 'user-optimistic-1',
+      role: 'user' as const,
+      rowId: 1,
+      parts: [{ type: 'text' as const, text: 'do not say hyped' }]
+    },
+    {
+      id: 'assistant-interim-1',
+      role: 'assistant' as const,
+      interim: true,
+      parts: [toolCall('pm1', 'process_manage', { action: 'wait' }, { at: 102, result: { status: 'exited' } })]
+    },
+    { id: 'user-steer-1', role: 'user' as const, parts: [{ type: 'text' as const, text: 'use the docsend link' }] },
+    {
+      id: 'assistant-stream-rt-B',
+      role: 'assistant' as const,
+      pending: true,
+      parts: [
+        toolCall('ss1', 'session_search', { query: 'docsend' }, { at: 105, result: { success: true } }),
+        toolCall('pm2', 'process_manage', { action: 'wait' }, { at: 106, result: { status: 'exited' } })
+      ]
+    }
+  ]
+
+  const toolParts = (messages: readonly { parts: readonly unknown[] }[]) =>
+    messages.flatMap(message =>
+      message.parts.filter(
+        (part): part is { completedAt?: number; result?: unknown; toolCallId: string } =>
+          (part as { type?: string }).type === 'tool-call'
+      )
+    )
+
+  beforeEach(() => {
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback: FrameRequestCallback) => {
+      callback(0)
+
+      return null as unknown as number
+    })
+    vi.mocked(ensureGatewayProfile).mockReset().mockResolvedValue(undefined)
+    vi.mocked(getLatestSessionMessages)
+      .mockReset()
+      .mockResolvedValue({ messages: persistedRows, session_id: 'stored-B' } as never)
+    setSessions([
+      storedSession({ id: 'stored-A', message_count: 2, profile: 'default' }),
+      storedSession({ id: 'stored-B', message_count: 6, profile: 'default' })
+    ])
+  })
+
+  afterEach(() => {
+    cleanup()
+    setActiveSessionId(null)
+    setSelectedStoredSessionId(null)
+    setAwaitingResponse(false)
+    setBusy(false)
+    setMessages([])
+    setSessions([])
+    vi.mocked(requestGatewayForProfile).mockReset()
+    vi.mocked(getLatestSessionMessages)
+      .mockReset()
+      .mockResolvedValue({ messages: [] } as never)
+    vi.restoreAllMocks()
+  })
+
+  it('keeps a tool result the live stream delivered when the persisted page predates its row', async () => {
+    const requestGateway = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
+      if (method === 'session.activate') {
+        return {
+          session_id: 'rt-B',
+          session_key: 'stored-B',
+          resumed: 'stored-B',
+          message_count: 6,
+          messages: [],
+          messages_omitted: true,
+          running: true,
+          turn_started_at: 100,
+          inflight: {
+            user: 'do not say hyped',
+            corrections: ['use the docsend link'],
+            correction_offsets: [0],
+            assistant: '',
+            streaming: false
+          },
+          info: {}
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let harness!: Parameters<Parameters<typeof WarmSwitchHarness>[0]['onReady']>[0]
+    render(<WarmSwitchHarness onReady={ready => (harness = ready)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(harness).toBeDefined())
+    vi.mocked(requestGatewayForProfile).mockImplementation((_profile, method, params) => requestGateway(method, params))
+
+    act(() => {
+      setSelectedStoredSessionId('stored-A')
+      setActiveSessionId('rt-A')
+    })
+
+    act(() => {
+      harness.cache.updateSessionState('rt-A', state => ({ ...state, messages: [] }), 'stored-A')
+      harness.cache.updateSessionState(
+        'rt-B',
+        state => ({
+          ...state,
+          awaitingResponse: true,
+          busy: true,
+          messages: liveTurn,
+          streamId: 'assistant-stream-rt-B',
+          turnLive: true,
+          turnStartedAt: 100_000
+        }),
+        'stored-B'
+      )
+    })
+
+    await act(async () => {
+      await harness.resume('stored-B', true)
+    })
+
+    const cached = toolParts(harness.cache.sessionStateByRuntimeIdRef.current.get('rt-B')?.messages ?? [])
+    const shown = toolParts(PRIMARY_SESSION_VIEW.$messages.get())
+
+    for (const parts of [cached, shown]) {
+      // Each call once, every one with the result it already has.
+      expect(parts.map(part => part.toolCallId)).toEqual(['pm1', 'ss1', 'pm2'])
+      expect(parts.find(part => part.toolCallId === 'ss1')?.result).toEqual({ success: true })
+      expect(parts.find(part => part.toolCallId === 'pm2')?.result).toEqual({ status: 'exited' })
+      expect(parts.find(part => part.toolCallId === 'pm2')?.completedAt).toBe(106)
+    }
+  })
+})
