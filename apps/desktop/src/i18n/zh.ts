@@ -905,7 +905,9 @@ export const zhOverrides = {
         maxLineLength: '行长度上限'
       },
       codeExecution: {
-        mode: '代码执行模式'
+        mode: '代码执行模式',
+        maxToolCalls: '代码运行工具调用上限',
+        timeout: '代码运行超时（秒）'
       },
       approvals: {
         mode: '审批模式',
@@ -1071,7 +1073,9 @@ export const zhOverrides = {
         daytonaImage: '当执行后端为 Daytona 时使用的镜像。'
       },
       codeExecution: {
-        mode: '代码执行被限定到当前项目的严格程度。'
+        mode: '代码执行被限定到当前项目的严格程度。',
+        maxToolCalls: '单次代码执行在停止前最多可进行的工具调用次数。',
+        timeout: '单次代码执行在被停止前最多可运行的秒数。'
       },
       fileReadMaxChars: 'Hermes 单次文件读取可读取的最大字符数。',
       approvals: {

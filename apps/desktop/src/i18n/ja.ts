@@ -696,7 +696,9 @@ export const jaOverrides = {
         maxLineLength: '行長上限'
       },
       codeExecution: {
-        mode: 'コード実行モード'
+        mode: 'コード実行モード',
+        maxToolCalls: 'コード実行のツール呼び出し上限',
+        timeout: 'コード実行のタイムアウト（秒）'
       },
       approvals: {
         mode: '承認モード',
@@ -848,7 +850,9 @@ export const jaOverrides = {
         envPassthrough: 'ツール実行へ渡す環境変数です。'
       },
       codeExecution: {
-        mode: 'コード実行を現在のプロジェクトにどれだけ厳密に制限するかを設定します。'
+        mode: 'コード実行を現在のプロジェクトにどれだけ厳密に制限するかを設定します。',
+        maxToolCalls: '1 回のコード実行が停止するまでに行えるツール呼び出しの最大数です。',
+        timeout: '1 回のコード実行が停止されるまでにかけられる最大秒数です。'
       },
       fileReadMaxChars: 'Hermes が 1 回のファイル読み取りで取得できる最大文字数です。',
       approvals: {

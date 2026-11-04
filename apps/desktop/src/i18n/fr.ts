@@ -1191,7 +1191,11 @@ export const frOverrides = {
         maxLines: 'Limite de pagination de fichier',
         maxLineLength: 'Limite de longueur de ligne'
       },
-      codeExecution: { mode: "Mode d'exécution du code" },
+      codeExecution: {
+        mode: "Mode d'exécution du code",
+        maxToolCalls: "Limite d'appels d'outils par exécution de code",
+        timeout: "Délai d'exécution du code (secondes)"
+      },
       approvals: {
         mode: "Mode d'approbation",
         timeout: "Délai d'expiration de l'approbation",
@@ -1361,7 +1365,9 @@ export const frOverrides = {
         daytonaImage: "Image utilisée lorsque le backend d'exécution est Daytona."
       },
       codeExecution: {
-        mode: "Degré de restriction de l'exécution du code au projet actuel."
+        mode: "Degré de restriction de l'exécution du code au projet actuel.",
+        maxToolCalls: "Nombre maximal d'appels d'outils qu'une exécution de code peut faire avant de s'arrêter.",
+        timeout: "Nombre maximal de secondes qu'une exécution de code peut durer avant d'être arrêtée."
       },
       fileReadMaxChars: 'Nombre maximal de caractères que Hermes peut lire dans une demande de fichier.',
       approvals: {
@@ -3700,6 +3706,9 @@ export const frOverrides = {
     row: {
       pin: 'Épingler',
       unpin: 'Désépingler',
+      pinInProject: 'Épingler dans le projet',
+      unpinFromProject: 'Désépingler du projet',
+      projectPinFailed: "Impossible de mettre à jour l'épinglage du projet",
       markUnread: 'Marquer comme non lue',
       markRead: 'Marquer comme lue',
       unreadFailed: "Impossible de mettre à jour l'état de lecture",

@@ -1186,7 +1186,11 @@ export const deOverrides = {
         maxLines: 'Datei-Seitenlimit',
         maxLineLength: 'Zeilenlängenlimit'
       },
-      codeExecution: { mode: 'Code-Ausführungsmodus' },
+      codeExecution: {
+        mode: 'Code-Ausführungsmodus',
+        maxToolCalls: 'Tool-Aufruflimit pro Code-Ausführung',
+        timeout: 'Timeout der Code-Ausführung (Sekunden)'
+      },
       approvals: {
         mode: 'Genehmigungsmodus',
         timeout: 'Genehmigungs-Timeout',
@@ -1355,7 +1359,9 @@ export const deOverrides = {
         daytonaImage: 'Image, das verwendet wird, wenn das Ausführungs-Backend Daytona ist.'
       },
       codeExecution: {
-        mode: 'Wie streng die Code-Ausführung auf das aktuelle Projekt begrenzt ist.'
+        mode: 'Wie streng die Code-Ausführung auf das aktuelle Projekt begrenzt ist.',
+        maxToolCalls: 'Maximale Anzahl an Tool-Aufrufen, die eine Code-Ausführung machen darf, bevor sie stoppt.',
+        timeout: 'Maximale Sekunden, die eine Code-Ausführung dauern darf, bevor sie gestoppt wird.'
       },
       fileReadMaxChars: 'Maximale Zeichenzahl, die Hermes aus einer Dateianfrage lesen kann.',
       approvals: {
@@ -3693,6 +3699,9 @@ export const deOverrides = {
     row: {
       pin: 'Anpinnen',
       unpin: 'Lösen',
+      pinInProject: 'Im Projekt anpinnen',
+      unpinFromProject: 'Im Projekt lösen',
+      projectPinFailed: 'Projekt-Pin konnte nicht aktualisiert werden',
       markUnread: 'Als ungelesen markieren',
       markRead: 'Als gelesen markieren',
       unreadFailed: 'Ungelesen-Status konnte nicht aktualisiert werden',
