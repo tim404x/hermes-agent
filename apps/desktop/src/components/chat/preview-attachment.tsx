@@ -281,7 +281,6 @@ export function PreviewAttachment({ target }: { target: string }) {
         className="shrink-0 rounded-md border border-(--ui-stroke-tertiary) bg-background/40 px-2 py-1 text-[0.7rem] font-medium text-muted-foreground transition-colors hover:bg-accent/55 hover:text-foreground disabled:opacity-50"
         disabled={opening}
         onClick={() => void openInBrowser()}
-        title={t.preview.openInBrowser}
         type="button"
       >
         {opening
