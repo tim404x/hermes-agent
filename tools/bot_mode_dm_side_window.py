@@ -97,17 +97,20 @@ def bot_chat_busy(profile_home: Path | str) -> tuple[bool, str]:
     return bool(why), why
 
 
-def unfinished_turn_at(db, session_id: str) -> float | None:
-    """When *session_id*'s newest row was written, if that row leaves a turn open: role user or
-    tool, or an assistant row still carrying tool_calls. None when the session is empty or ends on
-    a finished assistant reply. Clock-free, so a caller may memoise it per store state."""
-    newest = db.get_messages(session_id, latest=True, limit=1)
+def unfinished_turn_at(store, session_id: str) -> float | None:
+    """When *session_id*'s newest active row was written, if that row leaves a turn open: role user
+    or tool, or an assistant row still carrying tool_calls. None when the session is empty or ends on
+    a finished assistant reply. ``store`` is a storage-interface handle (``persistence_assembly``).
+    Clock-free, so a caller may memoise it per store state."""
+    from persistence.conversation.messages import TranscriptRead
+
+    newest = store.messages.read_transcript(session_id, TranscriptRead(latest=True, limit=1))
     if not newest:
         return None
     last = newest[-1]
-    if last.get("role") == "assistant" and not last.get("tool_calls"):
+    if last.role == "assistant" and not last.tool_calls:
         return None
-    return float(last.get("timestamp") or 0)
+    return float(last.timestamp or 0)
 
 
 def turn_is_fresh(started_at: float | None, now: float | None = None) -> bool:
@@ -117,25 +120,22 @@ def turn_is_fresh(started_at: float | None, now: float | None = None) -> bool:
     return (time.time() if now is None else now) - started_at <= BUSY_TURN_MAX_AGE_SECONDS
 
 
-def session_mid_turn(db, session_id: str, now: float | None = None) -> bool:
+def session_mid_turn(store, session_id: str, now: float | None = None) -> bool:
     """*session_id* is mid-turn right now: its newest row leaves a turn open, and it is fresh."""
-    return turn_is_fresh(unfinished_turn_at(db, session_id), now)
+    return turn_is_fresh(unfinished_turn_at(store, session_id), now)
 
 
 def _mid_turn(home: Path) -> str:
     """The Bot Chat tip is mid-turn (``session_mid_turn``)."""
     if not (home / "state.db").is_file():
         return ""
-    from hermes_state import SessionDB
+    from persistence_assembly import open_persistence_reader
     from tools.bot_mode_probe import BOT_CHAT_TITLE
 
-    db = SessionDB(db_path=home / "state.db", read_only=True)
-    try:
-        row = db.get_session_by_title(BOT_CHAT_TITLE)
-        tip = db.get_compression_tip(row["id"]) if row else None
-        busy = bool(tip) and session_mid_turn(db, tip)
-    finally:
-        db.close()
+    with open_persistence_reader(home) as store:
+        row = store.sessions.get_by_title(BOT_CHAT_TITLE)
+        tip = store.lineage.tip(row.session_id) if row else None
+        busy = bool(tip) and session_mid_turn(store, tip)
     return "mid-turn in its Bot Chat" if busy else ""
 
 
@@ -215,28 +215,25 @@ def resolve_window(profile_home: Path | str, profile: str, key: str, title: str,
     home = Path(profile_home)
     if not (home / "state.db").is_file():
         return title, False
-    from hermes_state import SessionDB
+    from persistence_assembly import open_persistence_reader
     from tools.bot_mode_probe import _hermes_root
     from tools.bot_relay import turn_lock_held
 
     root = _hermes_root(home)
-    db = SessionDB(db_path=home / "state.db", read_only=True)
-    try:
+    with open_persistence_reader(home) as store:
         busy_tab = ""
-        for window in db.find_side_windows(key):
-            if not window["title"] or now - window["last_active"] > REUSE_MAX_IDLE_SECONDS:
+        for window in store.sessions.find_side_windows(key):
+            if not window.title or now - window.last_active > REUSE_MAX_IDLE_SECONDS:
                 continue
-            if session_mid_turn(db, window["id"], now) or turn_lock_held(
-                    root, side_window_lock_name(profile, window["title"])):
-                busy_tab = busy_tab or window["title"]
+            if session_mid_turn(store, window.id, now) or turn_lock_held(
+                    root, side_window_lock_name(profile, window.title)):
+                busy_tab = busy_tab or window.title
                 continue
-            return window["title"], True
-        return _free_title(db, busy_tab or title, numbered=bool(busy_tab)), False
-    finally:
-        db.close()
+            return window.title, True
+        return _free_title(store, busy_tab or title, numbered=bool(busy_tab)), False
 
 
-def _free_title(db, title: str, *, numbered: bool) -> str:
+def _free_title(store, title: str, *, numbered: bool) -> str:
     """``title`` when no session holds it (``numbered``: start at ``(2)``), else the next free
     ``"<stem> (N)"``."""
     match = _NUMBERED_RE.search(title) if numbered else None
@@ -244,7 +241,7 @@ def _free_title(db, title: str, *, numbered: bool) -> str:
     first = int(match.group(1)) + 1 if match else 2
     candidates = ([] if numbered else [title]) + [f"{stem} ({n})" for n in range(first, _MAX_NUMBERED_TABS + 1)]
     for candidate in candidates:
-        if db.resolve_session_by_title(candidate) is None:
+        if store.sessions.resolve_by_title(candidate) is None:
             return candidate
     return candidates[-1]
 
@@ -288,49 +285,90 @@ def stamp_side_window(profile_home: Path | str, title: str, *, author: dict | No
     """Mark the session a side-window turn is about to run, so the desktop opens it as a tab.
 
     Resolves ``title`` exactly as the transport's ``chat -c <title>`` will (id, then title with its
-    ``#N`` continuation, then the compression tip) and creates the titled CLI session when it is
-    new, the same row ``--create-if-missing`` would mint, so the tab can appear before the turn
-    starts. ``key`` records the conversation (``side_window_key``) so its next DM finds this tab.
-    Runs inside the window's turn lock. Returns the stamped id; a failure is logged and
-    answers None, because a missing tab must never cost the DM."""
-    db = None
+    ``#N`` continuation, then the compression tip) and stamps that row through the target's own
+    store (``sessions.mark_side_window``). It never writes a window row: a new window is minted by
+    the gateway through the transport's ``--create-if-missing`` and stamped right after that turn
+    (Tim, 4 Nov 2026), and a target without a store has no window yet. ``key`` records the
+    conversation (``side_window_key``) so its next DM finds this tab. Runs inside the window's turn
+    lock. Returns the stamped id; a failure is logged and answers None, because a missing tab must
+    never cost the DM."""
+    store = None
     try:
-        from hermes_state_registry import acquire
+        from persistence_assembly import open_persistence, profile_scope, store_exists
 
-        db = acquire(Path(profile_home) / "state.db")
-        session_id = _resolve_window(db, title) or _create_window(db, title)
-        if session_id and db.mark_side_window(session_id, by=str((author or {}).get("id") or ""), key=key):
+        scope = profile_scope(home=Path(profile_home))
+        if not store_exists(scope):
+            return None
+        store = open_persistence(scope, eager=True)
+        session_id = _resolve_window(store, title)
+        if session_id and _is_stale_premint(store, session_id):
+            # An empty CLI row carrying only our stamp is a pre-mint left by an older runner (not
+            # gateway-owned, so resuming it fails with permission_denied). Drop it so the transport's
+            # --create-if-missing mints a gateway row (Tim, 4 Nov 2026).
+            try:
+                _drop_premint(store, Path(profile_home), session_id)
+            except Exception:
+                logger.warning("message_agent: could not drop pre-minted window %s", session_id, exc_info=True)
+            return None
+        if session_id and store.sessions.mark_side_window(
+                session_id, by=str((author or {}).get("id") or ""), key=key):
             return session_id
         return None
     except Exception:
         logger.warning("message_agent: could not stamp side window %r in %s", title, profile_home, exc_info=True)
         return None
     finally:
-        if db is not None:
-            from hermes_state_registry import release_or_close
-
-            release_or_close(db)
+        if store is not None:
+            store.close()
 
 
-def _resolve_window(db, title: str) -> str | None:
+def _resolve_window(store, title: str) -> str | None:
     """``hermes_cli.main._resolve_session_by_name_or_id`` against the target's own store."""
-    row = db.get_session(title)
-    session_id = row["id"] if row else db.resolve_session_by_title(title)
-    return (db.get_compression_tip(session_id) or session_id) if session_id else None
+    record = store.sessions.get(title)
+    session_id = record.session_id if record else store.sessions.resolve_by_title(title)
+    if not session_id and title.startswith("local-"):
+        session_id = store.sessions.resolve_id(title)
+    return (store.lineage.tip(session_id) or session_id) if session_id else None
 
 
-def _create_window(db, title: str) -> str | None:
-    from hermes_state_ids import new_session_id
+def _is_stale_premint(store, session_id: str) -> bool:
+    """An empty ``cli`` row whose origin is empty or only our own side-window stamp: what the old
+    runner minted directly. A gateway routing origin (telegram, local, ...) is never touched."""
+    from persistence.conversation.messages import TranscriptRead, TranscriptView
+    from persistence.conversation.sessions import origin_is_side_window_only
 
-    session_id = new_session_id()
-    db.create_session(session_id, source="cli")
+    record = store.sessions.get(session_id)
+    if record is None or record.source != "cli" or record.message_count:
+        return False
+    if store.messages.read_transcript(session_id, TranscriptRead(view=TranscriptView.ALL, limit=1)):
+        return False
+    return not record.origin_json or origin_is_side_window_only(record.origin_json)
+
+
+def _drop_premint(store, profile_home: Path, session_id: str) -> None:
+    """Delete a stale pre-minted window row, then run the delete's post-commit work
+    (``session_retention``) for the target profile."""
+    from persistence import SessionId
+
+    store.sessions.set_title(SessionId(session_id), "")  # empty clears it; the delete needs an untitled row
+    removed = store.sessions.delete_if_empty(SessionId(session_id), media_root=_media_root(profile_home))
+    if removed:
+        from session_retention import after_sessions_removed
+
+        after_sessions_removed(store, store.scope.profile_dir, removed, reason="delete", primary=session_id,
+                               sessions_dir=profile_home / "sessions")
+
+
+def _media_root(profile_home: Path) -> str:
+    """The target profile's retained native-input root, as that profile's own processes resolve it."""
+    from gateway.session_ingress_media import native_inputs_root
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(profile_home)
     try:
-        db.set_session_title(session_id, title)
-    except ValueError:
-        # Another writer took the title first: drop our empty row and use theirs.
-        db.delete_session_if_empty(session_id)
-        return _resolve_window(db, title)
-    return session_id
+        return str(native_inputs_root())
+    finally:
+        reset_hermes_home_override(token)
 
 
 def side_window_lock_name(profile: str, title: str) -> str:
