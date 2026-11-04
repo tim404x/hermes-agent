@@ -22,9 +22,14 @@ const { isDesktopFsRemoteMode, notifyError, openPreview, openPreviewTargetInBrow
   openPreviewTargetInBrowser: vi.fn(async () => {})
 }))
 
-vi.mock('@/app/chat/session-view', () => ({
-  useSessionView: () => ({ $cwd: { get: () => '/work', listen: () => () => {}, subscribe: () => () => {} } })
-}))
+// The card reads cwd plus the stored/runtime session ids from its session view.
+// Real atoms, so every store the component subscribes to exists.
+vi.mock('@/app/chat/session-view', async () => {
+  const { atom } = await import('nanostores')
+  const view = { $cwd: atom('/work'), $runtimeId: atom<string | null>(null), $storedId: atom<string | null>(null) }
+
+  return { useSessionView: () => view }
+})
 
 vi.mock('@/lib/desktop-fs', () => ({
   isDesktopFsRemoteMode,

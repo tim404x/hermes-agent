@@ -43,17 +43,19 @@ async function clickLinkIn(text: string, event: MouseEvent) {
 }
 
 describe('terminal links', () => {
-  it('opens a ⌘-clicked URL in the in-app browser, not the window.open Electron denies', async () => {
+  // Fork carry "clicked links open in the real browser": openLink hands every
+  // user click to the OS browser, so the terminal never opens an in-app tab.
+  it('opens a ⌘-clicked URL in the OS browser, not the window.open Electron denies', async () => {
     const uri = 'https://example.com/path'
 
     expect(await clickLinkIn(uri, new MouseEvent('click', { metaKey: true }))).toBe(uri)
-    expect(openExternal).not.toHaveBeenCalled()
-    await vi.waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe(uri))
+    expect(openExternal).toHaveBeenCalledWith(uri)
+    expect($previewTabs.get()).toHaveLength(0)
   })
 
-  // The terminal spends ⌘/Ctrl on activation itself, so ⇧ is what escapes to
-  // the OS browser here.
-  it('escapes to the OS browser on ⇧⌘-click', async () => {
+  // ⇧⌘ used to be the escape hatch out of the in-app pane; it still lands in
+  // the OS browser.
+  it('opens a ⇧⌘-clicked URL in the OS browser too', async () => {
     const uri = 'https://example.com/path'
 
     await clickLinkIn(uri, new MouseEvent('click', { metaKey: true, shiftKey: true }))
@@ -74,7 +76,8 @@ describe('terminal links', () => {
       start: { x: 1, y: 1 }
     })
 
-    await vi.waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/osc8'))
+    expect(openExternal).toHaveBeenCalledWith('https://example.com/osc8')
+    expect($previewTabs.get()).toHaveLength(0)
   })
 })
 
