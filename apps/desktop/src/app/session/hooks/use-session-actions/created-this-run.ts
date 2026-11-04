@@ -22,3 +22,17 @@ export function markSessionCreatedThisRun(storedSessionId: string): void {
 export function sessionCreatedThisRun(storedSessionId: string): boolean {
   return createdThisRun.has(storedSessionId)
 }
+
+/** A warm cache of a chat this window created, still under its first stored id: every row
+ *  came from this window's own stream, never from a runtime's (possibly compressed) context
+ *  replay, so it is the chat's display transcript and paints like a persisted-display one
+ *  while the REST refresh catches up. A compression rotation mints a new stored id, which
+ *  is not in this set, so a rotated chat stays on the loader as before (#73646). */
+export function isOwnStreamedTranscript(
+  storedSessionId: string,
+  state: { messages: readonly unknown[]; storedSessionId?: null | string }
+): boolean {
+  return (
+    sessionCreatedThisRun(storedSessionId) && state.storedSessionId === storedSessionId && state.messages.length > 0
+  )
+}
