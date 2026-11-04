@@ -33,7 +33,9 @@ test('a browser journal read lists the storage keys once, however many stores it
   }
 
   await removePreparedSubmission('c', 'c')
-  const key = vi.spyOn(window.localStorage, 'key')
+  // Spy on the prototype: jsdom's localStorage is a named-property proxy, so spying on the
+  // instance defines a storage ITEM called "key" and the real key() is never observed.
+  const key = vi.spyOn(Storage.prototype, 'key')
   expect((await readPreparedSubmission('a'))?.text).toBe('a')
   expect(await readPreparedSubmission('c')).toBeUndefined()
   expect(key).toHaveBeenCalledTimes(2 * window.localStorage.length)

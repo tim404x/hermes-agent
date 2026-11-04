@@ -13,7 +13,7 @@ const requestGatewayMock = vi.hoisted(() => vi.fn())
 const { $activeSessionId, $sessions, setSessions } = await import('@/store/session')
 const { $confirmRequest, settleConfirm } = await import('@/store/confirm')
 
-const { $sessionStates, $sessionTiles, clearAllSessionStates, publishSessionState, setSessionTileDelegate } =
+const { $sessionStates, $sessionTiles, clearAllSessionStates, publishSessionState, sessionTileDelegate, setSessionTileDelegate } =
   await import('@/store/session-states')
 
 const { listTileSessionRow, useSessionTileActions } = await import('./session-tile-actions')
@@ -166,7 +166,34 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
     await act(async () => {
       await expect(result.current.steerPrompt('keep correction', mode)).rejects.toThrow('correction unsupported')
     })
-    expect(requestGatewayMock).toHaveBeenCalledExactlyOnceWith(mode === 'steer' ? 'session.steer' : 'session.redirect', { session_id: RUNTIME_SESSION_ID, text: 'keep correction' })
+    expect(requestGatewayMock).toHaveBeenCalledExactlyOnceWith(mode === 'steer' ? 'session.steer' : 'session.redirect', { client_message_id: expect.any(String), session_id: RUNTIME_SESSION_ID, text: 'keep correction' })
+  })
+
+  // One user send action = one client_message_id on every path (fork #3). The tile's steer is
+  // such a path: the composer keeps a queue copy under the same id when a correction fails, so
+  // the gateway must see that id here too or a lost ACK turns one message into two turns.
+  it.each(['interrupt', 'steer'] as const)('a tile %s carries the caller send-action id; `duplicate` settles with no second bubble', async mode => {
+    const updates: Array<(state: never) => { messages: { id: string }[] }> = []
+    setSessionTileDelegate({
+      ...sessionTileDelegate()!,
+      updateSession: vi.fn((_runtimeId, updater) => {
+        updates.push(updater as never)
+
+        return updater({ messages: [] } as never)
+      })
+    })
+    requestGatewayMock.mockResolvedValue({ status: 'duplicate' })
+    const { result } = renderTileActions()
+    const ok = await act(async () => result.current.steerPrompt('one correction', mode, { clientMessageId: 'send-1-abc' }))
+    expect(ok).toBe(true)
+    expect(requestGatewayMock).toHaveBeenCalledExactlyOnceWith(mode === 'steer' ? 'session.steer' : 'session.redirect', {
+      client_message_id: 'send-1-abc',
+      session_id: RUNTIME_SESSION_ID,
+      text: 'one correction'
+    })
+    // Optimistic insert, then its removal: replaying both leaves no bubble.
+    const finalMessages = updates.reduce<{ id: string }[]>((messages, updater) => updater({ messages } as never).messages, [])
+    expect(finalMessages).toEqual([])
   })
 
   // #141644: a correction the owner refused before any agent saw it hands the words back (false)
@@ -211,7 +238,9 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
 
     expect(ok).toBe(true)
     expect(calls.map(c => c.method)).toEqual(['session.redirect', 'session.resume', 'session.redirect'])
-    expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID, text: 'actually use Postgres' })
+    expect(calls[2]?.params).toEqual({ client_message_id: expect.any(String), session_id: RECOVERED_SESSION_ID, text: 'actually use Postgres' })
+    // The recovery retry is the same send: one id, so the gateway can dedupe it.
+    expect(calls[2]?.params?.client_message_id).toBe(calls[0]?.params?.client_message_id)
     expect($sessionTiles.get()[0]?.runtimeId).toBe(RECOVERED_SESSION_ID)
   })
 
