@@ -2975,7 +2975,12 @@ describe('usePromptActions client_message_id dedupe', () => {
   })
 
   it('sends the caller send-action id as client_message_id', async () => {
-    const requestGateway = vi.fn(async () => ({ status: 'queued' }) as never)
+    // A real admission receipt names the submission it admitted; a bare
+    // `{ status: 'queued' }` is rejected as not this send's admission.
+    const requestGateway = vi.fn(
+      async (_method: string, params?: Record<string, unknown>) =>
+        ({ status: 'queued', submission_id: params?.submission_id }) as never
+    )
 
     let handle: HarnessHandle | null = null
     await actRender(

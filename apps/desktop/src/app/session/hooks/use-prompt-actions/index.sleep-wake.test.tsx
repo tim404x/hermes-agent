@@ -93,10 +93,15 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
     expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop', omit_messages: true })
     expect(calls[2]?.params).toEqual({
+      client_message_id: expect.any(String),
       submission_id: expect.any(String),
       session_id: RECOVERED_SESSION_ID,
       text: 'message after wake'
     })
+    // The recovery retry is the same user send: it reuses the first attempt's
+    // client_message_id, so a gateway that did admit the stale-id attempt
+    // answers the retry `duplicate` instead of running a second turn.
+    expect(calls[2]?.params?.client_message_id).toBe(calls[0]?.params?.client_message_id)
   })
 
   it('publishes the recovered runtime binding before retrying through the remote owner router', async () => {
@@ -147,6 +152,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(bindingPublished).toBe(true)
     expect(calls.map(call => call.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
     expect(calls[2]?.params).toEqual({
+      client_message_id: expect.any(String),
       submission_id: expect.any(String),
       session_id: RECOVERED_SESSION_ID,
       text: 'remote follow-up after reap'
@@ -368,6 +374,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls[0]?.params).toEqual({
       queued: true,
       session_id: 'rt-background-stale',
+      client_message_id: expect.any(String),
       submission_id: expect.any(String),
       text: 'queued background message after wake'
     })
@@ -379,6 +386,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls[2]?.params).toEqual({
       queued: true,
       session_id: RECOVERED_SESSION_ID,
+      client_message_id: expect.any(String),
       submission_id: expect.any(String),
       text: 'queued background message after wake'
     })
@@ -567,6 +575,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     })
     expect(calls[2]?.params).toEqual({
       session_id: RECOVERED_SESSION_ID,
+      client_message_id: expect.any(String),
       submission_id: expect.any(String),
       text: 'message during starved loop'
     })
@@ -690,6 +699,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        client_message_id: expect.any(String),
         submission_id: expect.any(String),
         session_id: RECOVERED_SESSION_ID,
         text: 'follow-up while the profile route is rebinding'
@@ -732,6 +742,7 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        client_message_id: expect.any(String),
         submission_id: expect.any(String),
         session_id: RECOVERED_SESSION_ID,
         text: 'stay in the routed profile session'
@@ -767,7 +778,12 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(resumeStoredSession).not.toHaveBeenCalled()
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      { submission_id: expect.any(String), session_id: RECOVERED_SESSION_ID, text: 'normal follow-up' },
+      {
+        client_message_id: expect.any(String),
+        submission_id: expect.any(String),
+        session_id: RECOVERED_SESSION_ID,
+        text: 'normal follow-up'
+      },
       1_800_000
     )
   })
@@ -824,7 +840,12 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(await handle!.submitText('retry after recovery')).toBe(true)
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
-      { submission_id: expect.any(String), session_id: RECOVERED_SESSION_ID, text: 'retry after recovery' },
+      {
+        client_message_id: expect.any(String),
+        submission_id: expect.any(String),
+        session_id: RECOVERED_SESSION_ID,
+        text: 'retry after recovery'
+      },
       1_800_000
     )
   })
