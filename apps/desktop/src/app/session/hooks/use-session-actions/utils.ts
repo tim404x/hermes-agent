@@ -204,6 +204,37 @@ export function preserveEquivalentTranscript(current: ChatMessage[], next: ChatM
   return chatMessageArraysEquivalent(current, next) ? current : next
 }
 
+/**
+ * {@link preserveEquivalentTranscript}, row by row: when the replacement did
+ * change, every row it left content-equivalent (same id included) is still the
+ * CURRENT object. A warm switch back to a chat whose last turn streamed live
+ * renames only that turn's rows to their durable ids, yet the fresh page used
+ * to republish the whole chat as new objects, so every row re-normalized and
+ * repainted for a two-row change: the switch read as a reload.
+ */
+export function preserveEquivalentRows(current: ChatMessage[], next: ChatMessage[]): ChatMessage[] {
+  if (chatMessageArraysEquivalent(current, next)) {
+    return current
+  }
+
+  const currentById = new Map(current.map(message => [message.id, message]))
+  let reused = false
+
+  const rows = next.map(message => {
+    const kept = currentById.get(message.id)
+
+    if (kept && kept !== message && chatMessagesEquivalent(kept, message)) {
+      reused = true
+
+      return kept
+    }
+
+    return message
+  })
+
+  return reused ? rows : next
+}
+
 /** Durable history against the local view: role-ordinal pairing, then the
  *  local pending turn and local assistant errors the DB cannot know about. */
 export function reconcileDurableHistory(messages: ChatMessage[], previous: ChatMessage[]): ChatMessage[] {

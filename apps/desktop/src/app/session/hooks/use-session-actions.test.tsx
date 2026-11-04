@@ -21,6 +21,7 @@ import {
   type SessionResumeResult,
   setSessionArchived
 } from '@/hermes'
+import { chatMessageText, toChatMessages } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $clarifyRequests, clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
@@ -7443,5 +7444,135 @@ describe('resumeSession warm switch back to a turn whose tool results land mid-r
       expect(parts.find(part => part.toolCallId === 'pm2')?.result).toEqual({ status: 'exited' })
       expect(parts.find(part => part.toolCallId === 'pm2')?.completedAt).toBe(106)
     }
+  })
+})
+
+// Coming back to a chat whose last turn streamed live: the REST page renames
+// that turn's live rows to their durable ids, so the reconciled transcript is
+// "changed" and was published as all-new objects. Every row of the chat then
+// re-normalized and repainted (markdown, highlighting) for a two-row change,
+// the reload feel of a warm switch (#95595 fixed only the all-equal case).
+describe('resumeSession warm switch keeps unchanged rows by identity', () => {
+  const HISTORY_TURNS = 15
+
+  const persisted = Array.from({ length: HISTORY_TURNS }, (_, turn) => [
+    { id: turn * 2 + 1, row_id: turn * 2 + 1, role: 'user', content: `question ${turn}`, timestamp: turn * 2 + 1 },
+    { id: turn * 2 + 2, row_id: turn * 2 + 2, role: 'assistant', content: `answer ${turn}`, timestamp: turn * 2 + 2 }
+  ]).flat()
+
+  const liveTailRows = [
+    { id: 101, row_id: 101, role: 'user', content: 'latest question', timestamp: 101 },
+    { id: 102, row_id: 102, role: 'assistant', content: 'latest answer', timestamp: 102 }
+  ]
+
+  beforeEach(() => {
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback: FrameRequestCallback) => {
+      callback(0)
+
+      return null as unknown as number
+    })
+    vi.mocked(ensureGatewayProfile).mockReset().mockResolvedValue(undefined)
+    vi.mocked(getLatestSessionMessages)
+      .mockReset()
+      .mockResolvedValue({ messages: [...persisted, ...liveTailRows], session_id: 'stored-B' } as never)
+    setSessions([
+      storedSession({ id: 'stored-A', message_count: 1, profile: 'default' }),
+      storedSession({ id: 'stored-B', message_count: persisted.length + 2, profile: 'default' })
+    ])
+  })
+
+  afterEach(() => {
+    cleanup()
+    setActiveSessionId(null)
+    setSelectedStoredSessionId(null)
+    setMessages([])
+    setSessions([])
+    vi.mocked(requestGatewayForProfile).mockReset()
+    vi.mocked(getLatestSessionMessages)
+      .mockReset()
+      .mockResolvedValue({ messages: [] } as never)
+    vi.restoreAllMocks()
+  })
+
+  it('repaints only the rows the persisted page actually changed', async () => {
+    const requestGateway = vi.fn(async (method: string, _params?: Record<string, unknown>) =>
+      method === 'session.activate'
+        ? ({
+            session_id: 'rt-B',
+            session_key: 'stored-B',
+            resumed: 'stored-B',
+            message_count: persisted.length + 2,
+            messages: [],
+            messages_omitted: true,
+            running: false,
+            info: {}
+          } as never)
+        : ({} as never)
+    )
+
+    let harness!: Parameters<Parameters<typeof WarmSwitchHarness>[0]['onReady']>[0]
+    render(<WarmSwitchHarness onReady={ready => (harness = ready)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(harness).toBeDefined())
+    vi.mocked(requestGatewayForProfile).mockImplementation((_profile, method, params) => requestGateway(method, params))
+
+    act(() => {
+      setSelectedStoredSessionId('stored-A')
+      setActiveSessionId('rt-A')
+    })
+
+    // Settled history from an earlier hydrate, then the turn that streamed live.
+    const history = toChatMessages(persisted as never)
+
+    const liveTurn = [
+      {
+        id: 'user-5f3a',
+        role: 'user' as const,
+        rowId: 101,
+        timestamp: 101,
+        parts: [{ type: 'text' as const, text: 'latest question' }]
+      },
+      {
+        id: 'assistant-stream-9c1',
+        role: 'assistant' as const,
+        timestamp: 102,
+        parts: [{ type: 'text' as const, text: 'latest answer' }]
+      }
+    ]
+
+    act(() => {
+      harness.cache.updateSessionState(
+        'rt-A',
+        state => ({ ...state, messages: [{ id: 'a', role: 'user', parts: [{ type: 'text', text: 'A' }] }] }),
+        'stored-A'
+      )
+      harness.cache.updateSessionState(
+        'rt-B',
+        state => ({
+          ...state,
+          messages: [...history, ...liveTurn],
+          transcriptProvenance: createPersistedDisplayTranscriptProvenance({
+            lineageRootId: null,
+            scope: 'default',
+            storedSessionId: 'stored-B'
+          })
+        }),
+        'stored-B'
+      )
+    })
+
+    await act(async () => {
+      await harness.resume('stored-B', true)
+    })
+
+    const shown = PRIMARY_SESSION_VIEW.$messages.get()
+
+    expect(shown.map(message => chatMessageText(message))).toEqual([
+      ...persisted.map(row => row.content),
+      'latest question',
+      'latest answer'
+    ])
+    // The settled history is the very same objects: nothing above the live
+    // turn re-normalizes or repaints.
+    expect(shown.slice(0, history.length).every((message, index) => message === history[index])).toBe(true)
   })
 })

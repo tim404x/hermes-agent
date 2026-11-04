@@ -212,7 +212,7 @@ import {
   isSessionGoneError,
   overlayConcurrentMessageChanges,
   patchSessionWorkspace,
-  preserveEquivalentTranscript,
+  preserveEquivalentRows,
   preserveLocalPendingTurnMessages,
   removeRepresentedLocalLiveProjection,
   resolveResumedBusy,
@@ -1833,8 +1833,10 @@ export function useSessionActions({
                 // visible row re-normalizes + remounts (markdown re-parse +
                 // shiki re-highlight per row, seconds of main-thread work).
                 // Keep the existing array when the content is unchanged —
-                // same guard the cold-resume path uses below.
-                const messages = preserveEquivalentTranscript(state.messages, visibleActivatedMessages)
+                // same guard the cold-resume path uses below — and, when it
+                // did change, every row it left equivalent: a live turn's rows
+                // renamed to durable ids must not repaint the whole chat.
+                const messages = preserveEquivalentRows(state.messages, visibleActivatedMessages)
 
                 return {
                   ...state,
