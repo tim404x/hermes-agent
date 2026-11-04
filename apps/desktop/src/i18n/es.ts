@@ -1192,7 +1192,11 @@ export const esOverrides = {
         maxLines: 'Límite de páginas de archivo',
         maxLineLength: 'Límite de longitud de línea'
       },
-      codeExecution: { mode: 'Modo de ejecución de código' },
+      codeExecution: {
+        mode: 'Modo de ejecución de código',
+        maxToolCalls: 'Límite de llamadas a herramientas por ejecución de código',
+        timeout: 'Tiempo límite de ejecución de código (segundos)'
+      },
       approvals: {
         mode: 'Modo de aprobación',
         timeout: 'Tiempo límite de aprobación',
@@ -1363,7 +1367,9 @@ export const esOverrides = {
         daytonaImage: 'Imagen usada cuando el backend de ejecución es Daytona.'
       },
       codeExecution: {
-        mode: 'Qué tan estrictamente se limita la ejecución de código al proyecto actual.'
+        mode: 'Qué tan estrictamente se limita la ejecución de código al proyecto actual.',
+        maxToolCalls: 'Máximo de llamadas a herramientas que puede hacer una ejecución de código antes de detenerse.',
+        timeout: 'Máximo de segundos que puede durar una ejecución de código antes de detenerse.'
       },
       fileReadMaxChars: 'Máximo de caracteres que Hermes puede leer en una solicitud de archivo.',
       approvals: {
@@ -3705,6 +3711,9 @@ export const esOverrides = {
     row: {
       pin: 'Fijar',
       unpin: 'Desfijar',
+      pinInProject: 'Fijar en el proyecto',
+      unpinFromProject: 'Desfijar del proyecto',
+      projectPinFailed: 'No se pudo actualizar el fijado del proyecto',
       markUnread: 'Marcar como no leído',
       markRead: 'Marcar como leído',
       unreadFailed: 'No se pudo actualizar el estado de no leído',

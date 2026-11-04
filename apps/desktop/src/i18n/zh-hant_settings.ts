@@ -481,7 +481,9 @@ export const zhHantSettings = {
         maxLineLength: '行長上限'
       },
       codeExecution: {
-        mode: '程式碼執行模式'
+        mode: '程式碼執行模式',
+        maxToolCalls: '程式碼執行工具呼叫上限',
+        timeout: '程式碼執行逾時（秒）'
       },
       approvals: {
         mode: '批准模式',
@@ -647,7 +649,9 @@ export const zhHantSettings = {
         daytonaImage: '執行後端為 Daytona 時使用的映像。'
       },
       codeExecution: {
-        mode: '程式碼執行被限制在目前專案中的嚴格程度。'
+        mode: '程式碼執行被限制在目前專案中的嚴格程度。',
+        maxToolCalls: '單次程式碼執行在停止前最多可進行的工具呼叫次數。',
+        timeout: '單次程式碼執行在被停止前最多可執行的秒數。'
       },
       fileReadMaxChars: 'Hermes 單次檔案讀取可讀取的最大字元數。',
       approvals: {
