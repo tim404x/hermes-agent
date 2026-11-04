@@ -1,6 +1,6 @@
 import { textWithoutReferenceLines } from '@/components/assistant-ui/reference-kinds'
 import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
-import { withoutCoveredAssistantPrefix } from '@/lib/chat-messages/coverage'
+import { withCoveredLiveToolResults, withoutCoveredAssistantPrefix } from '@/lib/chat-messages/coverage'
 import { parseErrorSurface } from '@/lib/error-surface'
 import type { SessionMessage, SessionResumeResult } from '@/types/hermes'
 
@@ -274,8 +274,11 @@ export function reconcilePersistedLiveTurn(
           ]
         : []
 
-    const local = pairedLocal ? withoutCoveredAssistantPrefix(durable, cached.intervals[index] ?? []) : []
-    result.push(...durable, ...mergeLiveAssistantRun(projected, local))
+    const cachedInterval = cached.intervals[index] ?? []
+    const local = pairedLocal ? withoutCoveredAssistantPrefix(durable, cachedInterval) : []
+    // The page can predate a result row the live stream already delivered.
+    const durableWithLive = pairedLocal ? withCoveredLiveToolResults(durable, cachedInterval) : durable
+    result.push(...durableWithLive, ...mergeLiveAssistantRun(projected, local))
 
     if (!final) {
       const correction = stored.users[index] ?? {
