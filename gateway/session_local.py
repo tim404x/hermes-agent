@@ -83,6 +83,16 @@ class LocalSessionAdapter(BasePlatformAdapter):
     async def edit_message(self, chat_id, message_id, content, *, finalize=False):
         return SendResult(success=True, message_id=message_id)
 
+    async def _send_media_fallback_notice(self, method, kind, path, chat_id, caption, reply_to, metadata, *,
+                                          file_name=None):
+        # No second transport to send a file over: a local viewer replays the durable transcript and
+        # opens the path itself (the desktop fetches MEDIA files from the gateway). The base notice
+        # would only pass through send() above, an acknowledgement, so its "native file send
+        # unavailable" WARNING reported a failure that never happened (every Outbox/oneshot worker
+        # reply naming its result file logged one).
+        logger.debug("[%s] %s: local route, %s stays in the transcript: %s", self.name, method, kind, path)
+        return SendResult(success=True, message_id=uuid.uuid4().hex)
+
     async def _record_delivery_obligation(self, *args, **kwargs):
         # No platform ACK to lose: viewers replay the durable transcript. A ledger row would only
         # park a raw copy of the reply in state.db that no redelivery can ever use.
