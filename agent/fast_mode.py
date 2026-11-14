@@ -94,6 +94,12 @@ def effective_request_overrides(agent: Any) -> dict[str, Any]:
         )
     if "speed" in overrides and getattr(agent, "model", None) in (getattr(agent, "_fast_mode_unavailable_models", None) or ()):
         overrides.pop("speed", None)
+    # ``speed`` has one consumer, the Anthropic Messages builder (a flag it gates per model and
+    # endpoint). A fallback or /model switch keeps the pinned ``request_overrides``, and every
+    # other builder splats them into the SDK kwargs: Codex Responses preflight refused the stray
+    # field ("unsupported field(s): speed"), so the fallback died while the primary was down.
+    if "speed" in overrides and getattr(agent, "api_mode", None) not in (None, "anthropic_messages"):
+        overrides.pop("speed", None)
     from agent.codex_service_tiers import apply_daybreak, negotiate_request_tier
     negotiate_request_tier(agent, overrides)
     apply_daybreak(agent, overrides)
