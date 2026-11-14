@@ -232,16 +232,21 @@ def check_systemd_timing_alignment(
 
 
 def _systemd_timeout_stop_us(unit_name: str) -> Optional[int]:
-    """``TimeoutStopUSec`` of ``unit_name`` in microseconds; ``--user`` first (hermes' usual)."""
+    """``TimeoutStopUSec`` of ``unit_name`` in microseconds, read from the manager that owns the
+    unit; ``--user`` first (hermes' usual). A manager without the unit still answers ``show`` with
+    rc 0 and its DEFAULT (``LoadState=not-found``, ``TimeoutStopUSec=1min 30s``): a system unit
+    whose process can reach the user manager read as 90 s and was reported "stale" at every start."""
     for flag in (["--user"], []):
         try:
             result = subprocess.run(
-                ["systemctl", *flag, "show", unit_name, "--property=TimeoutStopUSec"],
+                ["systemctl", *flag, "show", unit_name, "--property=TimeoutStopUSec", "--property=LoadState"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=2.0,
                 check=False,
             )
         except (subprocess.TimeoutExpired, OSError):
             continue
+        if any(line.strip() == "LoadState=not-found" for line in result.stdout.splitlines()):
+            continue  # this manager does not own the unit; its answer is a default, not the unit's
         # Output: "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000"
         for line in result.stdout.splitlines() if result.returncode == 0 else ():
             if line.startswith("TimeoutStopUSec="):
