@@ -33,3 +33,8 @@ def _normalize_failure_deliver(value: Any) -> Optional[str]:
     if isinstance(value, (list, tuple)):
         return ",".join(str(p).strip() for p in value if str(p).strip()) or None
     return _normalize_job_optional_text(value)
+
+
+def _normalize_bot_chat_title(value: Any) -> Optional[str]:
+    """Per-job chat for ``bot-chat`` delivery (beats ``cron.bot_chat_title``); ''/None clears."""
+    return " ".join(str(value or "").split()) or None
