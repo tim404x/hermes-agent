@@ -72,6 +72,7 @@ import {
   livePlaceOnCommittedPage,
   replyAfterLastTool
 } from './committed-reply'
+import { correctionsHeldByCommittedRows, optimisticEchoesHeldByCommittedRows } from './merged-steer-echo'
 import { chatMessageArraysEquivalent, chatMessagesEquivalent } from './message-equivalence'
 import {
   isLiveTailRow,
@@ -697,6 +698,7 @@ export function preserveLocalPendingTurnMessages(
   )
 
   const contentRefusedCounterparts = refusedPromptCounterparts(nextMessages)
+  const echoesHeldByMergedRows = optimisticEchoesHeldByCommittedRows(previousMessages, nextMessages, remainingNext)
 
   const preserved: ChatMessage[] = []
   // Authoritative id → richer local pending row. Replacing (not appending)
@@ -775,6 +777,13 @@ export function preserveLocalPendingTurnMessages(
       isOptimisticUser &&
       optimisticUserAlreadyRepresented(message, liveOptimisticUsers, contentRefusedCounterparts)
     ) {
+      continue
+    }
+
+    // One stored row can stand for several sends (steers drained in one tool
+    // batch). No echo equals its text, so each used to survive as unsent input
+    // and pin below the newest reply, cache and reload included.
+    if (isOptimisticUser && echoesHeldByMergedRows.has(message)) {
       continue
     }
 
@@ -1166,8 +1175,21 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
 
   const foldTarget = turnPartiallyCommitted ? committedPartial : null
 
+  // Steers drained in one tool batch persist as ONE row joining their words,
+  // which no single correction equals.
+  const correctionsInMergedRows = correctionsHeldByCommittedRows(
+    inflightCorrections,
+    messages,
+    turnStart,
+    SUBMIT_ROW_SLACK_S
+  )
+
   const pushCorrection = (correction: string, index: number): void => {
-    if (persistedInLatestRun(correction) || persistedSinceTurnStart(correction)) {
+    if (
+      persistedInLatestRun(correction) ||
+      persistedSinceTurnStart(correction) ||
+      correctionsInMergedRows.has(index)
+    ) {
       return
     }
 
