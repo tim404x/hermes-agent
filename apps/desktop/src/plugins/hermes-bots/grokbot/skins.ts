@@ -79,8 +79,9 @@ export const SHAPES: BotShape[] = [
   { id: 'capsule', radii: capsule },
   // -90deg : un sommet vers le haut de l'ecran (y est oriente vers le bas)
   { id: 'triangle', radii: regularPolygonProfile(3, 1.12, 0.34, -90) },
-  // 0deg : sommets a gauche et a droite, donc aretes du haut et du bas plates
-  { id: 'hexagone', radii: regularPolygonProfile(6, 1.04, 0.26, 0) },
+  // 30deg : un sommet vers le haut, comme le rendu officiel de xAI (Hermes : etait 0deg,
+  // aretes du haut et du bas plates ; recouvrement 88% -> 99% une fois tourne)
+  { id: 'hexagone', radii: regularPolygonProfile(6, 1.04, 0.26, 30) },
   { id: 'nuage', radii: cloud },
   { id: 'goutte', radii: droplet }
 ]
@@ -98,17 +99,18 @@ export interface BotColor {
   hex: string
 }
 
-/** Palette du personnalisateur d'origine. */
+/** Palette du personnalisateur d'origine. Hermes : rouge, orange, ambre, vert, bleu et violet
+ *  remplaces par les valeurs officielles de xAI (article de design + table du client). */
 export const COLORS: BotColor[] = [
   { id: 'encre', hex: '#0a0a0c' },
   { id: 'brun', hex: '#8b5e3c' },
-  { id: 'rouge', hex: '#e8483f' },
-  { id: 'orange', hex: '#f08a24' },
-  { id: 'ambre', hex: '#f0b429' },
-  { id: 'vert', hex: '#3ecf8e' },
+  { id: 'rouge', hex: '#ff263c' },
+  { id: 'orange', hex: '#ff6700' },
+  { id: 'ambre', hex: '#ff9800' },
+  { id: 'vert', hex: '#00c972' },
   { id: 'turquoise', hex: '#2fbfa0' },
-  { id: 'bleu', hex: '#3b93f0' },
-  { id: 'violet', hex: '#8b5cf6' },
+  { id: 'bleu', hex: '#1084fe' },
+  { id: 'violet', hex: '#9159fe' },
   { id: 'rose', hex: '#e152b0' },
   { id: 'gris', hex: '#a3a3a3' },
   { id: 'creme', hex: '#f1efe9' }
