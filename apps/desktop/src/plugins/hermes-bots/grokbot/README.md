@@ -6,6 +6,9 @@ bloub is a frame-measured recreation of xAI's Grok Bot avatar: 8 body shapes,
 16 rest expressions, 15 animated states. Its constants are measurements, not
 tuning: do not round them.
 
-Local changes: formatting only (eslint --fix + prettier to match this repo).
+Local changes: formatting (eslint --fix + prettier to match this repo), plus two
+measured corrections in `skins.ts` against xAI's own design-post render (16 Nov 2026):
+the hexagon is turned point-up (rotation 30, was 0) and six palette colours use
+xAI's official values (red, orange, amber, green, blue, violet).
 bloub's own engine/shape/skins/expressions/face tests are kept alongside and
 must stay green. The Hermes integration lives one level up in `grok-face.tsx`.

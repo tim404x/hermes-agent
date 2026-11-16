@@ -96,4 +96,24 @@ describe('profils des formes du personnalisateur', () => {
       expect(max, `${forme.id} max`).toBeLessThan(1.6)
     }
   })
+
+  /**
+   * Hermes : l'hexagone pointe vers le haut, comme le rendu officiel de xAI (article de
+   * design). A plat (rotation 0) il ne recouvrait ce rendu qu'a 88% ; tourne de 30 degres,
+   * 99%. y est oriente vers le bas, donc le haut de l'ecran est l'angle -PI/2.
+   */
+  it("l'hexagone pointe vers le haut : sommets en haut et en bas, aretes a gauche et a droite", () => {
+    const hexagone = SHAPES.find(s => s.id === 'hexagone')!.radii
+    const max = Math.max(...hexagone)
+    const haut = radiusAtAngle(hexagone, -TAU / 4)
+    const bas = radiusAtAngle(hexagone, TAU / 4)
+    const droite = radiusAtAngle(hexagone, 0)
+    const gauche = radiusAtAngle(hexagone, TAU / 2)
+
+    expect(haut).toBeCloseTo(max, 2)
+    expect(bas).toBeCloseTo(max, 2)
+    // Le milieu d'une arete d'un hexagone regulier est a cos(30deg) ~ 0,87 du sommet.
+    expect(droite / max).toBeLessThan(0.92)
+    expect(gauche / max).toBeLessThan(0.92)
+  })
 })
