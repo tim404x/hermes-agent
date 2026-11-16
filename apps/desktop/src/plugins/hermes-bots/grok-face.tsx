@@ -62,17 +62,19 @@ export const GROK_EXPRESSIONS = {
 export type GrokShapeId = keyof typeof GROK_SHAPES
 export type GrokExpressionId = keyof typeof GROK_EXPRESSIONS
 
-/** xAI's Grok Bot palette, offered as swatches next to the profile colours. */
+/** xAI's Grok Bot palette, offered as swatches next to the profile colours. Red, orange,
+ *  amber, green, blue and violet are xAI's official values (design post + client colour table,
+ *  measured 15 Nov 2026); the other six are bloub's picker samples. */
 export const GROK_PALETTE = [
   '#0a0a0c',
   '#8b5e3c',
-  '#e8483f',
-  '#f08a24',
-  '#f0b429',
-  '#3ecf8e',
+  '#ff263c',
+  '#ff6700',
+  '#ff9800',
+  '#00c972',
   '#2fbfa0',
-  '#3b93f0',
-  '#8b5cf6',
+  '#1084fe',
+  '#9159fe',
   '#e152b0',
   '#a3a3a3',
   '#f1efe9'
@@ -115,11 +117,9 @@ export function formatGrokShape(shape: GrokShapeId, expression: GrokExpressionId
 }
 
 /** Half-side of the avatar viewBox, in engine units (body radius = RAYON = 100).
- *  Same crop as bloub's still export: the body fills ~80% like the classic faces. */
-const HALF = 125
-/** Eyes are HOLES in the body; this is what shows through them. White on every
- *  theme, like the reference, so the face reads the same in light and dark. */
-const PAPER = '#ffffff'
+ *  Tighter than bloub's still export (125) so the body fills ~88% of the slot, like
+ *  xAI's own render; the work-mood orbit rings clip a little more at this crop. */
+const HALF = 113
 /** Work mood: one orbit (its measured length), a short rest beat, again. Orbit is a
  *  one-shot in the engine (rings fade at its end), so the loop re-arms it. */
 const ORBIT_HOLD = STATE_BY_ID.get('orbit')?.duration ?? 3.4
@@ -208,8 +208,11 @@ export function grokFrameMarkup(frame: BotFrame, ink: string, uid: string): stri
     })
     .join('')
 
+  // Eyes (and the notch) are real HOLES, like xAI's: the surface behind the avatar shows
+  // through. No white under-layer, whose anti-aliased edge left a pale rim around every
+  // face on a dark sidebar.
   const body =
-    `<g opacity="${frame.bodyAlpha}"><path d="${frame.bodyPath}" fill="${PAPER}"/>` +
+    `<g opacity="${frame.bodyAlpha}">` +
     `<g mask="url(#${maskId})"><rect x="${-HALF}" y="${-HALF}" width="${HALF * 2}" height="${HALF * 2}" fill="${color}"/></g></g>`
 
   return (
