@@ -13,8 +13,10 @@ from threading import Barrier
 
 import pytest
 
-from hermes_state import SessionDB
-from hermes_state_local import POLICY_PREFIX, _cached_local_lineage_index, local_lineage_index
+from persistence.sqlite._holder import StoreHolder
+from persistence.sqlite.conversation._store.local import POLICY_PREFIX, _cached_local_lineage_index, local_lineage_index
+from persistence.sqlite.conversation._store.messages import append_messages_batch
+from persistence.sqlite.conversation._store.sessions import create_session, list_sessions_rich
 
 
 def _receipt(owner, lineage, **extra):
@@ -27,9 +29,9 @@ def _put(conn, owner, value):
 
 @pytest.fixture
 def db(tmp_path):
-    database = SessionDB(db_path=tmp_path / 'state.db')
+    database = StoreHolder(tmp_path / 'state.db')
     for sid in ('owner', 'head', 'tail', 'solo', 'comp', 'cont'):
-        database.create_session(sid, source='cli')
+        create_session(database, sid, source='cli')
     conn = database._conn
     assert conn is not None
     conn.execute("UPDATE sessions SET end_reason='session_reset' WHERE id='owner'")
@@ -69,27 +71,27 @@ def test_an_unrelated_commit_does_not_parse_every_receipt_again(db):
     statements = []
     with db._read_ctx() as conn:
         conn.set_trace_callback(statements.append)
-    assert [row['id'] for row in db.list_sessions_rich(limit=50) if row['id'] in ('owner', 'head')] == ['head']
+    assert [row['id'] for row in list_sessions_rich(db, limit=50) if row['id'] in ('owner', 'head')] == ['head']
     assert len(_full_scans(statements)) == 1
     for n in range(5):
         # Any commit moves the reader's data_version: a new chat, a turn's rows, a cron run.
-        db.create_session(f'unrelated-{n}', source='cli')
-        db.append_messages_batch(f'unrelated-{n}', [{'role': 'user', 'content': 'hi'}])
-        rows = db.list_sessions_rich(limit=50)
+        create_session(db, f'unrelated-{n}', source='cli')
+        append_messages_batch(db, f'unrelated-{n}', [{'role': 'user', 'content': 'hi'}])
+        rows = list_sessions_rich(db, limit=50)
         assert 'owner' not in [row['id'] for row in rows]
         assert set(next(row for row in rows if row['id'] == 'head')['_lineage_ids']) == {'owner', 'head'}
     assert len(_full_scans(statements)) == 1
 
 
 def test_a_fresh_handle_does_not_parse_every_receipt_again(db):
-    assert 'owner' not in [row['id'] for row in db.list_sessions_rich(limit=50)]
+    assert 'owner' not in [row['id'] for row in list_sessions_rich(db, limit=50)]
     for _ in range(3):
         # The roster's profiles.list and the REST session routes open a handle per request.
-        with SessionDB(db_path=db.db_path, read_only=True) as reader:
+        with StoreHolder(db.db_path, read_only=True) as reader:
             statements = []
             with reader._read_ctx() as conn:
                 conn.set_trace_callback(statements.append)
-            assert 'owner' not in [row['id'] for row in reader.list_sessions_rich(limit=50)]
+            assert 'owner' not in [row['id'] for row in list_sessions_rich(reader, limit=50)]
             assert _full_scans(statements) == []
 
 
@@ -105,7 +107,7 @@ def test_every_receipt_change_is_seen_by_the_next_listing(db, change):
         conn.execute('UPDATE state_meta SET value=? WHERE key=?', (_receipt('owner', ['owner', 'head', 'tail']), key))
     elif change == 'same_length_rewrite':
         # A lineage write that keeps the receipt's byte length: its owner's revision moves with it
-        # (hermes_state_local_lineage._commit_local_target bumps it in the same transaction).
+        # (local_lineage._commit_local_target bumps it in the same transaction).
         before, after = _receipt('owner', ['owner', 'head']), _receipt('owner', ['owner', 'tail'])
         assert len(before) == len(after)
         conn.execute('UPDATE state_meta SET value=? WHERE key=?', (after, key))
@@ -125,8 +127,8 @@ def test_every_receipt_change_is_seen_by_the_next_listing(db, change):
     else:
         # More receipts move at once than are re-read one by one.
         for n in range(150):
-            db.create_session(f'bulk-{n}', source='cli')
-            db.create_session(f'bulk-{n}-next', source='cli')
+            create_session(db, f'bulk-{n}', source='cli')
+            create_session(db, f'bulk-{n}-next', source='cli')
         conn.execute("UPDATE sessions SET end_reason='session_reset' WHERE id LIKE 'bulk-%' AND id NOT LIKE '%-next'")
         for n in range(150):
             _put(conn, f'bulk-{n}', _receipt(f'bulk-{n}', [f'bulk-{n}', f'bulk-{n}-next']))
@@ -168,7 +170,7 @@ def test_concurrent_first_listings_agree(db):
 
     def read(_):
         barrier.wait(timeout=10)
-        with SessionDB(db_path=db.db_path, read_only=True) as reader:
+        with StoreHolder(db.db_path, read_only=True) as reader:
             with reader._read_ctx() as conn:
                 return _cached_local_lineage_index(reader, conn)
 
@@ -181,9 +183,9 @@ def test_concurrent_first_listings_agree(db):
 
 def test_stores_never_share_receipts(db, tmp_path):
     assert _both(db)[0][0] == {'owner'}
-    with SessionDB(db_path=tmp_path / 'other.db') as other:
-        other.create_session('owner', source='cli')
-        other.create_session('else', source='cli')
+    with StoreHolder(tmp_path / 'other.db') as other:
+        create_session(other, 'owner', source='cli')
+        create_session(other, 'else', source='cli')
         conn = other._conn
         assert conn is not None
         conn.execute("UPDATE sessions SET end_reason='session_reset' WHERE id='owner'")
@@ -192,3 +194,19 @@ def test_stores_never_share_receipts(db, tmp_path):
         used, scanned = _both(other)
         assert used == scanned == ({'owner'}, {'else': ('owner', ['owner', 'else'])})
     assert _both(db)[0][1]['head'] == ('owner', ['owner', 'head'])
+
+
+def test_a_sqlite_without_octet_length_lists_through_the_full_scan(db, monkeypatch):
+    """``octet_length()`` is SQLite 3.43+: an older library (Debian 12 ships 3.40) must still list, never
+    raise ``no such function`` on the fingerprint read."""
+    import sqlite3
+    monkeypatch.setattr(sqlite3, 'sqlite_version_info', (3, 40, 1))
+    with StoreHolder(db.db_path, read_only=True) as reader:
+        statements = []
+        with reader._read_ctx() as conn:
+            conn.set_trace_callback(statements.append)
+        rows = list_sessions_rich(reader, limit=50)
+    assert 'owner' not in [row['id'] for row in rows]
+    assert set(next(row for row in rows if row['id'] == 'head')['_lineage_ids']) == {'owner', 'head'}
+    assert not [sql for sql in statements if 'octet_length' in sql]
+    assert len(_full_scans(statements)) == 1
