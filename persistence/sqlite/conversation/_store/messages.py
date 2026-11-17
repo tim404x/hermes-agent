@@ -1362,9 +1362,15 @@ def get_messages(holder: StoreHolder, session_id: str, include_inactive: bool = 
         # display_order paging below does not apply across a lineage.)
         display = include_compacted and not include_inactive  # removed rows too: see drop_removed
         sql = f"SELECT * FROM messages WHERE session_id IN ({_placeholders(session_ids)}){active_clause} ORDER BY id ASC"
-        rows = _dedupe_display_generations(holder, _display_set(holder, sql, session_ids) if display
-                                           else holder._read_all(sql, session_ids), drop_removed=display)
-        rows = rows[::-1][offset:][:limit][::-1] if latest else rows[offset:][:limit]
+        rows = None
+        if display and limit is not None:
+            # A page of a long lineage: the kept projection, not every row's body again.
+            from persistence.sqlite.conversation._store.lineage_page import lineage_display_page
+            rows = lineage_display_page(holder, sql, session_ids, limit=limit, offset=offset, latest=latest)
+        if rows is None:
+            rows = _dedupe_display_generations(holder, _display_set(holder, sql, session_ids) if display
+                                               else holder._read_all(sql, session_ids), drop_removed=display)
+            rows = rows[::-1][offset:][:limit][::-1] if latest else rows[offset:][:limit]
     elif include_compacted and not include_inactive and _ensure_display_order(holder, session_id):
         # _read_retrying_ioerr: mode=ro pooled readers see a transient IOERR mid-checkpoint (#100871).
         rows = holder._read_retrying_ioerr(
