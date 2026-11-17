@@ -9,6 +9,8 @@ import asyncio
 import collections
 import contextlib
 import concurrent.futures
+import contextvars
+import functools
 import json
 import logging
 import socket
@@ -37,6 +39,21 @@ _dashboard_client_touch_lock = threading.Lock()
 _dashboard_client_touch_pool = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="dashboard-client-touch")
 _dashboard_client_touch_pending: set = set()
+
+# Inline RPCs are the client's controls (session.create, prompt.submit, session.interrupt, ping). On the
+# event loop's default executor they queued behind every REST handler's ``asyncio.to_thread`` work: a
+# burst of slow transcript reads held all of its threads and a 15 ms session.create answered after the
+# Desktop's 30 s timeout (a new tab that never opened). Their own pool, so a busy REST surface cannot
+# starve them. Workers start on demand; one connection's serial lane holds at most one at a time.
+_WS_RPC_DISPATCH_WORKERS = 32
+_ws_rpc_dispatch_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_WS_RPC_DISPATCH_WORKERS, thread_name_prefix="ws-rpc-dispatch")
+
+
+async def _dispatch_in_rpc_thread(func: Callable[..., Any], *args: Any) -> Any:
+    """``asyncio.to_thread`` on the RPC dispatch pool: the same context copy, never the default executor."""
+    run = functools.partial(contextvars.copy_context().run, func, *args)
+    return await asyncio.get_running_loop().run_in_executor(_ws_rpc_dispatch_pool, run)
 
 
 def _touch_dashboard_client_marker(path) -> None:
@@ -395,7 +412,7 @@ def _authority_connection(ws: Any, transport: WSTransport, auth_identity: dict |
 async def _dispatch_request(authority_connection: Any, req: Any, req_method: Any, transport: WSTransport) -> Any:
     """One request through the authority when attached, else the legacy dispatcher. A request from the
     local Desktop runs as work for it (the welcome trial and onboarding key on that), and so do the
-    threads it hands off to: ``to_thread`` and the legacy pool copy this context."""
+    threads it hands off to: the RPC dispatch pool and the legacy pool copy this context."""
     from hermes_cli.process_identity import serving_local_desktop
     from tui_gateway.server_requests import resolve_pinned_response
     if authority_connection is not None and resolve_pinned_response(req, transport):
@@ -404,7 +421,7 @@ async def _dispatch_request(authority_connection: Any, req: Any, req_method: Any
         return None
     with serving_local_desktop(getattr(transport, "desktop_local", False)):
         if authority_connection is None:
-            return await asyncio.to_thread(server.dispatch, req, transport)
+            return await _dispatch_in_rpc_thread(server.dispatch, req, transport)
         resp = await authority_connection.dispatch(req)
         actor = authority_connection.actor
         if (_is_unknown_method(resp) and req_method in server._methods
@@ -413,7 +430,7 @@ async def _dispatch_request(authority_connection: Any, req: Any, req_method: Any
             # registers (pet, wake word, connectors) keeps its legacy handler. A legacy
             # session writer keeps the authority's -32601 (ws_legacy_fallback), as does a
             # method neither side knows, which the client's capability fallbacks key on.
-            resp = await asyncio.to_thread(dispatch_legacy, server, req, transport, actor)
+            resp = await _dispatch_in_rpc_thread(dispatch_legacy, server, req, transport, actor)
         return resp
 
 
