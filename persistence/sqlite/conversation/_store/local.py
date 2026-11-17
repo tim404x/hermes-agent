@@ -132,7 +132,10 @@ def _cached_local_lineage_index(db, conn):
         if saved is not None and saved[0] == version:
             cache.move_to_end(conn)
             return _copy_lineage_index(saved[1])
-    value = local_lineage_index(conn)
+    # A commit anywhere in the store moved this connection's version: re-parse only the receipts that
+    # moved (a busy profile holds thousands of 36 KB receipts), never the whole table again.
+    from persistence.sqlite.conversation._store.local_lineage_memo import memoized_local_lineage_index
+    value = memoized_local_lineage_index(db, conn)
     # A concurrent writer may commit between the receipt scan and the end_reason reads. Never
     # publish that in-flight projection as a stable cache entry; the next call must rebuild it.
     if not conn.in_transaction and _lineage_version(conn) == version:
@@ -147,8 +150,9 @@ def _cached_local_lineage_index(db, conn):
 def exclude_superseded_segments(db, where_clauses, params):
     """Drop earlier reset segments from a listing or count query (one conversation, one row),
     in SQL before paging; returns ``heads`` for :func:`annotate_local_lineages`."""
-    with db._read_ctx() as conn:
-        superseded, heads = _cached_local_lineage_index(db, conn)
+    # Through the reader every other listing read uses: the index now reads ``sessions`` on every
+    # miss, so it can be the first to meet a damaged store, and that must latch like any read.
+    superseded, heads = db._read_retrying_ioerr(lambda conn: _cached_local_lineage_index(db, conn))
     if superseded:
         where_clauses.append("s.id NOT IN (SELECT value FROM json_each(?))")
         params.append(json.dumps(sorted(superseded)))
