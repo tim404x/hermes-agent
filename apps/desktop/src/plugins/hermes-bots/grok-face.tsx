@@ -1,7 +1,7 @@
 /**
  * Grok Bot faces: the xAI bot avatar family (8 clay shapes, 16 rest
- * expressions, slanted slit eyes punched through the body) drawn LIVE in any
- * colour, and animated by the roster mood instead of frozen in a PNG.
+ * expressions, solid white slanted slit eyes painted on the body) drawn LIVE in
+ * any colour, and animated by the roster mood instead of frozen in a PNG.
  *
  * The geometry and motion come from `./grokbot`, a vendored copy of bloub
  * (github.com/jeremy-prt/bloub, MIT), whose constants are measured frame by
@@ -166,8 +166,11 @@ export function grokFrameMarkup(frame: BotFrame, ink: string, uid: string): stri
   const color = attr(ink)
   const maskId = `hb-grok-${uid}`
 
-  const holes = frame.eyes
-    .map(eye => `<path d="${eye.d}" transform="${eye.matrix}" opacity="${eye.alpha}" fill="#000"/>`)
+  // Eyes are solid WHITE paint on the opaque body (Tim, 17 Nov 2026: he prefers the white
+  // eyes the picker shows on a white card). `alpha` drives blinks and mood fades, so it
+  // stays the eye's opacity: a fading eye blends into the body colour, never into a hole.
+  const whiteEyes = frame.eyes
+    .map(eye => `<path d="${eye.d}" transform="${eye.matrix}" opacity="${eye.alpha}" fill="#fff"/>`)
     .join('')
 
   const notch = frame.notch
@@ -208,16 +211,18 @@ export function grokFrameMarkup(frame: BotFrame, ink: string, uid: string): stri
     })
     .join('')
 
-  // Eyes (and the notch) are real HOLES, like xAI's: the surface behind the avatar shows
-  // through. No white under-layer, whose anti-aliased edge left a pale rim around every
-  // face on a dark sidebar.
+  // The body is never cut where the eyes are: the eyes are painted ON TOP of the opaque
+  // colour, inside the same body mask, so their anti-aliased edge blends white into the
+  // body colour only. Eye holes let a dark sidebar show through as black eyes, and a white
+  // under-layer left a pale rim around the body; this has neither. The notch stays a real
+  // hole: it is the gap that separates the notification dot from the body, not an eye.
   const body =
     `<g opacity="${frame.bodyAlpha}">` +
-    `<g mask="url(#${maskId})"><rect x="${-HALF}" y="${-HALF}" width="${HALF * 2}" height="${HALF * 2}" fill="${color}"/></g></g>`
+    `<g mask="url(#${maskId})"><rect x="${-HALF}" y="${-HALF}" width="${HALF * 2}" height="${HALF * 2}" fill="${color}"/>${whiteEyes}</g></g>`
 
   return (
     `<defs><mask id="${maskId}" maskUnits="userSpaceOnUse" x="${-HALF}" y="${-HALF}" width="${HALF * 2}" height="${HALF * 2}">` +
-    `<path d="${frame.bodyPath}" fill="#fff"/>${holes}${notch}</mask>${gradients}</defs>` +
+    `<path d="${frame.bodyPath}" fill="#fff"/>${notch}</mask>${gradients}</defs>` +
     arcs('back') +
     (frame.dotsBehind ? dots : '') +
     body +
