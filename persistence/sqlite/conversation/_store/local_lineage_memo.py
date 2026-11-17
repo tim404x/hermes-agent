@@ -1,6 +1,6 @@
 """The local lineage index without re-parsing every receipt on every listing.
 
-``hermes_state_local.local_lineage_index`` finds the receipts whose lineage has more than one segment
+``local.local_lineage_index`` finds the receipts whose lineage has more than one segment
 by JSON-parsing EVERY ``gateway.local_policy.v1:*`` row. A receipt carries its session's whole policy
 (about 36 KB) and every cron run leaves one: a profile with 8,900 receipts parses 317 MB of JSON, 0.4 s
 of CPU, per session listing. Its per-connection reuse keys on ``PRAGMA data_version``, which any commit
@@ -24,13 +24,19 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import threading
 from collections import OrderedDict
 from typing import Any, Optional
 
-from hermes_state_local import POLICY_PREFIX, local_lineage_index
+from persistence.sqlite._holder import StoreHolder
+from persistence.sqlite.conversation._store.local import POLICY_PREFIX, local_lineage_index
 
 _MAX_STORES = 16
+# The fingerprint's byte length comes from ``octet_length()`` (record header, no body read), which SQLite
+# only has since 3.43. On an older library every listing would raise ``no such function``: it takes the
+# full scan instead, exactly as before this memo.
+_OCTET_LENGTH_SQLITE = (3, 43, 0)
 # More moved receipts than this: one pass over all of them beats that many keyed reads.
 _REPARSE_ONE_BY_ONE = 64
 
@@ -56,9 +62,9 @@ _stores: OrderedDict[tuple, _Memo] = OrderedDict()
 _stores_lock = threading.Lock()
 
 
-def _store_identity(db: Any) -> Optional[tuple]:
-    """The store FILE this handle reads: a recovered or recreated state.db at the same path is another."""
-    path = getattr(db, "db_path", None)
+def _store_identity(holder: StoreHolder) -> Optional[tuple]:
+    """The store FILE this holder reads: a recovered or recreated state.db at the same path is another."""
+    path = getattr(holder, "db_path", None)
     if path is None:
         return None
     try:
@@ -148,10 +154,12 @@ def _index(conn, receipts: list[tuple]) -> tuple[set, dict]:
     return superseded, heads
 
 
-def memoized_local_lineage_index(db: Any, conn) -> tuple[set, dict]:
+def memoized_local_lineage_index(holder: StoreHolder, conn) -> tuple[set, dict]:
     """``local_lineage_index(conn)``, parsing only the receipts that moved since this store was last read.
-    The caller's own open transaction (uncommitted writes) and a store without a file take the full scan."""
-    store = None if conn.in_transaction else _store_identity(db)
+    The caller's own open transaction (uncommitted writes), a store without a file and a SQLite older than
+    3.43 take the full scan."""
+    old_sqlite = sqlite3.sqlite_version_info < _OCTET_LENGTH_SQLITE
+    store = None if conn.in_transaction or old_sqlite else _store_identity(holder)
     if store is None:
         return local_lineage_index(conn)
     memo = _memo_for(store)
