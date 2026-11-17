@@ -42,9 +42,11 @@ function face(shape: string, color = '#ff9800', mood: 'idle' | 'think' | 'work' 
   return container.querySelector('svg') as SVGSVGElement
 }
 
-/** Eye holes are the black paths punched into the body mask. */
-function eyeHoles(svg: SVGSVGElement) {
-  return [...svg.querySelectorAll('mask path[fill="#000"]')].filter(p => Number(p.getAttribute('opacity') ?? 1) > 0.05)
+/** Visible eyes: the white paths painted on the body (outside the mask defs). */
+function whiteEyes(svg: SVGSVGElement) {
+  return [...svg.querySelectorAll('path[fill="#fff"]')].filter(
+    p => !p.closest('mask, defs') && Number(p.getAttribute('opacity') ?? 1) > 0.05
+  )
 }
 
 describe('grok appearance strings', () => {
@@ -71,13 +73,13 @@ describe('grok face render', () => {
     expect(svg.getAttribute('data-hb-grok')).toBe('grok:hexagon')
     expect(svg.getAttribute('data-bot-face')).toBe('delta')
     expect(svg.querySelector('rect')?.getAttribute('fill')).toBe('#ff6700')
-    expect(eyeHoles(svg)).toHaveLength(2)
+    expect(whiteEyes(svg)).toHaveLength(2)
   })
 
-  it('cuts the eyes out as holes: no light under-layer anywhere outside the mask', () => {
-    // A white copy of the body under the colour used to leak a pale anti-aliased rim
-    // around every face on a dark sidebar. Eyes are holes now (xAI's look): the only
-    // paint is the colour, clipped by the body mask the eyes are punched into.
+  it('paints the eyes solid white on the opaque body: no eye holes, no under-layer', () => {
+    // Eye holes let a dark sidebar show through as black eyes; a white copy of the body
+    // under the colour leaked a pale rim. Now the mask is the body alone (no eye cut-outs),
+    // and the only paint is the colour plus two white eyes on top of it, inside the mask.
     for (const shape of [
       'grok:squircle',
       'grok:pebble',
@@ -88,11 +90,24 @@ describe('grok face render', () => {
     ]) {
       const svg = face(shape, '#9159fe')
       const painted = [...svg.querySelectorAll('path, rect, circle')].filter(el => !el.closest('mask, defs'))
+      const eyes = whiteEyes(svg)
 
-      expect(eyeHoles(svg), shape).toHaveLength(2)
-      expect(painted.length, shape).toBeGreaterThan(0)
+      expect(eyes, shape).toHaveLength(2)
+      expect(svg.querySelectorAll('mask path[fill="#000"]'), shape).toHaveLength(0)
+      // Eyes sit after the body colour in the same masked group, so they paint over it.
+      const body = svg.querySelector('rect')!
       expect(
-        painted.filter(el => el.getAttribute('fill') !== '#9159fe').map(el => el.outerHTML.slice(0, 80)),
+        eyes.every(eye => eye.parentElement === body.parentElement),
+        shape
+      ).toBe(true)
+      expect(
+        eyes.every(eye => body.compareDocumentPosition(eye) & Node.DOCUMENT_POSITION_FOLLOWING),
+        shape
+      ).toBe(true)
+      expect(
+        painted
+          .filter(el => !eyes.includes(el) && el.getAttribute('fill') !== '#9159fe')
+          .map(el => el.outerHTML.slice(0, 80)),
         shape
       ).toEqual([])
     }
@@ -120,12 +135,12 @@ describe('grok face render', () => {
 })
 
 describe('grok face moods', () => {
-  it('idle keeps the slit eyes open on the body', () => {
+  it('idle keeps the white slit eyes open on the body', () => {
     const svg = face('grok:squircle')
     paintGrokFace(svg, 10)
     paintGrokFace(svg, 11)
 
-    expect(eyeHoles(svg)).toHaveLength(2)
+    expect(whiteEyes(svg)).toHaveLength(2)
     expect(svg.querySelectorAll('linearGradient')).toHaveLength(0)
   })
 
@@ -138,7 +153,7 @@ describe('grok face moods', () => {
 
     // The body is the middle dot; the two side dots are separate circles.
     expect(svg.querySelectorAll(':scope > circle')).toHaveLength(2)
-    expect(eyeHoles(svg)).toHaveLength(0)
+    expect(whiteEyes(svg)).toHaveLength(0)
   })
 
   it('work spins the orbit rings, and re-arms them after the rest beat', () => {
