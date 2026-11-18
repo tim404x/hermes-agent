@@ -15,16 +15,27 @@ import { clamp, createRng, loopNoise } from './math'
  * (erreur residuelle ~1 px sur un rayon de 190 px).
  */
 
-type Vec3 = [number, number, number]
+export type Vec3 = [number, number, number]
 
 /** Demi-ecart des yeux sur la sphere, en degres (separation totale ~31deg). */
 export const EYE_SPLIT = 15.46
 /** Taille de l'oeil au repos, en unites de rayon de boule. */
 export const EYE_W = 0.186
 export const EYE_H = 0.412
+/**
+ * Hermes: rendered eye size multiplier on top of bloub's measured rest size.
+ * Tim's reference render of xAI's bot (18 Nov 2026) has eyes 1.4x bloub's in
+ * length and width; applied at render time so every expression scales alike.
+ */
+export const EYE_SCALE = 1.4
 
 /** Orientation de tete au repos, ajustee sur les frames de reference. */
-export const REST_GAZE: HeadGaze = { yaw: 28.49, pitch: 28.62, roll: -13 }
+// Hermes: re-fitted on Tim's xAI reference render (18 Nov 2026), with EYE_SCALE and the
+// spherical eye wrap: the eyes sit lower, nearer the middle and more tilted than bloub's
+// video fit ({ yaw: 28.49, pitch: 28.62, roll: -13 }).
+export const REST_GAZE: HeadGaze = { yaw: 18, pitch: 26, roll: -27 }
+/** bloub's rest gaze, as fitted on the reference video. Kept: the sphere-model tests check against it. */
+export const VIDEO_REST_GAZE: HeadGaze = { yaw: 28.49, pitch: 28.62, roll: -13 }
 
 export interface EyePose {
   x: number
@@ -36,6 +47,10 @@ export interface EyePose {
   d: number
   /** composante z de la normale : > 0 = face visible */
   depth: number
+  /** Hermes: 3D frame of the eye (normal, tangent right, tangent down) for the spherical wrap */
+  normal: Vec3
+  tangentX: Vec3
+  tangentY: Vec3
 }
 
 export interface HeadGaze {
@@ -88,7 +103,10 @@ export function eyePoses(gaze: HeadGaze, scale: number, split = EYE_SPLIT): [Eye
       b: er[1],
       c: down[0],
       d: down[1],
-      depth: ef[2]
+      depth: ef[2],
+      normal: ef,
+      tangentX: er,
+      tangentY: down
     }
   }
 
@@ -189,4 +207,109 @@ export function liveliness(t: number, opt: LivelinessOptions = {}): Liveliness {
  */
 export function blinkScale(lid: number): number {
   return 0.06 + 0.94 * clamp(lid)
+}
+
+/**
+ * Hermes: the eye painted ON the sphere instead of a flat capsule under an affine
+ * tangent map. The capsule outline (w x h, in sphere-radius units, tilted by `tilt`
+ * radians in the eye plane) is sampled in the tangent plane, carried onto the unit
+ * sphere along great circles (exponential map) and projected orthographically. The
+ * eye nearest the rim therefore bends and thins toward the edge, like xAI's render.
+ * `at` places the result: eye centre on screen, sphere radius in px, blink squash.
+ */
+export function sphereEyePath(
+  pose: EyePose,
+  tilt: number,
+  w: number,
+  h: number,
+  at: { scale: number; squash: number; x: number; y: number },
+  steps = 16
+): string {
+  const hw = Math.max(w, 0.0001) / 2
+  const hh = Math.max(h, 0.0001) / 2
+  const r = Math.min(hw, hh)
+  const cos = Math.cos(tilt)
+  const sin = Math.sin(tilt)
+  const ex = pose.tangentX.map((v, i) => v * cos + pose.tangentY[i]! * sin)
+  const ey = pose.tangentX.map((v, i) => -v * sin + pose.tangentY[i]! * cos)
+  const n = pose.normal
+  const pts: string[] = []
+
+  const put = (u: number, v: number) => {
+    const t = [u * ex[0]! + v * ey[0]!, u * ex[1]! + v * ey[1]!, u * ex[2]! + v * ey[2]!]
+    const len = Math.hypot(t[0]!, t[1]!, t[2]!)
+    const c = Math.cos(len)
+    const s = len > 1e-9 ? Math.sin(len) / len : 1
+    const px = (n[0] * c + t[0]! * s - n[0]) * at.scale
+    const py = (n[1] * c + t[1]! * s - n[1]) * at.scale * at.squash
+    pts.push(`${Math.round((at.x + px) * 100) / 100} ${Math.round((at.y + py) * 100) / 100}`)
+  }
+
+  // Long axis along the eye's own vertical (as capsulePath with h > w): straight
+  // sides are sampled too, so they follow the sphere's curvature.
+  const capsule = (cx: number, cy: number, from: number) => {
+    for (let j = 0; j <= steps; j++) {
+      const a = from + (Math.PI * j) / steps
+      put(cx + r * Math.cos(a), cy + r * Math.sin(a))
+    }
+  }
+
+  const side = (x0: number, y0: number, x1: number, y1: number) => {
+    for (let j = 1; j < steps; j++) {
+      put(x0 + ((x1 - x0) * j) / steps, y0 + ((y1 - y0) * j) / steps)
+    }
+  }
+
+  if (hh >= hw) {
+    capsule(0, -(hh - r), Math.PI)
+    side(r, -(hh - r), r, hh - r)
+    capsule(0, hh - r, 0)
+    side(-r, hh - r, -r, -(hh - r))
+  } else {
+    capsule(hw - r, 0, -Math.PI / 2)
+    side(hw - r, r, -(hw - r), r)
+    capsule(-(hw - r), 0, Math.PI / 2)
+    side(-(hw - r), -r, hw - r, -r)
+  }
+
+  return `M${pts.join('L')}Z`
+}
+
+/**
+ * Hermes: where the two eyes land, and how big they are drawn.
+ *
+ * With `face` (one of xAI's bodies, `FaceFit` in skins.ts) the eyes follow xAI's own
+ * rule: the round-body centres are scaled by `face.k` about the body centre and moved
+ * down by `face.y` radii; the eyes are drawn `face.size` times. Without it (an animated
+ * silhouette) bloub's radial fit stays, with one change: the pair's midpoint is fitted,
+ * each eye keeps its offset, so the bigger EYE_SCALE eyes never collide on narrow bodies.
+ * `scale` is the body radius in output units; `radiusAt(x, y)` the body's radius ratio.
+ */
+export function placeEyes(
+  poses: [EyePose, EyePose],
+  scale: number,
+  radiusAt: (x: number, y: number) => number,
+  face?: { k: number; size: number; y: number } | null
+): { at: [{ x: number; y: number }, { x: number; y: number }]; size: number } {
+  if (face) {
+    return {
+      at: [
+        { x: poses[0].x * face.k, y: poses[0].y * face.k + face.y * scale },
+        { x: poses[1].x * face.k, y: poses[1].y * face.k + face.y * scale }
+      ],
+      size: face.size
+    }
+  }
+
+  const mx = (poses[0].x + poses[1].x) / 2
+  const my = (poses[0].y + poses[1].y) / 2
+  const fit = radiusAt(mx, my)
+
+  return {
+    at: [
+      { x: mx * fit + (poses[0].x - mx), y: my * fit + (poses[0].y - my) },
+      { x: mx * fit + (poses[1].x - mx), y: my * fit + (poses[1].y - my) }
+    ],
+    size: 1
+  }
 }
