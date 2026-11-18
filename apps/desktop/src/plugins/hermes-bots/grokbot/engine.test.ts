@@ -155,7 +155,7 @@ describe('forme personnalisee', () => {
 
   it('morphe vers la nouvelle forme au lieu de sauter', () => {
     const e = new BotEngine(100, 'idle', radii('cercle'))
-    // le cercle fait 2.0 de haut, la capsule 1.24 : la hauteur est parlante
+    // le cercle fait 2.0 de haut, la capsule 1.30 (contour xAI) : la hauteur est parlante
     expect(hauteur(e, 1)).toBeCloseTo(2, 1)
     e.setShape(radii('capsule'), 1)
 
@@ -167,10 +167,10 @@ describe('forme personnalisee', () => {
     }
 
     expect(etapes[0]!).toBeLessThan(2)
-    expect(etapes[etapes.length - 1]!).toBeGreaterThan(1.24)
+    expect(etapes[etapes.length - 1]!).toBeGreaterThan(1.3)
 
     // arrive apres la duree du morph
-    expect(hauteur(e, 1 + BotEngine.SHAPE_MORPH + 0.05)).toBeCloseTo(1.24, 1)
+    expect(hauteur(e, 1 + BotEngine.SHAPE_MORPH + 0.05)).toBeCloseTo(1.3, 1)
   })
 
   it('reste une fonction pure du temps pendant un morph de forme', () => {

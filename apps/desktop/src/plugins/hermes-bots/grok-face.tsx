@@ -64,18 +64,19 @@ export type GrokExpressionId = keyof typeof GROK_EXPRESSIONS
 
 /** xAI's Grok Bot palette, offered as swatches next to the profile colours. Red, orange,
  *  amber, green, blue and violet are xAI's official values (design post + client colour table,
- *  measured 15 Nov 2026); the other six are bloub's picker samples. */
+ *  measured 15 Nov 2026); teal, pink and brown were sampled off the same design post's avatar
+ *  grid on 18 Nov 2026; ink, grey and cream are bloub's picker samples. */
 export const GROK_PALETTE = [
   '#0a0a0c',
-  '#8b5e3c',
+  '#97683d',
   '#ff263c',
   '#ff6700',
   '#ff9800',
   '#00c972',
-  '#2fbfa0',
+  '#00bca6',
   '#1084fe',
   '#9159fe',
-  '#e152b0',
+  '#ff309b',
   '#a3a3a3',
   '#f1efe9'
 ] as const
@@ -170,7 +171,11 @@ export function grokFrameMarkup(frame: BotFrame, ink: string, uid: string): stri
   // eyes the picker shows on a white card). `alpha` drives blinks and mood fades, so it
   // stays the eye's opacity: a fading eye blends into the body colour, never into a hole.
   const whiteEyes = frame.eyes
-    .map(eye => `<path d="${eye.d}" transform="${eye.matrix}" opacity="${eye.alpha}" fill="#fff"/>`)
+    .map(eye =>
+      eye.wrap
+        ? `<path d="${eye.wrap}" opacity="${eye.alpha}" fill="#fff"/>`
+        : `<path d="${eye.d}" transform="${eye.matrix}" opacity="${eye.alpha}" fill="#fff"/>`
+    )
     .join('')
 
   const notch = frame.notch

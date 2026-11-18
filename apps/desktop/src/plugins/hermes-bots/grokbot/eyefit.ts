@@ -39,9 +39,9 @@
  */
 
 import { type BotExpression, EXPRESSIONS } from './expressions'
-import { eyePoses } from './face'
+import { EYE_SCALE, eyePoses, placeEyes } from './face'
 import { type Point, radiusAtAngle, toPoints } from './shape'
-import { SHAPES } from './skins'
+import { FACE_BY_RADII, SHAPES } from './skins'
 import { type Pose, type StateDef, type StateId, STATES } from './states'
 
 /** Rayon de reference du solveur. Le decalage rendu est en unites de ce rayon. */
@@ -107,9 +107,17 @@ interface Empreinte {
  *
  * Le clignement n'y est pas : un oeil ferme n'a pas besoin qu'on lui fasse de la place.
  */
-function empreintes(visage: Visage, sil: Pose['sil'], radii: number[]): Empreinte[] {
+function empreintes(visage: Visage, sil: Pose['sil'], radii: number[], eyeScale = EYE_SCALE): Empreinte[] {
   const out: Empreinte[] = []
   const poses = eyePoses(visage.gaze, R, visage.split)
+
+  // le meme placement que le moteur (Hermes : visage xAI sur ses formes, sinon paire recentree)
+  const placed = placeEyes(
+    poses,
+    R,
+    (x, y) => radiusAtAngle(radii, Math.atan2(y, x) - sil.rot),
+    FACE_BY_RADII.get(radii)
+  )
 
   for (let i = 0; i < 2; i++) {
     const e = poses[i]!
@@ -127,17 +135,15 @@ function empreintes(visage: Visage, sil: Pose['sil'], radii: number[]): Empreint
     const cx = -e.a * sp + e.c * cp
     const cy = -e.b * sp + e.d * cp
 
-    const hw = Math.max(cfg.w * R, 0.01) / 2
-    const hh = Math.max(cfg.h * R, 0.01) / 2
+    const hw = Math.max(cfg.w * eyeScale * placed.size * R, 0.01) / 2
+    const hh = Math.max(cfg.h * eyeScale * placed.size * R, 0.01) / 2
     const r = Math.min(hw, hh)
     // l'axe est celui de la plus grande dimension
     const long = hh > hw
     const demi = long ? hh - r : hw - r
-    // le prorata du rayon local, exactement comme le fait le moteur
-    const fit = radiusAtAngle(radii, Math.atan2(e.y, e.x) - sil.rot)
     out.push({
-      x: e.x * fit,
-      y: e.y * fit,
+      x: placed.at[i]!.x,
+      y: placed.at[i]!.y,
       ax: (long ? cx : ax) * demi,
       ay: (long ? cy : ay) * demi,
       r,
@@ -429,8 +435,8 @@ function decalagePour(def: StateDef, radii: number[], expr: BotExpression | null
 
     for (const c of coins) {
       epreuves.push({
-        empreintes: empreintes(c, pose.sil, radii),
-        reference: empreintes(c, pose.sil, pose.sil.radii),
+        empreintes: empreintes(c, pose.sil, radii, def.ownEyeSize ? 1 : EYE_SCALE),
+        reference: empreintes(c, pose.sil, pose.sil.radii, def.ownEyeSize ? 1 : EYE_SCALE),
         contour,
         calContour
       })

@@ -183,6 +183,12 @@ export interface StateDef {
    * sur la video, c'est precisement ce qu'on reproduit.
    */
   baseFace: boolean
+  /**
+   * Hermes: true when the state's eye size is its own measured size (wide-open eyes,
+   * the notification face). Those are left as they are; every other state draws its
+   * eyes EYE_SCALE times bloub's size.
+   */
+  ownEyeSize?: boolean
   pose(local: number): Pose
 }
 
@@ -261,6 +267,7 @@ export const STATES: StateDef[] = [
     duration: 1.8,
     morph: 0.55,
     blinkIn: true,
+    ownEyeSize: true,
     baseFace: false,
     baseBody: true,
     pose: () =>
@@ -313,6 +320,7 @@ export const STATES: StateDef[] = [
     duration: 2.2,
     morph: 0.5,
     blinkIn: true,
+    ownEyeSize: true,
     baseFace: false,
     baseBody: true,
     pose: t => {
