@@ -223,12 +223,13 @@ def _maybe_title_session_at_turn_start(
     if platform in _UNTITLED_PLATFORMS:
         return
     from agent.oneshot_footprint import agent_is_oneshot
-    if agent_is_oneshot(agent):  # nothing shows a one-shot's title, and the call is a second paid request
-        return
+    # A one-shot gets a free derived title (apply_oneshot_title) but never the model call: that is a
+    # second paid request for a run that answers one query.
+    oneshot = agent_is_oneshot(agent)
     try:
         from agent.agent_init_session import agent_interface
         from session_rules.turns import flatten_message_text
-        from agent.title_generator import apply_subagent_title, maybe_auto_title
+        from agent.title_generator import apply_oneshot_title, apply_subagent_title, maybe_auto_title
 
         # Turn's user message as text; image-only turns yield "" and are skipped.
         user_text = ""
@@ -255,6 +256,9 @@ def _maybe_title_session_at_turn_start(
         persistence = agent_interface(agent)
         if platform == "subagent":
             apply_subagent_title(session_db, session_id, user_text, persistence=persistence)
+            return
+        if oneshot:
+            apply_oneshot_title(session_db, session_id, user_text, persistence=persistence)
             return
         # Snapshot runtime identity so the background titler can skip if the user
         # switches models before it fires.

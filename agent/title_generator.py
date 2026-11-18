@@ -772,6 +772,39 @@ def apply_subagent_title(session_db, session_id: str, goal: str, *, persistence=
         return None
 
 
+_ONESHOT_HEADING_RE = re.compile(r"^\s{0,3}#\s+(\S.*)$")
+_TRAILING_PARENTHETICAL_RE = re.compile(r"\s*\([^()]*\)\s*$")
+
+
+def oneshot_title_line(user_message: str) -> str:
+    """The line a one-shot run is named after: the first markdown ``# `` heading when the prompt has one,
+    else its first non-empty line; heading marks and a trailing ``(...)`` note (a job's dateline) dropped."""
+    text = strip_control_wrappers(user_message or "")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    heading = next((m.group(1) for m in map(_ONESHOT_HEADING_RE.match, lines) if m), None)
+    line = (heading or (lines[0] if lines else "")).lstrip("#").strip()
+    stripped = _TRAILING_PARENTHETICAL_RE.sub("", line).strip()
+    return stripped or line
+
+
+def apply_oneshot_title(session_db, session_id: str, user_message: str, *, persistence=None) -> Optional[str]:
+    """Free ``derived`` title for a one-shot run (fork carry): no model call, ever. A one-shot answers
+    one query, so the paid upgrade is skipped by design, but an untitled row is unreadable wherever a
+    client lists it. Repeated openers (a worker's fixed contract line) take ``#N``. Never raises."""
+    if not session_db or not session_id or not is_titleable_user_message(user_message or ""):
+        return None
+    try:
+        if not _auto_title_enabled():
+            return None
+        title = derive_title(oneshot_title_line(user_message))
+        return _persist_session_title(
+            session_db, session_id, title, source="derived", persistence=persistence,
+        ) if title else None
+    except Exception:
+        logger.debug("One-shot title failed for %s", session_id, exc_info=True)
+        return None
+
+
 def apply_instant_title(
     session_db, session_id: str, user_message: str, title_callback: Optional[TitleCallback] = None,
     title_preview: str | None = None, *, persistence=None,
