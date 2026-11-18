@@ -1,20 +1,12 @@
 import { PROFILE_SAMPLES } from './profiles'
-import {
-  hullOfCircles,
-  profileFromPolygon,
-  regularPolygonProfile,
-  superellipseProfile,
-  unionOfCirclesProfile
-} from './shape'
+import { XAI_PROFILE_RAYS, XAI_PROFILES } from './xai-profiles'
 
 /**
  * Formes et couleurs proposees par le personnalisateur du bot.
  *
  * A la difference des silhouettes d'animation (`profiles.ts`), celles-ci ne sont
- * PAS relevees sur la video : elles sont construites analytiquement d'apres la
- * grille du personnalisateur d'origine. Deux sources distinctes, donc, et c'est
- * volontaire — les etats animes doivent rester fideles a la video, les formes de
- * base sont un choix d'utilisateur.
+ * PAS relevees sur la video. Hermes : ce sont les contours exacts des avatars de
+ * xAI (`xai-profiles.ts`), plus des constructions analytiques.
  */
 
 /**
@@ -26,65 +18,58 @@ import {
  */
 export type ShapeId = 'cercle' | 'galet' | 'squircle' | 'capsule' | 'triangle' | 'hexagone' | 'nuage' | 'goutte'
 
+/**
+ * Hermes: xAI's face placement for a body. Eye centres (as laid out on the round
+ * body) are scaled by `k` about the body centre then moved down by `y` body radii;
+ * each eye is drawn `size` times its round-body size. Read off the eye transforms
+ * of xAI's eight design-post avatars (residual under 0.6 px on a 140 px avatar).
+ */
+export interface FaceFit {
+  k: number
+  size: number
+  y: number
+}
+
 export interface BotShape {
   id: ShapeId
   radii: number[]
+  face?: FaceFit
 }
 
-/** Ramene le rayon maximal a `max` pour que toutes les formes pesent pareil a l'oeil. */
-function normalize(radii: number[], max = 1): number[] {
-  const peak = Math.max(...radii)
+/** Hermes: xAI's exact outline, resampled from its 256 rays to PROFILE_SAMPLES. */
+function xai(id: keyof typeof XAI_PROFILES): number[] {
+  const src = XAI_PROFILES[id]
 
-  if (peak <= 0) {
-    return radii
-  }
+  return Array.from({ length: PROFILE_SAMPLES }, (_, i) => {
+    const t = (i / PROFILE_SAMPLES) * XAI_PROFILE_RAYS
+    const j = Math.floor(t)
+    const a = src[j % XAI_PROFILE_RAYS] ?? 1
+    const b = src[(j + 1) % XAI_PROFILE_RAYS] ?? 1
 
-  const k = max / peak
-
-  return radii.map(r => r * k)
+    return a + (b - a) * (t - j)
+  })
 }
 
-const ANGLES = Array.from({ length: PROFILE_SAMPLES }, (_, i) => (i / PROFILE_SAMPLES) * Math.PI * 2)
-
-/** Galet : cercle deforme par deux harmoniques basses, donc irregulier mais lisse. */
-const pebble = normalize(
-  ANGLES.map(a => 1 + 0.075 * Math.cos(2 * a + 0.5) + 0.035 * Math.cos(3 * a + 2.1)),
-  1.02
-)
-
-/** Nuage : union de bosses, large en bas, deux lobes en haut. */
-const cloud = normalize(
-  unionOfCirclesProfile([
-    { x: -0.44, y: 0.2, r: 0.54 },
-    { x: 0.46, y: 0.2, r: 0.5 },
-    { x: 0.02, y: 0.3, r: 0.6 },
-    { x: -0.24, y: -0.3, r: 0.48 },
-    { x: 0.3, y: -0.24, r: 0.44 }
-  ]),
-  1.02
-)
-
-/** Goutte : gros disque en bas, pointe effilee en haut. */
-const droplet = normalize(profileFromPolygon(hullOfCircles(0, 0.28, 0.66, 0, -0.96, 0.05), 0, 0), 1.04)
-
-/** Capsule couchee : enveloppe de deux disques cote a cote. */
-const capsule = profileFromPolygon(hullOfCircles(-0.42, 0, 0.62, 0.42, 0, 0.62), 0, 0)
+// Hermes (18 Nov 2026): the seven non-circle bodies are xAI's own outlines, traced off
+// the design post's avatars (`xai-profiles.ts`). They replace bloub's approximations
+// (harmonic pebble, five-disc cloud, disc-hull droplet and capsule, rounded polygons):
+// Tim wanted pixel-exact Grok shapes.
 
 export const SHAPES: BotShape[] = [
-  { id: 'cercle', radii: new Array(PROFILE_SAMPLES).fill(1) },
-  { id: 'galet', radii: pebble },
-  // 1.15 et pas 1.02 : sur une superellipse le rayon maximal est la diagonale,
-  // donc normaliser dessus donne une forme qui parait plus petite que le cercle.
-  { id: 'squircle', radii: normalize(superellipseProfile(4.2), 1.15) },
-  { id: 'capsule', radii: capsule },
-  // -90deg : un sommet vers le haut de l'ecran (y est oriente vers le bas)
-  { id: 'triangle', radii: regularPolygonProfile(3, 1.12, 0.34, -90) },
-  // 30deg : un sommet vers le haut, comme le rendu officiel de xAI (Hermes : etait 0deg,
-  // aretes du haut et du bas plates ; recouvrement 88% -> 99% une fois tourne)
-  { id: 'hexagone', radii: regularPolygonProfile(6, 1.04, 0.26, 30) },
-  { id: 'nuage', radii: cloud },
-  { id: 'goutte', radii: droplet }
+  { id: 'cercle', radii: new Array(PROFILE_SAMPLES).fill(1), face: { k: 1, size: 1, y: 0 } },
+  { id: 'galet', radii: xai('galet'), face: { k: 0.966, size: 1.0, y: 0.045 } },
+  { id: 'squircle', radii: xai('squircle'), face: { k: 0.995, size: 1.0, y: -0.001 } },
+  { id: 'capsule', radii: xai('capsule'), face: { k: 0.929, size: 0.82, y: 0.124 } },
+  { id: 'triangle', radii: xai('triangle'), face: { k: 0.7, size: 0.79, y: 0.207 } },
+  { id: 'hexagone', radii: xai('hexagone'), face: { k: 0.91, size: 1.0, y: -0.004 } },
+  { id: 'nuage', radii: xai('nuage'), face: { k: 0.787, size: 0.818, y: 0.07 } },
+  { id: 'goutte', radii: xai('goutte'), face: { k: 0.786, size: 0.887, y: 0.192 } }
 ]
+
+/** Hermes: face placement by body profile (keyed by the SHAPES radii arrays, by identity). */
+export const FACE_BY_RADII = new Map<number[], FaceFit>(
+  SHAPES.flatMap(s => (s.face ? [[s.radii, s.face] as const] : []))
+)
 
 // Map indexee par `string` et non par `ShapeId` : les appelants interrogent avec
 // une valeur relue du localStorage ou d'une prop, donc non validee.
@@ -103,15 +88,15 @@ export interface BotColor {
  *  remplaces par les valeurs officielles de xAI (article de design + table du client). */
 export const COLORS: BotColor[] = [
   { id: 'encre', hex: '#0a0a0c' },
-  { id: 'brun', hex: '#8b5e3c' },
+  { id: 'brun', hex: '#97683d' },
   { id: 'rouge', hex: '#ff263c' },
   { id: 'orange', hex: '#ff6700' },
   { id: 'ambre', hex: '#ff9800' },
   { id: 'vert', hex: '#00c972' },
-  { id: 'turquoise', hex: '#2fbfa0' },
+  { id: 'turquoise', hex: '#00bca6' },
   { id: 'bleu', hex: '#1084fe' },
   { id: 'violet', hex: '#9159fe' },
-  { id: 'rose', hex: '#e152b0' },
+  { id: 'rose', hex: '#ff309b' },
   { id: 'gris', hex: '#a3a3a3' },
   { id: 'creme', hex: '#f1efe9' }
 ]

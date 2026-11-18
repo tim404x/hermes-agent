@@ -10,5 +10,8 @@ Local changes: formatting (eslint --fix + prettier to match this repo), plus two
 measured corrections in `skins.ts` against xAI's own design-post render (16 Nov 2026):
 the hexagon is turned point-up (rotation 30, was 0) and six palette colours use
 xAI's official values (red, orange, amber, green, blue, violet).
+Hermes changes on 18 Nov 2026 (Tim's reference render of xAI's bot): teal, pink and brown
+set to the design post's values; eyes rendered 1.4x (`EYE_SCALE`) and wrapped onto the
+sphere (`sphereEyePath`, curved and thinner near the rim); `REST_GAZE` re-fitted to match.
 bloub's own engine/shape/skins/expressions/face tests are kept alongside and
 must stay green. The Hermes integration lives one level up in `grok-face.tsx`.
