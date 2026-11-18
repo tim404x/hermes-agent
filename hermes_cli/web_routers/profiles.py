@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query
 
-from hermes_cli.session_listing import subagent_listing_scope
+from hermes_cli.session_listing import subagent_listing_scope, with_internal_listing_excludes
 from hermes_cli.web_deps import late
 from hermes_cli.config import get_process_hermes_home
 from hermes_cli.isolated_scope import scope_to_launch_profile
@@ -442,6 +442,9 @@ def get_profiles_sessions(
             include_subagents, exclude = subagent_listing_scope(
                 home, source=filters["source"], sources=filters["sources"],
                 exclude_sources=filters["exclude_sources"])
+            if not filters["exclude_sources"]:
+                exclude = with_internal_listing_excludes(
+                    exclude, source=filters["source"], sources=filters["sources"])
             scoped = {**filters, "exclude_sources": exclude, "include_subagents": include_subagents}
             rows = _session_rows(
                 store, limit=per_profile, offset=0, order_by_last_active=order == "recent",
@@ -508,6 +511,8 @@ def get_profiles_sessions_sidebar(
         source, exclude = slice_scope[key]
         # Only recents takes subagent runs (sessions.show_subagents); cron/messaging keep shape.
         include_subagents, exclude = recents_subagents if key == "recents" else (False, exclude)
+        if key != "cron" and not slice_scope[key][1]:
+            exclude = with_internal_listing_excludes(exclude)
         # include_pinned: a pinned conversation must reach the sidebar even when it has aged
         # past the window, or its Pinned row renders empty.
         return _session_rows(
