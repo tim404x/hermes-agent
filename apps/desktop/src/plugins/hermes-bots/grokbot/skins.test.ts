@@ -220,17 +220,30 @@ describe('formes du personnalisateur', () => {
    * petits sur un corps plat, et changer d'expression animait alors ce grossissement. Ca se
    * lisait comme un defaut.
    */
-  it('la taille des yeux ne depend pas de la forme', () => {
-    const tailles = new Set(
-      SHAPES.map(f =>
-        new BotEngine(R, 'idle', f.radii, null)
-          .sample(1)
-          .eyes.map(y => y.d)
-          .join('|')
-      )
-    )
+  /**
+   * Hermes: xAI draws the eyes smaller on its narrow bodies (triangle 0.79, capsule 0.82,
+   * cloud 0.82, droplet 0.89, the rest 1). Shapes with the same `face.size` keep the very
+   * same eye; a different size gives a different eye.
+   */
+  it('la taille des yeux suit celle des avatars xAI', () => {
+    const oeil = (radii: number[]) =>
+      new BotEngine(R, 'idle', radii, null)
+        .sample(1)
+        .eyes.map(y => y.d)
+        .join('|')
 
-    expect(tailles.size).toBe(1)
+    const parTaille = new Map<number, Set<string>>()
+
+    for (const f of SHAPES) {
+      const size = f.face?.size ?? 1
+      parTaille.set(size, (parTaille.get(size) ?? new Set()).add(oeil(f.radii)))
+    }
+
+    for (const [size, yeux] of parTaille) {
+      expect(yeux.size, `size ${size}`).toBe(1)
+    }
+
+    expect(new Set([...parTaille.values()].map(y => [...y][0])).size).toBe(parTaille.size)
   })
 
   /**

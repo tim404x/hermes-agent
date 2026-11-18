@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { EYE_H, EYE_SPLIT, EYE_W, eyePoses, type HeadGaze, REST_GAZE } from './face'
+import { EYE_H, EYE_SPLIT, EYE_W, eyePoses, type HeadGaze, REST_GAZE, VIDEO_REST_GAZE } from './face'
 
 /**
  * Valeurs relevees image par image sur la video de reference (unites : rayon de
@@ -18,7 +18,9 @@ const MESURES: Array<{
 }> = [
   {
     nom: 'repos',
-    gaze: REST_GAZE,
+    // the video's rest gaze: Hermes' REST_GAZE is re-fitted on xAI's own render, the
+    // sphere model is still checked against the video measurements
+    gaze: VIDEO_REST_GAZE,
     split: EYE_SPLIT,
     w: EYE_W,
     h: EYE_H,
@@ -78,7 +80,7 @@ describe('yeux poses sur une sphere', () => {
       expect(e.a * e.d - e.b * e.c).toBeCloseTo(e.depth, 6)
     }
 
-    const [proche, loin] = eyePoses(REST_GAZE, 1)
+    const [proche, loin] = eyePoses(VIDEO_REST_GAZE, 1)
     expect(loin.depth / proche.depth).toBeCloseTo(0.663, 1)
     // mesure video de la largeur : 0.120 / 0.178 = 0.674
     expect(court(loin, EYE_W) / court(proche, EYE_W)).toBeCloseTo(0.674, 1)
