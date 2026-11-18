@@ -49,6 +49,26 @@ def subagent_listing_scope(
     return True, [s for s in excluded if s != SUBAGENT_SOURCE] or None
 
 
+def with_internal_listing_excludes(
+    exclude_sources: list[str] | None, *, source: str | None = None, sources: list[str] | None = None,
+) -> list[str] | None:
+    """Default exclusion of internal worker runs for a REST session list (fork carry).
+
+    The desktop's TUI listing already hides ``INTERNAL_LISTING_SOURCES`` (kanban workers, tool
+    integrations, one-shot runs) from every picker; the REST lists only dropped what the caller
+    named, so a client that passes no source params (the official iOS app) listed every
+    ``source='oneshot'`` run. A caller that states its own scope keeps it exactly: a source
+    filter (``source=oneshot`` still returns them) or an explicit ``exclude_sources`` list (the
+    web dashboard's Automation tab excludes the chat sources to list automation runs). Cron
+    sessions are not internal and stay listed.
+    """
+    if source or sources or exclude_sources:
+        return exclude_sources
+    from persistence.conversation.sessions import INTERNAL_LISTING_SOURCES
+
+    return list(INTERNAL_LISTING_SOURCES)
+
+
 def parse_session_listing_args(raw_args: str) -> tuple[bool, bool, str, str | None]:
     """Parse `/sessions`-style args into ``(include_all_sources, include_unnamed, target, search_query)``.
 
