@@ -1,15 +1,18 @@
 import { arcRender, type ArcRender, type DotRender } from './decor'
 import { blendExpression, type BotExpression } from './expressions'
 import { decalageDesYeux } from './eyefit'
-import { blinkScale, eyePoses, liveliness } from './face'
+import { blinkScale, EYE_SCALE, type EyePose, eyePoses, liveliness, placeEyes, sphereEyePath } from './face'
 import { clamp, easings, lerp, r2 } from './math'
 import { blend, capsulePath, closedPath, type Point, radiusAtAngle, type Silhouette, toPoints } from './shape'
+import { FACE_BY_RADII } from './skins'
 import { type Pose, STATE_BY_ID, type StateDef, type StateId } from './states'
 
 export interface RenderedEye {
   d: string
   matrix: string
   alpha: number
+  /** Hermes: the same eye wrapped onto the sphere, absolute coordinates (no transform). */
+  wrap?: string
 }
 
 export interface BotFrame {
@@ -118,6 +121,16 @@ function blendPose(a: Pose, b: Pose, t: number): Pose {
  * Consequence pratique : pause, reprise, ralenti et saut a une date arbitraire
  * donnent exactement la meme image, et le rendu est testable sans DOM.
  */
+const ROUND_FACE = { k: 1, size: 1, y: 0 }
+
+type PlacedEyes = ReturnType<typeof placeEyes>
+
+function blendPlaced(a: PlacedEyes, b: PlacedEyes, t: number): PlacedEyes {
+  const at = (i: 0 | 1) => ({ x: lerp(a.at[i].x, b.at[i].x, t), y: lerp(a.at[i].y, b.at[i].y, t) })
+
+  return { at: [at(0), at(1)], size: lerp(a.size, b.size, t) }
+}
+
 export class BotEngine {
   /** rayon de la boule au repos, en unites de viewBox */
   readonly scale: number
@@ -303,6 +316,42 @@ export class BotEngine {
   }
 
   /**
+   * Hermes: eye centres and size for this frame. Each end of a shape morph is placed with
+   * its own rule (xAI face for a known body, radial fit otherwise) and the two are blended
+   * on the morph curve, then blended with the radial fit by `faceMix` (state cross-fade).
+   */
+  private placedEyes(
+    poses: [EyePose, EyePose],
+    R: number,
+    bodyRadius: (x: number, y: number) => number,
+    now: number,
+    faceMix: number
+  ) {
+    const fitted = placeEyes(poses, R, bodyRadius)
+
+    if (faceMix <= 0) {
+      return fitted
+    }
+
+    // no shape chosen = the round body, so the identity face (k 1, size 1, y 0)
+    const via = (radii: number[] | null) => {
+      const face = radii ? FACE_BY_RADII.get(radii) : ROUND_FACE
+
+      return face ? placeEyes(poses, R, bodyRadius, face) : fitted
+    }
+
+    let placed = via(this.shape)
+    const k = (now - this.shapeAt) / BotEngine.SHAPE_MORPH
+
+    if (this.shapePrev !== this.shape && k < 1) {
+      const from = via(this.shapePrev)
+      placed = blendPlaced(from, placed, easings.easeOutQuint(clamp(k)))
+    }
+
+    return faceMix >= 1 ? placed : blendPlaced(fitted, placed, faceMix)
+  }
+
+  /**
    * Decalage des yeux a l'instant `now` pour un etat donne, en unites de rayon de boule.
    *
    * Il est LU dans une table et interpole, jamais recalcule : `eyefit.ts` explique
@@ -462,6 +511,10 @@ export class BotEngine {
     const expr = this.exprAtTime(now)
     let pose = this.posed(def, Math.max(0, now - this.tCur), shape, expr)
     let decalage = this.decalageAtTime(now, this.cur)
+    // Hermes: xAI's face placement holds on the states that show the chosen body
+    // (`baseBody`); animated silhouettes keep the radial fit. Cross-fades with the state.
+    let faceMix = def.baseBody ? 1 : 0
+    let eyeScale = def.ownEyeSize ? 1 : EYE_SCALE
 
     // --- transition -------------------------------------------------------
     const since = now - this.tCur
@@ -485,6 +538,8 @@ export class BotEngine {
       const quitte = this.prev
 
       if (quitte) {
+        faceMix = lerp(STATE_BY_ID.get(quitte)?.baseBody ? 1 : 0, faceMix, ratio)
+        eyeScale = lerp(STATE_BY_ID.get(quitte)?.ownEyeSize ? 1 : EYE_SCALE, eyeScale, ratio)
         const avant = this.decalageAtTime(now, quitte)
         decalage = {
           x: lerp(avant.x, decalage.x, ratio),
@@ -538,6 +593,7 @@ export class BotEngine {
 
     if (pose.eyeAlpha > 0.01) {
       const poses = eyePoses(gaze, R, pose.split)
+      const placed = this.placedEyes(poses, R, bodyRadius, now, faceMix)
 
       for (let i = 0; i < 2; i++) {
         const e = poses[i]!
@@ -547,7 +603,6 @@ export class BotEngine {
         }
 
         const cfg = pose.eyes[i]!
-        const fit = bodyRadius(e.x, e.y)
         // Inclinaison propre de l'oeil : on compose le repere tangent avec une
         // rotation dans le plan de l'oeil (Basis x Rot). C'est ce qui permet des
         // inclinaisons en miroir entre les deux yeux.
@@ -561,10 +616,14 @@ export class BotEngine {
         // Le clignement s'applique APRES tout ca : c'est un ecrasement vertical
         // a l'ecran, pas le long de l'axe de la gelule.
         const k = blinkScale(Math.min(lid, cfg.open))
+        const ex = placed.at[i]!.x + (offX + decalage.x) * R
+        const ey = placed.at[i]!.y + (offY + decalage.y) * R
+        const size = eyeScale * placed.size
         eyes.push({
-          d: capsulePath(cfg.w * R, cfg.h * R),
-          matrix: `matrix(${r2(ax)},${r2(ay * k)},${r2(cx2)},${r2(cy2 * k)},${r2(e.x * fit + (offX + decalage.x) * R)},${r2(e.y * fit + (offY + decalage.y) * R)})`,
-          alpha: pose.eyeAlpha * clamp(e.depth / 0.12)
+          d: capsulePath(cfg.w * size * R, cfg.h * size * R),
+          matrix: `matrix(${r2(ax)},${r2(ay * k)},${r2(cx2)},${r2(cy2 * k)},${r2(ex)},${r2(ey)})`,
+          alpha: pose.eyeAlpha * clamp(e.depth / 0.12),
+          wrap: sphereEyePath(e, phi, cfg.w * size, cfg.h * size, { x: ex, y: ey, scale: R, squash: k })
         })
       }
     }
