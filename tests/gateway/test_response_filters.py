@@ -1,3 +1,8 @@
+import json
+from pathlib import Path
+
+import pytest
+
 from gateway.response_filters import (
     is_autonomous_silence_response,
     is_intentional_silence_agent_result,
@@ -175,3 +180,14 @@ def test_damaged_silent_marker_corpus_never_reaches_the_chat_while_real_text_doe
     leaked = [r for r in _DAMAGED_SILENT_REPLIES if not is_autonomous_silence_response(r)]
     swallowed = [r for r in _MUST_DELIVER_REPLIES if is_autonomous_silence_response(r)]
     assert (leaked, swallowed) == ([], [])
+
+
+_SILENCE_CASES = json.loads(
+    (Path(__file__).parents[1] / "fixtures" / "silence_marker_cases.json").read_text(encoding="utf-8"))["cases"]
+
+
+@pytest.mark.parametrize("case", _SILENCE_CASES, ids=[case["name"] for case in _SILENCE_CASES])
+def test_shared_silence_marker_cases(case):
+    """Shared with the desktop twin (``apps/desktop/src/lib/silence-marker.test.ts``): a bot's
+    sign-off emoji after the marker (``NO_REPLY ⚡``) is still silence, a sentence naming it is not."""
+    assert is_intentional_silence_response(case["input"]) is case["silent"]

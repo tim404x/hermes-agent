@@ -67,3 +67,19 @@ def test_roster_preview_falls_back_past_frame_only_rows(db):
 def test_roster_preview_of_plain_text_is_unchanged(db):
     _seed(db, "s1", {"role": "user", "content": "hi"}, {"role": "assistant", "content": "  hello   there  "})
     assert _latest_message_preview(db, "s1") == "hello there"
+
+
+def test_roster_preview_skips_a_silent_wake(db):
+    """A background-process wake the bot answered with a bare silence marker painted ``NO_REPLY`` as
+    the bot's sidebar line; the preview falls back to the newest row a person can read."""
+    _seed(db, "s1", {"role": "user", "content": "build the heatmap"},
+          {"role": "assistant", "content": "The heatmap is ready for you to publish."},
+          {"role": "user", "content": PROCESS_DONE, "display_kind": "process_complete"},
+          {"role": "assistant", "content": "NO_REPLY"})
+    assert _latest_message_preview(db, "s1") == "The heatmap is ready for you to publish."
+
+
+def test_roster_preview_keeps_a_reply_that_mentions_the_marker(db):
+    _seed(db, "s1", {"role": "user", "content": "what did you answer?"},
+          {"role": "assistant", "content": "I answered NO_REPLY on purpose."})
+    assert _latest_message_preview(db, "s1") == "I answered NO_REPLY on purpose."

@@ -1,0 +1,21 @@
+{
+  "_doc": "Shared cases for gateway/response_filters.py::is_intentional_silence_response and its desktop twin apps/desktop/src/lib/silence-marker.ts::isSilenceMarkerText. Both suites load this file, so the server's delivery rule and the renderer's paint rule cannot drift apart.",
+  "cases": [
+    { "name": "bare NO_REPLY", "input": "NO_REPLY", "silent": true },
+    { "name": "bracketed SILENT", "input": "[SILENT]", "silent": true },
+    { "name": "bare SILENT", "input": "SILENT", "silent": true },
+    { "name": "NO REPLY with a space", "input": "NO REPLY", "silent": true },
+    { "name": "lower case with padding", "input": "  no_reply \n", "silent": true },
+    { "name": "trailing period", "input": "NO_REPLY.", "silent": true },
+    { "name": "markdown emphasis", "input": " *NO_REPLY* ", "silent": true },
+    { "name": "bot sign-off emoji", "input": "NO_REPLY \u26a1", "silent": true },
+    { "name": "sign-off emoji with variation selector", "input": "[SILENT] \u2708\ufe0f", "silent": true },
+    { "name": "astral sign-off emoji", "input": "NO_REPLY \ud83d\udd2d", "silent": true },
+    { "name": "zh-Hans marker", "input": "[\u9759\u9ed8]", "silent": true },
+    { "name": "a sentence mentioning the marker is prose", "input": "I replied NO_REPLY to Neo's ping.", "silent": false },
+    { "name": "bracketed marker opening a note is prose here", "input": "[SILENT] nothing new this tick", "silent": false },
+    { "name": "malformed bracket is not a marker", "input": "[SILENT", "silent": false },
+    { "name": "blank is not silence", "input": "   ", "silent": false },
+    { "name": "plain answer", "input": "No problem, shipping it now.", "silent": false }
+  ]
+}
