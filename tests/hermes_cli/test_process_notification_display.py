@@ -98,7 +98,7 @@ def test_process_completion_display_keeps_payload_separate_across_surfaces(monke
     cli._tui_process_one_input(cli._pending_input.get_nowait())
     visible = capsys.readouterr().out
     expected = process_completion_display_text(events)
-    assert "long-build.sh" in expected and expected in visible
+    assert expected == "Long build finished" and expected in visible
     assert "[IMPORTANT" not in visible and "SECRET_OUTPUT_LINE" not in visible
     queued = cli.chat.call_args.args[0]
     assert queued == payload  # the model still receives the full notification
