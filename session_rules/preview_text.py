@@ -47,6 +47,7 @@ _INLINE_NOTE_TAIL_RE = re.compile(r"\[(?:Runtime note|System note):[\s\S]*$")
 # scaffold also opens with "[IMPORTANT:"; it is described as the typed command before this check runs.)
 HARNESS_FRAME_OPENERS = (
     "[IMPORTANT:", "[ASYNC DELEGATION", "[System:", "[SYSTEM]", "[Planning state preserved", "[Your active task list",
+    "[Cronjob ",
 )
 # A compaction carrier is matched by its whole introduction, not the bracketed label: a user asking what
 # "[CONTEXT COMPACTION — REFERENCE ONLY]" means wrote a real message.
