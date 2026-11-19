@@ -130,6 +130,11 @@
       "name": "a reply that mentions the marker is kept",
       "input": "Told Neo NO_REPLY  was the right call.",
       "expected": "Told Neo NO_REPLY was the right call."
+    },
+    {
+      "name": "cron output frame is internal",
+      "input": "[Cronjob \"🤖 Team report | Apex\" output — scheduled job, not the user. Review it, act on anything that needs action, and summarize for the chat.]\n\n🎯 Apex Morning run is done.",
+      "expected": ""
     }
   ]
 }
