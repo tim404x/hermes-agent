@@ -87,7 +87,7 @@ def probe(base, source):
             assert len(completion_turns()) == 1, 'the unviewed completion must resume the parent once'
             assert noted() == [], 'a resumed completion is not also a note'
             assert len(found) == 1 and found[0][0] == 'process_complete', found
-            assert str(found[0][1]).startswith('Background Process Finished: '), found
+            assert str(found[0][1]).endswith(' finished') and '/' not in str(found[0][1]), found
         async with websocket(home, desc) as ws:
             assert 'result' in await rpc(ws, 'session.resume', session_id=sid)
             assert 'result' in await rpc(ws, 'prompt.submit', session_id=sid, input_id='after', text='AFTER_NOTE')
