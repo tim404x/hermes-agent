@@ -486,6 +486,46 @@ env-over-YAML rule as every other setting). Avoid
 `all` when peer bots can answer each other without an explicit mention, because
 their own reply policies can still create loops.
 
+### Recent conversation for new top-level messages (`history_backfill`)
+
+A top-level message opens its own session (each top-level message is its own thread with the
+default `reply_in_thread: true`, and each top-level DM message is its own session with
+`dm_top_level_threads_as_sessions: true`). Without help, that session sees only the one message,
+so a follow-up posted as a new message ("give him my number") loses the question asked a few
+minutes earlier in the same channel or group DM. With `history_backfill` (on by default), the
+first turn of such a NEW session carries the recent conversation:
+
+- the last `history_backfill_limit` top-level messages of the past 6 hours, oldest first;
+- for each of them whose thread had replies in that window, its 3 latest replies (indented);
+- speaker names, the time of each message and how long before the new message it was posted;
+  the bot's own messages are labelled `[assistant]`, other bots `[bot]`, people outside the
+  allowlist `[unverified]` and people from another workspace `[external]`.
+
+The block is passed beside the message (like thread context), never inside its text, so slash
+commands still parse and the cached prompt prefix is untouched. It is bounded by
+`history_backfill_char_limit`: when the conversation is longer, the oldest messages are dropped
+first. Thread replies keep their thread context and get no channel history; a session that already
+exists (for example a flat `reply_in_thread: false` channel session) gets nothing extra, because
+its history already holds the conversation; commands get nothing.
+
+```yaml
+slack:
+  history_backfill: true            # default: true
+  history_backfill_limit: 15        # top-level messages read (1-50, default 15)
+  history_backfill_char_limit: 6000 # budget for the whole block (500-20000, default 6000)
+```
+
+The reads use `conversations.history` and `conversations.replies` with the history scope of the
+conversation type (`channels:history`, `groups:history`, `mpim:history`, `im:history`), which the
+setup above already grants; no new scope is needed. If one is missing, that conversation type is
+skipped quietly and logged once.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `slack.history_backfill` | `true` | Give a new top-level session the recent conversation (env `SLACK_HISTORY_BACKFILL`). |
+| `slack.history_backfill_limit` | `15` | Top-level messages read from the past 6 hours, 1-50 (env `SLACK_HISTORY_BACKFILL_LIMIT`). |
+| `slack.history_backfill_char_limit` | `6000` | Character budget for the block, 500-20000; oldest messages drop first (env `SLACK_HISTORY_BACKFILL_CHAR_LIMIT`). |
+
 ### Working-State Status Line
 
 While the agent processes a message, Slack shows a status line next to the bot
@@ -906,6 +946,9 @@ stt_enabled: true
 slack:
   require_mention: true
   unauthorized_dm_behavior: "pair"
+  history_backfill: true
+  history_backfill_limit: 15
+  history_backfill_char_limit: 6000
 
 # Platform config
 platforms:
