@@ -12,11 +12,15 @@
  * - a compaction carrier keeps only the user message after the summary's end marker;
  * - `[Runtime note: …]` / `[System note: …]` blocks and `<memory-context>` fences are removed;
  * - a row that is only a harness frame (`[IMPORTANT: …]`, `[System: …]`, `[ASYNC DELEGATION …]`,
- *   a pure compaction summary, …) becomes '' so the caller shows nothing rather than internals.
+ *   a pure compaction summary, …) becomes '' so the caller shows nothing rather than internals;
+ * - a bare silence marker (`NO_REPLY`, `[SILENT]`; `lib/silence-marker.ts`) is a bot choosing to say
+ *   nothing, so it becomes '' too and never stands as a bot's "last message".
  *
  * Slash-skill scaffolds are described as the typed `/skill — request` by the backend only (that
  * needs the skill registry); here such a row falls under the `[IMPORTANT:` frame and reads ''.
  */
+
+import { isSilenceMarkerText } from './silence-marker'
 
 const SUMMARY_END_MARKER = '--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---'
 
@@ -67,7 +71,7 @@ export function sanitizePreviewText(raw: unknown, { keepLines = false }: { keepL
 
   const flat = text.replace(/\s+/g, ' ')
 
-  if (WHOLE_ROW_FRAME_OPENERS.some(opener => flat.startsWith(opener))) {
+  if (WHOLE_ROW_FRAME_OPENERS.some(opener => flat.startsWith(opener)) || isSilenceMarkerText(flat)) {
     return ''
   }
 
