@@ -772,9 +772,14 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // traffic lights.
   const secondaryTitlebarGap = 'calc(var(--titlebar-height) + 0.75rem)'
 
+  // The titlebar-relative pad only clears an overlaid titlebar. Inside the
+  // layout tree --titlebar-height is 0 (the tab strip is outside the scroller),
+  // so `0 - 0.5rem` clamps to 0 and the first row touches the tabs. Floor it at
+  // --thread-top-gap on the container so every chat gets the same air whether
+  // it opens on a user bubble, an assistant message or a hidden-DM row.
   const threadContentTopPad = secondaryWindow
-    ? 'pt-[calc(var(--titlebar-height)+0.75rem)]'
-    : 'pt-[calc(var(--titlebar-height)-0.5rem)]'
+    ? 'pt-[max(calc(var(--titlebar-height)+0.75rem),var(--thread-top-gap))]'
+    : 'pt-[max(calc(var(--titlebar-height)-0.5rem),var(--thread-top-gap))]'
 
   const surfaceId = useComposerSurfaceId()
   const scrollSessionId = sessionId ?? surfaceId
