@@ -4,6 +4,7 @@
 from __future__ import annotations
 import re
 from contextlib import contextmanager
+from session_rules.preview_text import display_preview_text
 from session_rules.turns import project_compaction_message_for_display, user_originated_turn_view
 from persistence.sqlite.conversation._store.compaction_display import not_a_later_tool_copy_sql
 from persistence.sqlite.conversation._store.messages import _decode_content, _encode_content, _row_to_message_dict
@@ -32,8 +33,10 @@ def _prompt_preview(db, content, display_kind, summary):
             for part in content if isinstance(part, (str, dict)))
     if not isinstance(content, str):
         return ""
-    text = " ".join(content.split())
-    if not text or _SYNTHETIC_PROMPT.match(text):
+    if _SYNTHETIC_PROMPT.match(content):
+        return ""
+    text = display_preview_text(content)
+    if not text:
         return ""
     return text if len(text) <= 120 else text[:119].rstrip() + "…"
 

@@ -8,6 +8,8 @@
  * of them can own it without the others importing a sibling surface.
  */
 
+import { sanitizePreviewText } from '@hermes/plugin-sdk'
+
 import { aliasIdentityFor } from './routing'
 import type { BotMeta, RosterRow } from './types'
 
@@ -131,7 +133,9 @@ export function botProfileIdentity(name: string, title: string) {
  *  like Discord's — no raw **bold**, `code`, > quotes, or [link](url)
  *  characters in the preview line. */
 export function stripPreviewMarkdown(text: unknown) {
-  return String(text || '')
+  // Harness frames first (a steer row's out-of-band marker, internal-only rows): a preview never
+  // shows them, even when an older backend or a cached roster still carries them.
+  return sanitizePreviewText(text, { keepLines: true })
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/`([^`\n]*)`/g, '$1')
     .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
