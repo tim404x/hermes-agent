@@ -7,6 +7,7 @@ import type { ClientSessionState } from '@/app/types'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { type ChatMessage, type ChatMessagePart, chatMessageText, textPart } from '@/lib/chat-messages'
 import { foldPersonalityName } from '@/lib/personalities'
+import { sanitizePreviewText } from '@/lib/preview-text'
 import type { ComposerAttachment } from '@/store/composer'
 import type { SessionInfo } from '@/types/hermes'
 
@@ -63,7 +64,7 @@ export function markReasoningEffortPending(state: ClientSessionState): ClientSes
 }
 
 export function sessionTitle(session: SessionInfo): string {
-  return session.title?.trim() || session.preview?.trim() || 'Untitled session'
+  return session.title?.trim() || sanitizePreviewText(session.preview) || 'Untitled session'
 }
 
 /** What a session is called before it has been sent — and before its composer
