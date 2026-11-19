@@ -459,6 +459,7 @@ export async function pluginSdkMock(host: Record<string, unknown>) {
   const { cn } = await import('@/lib/utils')
   const { randomUuid } = await import('@hermes/shared')
   const { LruCache } = await import('@/lib/lru-cache')
+  const { sanitizePreviewText } = await import('@/lib/preview-text')
 
   // The gateway Group Chat row's right-click menu (#143571) renders the real one.
   const { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } =
@@ -497,6 +498,8 @@ export async function pluginSdkMock(host: Record<string, unknown>) {
     host,
     LruCache,
     randomUuid,
+    // Row previews (labels.stripPreviewMarkdown) run the real harness-frame rule.
+    sanitizePreviewText,
     CapabilitiesView: undefined,
     MessageTextContent: undefined,
     Streamdown: undefined,

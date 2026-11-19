@@ -8,6 +8,7 @@ from persistence.sqlite._schema_ddl import _BRANCH_CHILD_SQL, _RESET_CHILD_SQL, 
 from persistence.sqlite.conversation._store.rules import (
     AUTO_LOAD_SCAFFOLD_SQL_LIKE, EPOCH_MAX, EPOCH_MIN, SKILL_SCAFFOLD_SQL_LIKE,
 )
+from session_rules.preview_text import HARNESS_FRAME_OPENERS
 from session_rules.turns import (
     LEGACY_SUMMARY_PREFIX, SKILL_EXCERPT_JOINT, SUMMARY_PREFIX, _MERGED_PRIOR_CONTEXT_HEADER, _MERGED_SUMMARY_DELIMITER,
     _SUMMARY_END_MARKER,
@@ -95,9 +96,23 @@ _PREVIEW_MERGED_PRIOR_UNWRAPPED_SQL = (f"CASE WHEN SUBSTR({_PREVIEW_MERGED_PRIOR
 _PREVIEW_FORCE_USER_REMAINDER_SQL = _sql_after_marker(_SUMMARY_END_MARKER)
 
 
+# A mid-turn steer row: ``[OUT-OF-BAND USER MESSAGE …]`` opener (no inner "]"), the user's words, the closing
+# marker. The preview column takes the words after the opener; ``_shape_preview`` drops the closing marker.
+_STEER_OPENER = "[OUT-OF-BAND USER MESSAGE"
+_PREVIEW_STEER_SQL = _sql_starts_with("m.content", (_STEER_OPENER,))
+_PREVIEW_STEER_BODY_SQL = _sql_ltrim_whitespace(
+    f"SUBSTR({_PREVIEW_CONTENT_SQL}, INSTR(m.content, ']') + 1, {_PREVIEW_HEAD_CHARS + 32})")
+
+# Rows that are harness frames end to end (background-process / delegation completions, stop-gate nudges, planning
+# carriers) hold no user words; compaction carriers keep the carrier rules below, and a slash-skill scaffold
+# ("[IMPORTANT: The user has invoked the …") is user intent.
+_PREVIEW_FRAME_ONLY_SQL = (
+    f"({_sql_starts_with('m.content', HARNESS_FRAME_OPENERS)}"
+    f" AND NOT {_PREVIEW_SCAFFOLDED_SQL})")
+
 # Pure compaction rows are ineligible; force-user-leading and merged carriers only when authentic content survives.
 # A display_kind="hidden" row is model-facing scaffolding the gateway never paints; the preview must not paint it either.
-_PREVIEW_ELIGIBLE_SQL = (f"(COALESCE(m.display_kind, '') <> 'hidden'"
+_PREVIEW_ELIGIBLE_SQL = (f"(COALESCE(m.display_kind, '') <> 'hidden' AND NOT {_PREVIEW_FRAME_ONLY_SQL}"
     f" AND ((NOT {_PREVIEW_STANDALONE_SUMMARY_SQL} AND NOT {_PREVIEW_MERGED_SUMMARY_SQL})"
     f" OR ({_PREVIEW_STANDALONE_SUMMARY_SQL} AND INSTR(m.content, {_sql_literal(_SUMMARY_END_MARKER)}) > 0"
     f" AND LENGTH({_sql_trim_whitespace(_PREVIEW_FORCE_USER_REMAINDER_SQL)}) > 0)"
@@ -107,7 +122,8 @@ _PREVIEW_ELIGIBLE_SQL = (f"(COALESCE(m.display_kind, '') <> 'hidden'"
 
 # ``_preview_raw`` SELECT for every listing query (scaffolded rows: head + tail around SKILL_EXCERPT_JOINT).
 _PREVIEW_RAW_SELECT = (
-    f"CASE WHEN {_PREVIEW_STANDALONE_SUMMARY_SQL} THEN {_PREVIEW_FORCE_USER_REMAINDER_SQL}"
+    f"CASE WHEN {_PREVIEW_STEER_SQL} AND INSTR(m.content, ']') > 0 THEN {_PREVIEW_STEER_BODY_SQL}"
+    f" WHEN {_PREVIEW_STANDALONE_SUMMARY_SQL} THEN {_PREVIEW_FORCE_USER_REMAINDER_SQL}"
     f" WHEN {_PREVIEW_MERGED_SUMMARY_SQL} THEN {_PREVIEW_MERGED_PRIOR_UNWRAPPED_SQL}"
     f" WHEN {_PREVIEW_SCAFFOLDED_SQL} AND LENGTH(m.content) > {_PREVIEW_SCAFFOLD_WINDOW * 2}"
     f" THEN SUBSTR({_PREVIEW_CONTENT_SQL}, 1, {_PREVIEW_SCAFFOLD_WINDOW}) || '{SKILL_EXCERPT_JOINT}'"
