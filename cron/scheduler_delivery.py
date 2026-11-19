@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import threading
 from dataclasses import dataclass
 from typing import Any, List, Optional
@@ -728,6 +729,18 @@ def bot_chat_message(job: dict, content: str) -> str:
         f"scheduled job, not the user. Review it, act on anything that needs action, and "
         f"summarize for the chat.]\n\n{content}"
     )
+
+
+# The frame ``bot_chat_message`` opens with, read back (any wording after ``" output`` up to the frame's
+# closing bracket, so frames stored under older wording parse too).
+_BOT_CHAT_FRAME_RE = re.compile(r'\[Cronjob "(.*?)" output[^\]\n]*\](?:\n\n?|$)', re.DOTALL)
+
+
+def parse_bot_chat_frame(text) -> Optional[tuple[str, str]]:
+    """``(job name, output)`` of a Bot Chat turn ``bot_chat_message`` built, else None. Pure: the display
+    projections use it to show a cron delivery as the job's output, never as the user's own message."""
+    match = _BOT_CHAT_FRAME_RE.match(text) if isinstance(text, str) else None
+    return (match.group(1), text[match.end():]) if match else None
 
 
 def _titled_owner(lookup, home, title: str):
