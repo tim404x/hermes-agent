@@ -81,3 +81,15 @@ def test_only_an_interrupted_close_carries_the_stopped_mark():
     truncated = _tool_tail()
     assert close_interrupted_tool_sequence(truncated, "Response truncated.") is True
     assert "display_metadata" not in truncated[-1]
+
+
+def test_an_interrupt_sentinel_is_never_persisted_as_assistant_prose():
+    """``Operation interrupted: waiting for model response (0.3s elapsed).`` is cancellation metadata: the closing
+    row keeps the stopped mark and the model-facing placeholder, never the sentinel as visible content."""
+    for sentinel in ("Operation interrupted: waiting for model response (0.3s elapsed).",
+                     "Operation interrupted: retrying API call after error (retry 1/3)."):
+        stopped = _tool_tail()
+        assert close_interrupted_tool_sequence(stopped, sentinel, stopped=True) is True
+        assert stopped[-1]["content"] == ""
+        assert stopped[-1]["display_metadata"] == {"interrupted": True}
+        assert "Operation interrupted" not in str(stopped[-1].get("api_content"))
