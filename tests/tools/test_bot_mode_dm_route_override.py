@@ -193,3 +193,69 @@ def test_multimodal_content_is_read_as_text():
     side.record_turn_human_text(agent, [{"type": "text", "text": "handoff in main chat"}, {"type": "image_url"}],
                                 new_turn=True)
     assert side.human_asked_main_chat(agent)
+
+
+# ── the main-chat delivery tells the receiver (and its Desktop row) who is reading ──
+
+
+@pytest.fixture
+def delivered(monkeypatch, spawned):
+    """Every DM text handed to a transport, in send order."""
+    texts, write = [], bot_mode_dm._write_dm_file
+    monkeypatch.setattr(bot_mode_dm, "_write_dm_file", lambda content: texts.append(content) or write(content))
+    return texts
+
+
+def test_a_main_chat_delivery_is_marked_so_the_receiver_answers_the_user(tmp_path, delivered):
+    home, target = _install(tmp_path)
+    _bot_chat(target, ("user", 30), ("assistant", 20))
+
+    assert _send(_agent(home, "make Neo update me in his main bot chat"))["routed"] == "main"
+
+    attribution, _, body = delivered[-1].partition("): ")
+    assert attribution.startswith("Message from ")
+    assert body.startswith(bot_mode_probe.MAIN_CHAT_MARKER + " ")
+    assert body.endswith("Tim's taking the investor doc")
+
+
+def test_the_marker_follows_the_notify_only_marker(tmp_path, delivered):
+    home, target = _install(tmp_path)
+    _bot_chat(target, ("user", 30), ("assistant", 20))
+    agent = _agent(home, "handoff to Neo in main chat")
+
+    bot_mode_dm.message_agent_tool("researcher", "post Tim a wrap-up", agent=agent, route="main",
+                                   expects_reply=False)
+
+    body = delivered[-1].partition("): ")[2]
+    assert body == (f"{bot_mode_probe.NO_REPLY_MARKER} {bot_mode_probe.MAIN_CHAT_MARKER} post Tim a wrap-up")
+
+
+def test_a_refused_override_and_a_normal_dm_carry_no_marker(tmp_path, delivered):
+    home, target = _install(tmp_path)
+    _bot_chat(target, ("user", 30), ("assistant", 20))
+
+    _send(_agent(home, "tell Neo I'm taking the investor doc"))  # refused: side window
+    _send(_agent(home, "handoff to Neo in main chat"), route="")  # no override asked
+
+    assert delivered and all(bot_mode_probe.MAIN_CHAT_MARKER not in text for text in delivered)
+
+
+def test_the_main_chat_marker_keeps_the_receivers_size_bound(tmp_path, delivered):
+    home, target = _install(tmp_path)
+    _bot_chat(target, ("user", 30), ("assistant", 20))
+    body = "x" * (bot_mode_dm.MESSAGE_MAX_CHARS - 10)
+
+    result = json.loads(bot_mode_dm.message_agent_tool("researcher", body, agent=_agent(home, "main chat please"),
+                                                       route="main"))
+
+    assert "too long for route='main'" in result["error"]
+    assert delivered == []
+
+
+def test_the_protocol_tells_a_receiver_to_answer_the_user_on_a_main_chat_delivery(tmp_path):
+    home, _target = _install(tmp_path)
+
+    section = bot_mode_probe.get_bot_mode_protocol_section(home)
+
+    assert bot_mode_probe.MAIN_CHAT_MARKER in section
+    assert "write your reply to the user directly" in section
