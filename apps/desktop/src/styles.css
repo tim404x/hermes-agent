@@ -537,6 +537,12 @@
        freely. */
     --paragraph-gap: 0.7rem;
     --sticky-human-top: 0.23rem;
+    /* Floor for the air above a chat's first row. In the layout tree the tab
+       strip sits OUTSIDE the scroller and --titlebar-height is 0, so the
+       titlebar-relative pad resolves to nothing and a transcript that opens on
+       an assistant message (a Bot Mode DM whose user row is not painted) sits
+       flush under the tabs. One knob, applied at the container. */
+    --thread-top-gap: 1.5rem;
     --file-tree-row-height: 1.375rem;
 
     --composer-width: 100%;
@@ -1210,7 +1216,7 @@
    utility class on the row pulls the top pad 0.5rem ABOVE the titlebar; give
    the air back, and only in this thread. */
 [data-slot='aui_thread-content'][data-thread-type='onboarding'] {
-  padding-top: calc(var(--titlebar-height) + 1rem);
+  padding-top: max(calc(var(--titlebar-height) + 1rem), var(--thread-top-gap));
 }
 
 /* The setup chat is a first conversation read at arm's length in a small
