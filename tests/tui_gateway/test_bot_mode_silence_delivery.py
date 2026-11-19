@@ -127,3 +127,36 @@ def test_live_bot_chat_stream_never_shows_or_speaks_a_closing_silence_marker(mon
         chunks = ["Paris.", "\n\nNO", tail[2:]] if len(tail) > 2 else ["Paris.", "\n\nNO"]
         deltas, spoken = _run(chunks)
         assert "".join(deltas) == "".join(spoken) == f"Paris.\n\n{tail}"
+
+
+def test_a_silent_wake_in_any_desktop_session_never_paints_the_marker(monkeypatch):
+    """A background-process / notification wake (machinery turn) answered with a bare marker is
+    silence in every desktop session, not only the Bot Chat: no delta carries it and the completed
+    text is empty. A human turn in a plain session keeps the upstream rule (marker delivered)."""
+    events = []
+    monkeypatch.setattr(srv, "_emit", lambda event, _sid, payload=None: events.append((event, payload)))
+    monkeypatch.setattr(srv, "_load_interim_assistant_messages", lambda: False)
+    monkeypatch.setattr(srv, "_start_usage_ticker", lambda _sid, _agent: (SimpleNamespace(set=lambda: None), SimpleNamespace(join=lambda: None)))
+    monkeypatch.setattr(srv, "_get_usage", lambda _agent: {})
+    monkeypatch.setattr(srv, "render_message", lambda _text, _cols: None)
+    monkeypatch.setattr(srv, "_clear_inflight_turn", lambda _session: None)
+    monkeypatch.setattr(srv, "_session_live_title", lambda _s, _k: "Scratch")
+
+    def _run(display_kind):
+        events.clear()
+
+        def run_conversation(_message, **kwargs):
+            for chunk in ("NO_", "REPLY"):
+                kwargs["stream_callback"](chunk)
+            return {"final_response": "NO_REPLY"}
+
+        agent = SimpleNamespace(_session_title_hint="Scratch", run_conversation=run_conversation)
+        session = {"pending_title": None, "session_key": "k", "history_lock": contextlib.nullcontext(), "agent": agent}
+        st = srv._TurnRun(agent=agent, one_turn_restore=None, terminal_callback=None, receipt_committed=True)
+        srv._invoke_agent("sid", session, st, "wake", "wake", None, [], display_kind, None)
+        payload, _, _ = srv._complete_turn_payload(session, st, None, 80)
+        return "".join(p["text"] for e, p in events if e == "message.delta"), payload["text"]
+
+    assert _run("process_complete") == ("", "")
+    assert _run("internal_notification") == ("", "")
+    assert _run(None) == ("NO_REPLY", "NO_REPLY")
