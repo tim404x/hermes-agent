@@ -147,6 +147,16 @@ describe('room listing', () => {
     expect(stripPreviewMarkdown('## Heading\nbody')).toBe('Heading body')
     expect(stripPreviewMarkdown('')).toBe('')
   })
+
+  it('stripPreviewMarkdown unwraps a steer and drops harness-only rows', () => {
+    const { stripPreviewMarkdown } = modules.labels
+
+    expect(
+      stripPreviewMarkdown('[OUT-OF-BAND USER MESSAGE — from the user]\n**ship** it\n[/OUT-OF-BAND USER MESSAGE]')
+    ).toBe('ship it')
+    expect(stripPreviewMarkdown('[IMPORTANT: Background process proc_1 completed normally.\n]')).toBe('')
+    expect(stripPreviewMarkdown('intro\n## Heading')).toBe('intro Heading')
+  })
 })
 
 describe('seating a room', () => {

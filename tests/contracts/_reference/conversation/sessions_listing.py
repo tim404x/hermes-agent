@@ -9,6 +9,8 @@ import time
 from datetime import datetime
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+from session_rules.preview_text import display_preview_text
+
 from persistence import ProfileScope, RowVisibility, SessionId
 from persistence.authority.vocabulary import OwnerRule
 from persistence.conversation.sessions import (
@@ -74,6 +76,15 @@ def activity_or_start(row: Mapping[str, Any]) -> float:
     return stamp if stamp is not None else row["started_at"].timestamp()
 
 
+def _frame_only(content: Any) -> bool:
+    """A user row that is a harness frame end to end (no user words): never a preview."""
+    from session_rules.preview_text import HARNESS_FRAME_OPENERS
+    from session_rules.turns import _AUTO_LOAD_PREFIX, _SKILL_INVOCATION_PREFIX
+
+    text = str(content or "").lstrip()
+    return text.startswith(HARNESS_FRAME_OPENERS) and not text.startswith((_SKILL_INVOCATION_PREFIX, _AUTO_LOAD_PREFIX))
+
+
 def _shape_preview(raw: Any) -> str:
     """The short first-turn preview a listing shows."""
     from ._turn_policy import skill_preview_text
@@ -81,7 +92,7 @@ def _shape_preview(raw: Any) -> str:
     text = str(raw or "").strip()
     if not text:
         return ""
-    text = skill_preview_text(text.replace("\n", " ").replace("\r", " "))
+    text = display_preview_text(skill_preview_text(text.replace("\n", " ").replace("\r", " ")))
     return text[:_PREVIEW_MAX_CHARS] + "..." if len(text) > _PREVIEW_MAX_CHARS else text
 
 
@@ -257,6 +268,7 @@ class SessionListingMixin:
             stored
             for stored in (transcript.rows if transcript is not None else ())
             if stored.message.role == "user" and stored.message.content is not None and stored.message.display_kind != "hidden"
+            and not _frame_only(stored.message.content)
         ]
         first = min(rows, key=lambda stored: (_epoch(stored.message), stored.id), default=None)
         return _shape_preview(first.message.content) if first is not None else ""
