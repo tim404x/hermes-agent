@@ -172,6 +172,32 @@ describe('inter-agent collapse gate', () => {
     expect(container.querySelector('[data-message-streaming="true"]')).toBeTruthy()
   })
 
+  it('shows the reply to a main-chat handoff as a normal message to the user', async () => {
+    // message_agent route="main": the user asked for this bot's update in its
+    // main chat, so the answer is FOR the user, not a folded bot exchange.
+    const handoff =
+      'Message from 🤖 Neo | Chief of Staff (@hermes): [no reply needed] [main chat: the user asked for this here; ' +
+      'answer the user directly] Post Tim a short wrap-up on the deal heatmap\nverdict first'
+
+    render(<Harness messages={[user('u1', handoff), assistant('a1', 'Heatmap shipped, here is the wrap-up', false)]} />)
+
+    await screen.findByText('Heatmap shipped, here is the wrap-up')
+    expect(screen.queryByText(/Replied to/)).toBeNull()
+    expect(screen.queryByText('show reply')).toBeNull()
+    // The delivery itself is a compact one-line header, still expandable.
+    expect(screen.getByText('Neo asked: Post Tim a short wrap-up on the deal heatmap')).toBeTruthy()
+    expect(screen.queryByText(/Message from/)).toBeNull()
+    expect(screen.getByText('show message')).toBeTruthy()
+  })
+
+  it('keeps folding an ordinary delivery that only mentions the main chat in its text', async () => {
+    const mention = 'Message from 🤖 Hermes (@hermes): Tim wants it in the [main chat] later'
+
+    render(<Harness messages={[user('u1', mention), assistant('a1', 'noted', false)]} />)
+
+    expect(await screen.findByText(/Replied to/)).toBeTruthy()
+  })
+
   it('leaves an ordinary reply expanded', async () => {
     render(<Harness messages={[user('u1', 'ordinary question'), assistant('a1', 'ordinary answer', false)]} />)
 
