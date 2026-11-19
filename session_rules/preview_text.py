@@ -15,6 +15,8 @@ prompts. The chat view projects those away; every list surface must too, or a si
 - ``[Runtime note: …]`` / ``[System note: …]`` blocks and ``<memory-context>`` fences are removed from real text;
 - a row that is nothing but a harness frame (``[IMPORTANT: …]``, ``[System: …]``, ``[ASYNC DELEGATION …]``, a pure
   compaction summary, …) yields ``""`` so the caller can fall back to an older row.
+- a bare silence marker (``NO_REPLY``, ``[SILENT]``, the gateway's :func:`is_intentional_silence_response` rule) is
+  a bot choosing to say nothing, so it yields ``""`` too and never stands as a bot's "last message".
 
 The desktop keeps a byte-for-byte twin in ``apps/desktop/src/lib/preview-text.ts`` (for previews cached or served by an
 older backend); both are pinned by the shared cases in ``tests/fixtures/preview_text_cases.json``.
@@ -25,6 +27,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from gateway.response_filters import is_intentional_silence_response
 from session_rules.turns import (
     LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX, _MERGED_PRIOR_CONTEXT_HEADER, _SUMMARY_END_MARKER, describe_skill_invocation,
     sanitize_context,
@@ -67,6 +70,6 @@ def display_preview_text(raw: Any) -> str:
     text = sanitize_context(text)
     text = _INLINE_NOTE_TAIL_RE.sub(" ", _INLINE_NOTE_RE.sub(" ", text))
     text = " ".join(text.split())
-    if text.startswith(WHOLE_ROW_FRAME_OPENERS):
+    if text.startswith(WHOLE_ROW_FRAME_OPENERS) or is_intentional_silence_response(text):
         return ""
     return text

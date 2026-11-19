@@ -105,6 +105,31 @@
       "name": "memory context fence is removed",
       "input": "<memory-context>Tim likes short replies</memory-context>\nwhat's next?",
       "expected": "what's next?"
+    },
+    {
+      "name": "a bare silence marker shows nothing",
+      "input": "NO_REPLY",
+      "expected": ""
+    },
+    {
+      "name": "a bracketed silence marker shows nothing",
+      "input": "[SILENT]",
+      "expected": ""
+    },
+    {
+      "name": "a padded lower-case marker with a period shows nothing",
+      "input": " no_reply. ",
+      "expected": ""
+    },
+    {
+      "name": "a silence marker with the bot's sign-off emoji shows nothing",
+      "input": "NO_REPLY ⚡",
+      "expected": ""
+    },
+    {
+      "name": "a reply that mentions the marker is kept",
+      "input": "Told Neo NO_REPLY  was the right call.",
+      "expected": "Told Neo NO_REPLY was the right call."
     }
   ]
 }
