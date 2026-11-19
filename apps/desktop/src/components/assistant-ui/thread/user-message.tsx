@@ -96,6 +96,24 @@ export const StopGlyph = <StopFilled aria-hidden className="size-3.5 -translate-
 export const AGENT_MESSAGE_RE =
   /^(?:Message from (?:🤖\s*)?([^:\n(]{1,64}?)(?:\s*\(@([a-z0-9][a-z0-9_-]{0,63})(?:@[a-zA-Z0-9][a-zA-Z0-9_-]{0,63})?\))?:\s*|\[Message from agent '([^']{1,64})'\]\s*)([\s\S]*)$/u
 
+// A delivery the user asked to land in this bot's MAIN chat (`message_agent`
+// route="main", tools/bot_mode_dm.py `mark_main_chat`): the sender stamps
+// MAIN_CHAT_MARKER after the attribution and any "[no reply needed]". The user
+// is reading this chat and the bot answers THEM, so the delivery shrinks to a
+// one-line "<sender> asked: ..." header and the reply is not folded under
+// "Replied to <sender>". Keyed on the stored text, so older rows keep folding.
+const MAIN_CHAT_LEAD_RE = /^(\[no reply needed\]\s*)?\[main chat(?::[^\]\n]*)?\]\s*/u
+
+/** The delivery body (AGENT_MESSAGE_RE group 4) is a main-chat handoff. */
+export function isMainChatDelivery(body: string): boolean {
+  return MAIN_CHAT_LEAD_RE.test(body.trim())
+}
+
+/** A main-chat delivery's body without its routing markers. */
+function mainChatBody(body: string): string {
+  return body.trim().replace(MAIN_CHAT_LEAD_RE, '').trim()
+}
+
 // sender handle -> avatar data URL. Module-level so a chat full of notices
 // from one bot resolves once. Bounded LRU: handles are parsed out of message
 // text (unbounded distinct senders over a long session list) and hits hold
@@ -202,6 +220,17 @@ const AgentMessageNote: FC<{ text: string }> = ({ text }) => {
     }
   }, [handle])
 
+  const mainChat = isMainChatDelivery(body)
+  const shownBody = mainChat ? mainChatBody(body) : body
+  // "Neo | Chief of Staff" -> "Neo": the header is one compact line.
+  const shortSender = sender.split(' | ')[0]?.trim() || sender
+
+  const firstLine =
+    shownBody
+      .split('\n')
+      .find(line => line.trim())
+      ?.trim() ?? ''
+
   // Grok-bots shape: an inter-agent delivery is a timeline EVENT, not a
   // conversation bubble — a subtle centered notice ("Message from 🤖 X"),
   // with the delivered text one click away instead of shouting in the
@@ -220,15 +249,21 @@ const AgentMessageNote: FC<{ text: string }> = ({ text }) => {
             🤖
           </span>
         )}
-        <span className="wrap-anywhere">Message from {sender}</span>
+        {mainChat ? (
+          <span className="min-w-0 truncate" data-slot="aui_agent-message-main-chat">
+            {shortSender} asked: {firstLine}
+          </span>
+        ) : (
+          <span className="wrap-anywhere">Message from {sender}</span>
+        )}
       </span>
-      {body && (
+      {shownBody && (
         <details className="self-center">
           <summary className="cursor-pointer select-none text-center text-muted-foreground/45 hover:text-muted-foreground/70">
             show message
           </summary>
           <div className="mt-1 max-w-[36rem] rounded-lg border border-(--ui-stroke-tertiary) px-3 py-2 text-left text-[0.75rem] leading-5 text-foreground/85">
-            <UserMessageText text={body} />
+            <UserMessageText text={shownBody} />
           </div>
         </details>
       )}
