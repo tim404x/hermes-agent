@@ -297,6 +297,7 @@ def _remember_tool_call_args(tool_calls: list, tool_call_args: dict) -> None:
 def _history_to_messages(history: list[dict], *, profile_home=None, image_urls: bool = True) -> list[dict]:
     """``image_urls=False`` is the ``inline_images=false`` projection (#116511): image parts render ``[image]``
     so a remote client's history read stays kilobytes instead of re-transmitting every stored attachment."""
+    from agent.display_row_typing import type_display_row
     from agent.history_commentary import project_history_commentary
     from session_rules.turns import withheld_prompt_text
 
@@ -317,11 +318,15 @@ def _history_to_messages(history: list[dict], *, profile_home=None, image_urls: 
         # turn's commentary too: its tool rows still render, labelled from the calls read above).
         if m.get("display_kind") == "hidden":
             continue
+        # Machine rows typed for display (job titles, cron deliveries, interrupt sentinels), as the REST page does.
+        m = type_display_row(m)
         content_text = _user_image_display_text(m.get("content")) if role == "user" else None
         if content_text is None:
             content_text = _coerce_message_text(m.get("content"), image_urls=image_urls)
         if _is_display_hidden_marker(role, content_text):
             continue
+        if isinstance(m.get("display_content"), str):
+            content_text = m["display_content"]
         if role == "user":
             content_text = _DISCORD_TRIGGERING_NOTE_RE.sub(r"\1", content_text)
             # A pre_llm_call veto stores a placeholder; the transcript shows what the user typed.
@@ -346,7 +351,9 @@ def _history_to_messages(history: list[dict], *, profile_home=None, image_urls: 
             continue
         # Assistant detail sidecars can carry the only visible reply or reasoning after resume/reload.
         has_assistant_detail = role == "assistant" and any(m.get(key) for key in _HISTORY_ASSISTANT_DETAIL_KEYS)
-        if not content_text.strip() and not has_assistant_detail:
+        # A stopped turn's closing row keeps its stop mark with no prose (its interrupt sentinel was blanked).
+        stopped_mark = role == "assistant" and (m.get("display_metadata") or {}).get("interrupted") is True
+        if not content_text.strip() and not has_assistant_detail and not stopped_mark:
             continue
         msg = {"role": role, "text": content_text}
         # Authoring time (Unix seconds) for display.timestamps; display-only.
