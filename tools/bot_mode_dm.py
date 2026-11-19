@@ -336,7 +336,7 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
     home = _agent_home(agent)
     try:
         from tools.bot_mode_probe import (
-            BOT_CHAT_TITLE, NO_REPLY_MARKER, _display_name, _handle, _hermes_root, _peers,
+            BOT_CHAT_TITLE, MAIN_CHAT_MARKER, NO_REPLY_MARKER, _display_name, _handle, _hermes_root, _peers,
             _profile_name as _self_profile_name, _roster, is_bot_mode_managed,
         )
 
@@ -377,6 +377,10 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
     if want_route not in ("", ROUTE_OVERRIDE_MAIN):
         return _err(f"route must be '{ROUTE_OVERRIDE_MAIN}' or omitted, not {route!r}. Nothing was sent.")
     route_override, route_note = _main_route_override(want_route, agent)
+    if route_override == ROUTE_OVERRIDE_MAIN and len(body) + len(MAIN_CHAT_MARKER) + 1 > MESSAGE_MAX_CHARS:
+        # The main-chat marker rides inside the receiver's attribution headroom: keep the total bound.
+        return _err(f"message too long for route='main' ({len(body)} chars > "
+                    f"{MESSAGE_MAX_CHARS - len(MAIN_CHAT_MARKER) - 1}). Send the essentials; nothing was sent.")
     sender = replace(sender, route_override=route_override, route_note=route_note)
 
     from tools.bot_mode_dm_coordination import split_targets
@@ -570,6 +574,7 @@ def _deliver_local(profile: str, profile_home: Path, content: str, *, author: di
 
     delivery = dict(author=author, roster=roster, task_id=task_id, agent=agent, wake=wake)
     if route_override == ROUTE_MAIN:
+        content = mark_main_chat(content)
         ack = json.loads(_start_delivery([_hermes_cli(), "-p", profile], content, f"@{_handle(profile, roster)}",
                                          stdin_file=False, profile_home=profile_home, author=author,
                                          task_id=task_id, agent=agent, wake=wake))
@@ -598,6 +603,25 @@ def _deliver_local(profile: str, profile_home: Path, content: str, *, author: di
     return _start_delivery([_hermes_cli(), "-p", profile], content, f"@{_handle(profile, roster)}",
                            stdin_file=False, profile_home=profile_home, author=author, task_id=task_id, agent=agent,
                            wake=wake)
+
+
+# The attribution ``message_agent_tool`` prefixes ("Message from 🤖 <name> (@<handle>): ").
+_ATTRIBUTION_RE = re.compile(r"Message from [^\n]*?\(@[^)\s]+\): ")
+
+
+def mark_main_chat(content: str) -> str:
+    """``content`` with ``MAIN_CHAT_MARKER`` after its attribution and any notify-only marker: the
+    receiving bot answers the user who asked for the main chat, and the Desktop shows that answer
+    unfolded. A delivery without the attribution is returned unchanged."""
+    from tools.bot_mode_probe import MAIN_CHAT_MARKER, NO_REPLY_MARKER
+
+    match = _ATTRIBUTION_RE.match(content)
+    if match is None or MAIN_CHAT_MARKER in content:
+        return content
+    head, rest = match.group(0), content[match.end():]
+    if rest.startswith(NO_REPLY_MARKER):
+        head, rest = head + NO_REPLY_MARKER + " ", rest[len(NO_REPLY_MARKER):].lstrip(" ")
+    return f"{head}{MAIN_CHAT_MARKER} {rest}"
 
 
 def _with_route_note(raw_ack: str, note: str) -> str:

@@ -26,6 +26,12 @@ _LEGACY_PROTOCOL_RE = re.compile(r"\n*" + re.escape(_PROTOCOL_HEADING) + r"[ \t]
 _BOT_MODE_PROTOCOL_VERSION = 3
 # Leads a notify-only DM's body (after the attribution colon, so every sender-card parser keeps it).
 NO_REPLY_MARKER = "[no reply needed]"
+# Leads a DM the user asked to land in the recipient's MAIN Bot Chat (``message_agent(route="main")``),
+# after the attribution colon and any notify-only marker. It is the recipient's cue that the user is
+# reading this chat and wants the answer, and the row's durable flag: the Desktop paints the reply as a
+# normal message to the user instead of folding it under "Replied to <sender>". Text, not metadata,
+# so it survives every transport and replay the way NO_REPLY_MARKER does.
+MAIN_CHAT_MARKER = "[main chat: the user asked for this here; answer the user directly]"
 
 
 def strip_legacy_protocol(text: str) -> str:
@@ -325,7 +331,11 @@ def _build_section(home: Path) -> str:
         f"\"{NO_REPLY_MARKER}\" or is a pure FYI with nothing to add, end your turn "
         "with an intentional silence token "
         "([SILENT] or NO_REPLY) — the transport swallows it, so the sender gets "
-        "no acknowledgement ping-pong.\n"
+        "no acknowledgement ping-pong. "
+        f"If it is marked \"{MAIN_CHAT_MARKER}\", the user asked the sender to put it in THIS chat "
+        "and is reading here: write your reply to the user directly, as your own update to them (not "
+        "addressed to the sending agent), and always give one, even when it is also marked "
+        f"\"{NO_REPLY_MARKER}\" (that only means the sender needs nothing back).\n"
         f"You are `@{_handle(me, names)}`. Your teammates (live roster; roles from their "
         "profiles):\n"
         f"{roster_block}"
