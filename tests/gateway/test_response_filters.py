@@ -1,3 +1,8 @@
+import json
+from pathlib import Path
+
+import pytest
+
 from gateway.response_filters import (
     is_autonomous_silence_response,
     is_intentional_silence_agent_result,
@@ -41,3 +46,14 @@ def test_autonomous_lane_agrees_with_interactive_lane_on_cjk_punctuation_variant
     for variant in ("【静默】", "静默。", "【沉默】", "沉默。", "**[静默]**", "NO_REPLY."):
         assert is_intentional_silence_response(variant)
         assert is_autonomous_silence_response(variant) == is_intentional_silence_response(variant), variant
+
+
+_SILENCE_CASES = json.loads(
+    (Path(__file__).parents[1] / "fixtures" / "silence_marker_cases.json").read_text(encoding="utf-8"))["cases"]
+
+
+@pytest.mark.parametrize("case", _SILENCE_CASES, ids=[case["name"] for case in _SILENCE_CASES])
+def test_shared_silence_marker_cases(case):
+    """Shared with the desktop twin (``apps/desktop/src/lib/silence-marker.test.ts``): a bot's
+    sign-off emoji after the marker (``NO_REPLY ⚡``) is still silence, a sentence naming it is not."""
+    assert is_intentional_silence_response(case["input"]) is case["silent"]

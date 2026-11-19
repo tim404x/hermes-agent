@@ -51,13 +51,22 @@ def _canonical_silence_candidate(text: str) -> str:
     return " ".join(text.strip().upper().split())
 
 
+# Symbol/format/mark categories a bot's sign-off emoji is built from (``⚡``, ``✈️`` = symbol +
+# variation selector, ZWJ sequences, skin tones): ``NO_REPLY ⚡`` is still the silence verdict.
+_EDGE_SIGNOFF_CATEGORIES = frozenset({"So", "Sk", "Cf", "Mn"})
+
+
 def _is_edge_punctuation(ch: str) -> bool:
     # Square brackets stay structural so malformed ``[SILENT`` cannot become ``SILENT``.
-    return ch not in "[]" and unicodedata.category(ch).startswith("P")
+    if ch in "[]":
+        return False
+    category = unicodedata.category(ch)
+    return ch.isspace() or category.startswith("P") or category in _EDGE_SIGNOFF_CATEGORIES
 
 
 def _strip_edge_silence_punctuation(text: str) -> str:
-    """Strip stray edge punctuation (``.NO_REPLY``, ``*NO_REPLY*``) without erasing marker structure."""
+    """Strip stray edge punctuation and sign-off emoji (``.NO_REPLY``, ``*NO_REPLY*``, ``NO_REPLY ⚡``)
+    without erasing marker structure."""
     start, end = 0, len(text)
     while start < end and _is_edge_punctuation(text[start]):
         start += 1
