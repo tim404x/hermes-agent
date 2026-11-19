@@ -38,7 +38,7 @@ import { ResponseLoadingIndicator, TurnActivityIndicator } from '@/components/as
 import { threadMessageIndex } from '@/components/assistant-ui/thread/thread-message-index'
 import { MessageTimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
 import { useMessageReactions, useTapbackDoubleClick } from '@/components/assistant-ui/thread/use-message-reactions'
-import { AGENT_MESSAGE_RE } from '@/components/assistant-ui/thread/user-message'
+import { AGENT_MESSAGE_RE, isMainChatDelivery } from '@/components/assistant-ui/thread/user-message'
 import { isApprovalActivity, isCurrentTurnMessage } from '@/components/assistant-ui/tool/approval-activity'
 import { TooltipIconButton } from '@/components/assistant-ui/tooltip-icon-button'
 import { formatElapsed } from '@/components/chat/activity-timer'
@@ -158,7 +158,10 @@ export const AssistantMessage: FC<AssistantMessageProps> = props => {
       if (prev.role === 'user') {
         const match = AGENT_MESSAGE_RE.exec(messageContentText(prev.content as never).trim())
 
-        if (!match) {
+        // A main-chat handoff (message_agent route="main"): the user asked
+        // for this bot's answer HERE, so the reply is a normal message to
+        // them, tool rows and all, not a folded bot-to-bot exchange.
+        if (!match || isMainChatDelivery(match[4] ?? '')) {
           return null
         }
 
