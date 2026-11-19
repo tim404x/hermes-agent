@@ -1580,6 +1580,16 @@ platform_toolsets:
 #   reactions: true                  # Show processing reactions (default: true)
 #   history_backfill: true           # Recover missed channel messages on mention (default: true)
 #   history_backfill_limit: 50       # Max messages to scan backwards (default: 50)
+#
+# Slack-specific settings (config.yaml top-level, not under platforms:):
+#
+# slack:
+#   require_mention: true              # Require @mention in channels and group DMs (default: true)
+#   history_backfill: true             # A top-level message opening a NEW session gets the recent
+#                                      # conversation: last N top-level messages of the past 6 h with
+#                                      # their latest thread replies (default: true)
+#   history_backfill_limit: 15         # Top-level messages read (default: 15, 1-50)
+#   history_backfill_char_limit: 6000  # Character budget for that block (default: 6000, 500-20000)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Available toolsets (use these names in platform_toolsets or the toolsets list)

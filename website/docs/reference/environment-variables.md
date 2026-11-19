@@ -372,6 +372,9 @@ These are set automatically by the Docker terminal backend when `proxy.enabled: 
 | `SLACK_ALLOW_BOTS` | Accept messages from other Slack bots: `none` (default), `mentions`, or `all`. The bot always ignores its own messages. |
 | `SLACK_THREAD_REQUIRE_MENTION` | Require an explicit @mention for Slack thread replies while preserving top-level free-response channels |
 | `SLACK_THREAD_FOLLOWUP_SILENCE` | Let a bare silence marker stand on unaddressed Slack channel-thread replies instead of posting the unexpected-silence notice (default `false`) |
+| `SLACK_HISTORY_BACKFILL` | Give a new top-level Slack session the recent conversation of its channel, group DM or DM (fallback for `slack.history_backfill`, default `true`). See [Recent conversation for new top-level messages](../user-guide/messaging/slack.md#recent-conversation-for-new-top-level-messages-history_backfill). |
+| `SLACK_HISTORY_BACKFILL_LIMIT` | Top-level messages read from the past 6 hours for that block (fallback for `slack.history_backfill_limit`, default `15`, 1-50). |
+| `SLACK_HISTORY_BACKFILL_CHAR_LIMIT` | Character budget for that block; the oldest messages drop first (fallback for `slack.history_backfill_char_limit`, default `6000`, 500-20000). |
 | `SLACK_HOME_CHANNEL` | Default Slack channel for cron delivery |
 | `SLACK_HOME_CHANNEL_NAME` | Display name for the Slack home channel |
 | `GOOGLE_CHAT_PROJECT_ID` | GCP project hosting the Pub/Sub topic (falls back to `GOOGLE_CLOUD_PROJECT`) |
