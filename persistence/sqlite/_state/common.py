@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from process_identity import persistent_record_pidns_checkable, pid_namespace_id
+from session_rules.preview_text import display_preview_text
 from session_rules.turns import SKILL_EXCERPT_JOINT, describe_skill_invocation
 
 
@@ -38,6 +39,8 @@ def _shape_preview(raw: Any) -> str:
     text = text.replace("\n", " ").replace("\r", " ")
     described = describe_skill_invocation(text)
     text = described if described is not None else text.split(SKILL_EXCERPT_JOINT)[0]
+    # Steer frames, notes and harness-only rows never reach a list row (session_rules.preview_text).
+    text = display_preview_text(text)
     return text[:_PREVIEW_MAX_CHARS] + "..." if len(text) > _PREVIEW_MAX_CHARS else text
 
 

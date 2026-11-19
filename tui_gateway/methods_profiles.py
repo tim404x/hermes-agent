@@ -94,14 +94,38 @@ def _clean_revisions(raw: dict) -> dict:
     return {str(k): max(0, int(v)) for k, v in raw.items() if isinstance(v, int) and not isinstance(v, bool)}
 
 
+# How far back the roster preview looks past harness-only rows (process completions, delegation results,
+# stop-gate nudges) for the newest message with words a person wrote or reads.
+_PREVIEW_FALLBACK_ROWS = 40
+
+
 def _latest_message_preview(persistence, session_id):
-    """≤80-char excerpt of the NEWEST active user/assistant message, or "" (roster semantics)."""
+    """≤80-char excerpt of the NEWEST active user/assistant message, or "" (roster semantics).
+
+    The stored cell is projected through ``display_preview_text`` first: a mid-turn steer row is stored inside the
+    ``[OUT-OF-BAND USER MESSAGE …]`` frame and once painted that frame under the bot's sidebar row. When the newest
+    row is nothing but a harness frame, the newest older row that shows text stands instead (one bounded read, only
+    on that path)."""
+    from session_rules.preview_text import display_preview_text
     try:
-        content = persistence.messages.latest_dialogue_message(session_id)
+        text = display_preview_text(persistence.messages.latest_dialogue_message(session_id))
+        if not text:
+            text = _older_dialogue_preview(persistence, session_id, display_preview_text)
     except Exception:
         return ""
-    text = " ".join(str(content or "").split()).strip()
     return text[:80] + "..." if len(text) > 80 else text
+
+
+def _older_dialogue_preview(persistence, session_id, project):
+    from persistence.conversation.messages import TranscriptRead
+    from session_rules.turns import flatten_message_text
+    rows = persistence.messages.read_transcript(session_id, TranscriptRead(limit=_PREVIEW_FALLBACK_ROWS, latest=True))
+    for row in reversed(rows):
+        if row.role in ("user", "assistant"):
+            text = project(flatten_message_text(row.content, sep=" "))
+            if text:
+                return text
+    return ""
 
 
 def _resurrect_recoverable_canonical(persistence, profile_path, session_id):
