@@ -5,6 +5,7 @@ import { splitLeadingAttachmentRefs } from '@/components/assistant-ui/reference-
 import { extractImageRefs } from '@/lib/embedded-images'
 import { parseErrorSurface } from '@/lib/error-surface'
 import { dedupeGeneratedImageEchoesInParts } from '@/lib/generated-images'
+import { isSilenceMarkerText, stripTrailingSilenceMarker } from '@/lib/silence-marker'
 import { isTodoToolName } from '@/lib/todos'
 import type { MessageReaction, SessionMessage } from '@/types/hermes'
 
@@ -375,6 +376,72 @@ function timelineDisplayContent(message: SessionMessage, content: string): strin
   return content
 }
 
+// Rows that wake a turn on their own, with no person behind them: a background process, a
+// delegation result, a runtime notification (gateway/response_filters.py MACHINERY_DISPLAY_KINDS).
+const WAKE_DISPLAY_KINDS: ReadonlySet<string> = new Set([
+  'async_delegation_complete',
+  'internal_notification',
+  'process_complete'
+])
+
+const storedRowText = (message: SessionMessage): string => {
+  const text = message.display_content !== undefined ? message.display_content : message.content
+
+  return typeof text === 'string' ? text : ''
+}
+
+const hasStoredToolCalls = (message: SessionMessage) =>
+  Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+
+/** An assistant row whose whole reply is a silence marker (`NO_REPLY`, `[SILENT]`): the bot chose to
+ *  say nothing. The gateway swallows it on delivery; the stored row keeps the model's text. */
+function isSilentReplyRow(message: SessionMessage): boolean {
+  return message.role === 'assistant' && !hasStoredToolCalls(message) && isSilenceMarkerText(storedRowText(message))
+}
+
+/**
+ * Stored positions a silent turn leaves nothing to paint for: each silent reply row, and the wake
+ * row ("Background Process Finished: …") of a machinery turn that ended silent without running a
+ * tool or saying anything, so a silent wake leaves no trace in the thread. A wake whose turn spoke,
+ * ran tools or is not stored yet stays visible.
+ */
+function silentTurnRows(rows: readonly { index: number; message: SessionMessage }[]): Set<number> {
+  const hidden = new Set<number>()
+  let wake: null | number = null
+  let quiet = false
+  let silent = false
+
+  const closeTurn = () => {
+    if (wake !== null && quiet && silent) {
+      hidden.add(wake)
+    }
+  }
+
+  for (const { index, message } of rows) {
+    if (message.role === 'user') {
+      closeTurn()
+      wake = message.display_kind && WAKE_DISPLAY_KINDS.has(message.display_kind) ? index : null
+      quiet = true
+      silent = false
+    } else if (isSilentReplyRow(message)) {
+      hidden.add(index)
+      silent = true
+    } else if (message.role !== 'assistant' || hasStoredToolCalls(message) || storedRowText(message).trim()) {
+      quiet = false
+    }
+  }
+
+  closeTurn()
+
+  return hidden
+}
+
+/** The reply text an assistant row paints: a bare marker paints nothing, a marker closing a real
+ *  reply on its own line is dropped (gateway/response_filters.py strip_trailing_silence_marker). */
+function paintedAssistantReply(reply: null | string | undefined): null | string | undefined {
+  return reply && (isSilenceMarkerText(reply) ? '' : stripTrailingSilenceMarker(reply))
+}
+
 export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   const result: ChatMessage[] = []
   let pendingToolParts: ChatMessagePart[] = []
@@ -494,7 +561,9 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   }
 
   // `index` stays the stored row position (it keys tool-part and message ids), so skipped merges shift nothing.
-  const painted = messages.flatMap((message, index) => (isPainted(message) ? [{ index, message }] : []))
+  const stored = messages.flatMap((message, index) => (isPainted(message) ? [{ index, message }] : []))
+  const silent = silentTurnRows(stored)
+  const painted = stored.filter(({ index }) => !silent.has(index))
 
   painted.forEach(({ message, index }) => {
     if (message.role === 'assistant') {
@@ -578,7 +647,8 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       parts.push(reasoningPart(reasoning, message.timestamp))
     }
 
-    const reply = message.display_content !== undefined ? displayContent : displayContent || codexText?.reply
+    const storedReply = message.display_content !== undefined ? displayContent : displayContent || codexText?.reply
+    const reply = displayRole === 'assistant' ? paintedAssistantReply(storedReply) : storedReply
     // Some providers also persist the joined commentary as canonical content.
     // Keep that authoritative copy once, without treating unrelated final text
     // as a reason to discard the earlier public messages.
