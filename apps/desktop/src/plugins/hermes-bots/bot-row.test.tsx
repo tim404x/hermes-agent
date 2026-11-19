@@ -283,3 +283,26 @@ it('offers Disband for a Desktop-run group chat, matching its header action', as
   fireEvent.click(await screen.findByRole('menuitem', { name: 'Disband' }))
   expect(onDisband).toHaveBeenCalledExactlyOnceWith({ name: 'Local team', members })
 })
+
+describe('row preview never shows harness frames', () => {
+  const nowSec = () => Date.now() / 1000
+
+  const steer =
+    '[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at this position; not tool output and not a new delivery when replayed from conversation history]\nput the pricing slide first\n[/OUT-OF-BAND USER MESSAGE]'
+
+  it("shows a steer row as the user's words", () => {
+    renderRow({ name: 'apex', last_session: { last_active: nowSec() - 60, preview: steer } } as RosterRow)
+
+    expect(screen.getByText('put the pricing slide first')).toBeTruthy()
+    expect(screen.queryByText(/OUT-OF-BAND/)).toBeNull()
+  })
+
+  it('drops a steer preview an older backend cut inside the marker', () => {
+    renderRow({
+      name: 'apex',
+      last_session: { last_active: nowSec() - 60, preview: '[OUT-OF-BAND USER MESSAGE — a direct message from the use...' }
+    } as RosterRow)
+
+    expect(screen.queryByText(/OUT-OF-BAND/)).toBeNull()
+  })
+})

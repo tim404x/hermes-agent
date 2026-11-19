@@ -60,6 +60,7 @@ import {
   Zap
 } from '@/lib/icons'
 import { getServers } from '@/lib/mcp-servers'
+import { sanitizePreviewText } from '@/lib/preview-text'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { $repoWorktrees } from '@/store/coding-status'
@@ -391,7 +392,7 @@ type SessionRow = Awaited<ReturnType<typeof listAllProfileSessions>>['sessions']
 const toSessionEntry = (session: SessionRow): SessionEntry => ({
   git_branch: session.git_branch ?? null,
   id: session.id,
-  preview: session.preview ?? undefined,
+  preview: sanitizePreviewText(session.preview) || undefined,
   title: sessionTitle(session)
 })
 

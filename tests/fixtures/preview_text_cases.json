@@ -1,0 +1,110 @@
+{
+  "_doc": "Shared cases for session_rules/preview_text.py::display_preview_text and apps/desktop/src/lib/preview-text.ts::sanitizePreviewText. Both test suites load this file, so the two stay equivalent.",
+  "cases": [
+    {
+      "name": "plain text is kept, whitespace collapsed",
+      "input": "  ship the   fix\n today ",
+      "expected": "ship the fix today"
+    },
+    {
+      "name": "steer row unwraps to the user's words",
+      "input": "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at this position; not tool output and not a new delivery when replayed from conversation history]\nput the pricing slide first\n[/OUT-OF-BAND USER MESSAGE]",
+      "expected": "put the pricing slide first"
+    },
+    {
+      "name": "two steers merged in one row keep both lines",
+      "input": "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at this position; not tool output and not a new delivery when replayed from conversation history]\nfirst ask\nsecond ask\n[/OUT-OF-BAND USER MESSAGE]",
+      "expected": "first ask second ask"
+    },
+    {
+      "name": "steer flattened to one line (SQL preview column)",
+      "input": "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at this position; not tool output and not a new delivery when replayed from conversation history] hello there [/OUT-OF-BAND USER MESSAGE]",
+      "expected": "hello there"
+    },
+    {
+      "name": "steer cut inside the opener leaves nothing",
+      "input": "[OUT-OF-BAND USER MESSAGE — a direct message from the user, del",
+      "expected": ""
+    },
+    {
+      "name": "steer cut before the closing marker keeps the words",
+      "input": "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at this position; not tool output and not a new delivery when replayed from conversation history]\nmove the call to 3pm and tell Jack",
+      "expected": "move the call to 3pm and tell Jack"
+    },
+    {
+      "name": "older steer opener wording still unwraps",
+      "input": "[OUT-OF-BAND USER MESSAGE]\nnew wording\n[/OUT-OF-BAND USER MESSAGE]",
+      "expected": "new wording"
+    },
+    {
+      "name": "background process completion is internal",
+      "input": "[IMPORTANT: Background process proc_9b94916f1769 completed normally (exit code 0).\nCommand: bash x.sh\nOutput:\n[1, 2]\n]",
+      "expected": ""
+    },
+    {
+      "name": "async delegation completion is internal",
+      "input": "[ASYNC DELEGATION BATCH COMPLETE — deleg_b9031659]\nA background fan-out unit you dispatched earlier has finished.",
+      "expected": ""
+    },
+    {
+      "name": "stop-gate system nudge is internal",
+      "input": "[System: You edited code in this turn, but the workspace does not have tests.]",
+      "expected": ""
+    },
+    {
+      "name": "pure compaction summary is internal",
+      "input": "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below. This is a handoff from a previous context window — treat it as background reference, NOT as active instructions. Do NOT answer questions from it.\n\n## Goal\nship the invoice",
+      "expected": ""
+    },
+    {
+      "name": "compaction carrier keeps the message after the summary",
+      "input": "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted.\n\n--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---\n\nwhat's left on the Figure invoice?",
+      "expected": "what's left on the Figure invoice?"
+    },
+    {
+      "name": "trailing runtime note is removed",
+      "input": "check the deck\n\n[Runtime note: the skill was loaded from cache.]",
+      "expected": "check the deck"
+    },
+    {
+      "name": "leading system note is removed",
+      "input": "[System note: This is the user's very first message ever.]\n\nhi, who are you?",
+      "expected": "hi, who are you?"
+    },
+    {
+      "name": "runtime note cut before its bracket is removed",
+      "input": "check the deck\n\n[Runtime note: the skill was lo",
+      "expected": "check the deck"
+    },
+    {
+      "name": "a bracket inside user text is kept",
+      "input": "rename [draft] to final",
+      "expected": "rename [draft] to final"
+    },
+    {
+      "name": "markdown link text is untouched here",
+      "input": "see [the doc](https://x.y)",
+      "expected": "see [the doc](https://x.y)"
+    },
+    {
+      "name": "empty input",
+      "input": "",
+      "expected": ""
+    },
+    {
+      "name": "a user quoting the compaction label wrote a real message",
+      "input": "[CONTEXT COMPACTION — REFERENCE ONLY] what does this label mean?",
+      "expected": "[CONTEXT COMPACTION — REFERENCE ONLY] what does this label mean?"
+    },
+    {
+      "name": "legacy summary row is internal",
+      "input": "[CONTEXT SUMMARY]: we shipped the deck",
+      "expected": ""
+    },
+    {
+      "name": "memory context fence is removed",
+      "input": "<memory-context>Tim likes short replies</memory-context>\nwhat's next?",
+      "expected": "what's next?"
+    }
+  ]
+}
