@@ -1479,6 +1479,8 @@ DEFAULT_CONFIG = {
         # Env: SLACK_IGNORE_OTHER_USER_MENTIONS.
         "ignore_other_user_mentions": False,
         "thread_require_mention": False,  # require @mention in thread replies too
+        # New top-level session gets the recent conversation (N top-level msgs of 6 h + thread replies).
+        "history_backfill": True, "history_backfill_limit": 15, "history_backfill_char_limit": 6000,
         "channel_prompts": {},  # per-channel ephemeral system prompts
     },
 

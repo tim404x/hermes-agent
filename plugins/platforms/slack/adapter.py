@@ -68,6 +68,7 @@ try:  # sibling modules; support both package and flat plugin-dir import
     from .adapter_socket_lifecycle import SlackSocketLifecycleMixin
     from .adapter_vault_code import SlackVaultCodeMixin
     from .adapter_image_batch import collect_image_uploads
+    from .adapter_history_backfill import ChannelHistoryBackfill, read_with_backoff
     from .adapter_forwarded import (
         append_forwards, files_with_forwarded, is_forward, own_bot_ids, shared_message_sections,
         slack_file_marker as _slack_file_marker)
@@ -82,6 +83,7 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
     from adapter_socket_lifecycle import SlackSocketLifecycleMixin  # type: ignore
     from adapter_vault_code import SlackVaultCodeMixin  # type: ignore
     from adapter_image_batch import collect_image_uploads  # type: ignore
+    from adapter_history_backfill import ChannelHistoryBackfill, read_with_backoff  # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -4763,6 +4765,12 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             channel_id=channel_id, event_thread_ts=event_thread_ts, ts=ts, user_id=user_id,
             team_id=team_id, is_thread_reply=is_thread_reply, is_mentioned=is_mentioned,
             is_dm=is_dm)
+        # A top-level message opening a NEW session gets the recent conversation instead.
+        channel_context = await self._lazy_attr(
+            "_channel_history", lambda: ChannelHistoryBackfill(self)).context_for(
+            channel_context, channel_id=channel_id, ts=ts, session_thread_ts=thread_ts,
+            user_id=user_id, team_id=team_id, channel_type=channel_type, is_dm=is_dm,
+            is_thread_reply=is_thread_reply, is_command=is_command_text)
         # Thread-root media is delivered ahead of the trigger message's own files.
         media_urls, media_types, media_text_inlined, text = await self._collect_inbound_media(
             event, channel_id, team_id, text, thread_root_media_urls, thread_root_media_types)
@@ -5974,26 +5982,13 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         return next((m for m in messages if m.get("ts", "") == thread_ts), None)
 
     async def _conversations_replies_with_backoff(
-        self, channel_id: str, thread_ts: str, limit: int, team_id: str) -> Any:
-        """``conversations.replies`` with 1s/2s backoff on Tier-3 rate limits (429)."""
+        self, channel_id: str, thread_ts: str, limit: int, team_id: str, **params: Any) -> Any:
+        """``conversations.replies`` with 1s/2s backoff on Tier-3 rate limits (429); ``params``
+        (``oldest``, ``latest``, ``cursor``) pass through."""
         client = self._get_client(channel_id, team_id=team_id)
-        for attempt in range(3):
-            try:
-                return await client.conversations_replies(
-                    channel=channel_id, ts=thread_ts, limit=limit, inclusive=True)
-            except Exception as exc:
-                err_str = str(exc).lower()
-                is_rate_limit = (
-                    "ratelimited" in err_str or "429" in err_str or "rate_limited" in err_str)
-                if is_rate_limit and attempt < 2:
-                    retry_after = 1.0 * (2**attempt)
-                    logger.warning(
-                        "[Slack] conversations.replies rate limited; retrying in %.1fs (attempt %d/3)",
-                        retry_after, attempt + 1)
-                    await asyncio.sleep(retry_after)
-                    continue
-                raise
-        return None
+        return await read_with_backoff(
+            "conversations.replies", client.conversations_replies,
+            channel=channel_id, ts=thread_ts, limit=limit, inclusive=True, **params)
 
     async def _format_thread_context(
         self, messages: list[dict[str, Any]], *, thread_ts: str, current_ts: str, team_id: str,
@@ -7034,6 +7029,9 @@ _YAML_BRIDGE = (  # (yaml key, env var, kind) for apply_yaml_bridge
     ("require_mention_channels", "SLACK_REQUIRE_MENTION_CHANNELS", "csv"),
     ("reaction_triggers", "SLACK_REACTION_TRIGGERS", "csv"), ("reaction_trigger_target", "SLACK_REACTION_TRIGGER_TARGET", "str"),
     ("allowed_channels", "SLACK_ALLOWED_CHANNELS", "csv"), ("ignored_channels", "SLACK_IGNORED_CHANNELS", "csv"),
+    ("history_backfill", "SLACK_HISTORY_BACKFILL", "lower"),
+    ("history_backfill_limit", "SLACK_HISTORY_BACKFILL_LIMIT", "str"),
+    ("history_backfill_char_limit", "SLACK_HISTORY_BACKFILL_CHAR_LIMIT", "str"),
 )
 
 
