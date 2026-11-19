@@ -509,6 +509,7 @@ class _TurnRun:
     prompt_text: str = ""
     marker_key: str = ""
     receipt_attempted: bool = False
+    silence_ok: bool = False  # a bare silence marker is delivered as nothing (Bot Chat or a machinery wake)
 
 
 def _adopt_out_of_band_turns(session: dict) -> None:
@@ -764,8 +765,11 @@ def _invoke_agent(
     # be a bare silence marker ("NO"->"NO_REPLY") or its last line a closing one
     # ("Paris.\n\nNO"), so a marker is never shown or spoken (the client keeps streamed text
     # when message.complete is "").
-    from gateway.response_filters import SilenceMarkerStreamHold
-    hold = SilenceMarkerStreamHold() if _is_bot_mode_session(session) else None
+    # A machinery wake (background process / delegation / notification) may vanish on a bare marker in
+    # ANY desktop session, as gateway.response_filters.silence_allowed lets it on every platform.
+    from gateway.response_filters import SilenceMarkerStreamHold, is_machinery_display_kind
+    st.silence_ok = is_machinery_display_kind(display_kind) or _is_bot_mode_session(session)
+    hold = SilenceMarkerStreamHold() if st.silence_ok else None
 
     def _stream(delta):
         if getattr(agent, "_mute_notification_reply", False):
@@ -967,7 +971,7 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
     # The receipt verifies the stored row's body, which keeps the model's text as written;
     # only the delivered copy drops a silence marker.
     receipt = _persisted_turn_receipt(st, raw, status)
-    if _is_bot_mode_session(session):
+    if getattr(st, "silence_ok", False) or _is_bot_mode_session(session):  # turn stubs predate the field
         raw = _bot_mode_delivery_text(raw, successful=status == "complete")
     payload = {"text": raw, "usage": _get_usage(agent), "status": status, **_pause_mark(session, status)}
     if receipt:
