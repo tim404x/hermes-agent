@@ -309,10 +309,12 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None, 
     if not isinstance(last, dict) or last.get("role") != "tool":
         return False
     text = final_response if isinstance(final_response, str) else ""
+    from agent.display_row_typing import is_interrupt_sentinel
     from agent.message_metadata import append_message
 
     stripped = text.strip()
-    if not stripped or stripped == _INTERRUPTED_PLACEHOLDER:
+    # An ``Operation interrupted: ...`` sentinel is cancellation metadata, never prose: it closes like the placeholder.
+    if not stripped or stripped == _INTERRUPTED_PLACEHOLDER or is_interrupt_sentinel(stripped):
         row = hidden_interrupt_placeholder_row()
     else:
         row = {"role": "assistant", "content": stripped}
