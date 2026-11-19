@@ -3,6 +3,7 @@ watch_match, watch_disabled, watch_overflow_*, async_delegation) into the
 ``[IMPORTANT: ...]`` / ``[ASYNC DELEGATION ...]`` text the CLI drain loop, gateway and
 TUI inject into the agent conversation."""
 
+import re
 import time
 from dataclasses import dataclass
 from contextlib import suppress
@@ -436,21 +437,105 @@ def _short_command(command) -> str:
     return cmd[:77] + "..." if len(cmd) > 80 else cmd
 
 
-def process_completion_display_text(events: list) -> str:
-    """Compact UI title for one or more process completions; the model text keeps the full output."""
-    if len(events) != 1:
-        return f"{len(events)} Background Processes Finished"
-    evt = events[0]
+# The job label a title shows instead of the command (cases: tests/fixtures/process_label_cases.json,
+# shared with the desktop twin apps/desktop/src/lib/process-title.ts). Candidate kinds, in order:
+# a shell variable holding a path, a ``cd`` target, a script path.
+_LABEL_CANDIDATES = (
+    (re.compile(r"""(?:^|[\s;&|(])[A-Z][A-Z0-9_]*=(["']?)((?:/|~)[^\s;&|"')]*)\1"""), "path"),
+    (re.compile(r"""(?:^|[\s;&|(])cd\s+(["']?)([^\s;&|"')]+)\1"""), "path"),
+    (re.compile(r"""(?:^|\s)(["']?)([^\s;&|"'()]+\.(?:py|sh|js|mjs|ts|rb))\1(?=$|[\s;&|)])"""), "script"),
+)
+_GENERIC_DIRS = frozenset({
+    "~", "hermes", "home", "work", "cache", "scratch", "tmp", "src", "app", "apps", "bin", "scripts",
+    "script", "element", "build", "dist", "out", "logs", "data", "tools"})
+_GENERIC_SCRIPTS = frozenset({"run", "main", "build", "index", "script", "test", "start", "job", "task"})
+_LEGACY_CUT = "..."
+
+
+def _humanize(segment: str) -> str | None:
+    text = re.sub(r"[-_]\d{3,8}$", "", segment)
+    text = re.sub(r"\s+", " ", re.sub(r"[-_.]+", " ", text)).strip()
+    if not re.search(r"[^\W\d_]", text):
+        return None
+    return text[0].upper() + text[1:]
+
+
+def _path_label(path: str) -> str | None:
+    for segment in reversed([part for part in path.split("/") if part]):
+        segment = segment.lstrip(".")
+        if segment and segment.lower() not in _GENERIC_DIRS:
+            return _humanize(segment)
+    return None
+
+
+def _script_label(path: str) -> str | None:
+    stem = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    return None if stem.lower() in _GENERIC_SCRIPTS else _humanize(stem)
+
+
+_LABELERS = {"path": _path_label, "script": _script_label}
+
+
+def process_job_label(command) -> str | None:
+    """A short human name for a background job ("Asim short"), or None when its command names none.
+
+    A trailing ``...`` (a title cut by the old 80-char rule) is dropped first, and then a
+    candidate running to the end of the text is ignored: its path may be cut mid-word."""
+    text = str(command or "")
+    cut = text.endswith(_LEGACY_CUT)
+    if cut:
+        text = text[: -len(_LEGACY_CUT)]
+    for pattern, kind in _LABEL_CANDIDATES:
+        for match in pattern.finditer(text):
+            if cut and match.end() >= len(text):
+                continue
+            label = _LABELERS[kind](match.group(2))
+            if label:
+                return label
+    return None
+
+
+def _outcome(evt: dict) -> str:
     reason, exit_code = evt.get("completion_reason") or "exited", evt.get("exit_code", "?")
     if reason == "killed":
-        outcome = "Terminated"
-    elif reason in _REASON_STATUS:
-        outcome = "Lost"
-    else:
-        outcome = "Finished" if exit_code == 0 else "Failed"
-    cmd = _short_command(evt.get("command"))
-    detail = f" (exit {exit_code})" if reason not in ("killed", *_REASON_STATUS) and exit_code != 0 else ""
-    return f"Background Process {outcome}{detail}: {cmd}" if cmd else f"Background Process {outcome}{detail}"
+        return "stopped"
+    if reason in _REASON_STATUS:
+        return "lost"
+    return "finished" if exit_code == 0 else f"failed, exit {exit_code}"
+
+
+def _jobs_finished(count: int) -> str:
+    return f"{count} background jobs finished"
+
+
+def process_completion_display_text(events: list) -> str:
+    """Compact UI title for one or more process completions; the model text keeps the full output.
+    The title names the job ("Asim short finished"), never its shell command, path or id."""
+    if len(events) != 1:
+        return _jobs_finished(len(events))
+    evt = events[0]
+    return f"{process_job_label(evt.get('command')) or 'Background job'} {_outcome(evt)}"
+
+
+_LEGACY_TITLE = re.compile(
+    r"^Background Process (Finished|Failed|Terminated|Lost)(?: \(exit ([^)]*)\))?(?:: (.*))?$", re.DOTALL)
+_LEGACY_BATCH = re.compile(r"^(\d+) Background Processes Finished$")
+_LEGACY_OUTCOME = {"Finished": "finished", "Terminated": "stopped", "Lost": "lost"}
+
+
+def relabel_legacy_process_title(display_text: str) -> str:
+    """A title stored before job labels ("Background Process Finished: W=/home/...") in today's form
+    ("Asim short finished"); any other text is returned unchanged. Render-time only."""
+    text = str(display_text or "")
+    batch = _LEGACY_BATCH.match(text)
+    if batch:
+        return _jobs_finished(int(batch.group(1)))
+    legacy = _LEGACY_TITLE.match(text)
+    if not legacy:
+        return text
+    word, exit_code, command = legacy.groups()
+    outcome = _LEGACY_OUTCOME.get(word) or (f"failed, exit {exit_code}" if exit_code else "failed")
+    return f"{process_job_label(command) or 'Background job'} {outcome}"
 
 
 HEARTBEAT_DISPLAY_KIND = "hidden"  # a wake, not a message: no surface paints the row
