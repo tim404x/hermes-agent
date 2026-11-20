@@ -70,4 +70,50 @@ describe('unread after a silent turn', () => {
     finishTurn(false)
     expect($unreadFinishedSessionIds.get()).toEqual(['s1'])
   })
+
+  // The acknowledgement covers exactly the silent turn's committed rows in its own profile's
+  // session: an unseen real answer around it stays unread, and a partial refresh does not spend it.
+  it('keeps a real answer that arrived before the silent wake unread', () => {
+    setSessions([session({ message_count: 6 })])
+    expect($unreadFinishedSessionIds.get()).toEqual(['s1'])
+
+    finishTurn(true)
+    setSessions([session({ message_count: 8 })])
+    expect($sessionSeenCounts.get()).toEqual({ default: { s1: 6 } })
+    expect($unreadFinishedSessionIds.get()).toEqual(['s1'])
+  })
+
+  it('keeps the acknowledgement through a refresh that shows only part of the silent turn', () => {
+    finishTurn(true)
+    setSessions([session({ message_count: 5 })])
+    expect($unreadFinishedSessionIds.get()).toEqual([])
+
+    setSessions([session({ message_count: 6 })])
+    expect($sessionSeenCounts.get()).toEqual({ default: { s1: 6 } })
+    expect($unreadFinishedSessionIds.get()).toEqual([])
+  })
+
+  it('acknowledges only the completing profile when two profiles hold the same id', () => {
+    setSessions([session({ message_count: 4, profile: 'work' }), session({ message_count: 4 })])
+    finishTurn(true)
+    setSessions([session({ message_count: 6, profile: 'work' }), session({ message_count: 6 })])
+    expect($sessionSeenCounts.get()).toEqual({ default: { s1: 6 }, work: { s1: 4 } })
+    expect($unreadFinishedSessionIds.get()).toEqual(['s1'])
+  })
+
+  it('keeps a real answer that arrived after the silent wake unread', () => {
+    finishTurn(true)
+    setSessions([session({ message_count: 8 })])
+    expect($sessionSeenCounts.get()).toEqual({ default: { s1: 6 } })
+    expect($unreadFinishedSessionIds.get()).toEqual(['s1'])
+  })
+
+  it('acknowledges the row count the completion receipt committed', () => {
+    publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
+    noteSilentCompletion('rt1', 4)
+    publishSessionState('rt1', { ...createClientSessionState('s1'), busy: false })
+    setSessions([session({ message_count: 8 })])
+    expect($sessionSeenCounts.get()).toEqual({ default: { s1: 8 } })
+    expect($unreadFinishedSessionIds.get()).toEqual([])
+  })
 })
