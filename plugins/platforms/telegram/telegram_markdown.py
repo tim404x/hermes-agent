@@ -409,15 +409,24 @@ def to_markdown_v2(content: str) -> str:
     text = re.sub(r'~~(.+?)~~', _ph_wrap('~', '~'), text)
     text = re.sub(r'\|\|(.+?)\|\|', _ph_wrap('||', '||'), text)
     # 9) Blockquotes: protect leading > from escaping; expandable quotes (**> starts, || ends the block's LAST line).
+    #    A lone > after a quote line is markdown's blank line inside the quote (a quoted draft's paragraph
+    #    break): Telegram takes it as an empty quote line, so it stays one; escaped, it painted a literal >.
     def _convert_blockquote(m):  # one quote block; a raw || anywhere but its last line is an unclosed spoiler
-        lines = [line.split(' ', 1) for line in m.group(0).split('\n')]  # [prefix, content]; prefix: >, >>, **> …
+        lines = [(line.split(' ', 1) + [''])[:2] for line in m.group(0).split('\n')]  # [prefix, content]: >, >>, **> …
         expandable = lines[0][0].startswith(_EXPANDABLE_QUOTE)
         lines[0][0] = lines[0][0].replace(_EXPANDABLE_QUOTE, '**')
         last = len(lines) - 1 if expandable and lines[-1][1].endswith('||') else -1
-        return '\n'.join(_ph(f'{p} {_escape_mdv2(c[:-2])}||' if i == last else f'{p} {_escape_mdv2(c)}')
-                         for i, (p, c) in enumerate(lines))
 
-    text = re.sub(rf'^(?:{_EXPANDABLE_QUOTE})?>{{1,3}} .+$(?:\n>{{1,3}} .+$)*', _convert_blockquote, text,
+        def _quote_line(i, prefix, content):
+            if not content.strip():  # a lone > : an empty line inside the quote
+                return _ph(prefix)
+            if i == last:
+                return _ph(f'{prefix} {_escape_mdv2(content[:-2])}||')
+            return _ph(f'{prefix} {_escape_mdv2(content)}')
+
+        return '\n'.join(_quote_line(i, p, c) for i, (p, c) in enumerate(lines))
+
+    text = re.sub(rf'^(?:{_EXPANDABLE_QUOTE})?>{{1,3}} .+$(?:\n>{{1,3}}(?: .*)?$)*', _convert_blockquote, text,
                   flags=re.MULTILINE)
     # A sentinel left over means the opener had no quote text after all: restore its literal **.
     text = text.replace(_EXPANDABLE_QUOTE, '**')
