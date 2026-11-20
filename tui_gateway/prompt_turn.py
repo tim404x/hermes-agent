@@ -798,6 +798,10 @@ def _invoke_agent(
         _emit("message.interim", sid, {"text": text, "already_streamed": already_streamed})
     agent.interim_assistant_callback = (
         _interim_assistant_cb if _load_interim_assistant_messages() else None)
+    # A prompt the person typed (a synthesized turn carries a display kind) opens a long turn with
+    # the model's own one-line ack, sealed by the desktop and the phone as its own bubble.
+    from agent.ack_first import stage_ack_first
+    stage_ack_first(agent, prompt, person_turn=display_kind is None)
     # A synthesized turn is typed at turn START so a crash persist writes a timeline event,
     # not a raw user bubble; the post-turn stamp is the fallback for an older agent.
     st.run_kwargs = run_kwargs = {
