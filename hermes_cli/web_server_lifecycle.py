@@ -487,6 +487,29 @@ def _report_port_in_use(host: str, port: int, *, headless: Optional[bool] = None
     return PORT_IN_USE_EXIT_CODE
 
 
+# uvicorn closes an idle HTTP/1.1 keep-alive socket after 5 s by default. Remote Desktop REST calls
+# arrive in bursts seconds apart, often through TCP relays (Mac 127.0.0.1:7777 -> tailnet relay -> here),
+# so every pause over 5 s cost a fresh tailnet handshake on the next call (174 ms vs 77 ms warm, measured
+# 20 Nov 2026). 75 s (nginx's default) keeps a client's pooled socket across normal pauses; an idle
+# socket costs one fd. Bounded so a typo can't hold sockets for hours.
+_DEFAULT_HTTP_KEEP_ALIVE_S = 75
+_MAX_HTTP_KEEP_ALIVE_S = 600
+
+
+def _dashboard_keep_alive_s(dashboard_config: dict[str, Any]) -> int:
+    """Seconds uvicorn keeps an idle HTTP keep-alive socket open (``dashboard.http_keep_alive_s``)."""
+    raw = dashboard_config.get("http_keep_alive_s", _DEFAULT_HTTP_KEEP_ALIVE_S)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = float("nan")
+    if not value >= 1:  # NaN, zero, negative and unparsable all fall back
+        if raw is not None:
+            _log.warning("dashboard.http_keep_alive_s must be a number >= 1; using %s", _DEFAULT_HTTP_KEEP_ALIVE_S)
+        return _DEFAULT_HTTP_KEEP_ALIVE_S
+    return int(min(value, _MAX_HTTP_KEEP_ALIVE_S))
+
+
 _DEFAULT_DASHBOARD_FORWARDED_ALLOW_IPS = ("127.0.0.1", "::1")
 
 
@@ -619,6 +642,7 @@ def build_listener_server(served_app, host: str, port: int, *, auth_required: bo
         # Loopback-only unless the operator trusts a bounded upstream proxy, so
         # spoofed X-Forwarded-* from arbitrary callers is never honoured.
         forwarded_allow_ips=_dashboard_forwarded_allow_ips(dash_cfg),
+        timeout_keep_alive=_dashboard_keep_alive_s(dash_cfg),
         ws_ping_interval=ws_ping[0],
         ws_ping_timeout=ws_ping[1],
         ws_per_message_deflate=per_message_deflate,
