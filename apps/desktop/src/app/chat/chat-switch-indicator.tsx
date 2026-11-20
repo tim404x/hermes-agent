@@ -15,6 +15,9 @@ import { dismissProfileSwitchFailure, type ProfileSwitchFailure } from '@/store/
 // that any chrome would only flash; between SLOW and STALLED a quiet corner
 // pill says what is happening; past STALLED an inline strip at the top of the
 // thread explains that sends will wait.
+// SWITCH_SLOW_MS supersedes the old overlay's SWAP_OVERLAY_GRACE_MS: a warm
+// bot switch paints its cached thread within a frame or two, so a switch that
+// settles inside the grace must never show any switch chrome (bot-switch-speed).
 export const SWITCH_SLOW_MS = 2_000
 export const SWITCH_STALLED_MS = 10_000
 
