@@ -733,7 +733,7 @@ def _is_untyped_scaffold_notice(message) -> bool:
 
 
 def _project_for_display(messages: list, *, home=None, inline_images: bool = True, bot_brief=None,
-                         silence_ok_session: bool = False) -> list:
+                         silence_ok_session: bool = False, opener: Optional[dict] = None) -> list:
     """Replace compaction summaries with their display-only projection and hide untyped
     gateway-scaffold notices.
 
@@ -808,19 +808,21 @@ def _project_for_display(messages: list, *, home=None, inline_images: bool = Tru
             if projected.get("display_kind") != CONTENT_REFUSED_DISPLAY_KIND:
                 projected.pop("display_kind", None)
         projected_messages.append(projected)
-    return _mark_silent_turns(project_history_commentary(projected_messages, home=home), silence_ok_session)
+    return _mark_silent_turns(project_history_commentary(projected_messages, home=home), silence_ok_session, opener)
 
 
-def _mark_silent_turns(messages: list, silence_ok_session: bool) -> list:
+def _mark_silent_turns(messages: list, silence_ok_session: bool, opener: Optional[dict] = None) -> list:
     """Rows a silent turn showed nothing for (``session_rules.silent_turns``) are marked ``silent_turn``,
     not dropped: the Desktop pages these transcripts by backend row offset and counts every row. A reply in
     a turn that may end silent carries its closing-marker-free text as ``display_content``."""
     from gateway.response_filters import strip_trailing_silence_marker
     from session_rules.silent_turns import reply_text, silent_turns
 
-    turns = silent_turns(messages, silence_ok_session=silence_ok_session)
+    # A page cut mid-turn judges its leading rows by the turn's real opener, read just outside the page.
+    lead = 1 if opener is not None else 0
+    turns = silent_turns([opener, *messages] if lead else messages, silence_ok_session=silence_ok_session)
     projected = []
-    for index, message in enumerate(messages):
+    for index, message in enumerate(messages, start=lead):
         if index in turns.hidden:
             message = {**message, "silent_turn": True}
         elif index in turns.silence_ok and (text := reply_text(message)) != (
@@ -828,6 +830,31 @@ def _mark_silent_turns(messages: list, silence_ok_session: bool) -> list:
             message = {**message, "display_content": stripped}
         projected.append(message)
     return projected
+
+
+_OPENER_LOOKBACK = 200
+
+
+def _page_opener(store, sid: str, page: list, read) -> Optional[dict]:
+    """The user row that opened the turn a page starts inside of, read from the rows just before the page.
+
+    Silence permission is the opener's (a wake, an unaddressed message): a page whose first rows continue
+    a turn opened outside it must judge them by that row, never as a person's turn by default. ``None``
+    when the page opens with a user row, starts the transcript, or no opener is within reach.
+    """
+    if not page or page[0].get("role") == "user":
+        return None
+    if read.latest:
+        before = TranscriptRead(view=read.view, limit=_OPENER_LOOKBACK, offset=read.offset + len(page),
+                                latest=True, include_lineage=read.include_lineage)
+    elif read.offset:
+        start = max(0, read.offset - _OPENER_LOOKBACK)
+        before = TranscriptRead(view=read.view, limit=read.offset - start, offset=start,
+                                include_lineage=read.include_lineage)
+    else:
+        return None
+    rows = [row.as_wire_row() for row in store.messages.read_transcript(sid, before)]
+    return next((row for row in reversed(rows) if row.get("role") == "user"), None)
 
 
 @manage_router.get("/api/sessions/{session_id}/messages")
@@ -859,16 +886,20 @@ async def get_session_messages(
             offset=offset, latest=latest_page, include_lineage=True))
         # The Bot Chat may end any turn silent, like its live delivery (tui_gateway/prompt_turn.py).
         bot_chat = (store.sessions.get_title(sid) or "").strip() == BOT_CHAT_TITLE
-        return sid, _limit, [row.as_wire_row() for row in rows], find_bot_brief(store, sid), bot_chat
+        wire = [row.as_wire_row() for row in rows]
+        opener = None if bot_chat else _page_opener(store, sid, wire, TranscriptRead(
+            view=TranscriptView.DISPLAY if include_compacted else TranscriptView.ACTIVE, limit=_limit,
+            offset=offset, latest=latest_page, include_lineage=True))
+        return sid, _limit, wire, find_bot_brief(store, sid), bot_chat, opener
 
     from tools.bot_mode_probe import BOT_CHAT_TITLE
     result = await asyncio.to_thread(_with_db, profile, _read, read_only=True)
     if result is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
-    sid, _limit, messages, brief, bot_chat = result
+    sid, _limit, messages, brief, bot_chat, opener = result
     projected_messages = await asyncio.to_thread(
         _project_for_display, messages, home=_history_profile_home(profile),
-        inline_images=inline_images, bot_brief=brief, silence_ok_session=bot_chat)
+        inline_images=inline_images, bot_brief=brief, silence_ok_session=bot_chat, opener=opener)
     return {
         "session_id": sid,
         # The same stamp list rows carry, so the Desktop keys a page under the
