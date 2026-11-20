@@ -948,6 +948,21 @@ def _cmd_pin(args, pinning, *, persistence=None):
     return 1 if failures else None
 
 
+def _cmd_open_tab(args, *, persistence=None):
+    """Stamp one session as a side window (``mark_side_window``) so the Desktop shows it as a task tab."""
+    resolved = persistence.sessions.resolve_id(args.session_id)
+    if not resolved:
+        return _not_found(args.session_id)
+    if args.title:
+        persistence.sessions.set_title(resolved, args.title)
+    by = str(args.by or "").strip()
+    if not persistence.sessions.mark_side_window(resolved, by=f"bot:{by}" if by else ""):
+        return _not_found(args.session_id)
+    title = persistence.sessions.get_title(resolved)
+    print(f"Opened session '{resolved}' as a Desktop tab.{f'  ({title})' if title else ''}")
+    return None
+
+
 def _cmd_pinned(args, *, persistence=None):
     from persistence.conversation.sessions import SessionQuery, SessionWindow
     # limit=1 keeps the recency page minimal; include_pinned back-fills ALL pinned rows the page missed.
@@ -1455,7 +1470,7 @@ _DB_HANDLERS = {
     "retitle-skills": _cmd_retitle_skills, "browse": _cmd_browse, "optimize": _cmd_optimize,
     "clean-markers": _cmd_clean_markers, "optimize-storage": _cmd_optimize_storage,
     "repair-routing": _cmd_repair_routing, "repair-prompts": _cmd_repair_prompts, "stats": _cmd_stats,
-    "refresh-prompts": _cmd_refresh_prompts,
+    "refresh-prompts": _cmd_refresh_prompts, "open-tab": _cmd_open_tab,
 }
 
 
