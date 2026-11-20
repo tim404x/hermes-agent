@@ -1,5 +1,5 @@
 import { randomUuid, SLASH_COMMAND_RE } from '@hermes/shared'
-import { type RefObject, useLayoutEffect, useRef } from 'react'
+import { type RefObject, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { translateNow, useI18n } from '@/i18n'
@@ -29,6 +29,8 @@ import { notify } from '@/store/notifications'
 import { isOnboardingChat } from '@/store/onboarding-session'
 import { answerParkedCard, skipParkedCards, yieldParkedCardsToMessage } from '@/store/parked-card-answers'
 import { hasBlockingPromptRequest } from '@/store/prompts'
+import { $activeSessionId, $selectedStoredSessionId, $sessions, resolveComposerSessionKey } from '@/store/session'
+import { awaitSubmitConfirmation, hasSubmitHold } from '@/store/session-open-confirmation'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
 import { onComposerSubmitRequest } from '../focus'
@@ -43,6 +45,31 @@ const sameOccurrence = (a: ComposerAttachment, b: ComposerAttachment) =>
 // Whether `scope`'s stashed draft is still the message just sent. By the time
 // the send is accepted the user may have typed the next one and the debounce
 // saved it there; that draft is not the sent one and stays.
+/** A send made while the composer's chat is still being confirmed (Bot Mode's
+ *  paint-first click), replayed once the registry answers. */
+type HeldAction =
+  | { kind: 'external'; run: () => void }
+  | { kind: 'queue' }
+  | { kind: 'steer'; mode: 'interrupt' | 'steer' }
+  | { kind: 'submit' }
+
+interface HeldSend {
+  action: HeldAction
+  attachments: ComposerAttachment[]
+  /** The composer scope the words were typed in. */
+  heldScope: null | string
+  loaded?: boolean
+  /** The confirmed chat is another one: its composer takes the words first. */
+  moved?: boolean
+  /** Unset while the registry is answering; then the scope the send runs in. */
+  runScope?: null | string
+  text: string
+}
+
+/** Ceiling on how long a held send waits for the confirmed chat to take the
+ *  screen, matching the submit pipeline's own wait. */
+const HELD_SEND_SCREEN_WAIT_MS = 10_000
+
 function stashStillHoldsSent(scope: string | null, text: string, attachments: ComposerAttachment[]): boolean {
   const stashed = takeSessionDraft(scope)
 
@@ -243,8 +270,84 @@ export function useComposerSubmit({
   // if the turn has already ended, or a steer is not possible, queue it so it
   // runs next. This holds for hidden setup notes and for visible messages a
   // button sends on the user's behalf alike.
-  const externalSubmitRef = useRef({ busy, dispatchSubmit, onSteer, onSteerHidden })
-  externalSubmitRef.current = { busy, dispatchSubmit, onSteer, onSteerHidden }
+  // Confirmation gate for every send that writes to this composer's chat
+  // (switch-fix2-1119). A Bot Mode paint-first click shows the roster's last
+  // known Bot Chat before the registry confirms it; the submit pipeline holds
+  // idle sends, but a busy Send (redirect / steer), a queued draft or a parked
+  // card answer would reach the painted runtime directly. So the composer
+  // decides nothing while its chat is unconfirmed: the words stay in the
+  // draft, and once the registry answers the same action runs again against
+  // the chat then on screen, whose busy state picks redirect, steer or a new
+  // turn. A replaced chat takes the words into the confirmed chat's composer
+  // first; a user who moved elsewhere meanwhile keeps the draft and is told.
+  const heldSendRef = useRef<HeldSend | null>(null)
+  const [, setHeldSendVerdicts] = useState(0)
+
+  const heldStoredSessionId = (): null | string => {
+    const queueKey = activeQueueSessionKeyRef.current
+
+    if (hasSubmitHold(queueKey)) {
+      return queueKey
+    }
+
+    const selected = $selectedStoredSessionId.get()
+
+    return sessionId && sessionId === $activeSessionId.get() && hasSubmitHold(selected) ? selected : null
+  }
+
+  const deferUntilConfirmed = (action: HeldAction): boolean => {
+    const heldId = heldStoredSessionId()
+
+    if (!heldId) {
+      return false
+    }
+
+    // One held send per composer: a second Enter while it waits is the same send.
+    if (heldSendRef.current) {
+      return true
+    }
+
+    const held: HeldSend = {
+      action,
+      attachments: cloneAttachments(attachments),
+      heldScope: activeQueueSessionKeyRef.current,
+      text: draftRef.current
+    }
+
+    heldSendRef.current = held
+
+    void awaitSubmitConfirmation(heldId).then(verdict => {
+      if (heldSendRef.current !== held) {
+        return
+      }
+
+      if (verdict.kind !== 'confirmed') {
+        // Unconfirmed: nothing was sent and the words never left the draft;
+        // the opener explains and offers a retry.
+        heldSendRef.current = null
+
+        return
+      }
+
+      held.moved = verdict.storedSessionId !== heldId
+      held.runScope = held.moved
+        ? (resolveComposerSessionKey(verdict.storedSessionId, $sessions.get()) ?? verdict.storedSessionId)
+        : held.heldScope
+      setHeldSendVerdicts(count => count + 1)
+
+      setTimeout(() => {
+        if (heldSendRef.current === held) {
+          heldSendRef.current = null
+          notify({ kind: 'info', message: copy.heldSendNotSent })
+        }
+      }, HELD_SEND_SCREEN_WAIT_MS)
+    })
+
+    return true
+  }
+
+  const externalSubmitRef = useRef({ busy, deferUntilConfirmed, dispatchSubmit, onSteer, onSteerHidden })
+  externalSubmitRef.current = { busy, deferUntilConfirmed, dispatchSubmit, onSteer, onSteerHidden }
 
   useLayoutEffect(
     () =>
@@ -256,6 +359,12 @@ export function useComposerSubmit({
           paneVisible &&
           !inputDisabled
         ) {
+          if (!externalSubmitRef.current.deferUntilConfirmed({ kind: 'external', run: () => handleRequest() })) {
+            handleRequest()
+          }
+        }
+
+        function handleRequest() {
           const current = externalSubmitRef.current
           const queueKey = activeQueueSessionKeyRef.current
           // One request = one send action: the steer, the direct submit and
@@ -530,6 +639,12 @@ export function useComposerSubmit({
       return
     }
 
+    // Before the parked-card, busy and idle dispatch below: each one writes
+    // to the chat on screen, which may still be an unconfirmed paint.
+    if (!queueEdit && deferUntilConfirmed({ kind: 'submit' })) {
+      return
+    }
+
     const parked = answerParkedCardWithDraft(text, payloadPresent)
 
     if (parked === 'answered') {
@@ -575,6 +690,10 @@ export function useComposerSubmit({
   // active model request with its displayed context or waits for the current
   // tool boundary. If the turn already ended, queue the words instead.
   const steerDraft = (mode: 'interrupt' | 'steer' = 'interrupt') => {
+    if (deferUntilConfirmed({ kind: 'steer', mode })) {
+      return
+    }
+
     const text = draftRef.current.trim()
     // The Steer action on a restored send: queued under its id like a busy Enter (see queueRetry).
     const retry = attachments.length ? undefined : takeDraftRetry?.(draftRef.current, [])
@@ -658,7 +777,7 @@ export function useComposerSubmit({
   }
 
   const queueDraft = () => {
-    if (disabled || !busy || refusedDuringSetup(draftRef.current)) {
+    if (disabled || !busy || refusedDuringSetup(draftRef.current) || deferUntilConfirmed({ kind: 'queue' })) {
       return
     }
 
@@ -673,6 +792,59 @@ export function useComposerSubmit({
 
     refocusAfterSend(editorHadFocus)
   }
+
+  // Runs a held send once its verdict is in and this composer shows the chat
+  // it belongs to. Called from a commit (below), so the busy state, the
+  // dispatch functions and the draft are that chat's.
+  const settleHeldSend = (scopeNow: null | string) => {
+    const held = heldSendRef.current
+
+    if (!held || held.runScope === undefined) {
+      return
+    }
+
+    if (scopeNow === held.runScope) {
+      if (held.moved && !held.loaded && held.action.kind !== 'external') {
+        // The words were typed into the replaced chat: move them into the
+        // confirmed chat's draft and send on the next render.
+        held.loaded = true
+
+        if (held.heldScope) {
+          stashAt(held.heldScope, '', [])
+        }
+
+        loadIntoComposer(held.text, held.attachments)
+        setHeldSendVerdicts(count => count + 1)
+
+        return
+      }
+
+      heldSendRef.current = null
+      const { action } = held
+
+      if (action.kind === 'external') {
+        action.run()
+      } else if (action.kind === 'queue') {
+        queueDraft()
+      } else if (action.kind === 'steer') {
+        steerDraft(action.mode)
+      } else {
+        submitDraft()
+      }
+
+      return
+    }
+
+    // Still on the replaced chat (or between routes): wait for the confirmed
+    // one. Anywhere else, the user moved on; the draft stays where it was typed.
+    if (scopeNow && !isFreshDraftScope(scopeNow) && scopeNow !== held.heldScope) {
+      heldSendRef.current = null
+      notify({ kind: 'info', message: copy.heldSendNotSent })
+    }
+  }
+
+  // Every commit: a verdict, or the confirmed chat taking the screen, re-renders.
+  useEffect(() => settleHeldSend(activeQueueSessionKey))
 
   return { dispatchSubmit, queueDraft, steerDraft, submitDraft }
 }
