@@ -2532,13 +2532,17 @@ def run_job(
     if not job.get("no_agent") and owner_execution is None:
         # apexfix: monitor gate runs before admission. An unchanged scheduled monitor tick returns
         # the owner's own no_change result here, so it never reserves a session or a policy receipt.
-        from cron.monitor_preadmit import preadmit_monitor_gate
-        _unchanged = preadmit_monitor_gate(job, extra_prompt=extra_prompt, cancel_event=cancel_event)
+        from cron.monitor_preadmit import preadmit_monitor_decision
+        _unchanged, _admission = preadmit_monitor_decision(job, extra_prompt=extra_prompt, cancel_event=cancel_event)
         if _unchanged is not None:
             return _unchanged
         from cron.scheduler_authority import run_canonical_job
-        return run_canonical_job(job, extra_prompt=extra_prompt, cancel_event=cancel_event,
-                                 execution_id=execution_id)
+        try:
+            return run_canonical_job(job, extra_prompt=extra_prompt, cancel_event=cancel_event,
+                                     execution_id=execution_id)
+        finally:
+            if _admission is not None:
+                _admission.after()  # did the owner agree with the peek? (divergence latch, revalidation clock)
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
