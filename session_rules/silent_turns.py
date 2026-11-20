@@ -1,7 +1,7 @@
 """Silent turns: the stored rows a turn that chose silence leaves nothing to show for.
 
 A bot may end a turn with a bare silence marker (``NO_REPLY``, ``[SILENT]``; the rule is
-:func:`gateway.response_filters.is_intentional_silence_response`), and the live delivery lets it
+:func:`session_rules.silence.is_intentional_silence_response`), and the live delivery lets it
 vanish only where :func:`gateway.response_filters.silence_allowed` does: a machinery wake
 (background process, delegation result, runtime notification), a message nobody addressed to the
 bot, or a session that is silent by nature (the Bot Chat). Every history projection hides the rows
@@ -20,7 +20,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from gateway.response_filters import is_intentional_silence_response, is_machinery_display_kind
+from session_rules.silence import is_intentional_silence_response, is_machinery_display_kind
 
 FAILED_TURN_DISPLAY_KIND = "failed_turn"
 
