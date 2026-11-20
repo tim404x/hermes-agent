@@ -582,6 +582,21 @@ hermes sessions pinned
 hermes sessions pinned --json > pinned-sessions.json
 ```
 
+### Open a Chat as a Desktop Task Tab
+
+A Bot Mode teammate's DM opens in a *side window* that the Desktop shows as a tab
+under that Bot. `hermes sessions open-tab` gives any existing chat the same
+stamp, so a Bot can turn one of its own chats into a task tab without touching
+the database. Run it under the Bot's profile; the chat's routing is unchanged.
+
+```bash
+# Show a chat as a tab under the kepler Bot, opened by Neo
+hermes -p kepler sessions open-tab local-89ed5d6e --by neo
+
+# Set the tab label at the same time
+hermes -p kepler sessions open-tab local-89ed5d6e --title "Sales | Deal heatmap" --by neo
+```
+
 ### Prune Old Sessions
 
 ```bash
