@@ -93,6 +93,7 @@ import {
   setSessionOwnerHint
 } from '@/store/session'
 import { $focusedStoredSessionId } from '@/store/session-focus'
+import { holdSubmitsUntilConfirmed, type SubmitHoldOptions } from '@/store/session-open-confirmation'
 import {
   $focusedRuntimeId,
   $focusedSessionState,
@@ -432,18 +433,43 @@ function waitForFocusedSessionHydration({
       }
     }
 
-    unbinds.push($activeGatewayProfile.listen(check))
-    unbinds.push($activeConnectionId.listen(check))
-    unbinds.push($selectedStoredSessionId.listen(check))
-    unbinds.push($activeSessionId.listen(check))
-    unbinds.push($messages.listen(check))
-    unbinds.push($focusedStoredSessionId.listen(check))
-    unbinds.push($focusedRuntimeId.listen(check))
-    unbinds.push($focusedSessionState.listen(check))
-    unbinds.push($sessionTiles.listen(check))
-    unbinds.push($sessionStates.listen(check))
-    unbinds.push($workspaceMode.listen(check))
-    unbinds.push($workspaceOwnerKey.listen(check))
+    // Every trigger checks on a microtask, never inside the store write that
+    // fired it. resumeSession moves the selection first and only then, in the
+    // same synchronous step, unbinds the previous chat and clears its
+    // transcript: a check run inside the selection write saw this session
+    // selected over the PREVIOUS bot's rows, counted them as painted, and
+    // ended the wake on the wrong transcript (switch-fix-1119: a cold switch
+    // from another bot never showed the overlay, and the open reported
+    // success before the new bot had painted anything).
+    let checkQueued = false
+
+    const scheduleCheck = () => {
+      if (checkQueued || settled) {
+        return
+      }
+
+      checkQueued = true
+      queueMicrotask(() => {
+        checkQueued = false
+
+        if (!settled) {
+          check()
+        }
+      })
+    }
+
+    unbinds.push($activeGatewayProfile.listen(scheduleCheck))
+    unbinds.push($activeConnectionId.listen(scheduleCheck))
+    unbinds.push($selectedStoredSessionId.listen(scheduleCheck))
+    unbinds.push($activeSessionId.listen(scheduleCheck))
+    unbinds.push($messages.listen(scheduleCheck))
+    unbinds.push($focusedStoredSessionId.listen(scheduleCheck))
+    unbinds.push($focusedRuntimeId.listen(scheduleCheck))
+    unbinds.push($focusedSessionState.listen(scheduleCheck))
+    unbinds.push($sessionTiles.listen(scheduleCheck))
+    unbinds.push($sessionStates.listen(scheduleCheck))
+    unbinds.push($workspaceMode.listen(scheduleCheck))
+    unbinds.push($workspaceOwnerKey.listen(scheduleCheck))
 
     timer = window.setTimeout(() => {
       finish(new Error(`Timed out loading ${profile}'s session history.`))
@@ -1249,6 +1275,18 @@ export const host = {
     isStaleTile?: (tile: { storedSessionId: string; workspaceTabTitle?: string }) => boolean,
     onlyStoredIds?: readonly string[]
   ): null | string => focusWorkspaceOwnerSessionTile(workspaceOwnerKey, isStaleTile, onlyStoredIds),
+
+  /** Hold the user's sends into `storedSessionId` until `confirmation` names
+   *  the confirmed stored id (`null`: superseded; rejection: unconfirmed). For
+   *  an open that paints a session before its identity is confirmed (Bot
+   *  Mode's paint-first click); register it before the open. A held send is
+   *  delivered to the confirmed chat, or refused with its draft kept. See
+   *  store/session-open-confirmation.ts. Feature-detect on older desktops. */
+  holdSubmitsUntilConfirmed: (
+    storedSessionId: string,
+    confirmation: Promise<null | string>,
+    options?: SubmitHoldOptions
+  ): (() => void) => holdSubmitsUntilConfirmed(storedSessionId, confirmation, options),
 
   /** Reactive on-screen visibility of a contributed pane: true while it is in
    *  the layout tree, not dismissed/hidden, its zone un-minimized, AND holding
