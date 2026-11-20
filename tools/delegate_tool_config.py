@@ -95,6 +95,32 @@ def _get_prefix_stagger_seconds() -> float:
     )
 
 
+def _get_launch_waves() -> tuple[int, float]:
+    """``(delegation.launch_wave_size, delegation.launch_wave_seconds)``: at most size subagents START per window
+    across the process (tools/delegate_tool_launch_waves.py). Size 0 = off, the default; the window defaults
+    to 10 s and is capped at 300."""
+    size = _knob(
+        "launch_wave_size", None, lambda v: max(0, int(v)), 0,
+        "delegation.launch_wave_size=%r is not a valid integer; subagents launch without waves",
+    )
+    window = _knob(
+        "launch_wave_seconds", None, lambda v: min(300.0, max(0.0, float(v))), 10.0,
+        "delegation.launch_wave_seconds=%r is not a number; using 10",
+    )
+    return size, window
+
+
+def _get_max_children_per_child() -> int:
+    """delegation.max_children_per_child: most tasks ONE subagent (depth >= 1) may put in a delegate_task call
+    (0 = no extra cap, the default: max_concurrent_children applies at every level). Bounds depth-2 fan-out:
+    N orchestrator children could otherwise run N x max_concurrent_children grandchildren at once. A subagent's
+    delegations are synchronous, so the per-call cap is also its live child count."""
+    return _knob(
+        "max_children_per_child", None, lambda v: max(0, int(v)), 0,
+        "delegation.max_children_per_child=%r is not a valid integer; subagent batches are not capped separately",
+    )
+
+
 def _get_max_concurrent_children() -> int:
     """delegation.max_concurrent_children > DELEGATION_MAX_CONCURRENT_CHILDREN env > 10.
 
