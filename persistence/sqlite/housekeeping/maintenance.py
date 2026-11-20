@@ -472,7 +472,8 @@ class SQLiteSessionMaintenance(SessionPortability):
 
     def session_projection_digest(self, *, busy_timeout_s: float = 0.05) -> Optional[tuple[tuple[str, ...], bytes]]:
         with translated(), self._store.holder()._read_ctx_with_timeout(busy_timeout_s) as conn:
-            available = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+            declared = {row[1]: str(row[2] or "").upper() for row in conn.execute("PRAGMA table_info(sessions)")}
+            available = set(declared)
             fields = tuple(field for field in SESSION_PROJECTION_FIELDS if field in available)
             if not fields:
                 return None
@@ -482,7 +483,14 @@ class SQLiteSessionMaintenance(SessionPortability):
                 # every commit to every served store; the Python walk below held the GIL for ~75-140 ms per
                 # store and stalled every request meanwhile. NULL renders as char(0), apart from ''. Rows come
                 # in table order: the digest is only ever compared with this store's previous one.
-                cells = ", ".join(f"coalesce({field}, char(0))" for field in fields)
+                # REAL columns render with 17 significant digits: before SQLite 3.52 the text conversion keeps
+                # only 15, and a timestamp moved by microseconds would not move the digest.
+                cells = ", ".join(
+                    f"CASE typeof({field}) WHEN 'real' THEN printf('%!.17g', {field}) WHEN 'null' THEN char(0) "
+                    f"ELSE {field} END"
+                    if "REAL" in declared[field] or "FLOA" in declared[field] or "DOUB" in declared[field]
+                    else f"coalesce({field}, char(0))"
+                    for field in fields)
                 rendered = conn.execute(
                     f"SELECT CAST(group_concat(concat_ws(char(31), {cells}), char(30)) AS BLOB) FROM sessions",
                 ).fetchone()[0]
