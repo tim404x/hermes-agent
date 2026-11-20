@@ -126,6 +126,14 @@ def _cached_local_lineage_index(db, conn):
         with lock:
             cache.pop(conn, None)
         return local_lineage_index(conn)
+    # Browse handles are opened per request, so their connection's cache below never hits twice: a
+    # store that has not moved shares one projection across every read-only handle (``listing_memo``).
+    from persistence.sqlite.conversation._store.listing_memo import memoized
+    return _copy_lineage_index(memoized(db, 'local_lineage_index', (), lambda: _connection_lineage_index(db, conn)))
+
+
+def _connection_lineage_index(db, conn):
+    cache, lock = db.__dict__['_local_lineage_cache']
     version = _lineage_version(conn)
     with lock:
         saved = cache.get(conn)
