@@ -1,9 +1,20 @@
+import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ChatMessage } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $messages, $selectedStoredSessionId } from '@/store/session'
+import { $focusedStoredSessionId } from '@/store/session-focus'
 import { $sessionStates } from '@/store/session-states'
+
+// The fronted pane (in Bots mode: the workspace's active bot tile) is derived from the layout tree;
+// a plain atom stands in for it here.
+vi.mock('@/store/session-focus', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  $focusedStoredSessionId: atom<null | string>(null)
+}))
+
+const setFocused = (id: null | string) => ($focusedStoredSessionId as unknown as ReturnType<typeof atom<null | string>>).set(id)
 
 import { __flushActionTimingForTests, __resetActionTimingForTests, ACTION_TIMING_LINE_PREFIX } from './action-timing'
 import { __resetViewTimingForTests, viewActionAbandon, viewActionBind, viewActionStart } from './action-timing-view'
@@ -35,6 +46,7 @@ describe('action-timing-view (switch / open_chat painted)', () => {
     $messages.set([msg('old')])
     $selectedStoredSessionId.set('previous')
     $sessionStates.set({})
+    setFocused('previous')
   })
 
   afterEach(() => {
@@ -67,14 +79,41 @@ describe('action-timing-view (switch / open_chat painted)', () => {
     expect(flushed()?.a).toEqual({ open_chat: [166] })
   })
 
-  it('switch binds late and ends when the bot chat tile state is published', () => {
+  it('switch binds late and ends when the bot chat tile is fronted with its transcript', () => {
     viewActionStart('switch', 'local::atlas')
     now += 300
     viewActionBind('switch', 'local::atlas', 'atlas-chat')
     now += 200
     $sessionStates.set({ rt1: createClientSessionState('atlas-chat', [msg('x')]) })
+    // Loaded but not on screen yet: the cache ingests every session's events.
+    expect(frames).toHaveLength(0)
+    now += 40
+    setFocused('atlas-chat')
     runFrames()
-    expect(flushed()?.a).toEqual({ switch: [500] })
+    expect(flushed()?.a).toEqual({ switch: [540] })
+  })
+
+  it("a busy bot's background deltas do not end the switch before its tile is on screen", () => {
+    $sessionStates.set({ rt9: createClientSessionState('kepler-chat', [msg('k1')]) })
+    viewActionStart('switch', 'local::kepler')
+    viewActionBind('switch', 'local::kepler', 'kepler-chat')
+    now += 30
+    $sessionStates.set({ rt9: createClientSessionState('kepler-chat', [msg('k1'), msg('k2')]) })
+    $sessionStates.set({ rt9: createClientSessionState('kepler-chat', [msg('k1'), msg('k2'), msg('k3')]) })
+    expect(frames).toHaveLength(0)
+    now += 270
+    setFocused('kepler-chat')
+    runFrames()
+    expect(flushed()?.a).toEqual({ switch: [300] })
+  })
+
+  it('re-picking the bot tile already on screen records nothing', () => {
+    $sessionStates.set({ rt2: createClientSessionState('forge-chat', [msg('f')]) })
+    setFocused('forge-chat')
+    viewActionStart('switch', 'local::forge')
+    viewActionBind('switch', 'local::forge', 'forge-chat')
+    runFrames()
+    expect(flushed()).toBeNull()
   })
 
   it('a fronted open tab is painted on the next frame', () => {
