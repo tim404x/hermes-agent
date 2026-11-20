@@ -402,12 +402,19 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             def release_held() -> None:
                 rest, hold[0] = hold[0].finish(), SilenceMarkerStreamHold()
                 if rest:
-                    deliver_delta(rest)
+                    try:
+                        deliver_delta(rest)
+                    except _NoStreamConsumer:
+                        # No painting viewer took it (a finite `chat -q` / `-z` turn, or nobody watching):
+                        # outside the agent's stream nothing swallows this, and message.complete carries
+                        # the text anyway.
+                        pass
 
             def stream_delta_cb(text: Optional[str]) -> None:
                 if not ctx._run_still_current():
                     return
-                if hold is None or not silence_ok[0]:
+                if hold is None or not silence_ok[0] or _finite_viewer_turn():
+                    # A finite viewer prints only the terminal reply, so it never paints a marker to hold.
                     # A turn that may not end silent (a person's question) streams its words as they come.
                     deliver_delta(text)
                 elif text is None:
