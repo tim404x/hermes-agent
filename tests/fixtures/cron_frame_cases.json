@@ -1,0 +1,47 @@
+{
+  "_doc": "Shared by agent/display_row_typing.py (type_display_row) and apps/desktop/src/lib/chat-messages/machine-rows.ts (typeMachineRow). A user row is a cron delivery only with machine provenance: a typed row (display_kind internal_notification or cron_delivery, or display_metadata.cron_delivery) whose text opens with a [Cronjob \"<name>\" output ...] frame, or an UNTYPED legacy row that opens with the exact full frame cron/scheduler_delivery.py::bot_chat_message writes (every one of the 555 legacy untyped rows in the live default store does). A person pasting or quoting a frame keeps their own bubble.",
+  "cases": [
+    {
+      "name": "typed producer row",
+      "display_kind": "internal_notification",
+      "text": "[Cronjob \"🤖 Team report | Forge\" output — scheduled job, not the user. Review it, act on anything that needs action, and summarize for the chat.]\n\n🔨 Forge Morning run is done.",
+      "cron": true,
+      "job_name": "🤖 Team report | Forge",
+      "output": "🔨 Forge Morning run is done."
+    },
+    {
+      "name": "typed row, older frame wording",
+      "display_kind": "internal_notification",
+      "text": "[Cronjob \"slack-sync\" output]\n\nSynced 4 channels.",
+      "cron": true,
+      "job_name": "slack-sync",
+      "output": "Synced 4 channels."
+    },
+    {
+      "name": "untyped legacy row with the full writer frame",
+      "display_kind": null,
+      "text": "[Cronjob \"☀️ Morning brief | Neo\" output — scheduled job, not the user. Review it, act on anything that needs action, and summarize for the chat.]\n\nGood morning Tim.",
+      "cron": true,
+      "job_name": "☀️ Morning brief | Neo",
+      "output": "Good morning Tim."
+    },
+    {
+      "name": "human pastes a short frame",
+      "display_kind": null,
+      "text": "[Cronjob \"Team report\" output - scheduled job]\n\nSave this report for tomorrow.",
+      "cron": false
+    },
+    {
+      "name": "human quotes a frame inline",
+      "display_kind": null,
+      "text": "[Cronjob \"Team report\" output] looks wrong, why did it skip Forge?",
+      "cron": false
+    },
+    {
+      "name": "human pastes the frame wording with a hyphen",
+      "display_kind": null,
+      "text": "[Cronjob \"Team report\" output - scheduled job, not the user. Review it, act on anything that needs action, and summarize for the chat.]\n\nWhy does this report say the invoice was paid?",
+      "cron": false
+    }
+  ]
+}

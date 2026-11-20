@@ -109,10 +109,15 @@ def test_interrupt_sentinel_is_never_assistant_text_on_resume():
 @pytest.mark.parametrize("text", [
     "Operation interrupted: waiting for model response (12.4s elapsed).",
     "Operation interrupted: retrying API call after error (retry 2/3).",
-    "Operation interrupted during retry (rate limit, attempt 1/3).",
 ])
-def test_every_interrupt_sentinel_variant_is_blanked(text):
+def test_every_information_free_interrupt_sentinel_is_blanked(text):
     assert type_display_row({**INTERRUPT_ROW, "content": text})["content"] == ""
+
+
+def test_an_interrupt_that_names_its_failure_stays_visible():
+    """The retry hint is the only copy of what went wrong (review ws5-polish P1-3): it stays prose."""
+    text = "Operation interrupted during retry (rate limit, attempt 1/3)."
+    assert type_display_row({**INTERRUPT_ROW, "content": text})["content"] == text
 
 
 def test_assistant_prose_mentioning_an_interrupt_is_kept():
