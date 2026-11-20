@@ -20,7 +20,7 @@ from persistence_assembly import open_persistence_reader
 from tests.persistence_sqlite.conftest import store_for
 
 VISIBLE = SessionQuery(exclude_sources=(*INTERNAL_LISTING_SOURCES, "cron"))
-TRIGGER_SQL_DIGEST_V1 = "0701259605c6e607"
+TRIGGER_SQL_DIGEST_V1 = "e944a2fccd5f4fb5"
 
 
 @pytest.fixture(autouse=True)
@@ -380,3 +380,206 @@ def test_a_store_without_the_index_keeps_the_memoized_receipt_pass(store, scope_
     calls = _count_calls(monkeypatch, local_lineage_memo, "memoized_local_lineage_index")
     _browse(scope_a, lambda r: r.sessions.list_sessions(SessionQuery(), SessionWindow(limit=20), compact_rows=True))
     assert calls
+
+
+# --- Old SQLite builds must still read (and create) the schema (integrated review #2, finding 1) -------------------
+# SQLite < 3.46 parses with a fixed 100-entry LALR stack. A trigger whose ancestor walk nested one subquery per hop
+# overflowed it from 4 hops on (paren depth 18; 15 still parsed on 3.45.1), and SQLite parses the WHOLE schema on
+# first use, so one such trigger made the store unreadable to every older build: this VPS's system sqlite3 CLI and
+# /usr/bin/python3 (3.45.1), macOS's sqlite3, the recovery salvage CLI (find_sqlite3_cli).
+_PAREN_DEPTH_BOUND = 12
+_OLD_SQLITE = (3, 46, 0)
+
+
+def _paren_depth(sql: str) -> int:
+    depth = deepest = 0
+    quoted = False
+    for ch in sql:
+        if ch == "'":
+            quoted = not quoted
+        elif not quoted and ch == "(":
+            depth += 1
+            deepest = max(deepest, depth)
+        elif not quoted and ch == ")":
+            depth -= 1
+    return deepest
+
+
+def test_the_generated_ddl_nesting_is_bounded_and_does_not_grow_with_the_hop_count(monkeypatch):
+    # Portable guard: runs where no old SQLite is installed (CI).
+    from persistence.sqlite._schema_ddl import DEFERRED_INDEX_SQL
+
+    assert _paren_depth(list_revision.VISIBLE_LIST_REVISION_SQL) <= _PAREN_DEPTH_BOUND
+    assert _paren_depth(DEFERRED_INDEX_SQL) <= _PAREN_DEPTH_BOUND
+    depths = set()
+    for hops in (0, 1, list_revision._ANCESTOR_HOPS, 20):
+        monkeypatch.setattr(list_revision, "_ANCESTOR_HOPS", hops)
+        depths.add(_paren_depth(list_revision._build_trigger_sql()))
+    assert len(depths) == 1, depths
+
+
+@pytest.mark.parametrize("internal_hops, extra, internal", [
+    (0, None, True), (1, None, True), (6, None, True), (7, None, False),  # deeper than _ANCESTOR_HOPS: shown
+    (2, "visible", False), (2, "dangling", False), (2, "cycle", False), (0, "self", False),
+])
+def test_the_ancestor_walk(store, scope_a, internal_hops, extra, internal):
+    with _db(scope_a) as conn:
+        parent = None
+        if extra == "visible":
+            conn.execute("INSERT INTO sessions(id, source, started_at) VALUES ('top', 'desktop', 0)")
+            parent = "top"
+        elif extra == "dangling":
+            parent = "gone"
+        for hop in range(internal_hops):
+            conn.execute("INSERT INTO sessions(id, source, started_at, parent_session_id) VALUES (?, 'cron', 0, ?)",
+                         (f"a{hop}", parent))
+            parent = f"a{hop}"
+        if extra == "cycle":
+            conn.execute("UPDATE sessions SET parent_session_id = ? WHERE id = 'a0'", (parent,))
+        conn.execute("INSERT INTO sessions(id, source, started_at, parent_session_id) VALUES ('leaf', 'cron', 0, ?)",
+                     ("leaf" if extra == "self" else parent,))
+        row = conn.execute(f"SELECT {list_revision._ancestors_internal('s')} FROM sessions s WHERE id = 'leaf'")
+        assert bool(row.fetchone()[0]) is internal
+
+
+def _old_sqlite_runners():
+    """(label, runner) for each SQLite older than 3.46 on this host; runner(db_path, script) -> (ok, output)."""
+    import shutil
+    import subprocess
+
+    runners = []
+    cli = shutil.which("sqlite3")
+    if cli:
+        version = subprocess.run([cli, "--version"], capture_output=True, text=True, check=False).stdout.split()[:1]
+        if version and tuple(int(p) for p in version[0].split(".")[:3]) < _OLD_SQLITE:
+            def run_cli(path, script, cli=cli):
+                done = subprocess.run([cli, "-bail", str(path)], input=script, capture_output=True, text=True, check=False)
+                return done.returncode == 0 and not done.stderr, done.stdout + done.stderr
+            runners.append((f"sqlite3 CLI {version[0]}", run_cli))
+    py = "/usr/bin/python3"
+    if os.path.exists(py):
+        version = subprocess.run([py, "-c", "import sqlite3; print(sqlite3.sqlite_version)"], capture_output=True,
+                                 text=True, check=False).stdout.strip()
+        if version and tuple(int(p) for p in version.split(".")[:3]) < _OLD_SQLITE:
+            code = ("import sqlite3, sys; c = sqlite3.connect(sys.argv[1], isolation_level=None);"
+                    " c.executescript(sys.stdin.read()); print('ok')")
+
+            def run_py(path, script, py=py, code=code):
+                done = subprocess.run([py, "-c", code, str(path)], input=script, capture_output=True, text=True,
+                                      check=False)
+                return done.returncode == 0, done.stdout + done.stderr
+            runners.append((f"{py} (SQLite {version})", run_py))
+    return runners
+
+
+def test_every_generated_ddl_statement_parses_on_an_old_sqlite(store, scope_a, tmp_path):
+    runners = _old_sqlite_runners()
+    if not runners:
+        pytest.skip("no SQLite older than 3.46 on this host (system sqlite3 CLI or /usr/bin/python3): only the "
+                    "portable nesting guard runs")
+    from persistence.sqlite._schema_ddl import DEFERRED_INDEX_SQL, SCHEMA_SQL
+
+    _sql(scope_a, "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+         (POLICY_PREFIX + "chat", json.dumps({"lineage": ["chat", "gone"]})))()
+    for label, run in runners:
+        # A store this build wrote (triggers + receipt index in sqlite_master): the old build reads it ...
+        ok, out = run(store_for(scope_a), "SELECT COUNT(*) FROM sessions;\nPRAGMA quick_check;\n")
+        assert ok and "ok" in out, (label, out)
+        # ... and creates every statement itself (a Hermes process linked to it opens writable), triggers firing.
+        fresh = tmp_path / f"fresh-{len(label)}.db"
+        script = (SCHEMA_SQL + "\n" + DEFERRED_INDEX_SQL
+                  + "\nINSERT INTO sessions(id, source, started_at) VALUES ('w', 'cron', 0);"
+                  + "\nINSERT INTO sessions(id, source, started_at, parent_session_id) VALUES ('v', 'desktop', 0, 'w');"
+                  + "\nINSERT INTO messages(session_id, role, content, timestamp) VALUES ('w', 'user', 'x', 1);\n")
+        ok, out = run(fresh, script)
+        assert ok, (label, out)
+        current = tmp_path / f"current-{len(label)}.db"
+        with closing(sqlite3.connect(current, isolation_level=None)) as conn:
+            conn.executescript(script)  # the same script on this interpreter's (current) SQLite
+            expected = list_revision.visible_list_revision(conn)[0]
+        with closing(sqlite3.connect(fresh)) as conn:
+            names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")}
+            assert set(list_revision.TRIGGER_NAMES) <= names, (label, names)
+            assert list_revision.visible_list_revision(conn)[0] == expected > 0, label  # same bumps on both engines
+
+
+# --- A rebuild of a table the triggers name never leaves them dangling (integrated review #2, finding 2) ----------
+def _visible_triggers(conn):
+    return {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE '%visible_list_rev%'")}
+
+
+@pytest.mark.parametrize("legacy_alter_table", [False, True])
+def test_a_sessions_rebuild_drops_the_triggers_and_writes_keep_working(store, scope_a, legacy_alter_table):
+    # legacy_alter_table=OFF is the review's probe2 shape: the RENAME rewrites every trigger body naming sessions
+    # to sessions_legacy. It also rewrites the child tables' REFERENCES and five pre-existing messages triggers
+    # (transcript/display revision, FTS trigram), so a messages write there fails whatever add45 does: a real
+    # sessions rebuild has to run with legacy_alter_table=ON (as _schema's FTS renames do), the second case, where
+    # the store's own message append must keep working. state_meta is only named by add45's triggers: both cases.
+    from persistence.sqlite._schema import _rebuild_table
+
+    with _db(scope_a) as conn:
+        conn.isolation_level = None
+        # An older version's trigger naming sessions goes too; an unrelated trigger stays.
+        conn.execute("CREATE TRIGGER messages_visible_list_rev_v0_insert AFTER INSERT ON messages "
+                     "WHEN (SELECT 1 FROM sessions WHERE id = new.session_id) BEGIN SELECT 1; END")
+        conn.execute("CREATE TRIGGER unrelated_audit AFTER INSERT ON messages BEGIN SELECT 1; END")
+        ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'sessions'").fetchone()[0]
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute(f"PRAGMA legacy_alter_table = {'ON' if legacy_alter_table else 'OFF'}")
+        _rebuild_table(conn.cursor(), "sessions", "sessions_legacy", ddl,
+                       "INSERT INTO sessions SELECT * FROM sessions_legacy")
+        conn.execute("PRAGMA legacy_alter_table = OFF")
+        assert _visible_triggers(conn) == set()
+        assert "unrelated_audit" in {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
+        conn.execute("DROP TRIGGER unrelated_audit")
+    assert _revision(scope_a) is None  # readers fall back to the stat signature
+    for key in (POLICY_PREFIX + "chat", "other"):  # a receipt (the state_meta triggers' own path) and a plain key
+        _sql(scope_a, "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+             (key, json.dumps({"lineage": ["chat", "job"]})))()
+    if legacy_alter_table:
+        store.messages.append("chat", NewMessage(role="user", content="after the rebuild"))
+        store.messages.append("job", NewMessage(role="user", content="after the rebuild"))
+    from persistence.sqlite._holder import StoreHolder
+
+    StoreHolder(store_for(scope_a)).close()  # the next writable open re-creates the set
+    with _db(scope_a) as conn:
+        assert _visible_triggers(conn) == set(list_revision.TRIGGER_NAMES)
+    assert _revision(scope_a) is not None
+
+
+def test_a_rebuild_of_another_table_keeps_the_triggers(store, scope_a):
+    from persistence.sqlite._schema import _rebuild_table
+
+    with _db(scope_a) as conn:
+        conn.isolation_level = None
+        ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'session_model_usage'").fetchone()[0]
+        _rebuild_table(conn.cursor(), "session_model_usage", "session_model_usage_legacy", ddl,
+                       "INSERT INTO session_model_usage SELECT * FROM session_model_usage_legacy")
+        assert _visible_triggers(conn) == set(list_revision.TRIGGER_NAMES)
+
+
+def test_dropping_them_first_lets_a_column_drop_through(store, scope_a):
+    # No migration drops or renames a column of sessions/messages/state_meta today; one that does must call
+    # drop_visible_list_triggers first, as _rebuild_table does (SQLite refuses the DROP COLUMN otherwise).
+    with _db(scope_a) as conn:
+        conn.isolation_level = None
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("ALTER TABLE sessions DROP COLUMN end_reason")
+        conn.execute("BEGIN IMMEDIATE")
+        assert set(list_revision.drop_visible_list_triggers(conn.cursor(), "sessions")) == set(
+            list_revision.TRIGGER_NAMES)
+        conn.execute("ALTER TABLE sessions DROP COLUMN end_reason")
+        conn.execute("ROLLBACK")
+        assert _visible_triggers(conn) == set(list_revision.TRIGGER_NAMES)
+
+
+def test_a_recovery_destination_is_created_without_the_triggers(tmp_path):
+    from persistence.sqlite.admin._recovery import _fresh_destination
+
+    conn = _fresh_destination(tmp_path / "recovered.db")
+    try:
+        assert _visible_triggers(conn) == set()
+        assert list_revision.visible_list_revision(conn) is None
+    finally:
+        conn.close()
