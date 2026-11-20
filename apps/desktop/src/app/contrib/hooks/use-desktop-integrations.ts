@@ -39,7 +39,12 @@ import {
   setRememberedSessionId,
   setSessionOwnerHint
 } from '@/store/session'
-import { $botChatScopes, $sessionTiles, storedSessionIdForRuntimeId } from '@/store/session-states'
+import {
+  $botChatScopes,
+  $sessionTiles,
+  focusedSessionWorkspaceScope,
+  storedSessionIdForRuntimeId
+} from '@/store/session-states'
 import { onSessionsChanged } from '@/store/session-sync'
 import { requestSkillInstallFromDeepLink } from '@/store/skill-deeplink-install'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/updates'
@@ -499,9 +504,22 @@ export function useDesktopIntegrations({
       // rejects reserved kinds and unsafe paths.
       const path = pathFromHermesDeepLink(payload.kind, payload.name || '', payload.params || {})
 
-      if (path) {
-        navigate(path)
+      if (!path) {
+        return
       }
+
+      // A link to a chat (hermes://open/<session id>) opens it as a real tab beside the one on
+      // screen, or fronts it when it is already open. It never swaps out the chat the user is
+      // reading: five links in a row are five tabs. `?in=current` keeps the in-place open.
+      const linkedSessionId = payload.kind === 'open' && payload.params?.in !== 'current' ? routeSessionId(path) : null
+
+      if (linkedSessionId) {
+        openSession(linkedSessionId, navigate, 'tab', focusedSessionWorkspaceScope())
+
+        return
+      }
+
+      navigate(path)
     })
 
     void window.hermesDesktop?.signalDeepLinkReady?.()
