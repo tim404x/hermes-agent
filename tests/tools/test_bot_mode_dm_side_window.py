@@ -169,10 +169,53 @@ def test_title_comes_from_topic_sanitized():
     assert len(side.side_window_title("x" * 200, "Atlas", "hey")) == 60
 
 
-def test_title_falls_back_to_sender_and_first_words():
+def test_topic_keeps_apostrophes_and_loses_only_wrapping_quotes():
+    """Regression (P9, 19 Nov 2026): "Lab | Review Emmanuel's compute model" became "Emmanuels"."""
+    assert side.side_window_title("Lab | Review Emmanuel's compute model", "Neo", "hey") \
+        == "Lab | Review Emmanuel's compute model"
+    assert side.side_window_title("Tim\u2019s O-1 packet", "Neo", "hey") == "Tim\u2019s O-1 packet"
+    assert side.side_window_title('"Deal heatmap"', "Neo", "hey") == "Deal heatmap"
+    assert side.side_window_title("`Deal heatmap`", "Neo", "hey") == "Deal heatmap"
+    assert side.side_window_title("'Deal heatmap'", "Neo", "hey") == "Deal heatmap"
+
+
+def test_a_long_topic_is_cut_on_a_word_boundary_with_an_ellipsis():
+    topic = ("Fundraising | Data room follow-ups for the Series A investors and the remaining diligence asks"
+             " from counsel")
+    title = side.side_window_title(topic, "Neo", "hey")
+    assert len(title) <= side.TITLE_MAX_CHARS
+    assert title.endswith("\u2026") and title.count("\u2026") == 1
+    assert topic.startswith(title[:-1])
+    assert topic[len(title) - 1] == " "  # the cut fell on a word boundary
+    assert title[:-1].split()[-1].casefold() not in {"the", "a", "to", "for", "and", "of", "from"}
+
+
+def test_title_falls_back_to_the_first_clause_without_the_sender():
     message = 'check the micro1 call\n"wispr" + the price sheet and the volume ask'
-    assert side.side_window_title("", "Atlas", message) == "Atlas: check the micro1 call wispr +"
-    assert side.side_window_title(" \n ", "Atlas", "short") == "Atlas: short"
+    assert side.side_window_title("", "Atlas", message) == "Check the micro1 call"
+    assert side.side_window_title(" \n ", "Atlas", "short") == "Short"
+
+
+def test_fallback_title_never_ends_on_a_stop_word_and_has_no_sender_prefix():
+    """Regression (P9): Kepler's tab read "Neo: Tim added on the task: your"."""
+    message = 'Tim added "on the task": your main-chat update should be about the deal heatmap task'
+    title = side.side_window_title("", "Neo | Chief of Staff", message)
+    assert not title.startswith("Neo")
+    assert title.rstrip("\u2026").split()[-1].casefold() not in side._TITLE_STOP_WORDS
+    assert title == "Tim added on the task"
+
+
+def test_fallback_title_drops_greetings_bracket_tags_and_cuts_at_48():
+    assert side.side_window_title("", "Neo", "[no reply needed] Hey Kepler, the heatmap export is ready. Ship it") \
+        == "The heatmap export is ready"
+    assert side.side_window_title("", "Neo", "[main chat: Tim asked] Neo here: deal heatmap moved to Airtable") \
+        == "Deal heatmap moved to Airtable"
+    long = "please rebuild the contributor funnel dashboard with the new activation numbers from the app today"
+    title = side.side_window_title("", "Neo", long)
+    assert len(title) <= 49 and title.endswith("\u2026")
+    assert long.casefold().startswith(title[:-1].casefold())
+    assert title[:-1].split()[-1].casefold() not in side._TITLE_STOP_WORDS
+    assert title[0].isupper()
 
 
 @pytest.mark.parametrize("topic", ["Bot Chat", "bot chat", ' "Bot  Chat" '])
@@ -217,9 +260,9 @@ def test_busy_teammate_without_topic_gets_the_fallback_title(tmp_path, monkeypat
     result = json.loads(bot_mode_dm.message_agent_tool(
         "researcher", "please review the Q3 volume numbers today", agent=_FakeAgent(home)))
 
-    assert result["window"] == "hermes: please review the Q3 volume numbers"
+    assert result["window"] == "Please review the Q3 volume numbers today"
     _, argv = _runner(calls[0]["command"])
-    assert argv[argv.index("-c") + 1] == "hermes: please review the Q3 volume numbers"
+    assert argv[argv.index("-c") + 1] == "Please review the Q3 volume numbers today"
 
 
 def test_idle_teammate_keeps_the_exact_bot_chat_path(tmp_path, monkeypatch):
@@ -393,8 +436,8 @@ def test_real_side_window_runner_round_trip(tmp_path):
     assert not Path(bot_mode_dm._live_intent_file(dm_file)).exists()
 
 
-def test_fallback_title_uses_short_bot_name_and_skips_self_intro():
+def test_fallback_title_skips_self_intro():
     from tools import bot_mode_dm_side_window as side
     assert side.side_window_title("", "Neo | Chief of Staff", "Neo here: template batches and --gap are LIVE now") \
-        == "Neo: template batches and --gap are LIVE"
-    assert side.side_window_title("", "Atlas", "check the micro1 call") == "Atlas: check the micro1 call"
+        == "Template batches and --gap are LIVE now"
+    assert side.side_window_title("", "Atlas", "check the micro1 call") == "Check the micro1 call"
