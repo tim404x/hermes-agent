@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Sequence
@@ -33,6 +34,8 @@ REUSE_MAX_IDLE_SECONDS = 6 * 60 * 60
 # Numbered tabs tried before giving up on a free title ("<title> (2)" ... "<title> (N)").
 _MAX_NUMBERED_TABS = 50
 _NUMBERED_RE = re.compile(r" \((\d{1,2})\)$")
+# How often a runner looks for the row the gateway mints for a NEW window, to stamp its tab while the turn runs.
+TAB_STAMP_POLL_SECONDS = 0.5
 
 ROUTE_SIDE_WINDOW, ROUTE_AUTO, ROUTE_MAIN = "side_window", "auto", "main"
 DEFAULT_DM_ROUTE = ROUTE_SIDE_WINDOW
@@ -398,6 +401,54 @@ def stamp_side_window(profile_home: Path | str, title: str, *, author: dict | No
     finally:
         if store is not None:
             store.close()
+
+
+def window_has_brief(profile_home: Path | str, title: str) -> bool:
+    """Whether ``title`` resolves (as the transport's ``chat -c`` does) to a row the stamp may mark: it exists and is
+    not an empty pre-mint (``_is_stale_premint``), so the gateway has written the turn's first message, or minted the
+    row with its own routing origin. Never raises; unknown is False."""
+    try:
+        from persistence_assembly import open_persistence_reader
+
+        home = Path(profile_home)
+        if not (home / "state.db").is_file():
+            return False
+        with open_persistence_reader(home) as store:
+            session_id = _resolve_window(store, title)
+            return bool(session_id) and not _is_stale_premint(store, session_id)
+    except Exception:
+        logger.debug("message_agent: could not read side window %r in %s", title, profile_home, exc_info=True)
+        return False
+
+
+def stamp_when_minted(profile_home: Path | str, title: str, *, author: dict | None, key: str | None,
+                      stop: threading.Event) -> str | None:
+    """Stamp a NEW side window as soon as the gateway (the single writer) mints its row with the turn's first message
+    in it, so the desktop opens the tab while the turn runs (a long task tab otherwise appears only when it ends) and a
+    follow-up on the same conversation finds it (``resolve_window``) instead of opening ``"<title> (2)"``. Checks every
+    ``TAB_STAMP_POLL_SECONDS`` until it stamps once or ``stop`` is set. It waits for that first message because a
+    fresh empty row looks like an older runner's pre-mint, which ``stamp_side_window`` drops. Returns the stamped id."""
+    while not stop.is_set():
+        if window_has_brief(profile_home, title):
+            return stamp_side_window(profile_home, title, author=author, key=key)
+        stop.wait(TAB_STAMP_POLL_SECONDS)
+    return None
+
+
+def tab_session(profile_home: Path | str, key: str, title: str) -> str | None:
+    """The live tip id of the side window stamped with conversation ``key`` under ``title``, or None (also when the
+    store cannot answer)."""
+    try:
+        from persistence_assembly import open_persistence_reader
+
+        home = Path(profile_home)
+        if not (home / "state.db").is_file():
+            return None
+        with open_persistence_reader(home) as store:
+            return next((w.id for w in store.sessions.find_side_windows(key) if w.title == title), None)
+    except Exception:
+        logger.debug("message_agent: could not read side window %r in %s", title, profile_home, exc_info=True)
+        return None
 
 
 def is_conversation_window(profile_home: Path | str, title: str, key: str | None) -> bool:
