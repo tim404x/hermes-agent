@@ -393,16 +393,13 @@ def _fire_subagent_stop_hooks(results, child_by_index, parent_agent) -> float:
     return children_cost_total
 
 def _rollup_children_cost(parent_agent, children_cost_total: float) -> None:
-    """Fold the children's spend into the parent's session cost (source/status
-    only set when the parent had none of its own)."""
+    """Fold the children's spend into the parent's session cost (source/status only set when the parent had
+    none of its own). Caller holds ``session_totals_lock(parent_agent)`` across its epoch check and this."""
     if children_cost_total <= 0.0:
         return
     try:
-        from agent.prompt_cache_lifecycle import session_totals_lock
-
-        with session_totals_lock(parent_agent):  # a keep-alive's reply adds to the same total under it
-            current = float(getattr(parent_agent, "session_estimated_cost_usd", 0.0) or 0.0)
-            parent_agent.session_estimated_cost_usd = current + children_cost_total
+        current = float(getattr(parent_agent, "session_estimated_cost_usd", 0.0) or 0.0)
+        parent_agent.session_estimated_cost_usd = current + children_cost_total
         if getattr(parent_agent, "session_cost_source", "none") in {None, "", "none"}:
             parent_agent.session_cost_source = "subagent"
         if getattr(parent_agent, "session_cost_status", "unknown") in {None, "", "unknown"}:
@@ -455,12 +452,14 @@ def _child_tree_spend(child) -> dict[str, float]:
     return {**{key: _number(getattr(child, attr, 0)) + _number(below.get(key)) for key, attr in _TREE_COUNTERS},
             "cost_usd": float(_number(getattr(child, "session_estimated_cost_usd", 0.0)))}
 
-def _rollup_tree_usage(children, parent_agent) -> dict[str, float]:
+def _rollup_tree_usage(children, parent_agent, children_cost: float = 0.0) -> dict[str, float]:
     """This call's delegation-tree spend (the children and everything below them), folded into the parent's
-    ``delegation_tree_usage`` so it reaches the grandparent in turn. A child that reports again adds only what it
-    spent since its last report, and a subagent counts once per session by its durable id, so an
-    action=continue rebuild of the same subagent is not a new one. Children built in an earlier session of the
-    parent report their spend here but never fold into the current session's totals."""
+    ``delegation_tree_usage`` so it reaches the grandparent in turn, with ``children_cost`` folded into the
+    parent's session cost. A child that reports again adds only what it spent since its last report, and a
+    subagent counts once per session by its durable id, so an action=continue rebuild of the same subagent is not
+    a new one. Children built in an earlier session of the parent report their spend here but never fold into the
+    current session's totals: the epoch check and every fold run under the parent's session accounting lock,
+    which ``reset_session_state`` holds too, so a /new either precedes the check or waits for the fold."""
     children = [child for child in children if child is not None]
     usage = {"subagents": 0, **{key: 0 for key, _ in _TREE_COUNTERS}, "cost_usd": 0.0}
     ids: set = set()
@@ -481,6 +480,7 @@ def _rollup_tree_usage(children, parent_agent) -> dict[str, float]:
         usage["subagents"] = len(ids - known)
         if _from_older_session(children, parent_agent):
             return usage
+        _rollup_children_cost(parent_agent, children_cost)
         total = getattr(parent_agent, "delegation_tree_usage", None)
         total = total if isinstance(total, dict) else {}
         parent_agent.delegation_tree_usage = {key: round(_number(total.get(key)) + value, 6) if key == "cost_usd"
@@ -508,9 +508,7 @@ def _finalize_child_results(
         _apply_summary_budget(results, parent_agent)
         _notify_memory_manager(results, task_list, child_by_index, parent_agent)
         children_cost = _fire_subagent_stop_hooks(results, child_by_index, parent_agent)
-        if not _from_older_session(child_by_index.values(), parent_agent):  # /new since: not this session's spend
-            _rollup_children_cost(parent_agent, children_cost)
-        return _rollup_tree_usage(child_by_index.values(), parent_agent)
+        return _rollup_tree_usage(child_by_index.values(), parent_agent, children_cost)
 
 def _run_child_lifecycle(task_index: int, goal: str, child=None, parent_agent=None) -> dict[str, Any]:
     """Run one child and apply the same host lifecycle used by delegate_task: the same child-start boundary
