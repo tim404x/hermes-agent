@@ -226,6 +226,37 @@ class TestSteerCancelsModelCall:
         for _, text in plan:
             assert all_text.count(text) == 1, text
 
+    def test_spaced_steers_never_trip_the_redirect_restart_cap(self):
+        agent = _agent(enabled=True)
+        cancels = []
+
+        def model(api_kwargs):
+            # Every request is slow and cancellable; the one after the last steer answers.
+            n = len(model.requests) + 1
+            model.requests.append([dict(m) for m in api_kwargs["messages"]])
+            model.entered.set()
+            end = time.monotonic() + (1.0 if n >= 3 else 20.0)
+            while time.monotonic() < end:
+                if agent._interrupt_requested:
+                    cancels.append(n)
+                    raise InterruptedError("cancel")
+                time.sleep(0.01)
+            return _final("done")
+
+        model.requests = []
+        model.entered = threading.Event()
+        steers = [(0.1, "s1")] + [(DEBOUNCE + 0.3, f"s{i}") for i in range(2, 6)]
+        result, _ = _drive(agent, model, steers)
+        assert result["completed"] is True
+        assert result["final_response"] == "done"
+        assert len(cancels) <= 2  # per-response budget
+        everywhere = "\n".join([
+            _texts([m for m in result["messages"] if m["role"] == "user"]),
+            str(result.get("pending_steer") or ""), str(agent._pending_steer or ""),
+        ])
+        for _, text in steers:
+            assert everywhere.count(text) == 1, text
+
     def test_flag_off_keeps_todays_behaviour(self):
         agent = _agent(enabled=False)
         model = _SlowModel(agent, slow_s=1.0)
@@ -307,9 +338,11 @@ class TestSteerCancelUnits:
         assert agent._fire_steer_cancel(agent._steer_cancel_gen) is True
         assert agent._pending_steer is None
         assert agent._steer_ticket_fates == {"t1": True}
-        assert agent._pending_redirect.startswith(STEER_MARKER_OPEN)
-        assert "plain\ntransfer" in agent._pending_redirect
+        assert agent._pending_redirect == "plain\ntransfer"  # raw text; the row shape comes from the flag
+        assert agent._pending_redirect_steer_only is True
         assert agent._interrupt_requested is True
+        # Consumed: a later gateway settlement must not re-queue it.
+        assert agent.withdraw_steer("t1") is False
 
     def test_hard_stop_pending_refuses_and_keeps_buffer(self):
         agent = self._bare()
@@ -318,6 +351,63 @@ class TestSteerCancelUnits:
         agent._interrupt_requested = True
         assert agent._fire_steer_cancel(agent._steer_cancel_gen) is False
         assert agent._pending_steer == "x"
+
+    def _fired(self, *steers):
+        agent = self._bare()
+        for text, ticket in steers:
+            agent.steer(text, ticket=ticket)
+        agent._steer_cancel_timer.cancel()
+        assert agent._fire_steer_cancel(agent._steer_cancel_gen) is True
+        assert agent._pending_steer is None
+        return agent
+
+    def test_soft_stop_after_fire_puts_the_steers_back(self):
+        agent = self._fired(("plain", None), ("transfer", "t1"))
+        agent.interrupt()  # soft stop (watchdog, gateway shutdown) before the loop applied it
+        assert agent._pending_redirect is None
+        assert agent._pending_steer == "plain\ntransfer"
+        # Unsettled again: the finalizer hands back the plain one, the transfer stays withdrawable.
+        assert agent._drain_leftover_steer() == "plain"
+        assert agent.withdraw_steer("t1") is True
+
+    def test_hard_stop_after_fire_settles_like_a_never_upgraded_steer(self):
+        agent = self._fired(("transfer", "t1"))
+        agent.interrupt(hard_cancel=True)
+        agent.clear_interrupt(hard_cancel=True)
+        assert agent._pending_steer is None
+        # Dropped unread -> the gateway puts the queued prompt back in its queue.
+        assert agent.withdraw_steer("t1") is True
+
+    def test_clear_without_preserve_puts_the_steers_back(self):
+        agent = self._fired(("note", None))
+        agent.clear_interrupt()
+        assert agent._pending_steer == "note"
+
+    def test_applied_redirect_clears_the_side_record(self):
+        agent = self._fired(("note", None))
+        assert agent._drain_pending_redirect() == "note"
+        assert agent._applied_redirect_steer_only is True
+        agent.interrupt()
+        assert agent._pending_steer is None  # nothing to restore: it was delivered
+
+    def test_explicit_redirect_merged_with_steer_is_not_a_steer_row(self):
+        agent = self._bare()
+        assert agent.redirect("explicit correction") is True
+        agent.steer("then a steer")
+        agent._steer_cancel_timer.cancel()
+        assert agent._fire_steer_cancel(agent._steer_cancel_gen) is True
+        assert agent._pending_redirect == "explicit correction\n\n[Additional user correction]\nthen a steer"
+        assert agent._pending_redirect_steer_only is False
+
+    def test_cancel_budget_per_response_and_subagents(self):
+        agent = self._bare()
+        agent._steer_cancels_since_response = 2
+        agent.steer("x")
+        assert agent._steer_cancel_timer is None
+        child = self._bare()
+        child._delegate_depth = 1
+        child.steer("x")
+        assert child._steer_cancel_timer is None
 
     def test_no_timer_when_disabled_or_idle_or_executing_tools(self):
         assert self._bare(enabled=False)._maybe_arm_steer_cancel() is False

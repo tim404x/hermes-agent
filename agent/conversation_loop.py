@@ -364,10 +364,12 @@ def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text
         append_message(messages, {"role": "assistant", "content": visible} if visible else hidden_interrupt_placeholder_row())
     # Transcript shows the user's own words; the provider replays the scaffolded form.
     _correction_row = {"role": "user", "content": text, "api_content": correction}
-    # A steer upgraded to a redirect (display.steer_cancels_model_call) carries the steer marker:
-    # keep the steer row's display kind so renderers and the alternation repair treat it as one.
-    from agent.prompt_builder import STEER_DISPLAY_KIND, STEER_MARKER_OPEN
-    if text.startswith(STEER_MARKER_OPEN):
+    # A redirect made only of steers (display.steer_cancels_model_call) is stored like any steer
+    # row (marker content, display_kind=steer) so renderers and the alternation repair treat it as
+    # one; the model still reads the plain correction through api_content.
+    if vars(agent).pop("_applied_redirect_steer_only", False):
+        from agent.prompt_builder import STEER_DISPLAY_KIND, format_steer_marker
+        _correction_row["content"] = format_steer_marker(text).lstrip()
         _correction_row["display_kind"] = STEER_DISPLAY_KIND
     append_message(messages, _correction_row)
 
@@ -1817,6 +1819,7 @@ def run_conversation(
 
     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
     agent._turn_user_intervened = False
+    agent._steer_cancels_since_response = 0  # debounced steer cancels (interrupt_control)
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
     with native_turn_images(user_message):

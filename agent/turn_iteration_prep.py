@@ -294,7 +294,16 @@ def _inject_steer_after_newest_tool_result(
         for idx in range(len(messages) - 1, current_turn_user_idx, -1):
             row = messages[idx]
             if isinstance(row, dict) and row.get("role") == "tool":
-                from agent.prompt_builder import steer_user_row
+                from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
+                # display.steer_cancels_model_call: rows after this tool result (a redirect's
+                # placeholder + correction) are already persisted; inserting above them would make
+                # the stored order differ from the request. Requeue instead: the request-start arm
+                # delivers it at the tail.
+                if getattr(agent, "_steer_cancels_model_call", False) and any(
+                    not (isinstance(later, dict) and later.get("display_kind") == STEER_DISPLAY_KIND)
+                    for later in messages[idx + 1:]
+                ):
+                    break
                 messages.insert(idx + 1, steer_user_row(steer_text))
                 logger.debug("Pre-API-call steer drain: appended user row after tool msg at index %d", idx)
                 return
@@ -570,4 +579,5 @@ def apply_retry_restarts(
     # Counting every mid-turn correction for the whole turn ended healthy interactive
     # turns on the (max_retries + 1)th message (#128000).
     restart_count = 0
+    agent._steer_cancels_since_response = 0  # debounced steer cancels (interrupt_control)
     return _verdict("fallthrough")
