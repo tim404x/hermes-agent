@@ -742,7 +742,12 @@ function MarkdownTextSurface({
         // (see the `code` override) so it doesn't vote here either, same
         // contract as the CSS isolate.
         // A `> [!NOTE]`/`[!WARNING]`/... blockquote renders as a GFM alert
-        // callout; everything else stays a plain quote.
+        // callout; everything else stays a plain quote. A quote is usually
+        // text to read closely (a draft waiting for approval, the message
+        // being answered), so it stays upright at reading contrast beside
+        // its bar: muted italics turned a long quoted draft into grey slant
+        // that was hard to read. styles.css also drops Typography's quote
+        // marks and medium weight (`.aui-md blockquote`).
         blockquote: ({ children, className, ...props }: ComponentProps<'blockquote'>) => {
           const alert = extractAlert(children)
 
@@ -752,7 +757,7 @@ function MarkdownTextSurface({
 
           return (
             <blockquote
-              className={cn('border-s-2 border-(--ui-stroke-tertiary) ps-3 text-muted-foreground italic', className)}
+              className={cn('border-s-2 border-(--ui-stroke-secondary) ps-3 wrap-anywhere', className)}
               dir={boxDir}
               {...props}
             >
@@ -766,8 +771,10 @@ function MarkdownTextSurface({
         ol: ({ className, ...props }: ComponentProps<'ol'>) => (
           <ol className={cn('my-1 gap-0', className)} dir={boxDir} {...props} />
         ),
+        // A tight list item holds its text directly (no <p>), so it needs its
+        // own wrap rule or one long URL overflows the column.
         li: ({ children, className, ...props }: ComponentProps<'li'>) => (
-          <li className={cn('leading-(--dt-line-height)', className)} {...props}>
+          <li className={cn('leading-(--dt-line-height) wrap-anywhere', className)} {...props}>
             {decorateText ? decorateText(children) : children}
           </li>
         ),

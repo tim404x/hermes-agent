@@ -176,6 +176,19 @@ const SAFE_HTML_TAG_NAMES = new Set([
   'wbr'
 ])
 
+// Slack mrkdwn entities reach the transcript whenever a bot quotes a Slack
+// message or shows a Slack draft for review. None of them is markdown:
+// `<https://x.ai|X>` parses as an autolink whose href keeps `|X`, the URL
+// hardening cannot parse that host and paints `https://x.ai|X [blocked]`; a
+// label with a space is not an autolink at all, so its `<`/`>` leak around a
+// blocked fragment; `<!here>` is an HTML declaration and vanishes. Each is
+// rewritten to what Slack itself shows: the label as a link, `#channel`,
+// `@name`, `@here`. The first `|` splits URL from label, as in Slack. An
+// unlabeled `<@U…>` / `<#C…>` stays as written: there is no name to show.
+const SLACK_LINK_RE = /<((?:https?|mailto):[^\s<>|]+)\|([^<>\n]+)>/gi
+const SLACK_LABELED_REF_RE = /<([#@])[A-Z0-9]+\|([^<>|\n]+)>/g
+const SLACK_BROADCAST_RE = /<!(here|channel|everyone)(?:\|[^<>\n]*)?>/g
+
 const CITATION_MARKER_RE = /(?<=[\p{L}\p{N})\].,!?:;"'”’])\[(?:\d+(?:\s*,\s*\d+)*)\](?!\()/gu
 
 // Web-citation transport markers (Gemini-style grounding): private-use
@@ -490,6 +503,32 @@ function escapeLoneTildes(text: string): string {
     .join('')
 }
 
+function rewriteSlackEntities(text: string): string {
+  if (!text.includes('<')) {
+    return text
+  }
+
+  return text
+    .replace(SLACK_LINK_RE, (_match, url: string, label: string) => {
+      const name = label.trim()
+
+      if (!name) {
+        return `<${url}>`
+      }
+
+      // A destination with a parenthesis goes in `<…>` so an unbalanced `)`
+      // can't end the link early; the label escapes its own brackets.
+      const destination = /[()]/.test(url) ? `<${url}>` : url
+
+      return `[${name.replace(/[[\]\\]/g, '\\$&')}](${destination})`
+    })
+    .replace(
+      SLACK_LABELED_REF_RE,
+      (_match, sigil: string, name: string) => `${sigil}${name.trim().replace(/^[#@]/, '')}`
+    )
+    .replace(SLACK_BROADCAST_RE, (_match, word: string) => `@${word}`)
+}
+
 function escapeUnknownHtmlLikeTags(text: string): string {
   return text.replace(HTML_TAG_RE, (tag: string, name: string) => {
     if (SAFE_HTML_TAG_NAMES.has(name.toLowerCase())) {
@@ -581,17 +620,19 @@ function rewriteProseSegment(segment: string, sourceListIds: Set<string>): strin
       autoLinkRawUrls(
         routeFileLinksToPreview(
           escapeUnknownHtmlLikeTags(
-            segment
-              .replace(/`{3,}/g, '')
-              .replace(CITATION_TRANSPORT_MARKER_RE, '')
-              .replace(CITATION_MARKER_RE, marker => {
-                const ids = marker
-                  .slice(1, -1)
-                  .split(',')
-                  .map(id => id.trim())
+            rewriteSlackEntities(
+              segment
+                .replace(/`{3,}/g, '')
+                .replace(CITATION_TRANSPORT_MARKER_RE, '')
+                .replace(CITATION_MARKER_RE, marker => {
+                  const ids = marker
+                    .slice(1, -1)
+                    .split(',')
+                    .map(id => id.trim())
 
-                return ids.every(id => sourceListIds.has(id)) ? marker : ''
-              })
+                  return ids.every(id => sourceListIds.has(id)) ? marker : ''
+                })
+            )
           )
         )
       )
