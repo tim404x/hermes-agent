@@ -1,0 +1,57 @@
+{
+  "_doc": "Shared by agent/display_row_typing.py::is_interrupt_sentinel (tests/agent/test_display_row_typing_provenance.py) and apps/desktop/src/lib/chat-messages/machine-rows.ts (machine-rows-provenance.test.ts). An assistant row is hidden as an interrupt sentinel ONLY when its whole text is one of the runtime's information-free sentinel formats. Anything else, including sentinels that carry an error, is prose and stays visible.",
+  "cases": [
+    {
+      "text": "Operation interrupted: waiting for model response (0.3s elapsed).",
+      "sentinel": true
+    },
+    {
+      "text": "Operation interrupted: waiting for model response (128.0s elapsed).",
+      "sentinel": true
+    },
+    {
+      "text": "  Operation interrupted: waiting for model response (12.5s elapsed).\n",
+      "sentinel": true
+    },
+    {
+      "text": "Operation interrupted: waiting for the provider to recover (cycle 2/5).",
+      "sentinel": true
+    },
+    {
+      "text": "Operation interrupted: retrying API call after error (retry 1/3).",
+      "sentinel": true
+    },
+    {
+      "text": "Operation interrupted: retrying empty response from model (retry 2/3).",
+      "sentinel": true
+    },
+    {
+      "text": "Operation interrupted during upload: the file was not saved. Please retry.",
+      "sentinel": false
+    },
+    {
+      "text": "Operation interrupted: handling API error (RateLimitError: 429 Too Many Requests).",
+      "sentinel": false
+    },
+    {
+      "text": "Operation interrupted during retry (empty response, attempt 2/3).",
+      "sentinel": false
+    },
+    {
+      "text": "Operation interrupted: the database was locked, nothing was written.",
+      "sentinel": false
+    },
+    {
+      "text": "Operation interrupted.",
+      "sentinel": false
+    },
+    {
+      "text": "Operation interrupted: waiting for model response (0.3s elapsed).\nHere is what I found so far.",
+      "sentinel": false
+    },
+    {
+      "text": "The import says: Operation interrupted: waiting for model response (0.3s elapsed).",
+      "sentinel": false
+    }
+  ]
+}
