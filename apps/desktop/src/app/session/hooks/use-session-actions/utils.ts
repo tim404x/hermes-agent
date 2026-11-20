@@ -1921,6 +1921,12 @@ function upsertResolvedSession(
     identities.some(id => (id ? removed.has(id) : false)) ||
     tombstoneLifecycleChanged(tombstoneGenerationsAtRequestStart, identities)
   ) {
+    // A parked hidden copy must not outlive an archive: it would keep
+    // answering owner-routed probes as live for the rest of the run.
+    if (session.archived) {
+      dropParkedHiddenSessionRow(storedSessionId)
+    }
+
     return
   }
 
@@ -1989,6 +1995,24 @@ function projectTreeSessions(): SessionInfo[] {
 // another bot never painted (bot-switch-speed). Kept out of `cachedSessionRow`
 // on purpose: gone-session and remembered-owner checks keep their reads. Draft
 // stubs share the atom but carry no `hidden` flag and never match.
+/** Drop the parked hidden copy of a session the backend archived or deleted.
+ *  Draft stubs on the same atom carry no `hidden` flag and are kept. */
+function dropParkedHiddenSessionRow(storedSessionId: string): void {
+  setUnlistedSessionOwnerRows(prev =>
+    prev.some(session => session.hidden === true && sessionMatchesStoredId(session, storedSessionId))
+      ? prev.filter(session => !(session.hidden === true && sessionMatchesStoredId(session, storedSessionId)))
+      : prev
+  )
+}
+
+/** An explicit "this session does not exist" answer, not a proxy 404 or a
+ *  transport failure (the same evidence probeStoredSession's `gone` needs). */
+function isSessionNotFoundError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+
+  return /\b404\b/.test(message) && /session not found/i.test(message)
+}
+
 export function parkedHiddenSessionRow(
   storedSessionId: string,
   owner?: Pick<SessionProfileRoute, 'connectionId' | 'profile'>
@@ -2047,8 +2071,7 @@ export async function probeStoredSession(
   let allGone = true
 
   const recordFailure = (error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error ?? '')
-    allGone &&= /\b404\b/.test(message) && /session not found/i.test(message)
+    allGone &&= isSessionNotFoundError(error)
   }
 
   // Snapshot BEFORE any await: a resolve that started before an archive/delete
@@ -2087,7 +2110,13 @@ export async function probeStoredSession(
     const parked = parkedHiddenSessionRow(storedSessionId, ownerRoute)
 
     if (parked) {
-      void readOwnedRow().catch(() => undefined)
+      // A definitive 404 (deleted from the CLI, the dashboard, another
+      // window) drops the parked copy; a transient failure keeps it.
+      void readOwnedRow().catch((error: unknown) => {
+        if (isSessionNotFoundError(error)) {
+          dropParkedHiddenSessionRow(storedSessionId)
+        }
+      })
 
       return { status: 'found', session: parked }
     }
