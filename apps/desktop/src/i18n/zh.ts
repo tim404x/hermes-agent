@@ -4682,6 +4682,7 @@ export const zhOverrides = {
     readOnlyTranscriptBody:
       '尚无已连接的后端认领这个较早的会话，因此它以只读记录方式打开。历史记录完好；在有后端认领之前无法发送消息。',
     readOnlyTranscriptSendBlocked: '该会话目前以只读记录方式打开——发送已禁用。',
+    heldSendNotSent: '未发送：此会话确认之前你已切换到其他会话。消息仍保留在草稿中。',
     resumeStrandedTitle: '无法加载此会话',
     resumeStrandedBody: '与此会话的连接失败，自动重试已停止。请确认网关正在运行，然后重试。',
     poolSlotTimeoutBody:

@@ -441,6 +441,7 @@ export const zhHantChat = {
     readOnlyTranscriptBody:
       '尚無已連線的後端認領這個較早的對話，因此它以唯讀逐字稿方式開啟。歷史紀錄完好；在有後端認領之前無法傳送訊息。',
     readOnlyTranscriptSendBlocked: '此對話目前以唯讀逐字稿方式開啟——傳送已停用。',
+    heldSendNotSent: '未傳送：此對話確認之前你已切換到其他對話。訊息仍保留在草稿中。',
     resumeStrandedTitle: '無法載入此工作階段',
     resumeStrandedBody: '與此工作階段的連線失敗，自動重試已停止。請確認閘道正在執行，然後重試。',
     poolSlotTimeoutBody:

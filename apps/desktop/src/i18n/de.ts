@@ -5489,6 +5489,8 @@ export const deOverrides = {
       'Noch kein verbundenes Backend beansprucht diesen älteren Chat, also wurde er als schreibgeschütztes Transkript geöffnet. Seine Historie ist intakt; Senden ist deaktiviert, bis ein Backend ihn beansprucht.',
     readOnlyTranscriptSendBlocked:
       'Dieser Chat ist als schreibgeschütztes Transkript geöffnet — Senden ist deaktiviert.',
+    heldSendNotSent:
+      'Nicht gesendet: Du hast den Chat gewechselt, bevor dieser bestätigt war. Deine Nachricht ist noch im Entwurf.',
     resumeStrandedTitle: 'Diese Session konnte nicht geladen werden',
     resumeStrandedBody:
       'Die Verbindung zu dieser Session ist fehlgeschlagen, und automatische Wiederholungen wurden eingestellt. Prüfen Sie, ob das Gateway läuft, und versuchen Sie es erneut.',
