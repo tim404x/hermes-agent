@@ -574,6 +574,8 @@ class SessionQuery:
     local_created_sources: Optional[tuple[str, ...]] = None
     #: Only rows in this workspace (``hermes -c``'s rule): the git repo root equals it, or a row without one has its cwd at or under it.
     workspace_key: Optional[str] = None
+    #: A speed hint, never a filter: a ``LAST_ACTIVE`` first page may be ranked over the roots of the N most recently active rows when that provably gives the full ranking's page (a busy store's roster poll); the answer is the same either way.
+    recent_candidates: Optional[int] = None
 
 
 @dataclass(frozen=True, slots=True)
