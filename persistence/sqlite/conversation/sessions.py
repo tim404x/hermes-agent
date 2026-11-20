@@ -35,6 +35,7 @@ from ._store import stored_reads
 from ._store.compression import _compression_tip_on, reopen_if_explicitly_closed
 from ._store.core import is_kanban_owned_session, retag_kanban_worker_sessions
 from ._store.gateway import list_gateway_sessions
+from ._store.listing_memo import frozen_key, memoized
 from ._store.local import POLICY_PREFIX
 from ._store.local_migration import LEGACY_PREFIX
 from ._store.model_config import session_ids_with_model_config_key, update_conversation_model_config_value
@@ -247,6 +248,13 @@ def _title_refusals(session_id: SessionId) -> Iterator[None]:
 
 def _optional_list(values: Optional[Sequence[str]]) -> Optional[list[str]]:
     return list(values) if values is not None else None
+
+
+def _query_key(query) -> tuple:
+    """A hashable key of a frozen query dataclass: its type and every field, sequences as tuples."""
+    from dataclasses import fields
+
+    return (type(query).__name__, frozen_key(*(getattr(query, f.name) for f in fields(query))))
 
 
 def _sql_limit(window: SessionWindow) -> int:
@@ -882,19 +890,24 @@ class SQLiteSessionRepository:
         compact_rows: bool = False,
     ) -> tuple[SessionListEntry, ...]:
         holder = self._store.holder()
-        with refusals(holder):
-            rows = list_sessions_rich(holder,
-                sources=_listed(query.sources), exclude_sources=_listed(query.exclude_sources),
-                cwd_prefix=query.cwd_prefix, limit=_sql_limit(window), offset=window.offset,
-                include_children=query.include_children, min_message_count=query.min_message_count,
-                project_compression_tips=query.project_compression_tips,
-                order_by_last_active=query.order is SessionOrder.LAST_ACTIVE, include_archived=query.include_archived,
-                archived_only=query.archived_only, id_query=query.id_query, search_query=query.search_text,
-                compact_rows=compact_rows, include_pinned=query.include_pinned, session_key=query.session_key,
-                include_hidden=query.include_hidden, include_subagents=query.include_subagents,
-                local_created_sources=_optional_list(query.local_created_sources), workspace_key=query.workspace_key,
-            )
-        return tuple(_list_entry(holder, row, compact=compact_rows) for row in rows)
+
+        def read() -> tuple[SessionListEntry, ...]:
+            with refusals(holder):
+                rows = list_sessions_rich(holder,
+                    sources=_listed(query.sources), exclude_sources=_listed(query.exclude_sources),
+                    cwd_prefix=query.cwd_prefix, limit=_sql_limit(window), offset=window.offset,
+                    include_children=query.include_children, min_message_count=query.min_message_count,
+                    project_compression_tips=query.project_compression_tips,
+                    order_by_last_active=query.order is SessionOrder.LAST_ACTIVE, include_archived=query.include_archived,
+                    archived_only=query.archived_only, id_query=query.id_query, search_query=query.search_text,
+                    compact_rows=compact_rows, include_pinned=query.include_pinned, session_key=query.session_key,
+                    include_hidden=query.include_hidden, include_subagents=query.include_subagents,
+                    local_created_sources=_optional_list(query.local_created_sources), workspace_key=query.workspace_key,
+                )
+            return tuple(_list_entry(holder, row, compact=compact_rows) for row in rows)
+
+        # A browse handle on a store that has not moved answers from the listing memo (``listing_memo``).
+        return memoized(holder, "list_sessions", (_query_key(query), window.limit, window.offset, compact_rows), read)
 
     def search_sessions(
         self,
@@ -951,13 +964,17 @@ class SQLiteSessionRepository:
 
     def count_sessions(self, query: SessionCountQuery = SessionCountQuery()) -> int:
         holder = self._store.holder()
-        with refusals(holder):
-            return int(session_count(holder,
-                sources=_listed(query.sources), cwd_prefix=query.cwd_prefix, min_message_count=query.min_message_count,
-                include_archived=query.include_archived, archived_only=query.archived_only,
-                exclude_children=query.exclude_children, exclude_sources=_listed(query.exclude_sources),
-                include_subagents=query.include_subagents, local_created_sources=_optional_list(query.local_created_sources),
-            ))
+
+        def read() -> int:
+            with refusals(holder):
+                return int(session_count(holder,
+                    sources=_listed(query.sources), cwd_prefix=query.cwd_prefix, min_message_count=query.min_message_count,
+                    include_archived=query.include_archived, archived_only=query.archived_only,
+                    exclude_children=query.exclude_children, exclude_sources=_listed(query.exclude_sources),
+                    include_subagents=query.include_subagents, local_created_sources=_optional_list(query.local_created_sources),
+                ))
+
+        return memoized(holder, "count_sessions", _query_key(query), read)
 
     def count_at_least(self, minimum: int = 1) -> bool:
         holder = self._store.holder()
