@@ -10,6 +10,7 @@
 
 import { ackStoredSessionId, atom, haptic, host, markSessionUnreadFinished } from '@hermes/plugin-sdk'
 
+import { noteSwitchAbandoned, noteSwitchStarted, noteSwitchTarget } from './action-timing'
 import {
   $openBotChat,
   $pendingBotOpen,
@@ -234,6 +235,7 @@ export interface OpenRosterBotOptions {
 export async function openRosterBot(bot: RosterRow, { intent = 'in-place' }: OpenRosterBotOptions = {}): Promise<boolean> {
   const generation = bumpBotOpenGeneration()
   const key = botRosterKey(bot)
+  noteSwitchStarted(key)
   const meta = botRosterMeta(bot, $botMeta.get())
   // Keep the currently visible group as a fallback until this explicit action
   // has actually fronted a new owner; a failed open must not steal the center
@@ -292,6 +294,7 @@ export async function openRosterBot(bot: RosterRow, { intent = 'in-place' }: Ope
     // round-trip. Both identities are recorded so the reclaim listener and
     // the roster-activity refresh treat it exactly like a registry open.
     $openBotChat.set({ key, openedRegistryId: fronted.registryId, openedSessionId: fronted.storedSessionId })
+    noteSwitchTarget(key, fronted.storedSessionId, true)
 
     // Fronting is presentation-only: the pane keeps whatever transcript it
     // last painted, which can predate rows the bot wrote while the user was
@@ -318,6 +321,7 @@ export async function openRosterBot(bot: RosterRow, { intent = 'in-place' }: Ope
       $openBotChat.set(null)
       restorePreviousGroup()
       notifyBotOpenFailure(error, bot, 'reach')
+      noteSwitchAbandoned(key)
     }
 
     settlePendingBotOpen(generation)
@@ -365,12 +369,16 @@ export async function openRosterBot(bot: RosterRow, { intent = 'in-place' }: Ope
       $openBotChat.set(null)
       restorePreviousGroup()
       notifyBotOpenFailure(error, bot, 'open', displayName(bot, meta))
+      noteSwitchAbandoned(key)
     }
 
     settlePendingBotOpen(generation)
 
     return false
   }
+
+  // No stored chat to paint: a fresh draft is not a transcript switch.
+  noteSwitchAbandoned(key)
 
   // An older Desktop without the profile-scoped draft API has no safe fallback:
   // do not navigate the current workspace or create a draft on the wrong owner.

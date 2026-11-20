@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef } from 'react'
 
 import { getApiRequestConnection, listAllProfileSessions, listSidebarSessions, type SessionInfo } from '@/hermes'
+import { actionEnd, actionNow, markOnce } from '@/lib/action-timing'
 import { sameCronSignature } from '@/lib/session-signatures'
 import {
   isMessagingSource,
@@ -361,6 +362,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       const requestId = refreshSessionsRequestRef.current + 1
       refreshSessionsRequestRef.current = requestId
       const switchToken = currentGatewaySwitchToken()
+      const refreshStartedAt = actionNow()
       // The loading flag exists to drive the initial skeletons (they only render
       // while the list is empty). Turn-complete / reconnect refreshes over a
       // populated list used to flip it true→false anyway, churning every
@@ -464,6 +466,13 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
             return sameCronSignature(prev, next) ? prev : next
           })
+          // Only a refresh that STARTED after the sessions.changed event serves it.
+          actionEnd('sidebar_update', '', { startedAtOrBefore: refreshStartedAt })
+
+          if ($sessions.get().length > 0) {
+            markOnce('open_sidebar')
+          }
+
           // "Is there another page?" instead of an exact total: the backend
           // reports which profiles filled their window, which costs nothing on
           // top of the rows it already read (the old exact totals ran a COUNT(*)

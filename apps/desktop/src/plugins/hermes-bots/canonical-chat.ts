@@ -12,10 +12,12 @@ import * as sdk from '@hermes/plugin-sdk'
 import { host } from '@hermes/plugin-sdk'
 import type { SessionListRow } from '@hermes/plugin-sdk'
 
+import { noteSwitchTarget } from './action-timing'
 import {
   $botMeta,
   botMetaKey,
   botOwner,
+  botRosterKey,
   persistBotMetaSnapshot,
   ROSTER_POLL_INTERVAL_MS,
   rosterSnapshotAgeMs
@@ -185,6 +187,11 @@ async function openStoredBotChat(
   // the tab strip (#121874), and the openSession below fronts explicit opens.
   const canonicalIds = [...new Set([summary?.id, storedId].filter(Boolean).map(String))]
   host.focusOpenWorkspaceSession?.(ownerKey, isStaleBotChatTile(canonicalIds), [])
+
+  if (!background) {
+    // Thunk: the key is read inside the timing guard, never on the open path.
+    noteSwitchTarget(() => botRosterKey(bot), storedId)
+  }
 
   await host.openSession(storedId, {
     ...(route
