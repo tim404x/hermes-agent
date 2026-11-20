@@ -1,8 +1,9 @@
 """effort-router delegation backend: per-task reasoning effort, tiered by how hard the task is.
 
-The parent may set ``effort`` per task; when it does not, a cheap heuristic sends short mechanical goals to
-medium; anything touching money, legal, sends, code changes or research synthesis never runs below high.
-The same schema, guidance and heuristic apply at every depth (an orchestrator child's own delegate_task).
+The parent may set ``effort`` per task; when it does not, only a deterministic read runs at medium. Reviews,
+plans, debugging and synthesis run at xhigh; anything touching money, legal, sends, code changes or writes never
+runs below high; low is only for deterministic reads. The same schema, guidance and heuristic apply at every depth
+(an orchestrator child's own delegate_task) and on every model option (``option``).
 """
 
 import json
@@ -76,7 +77,7 @@ EASY = ["Fetch the page title of https://example.com/about", "List the files in 
         "Look up the CNPJ of WeWork Faria Lima 4055", "Count the rows in /tmp/run-1119/out/ledger.csv",
         "Grep /tmp/run-1119/logs for TimeoutError"]
 SENSITIVE = ["Draft the reply email to Figure about invoice 1023", "Fix the failing test in tools/delegate_tool.py",
-             "Research and synthesize what labs pay for egocentric video", "Check the SOW terms Jackson sent",
+             "Check the SOW terms Jackson sent",
              "Fetch the Mercury balance, then wire 500 USD to Nox", "Send the Slack update to Theo"]
 # Every input the adversarial review (19 Nov 2026) ran: each one auto-lowered (or kept an explicit low) before.
 REVIEWED = [
@@ -121,6 +122,41 @@ LIGHT_VERBS = [
     "Get the contributors their Scout codes", "Show Jackson the dashboard", "Get the server back up",
     "Show the payout and send it", "Give Maxence edit permissions on the finance folder",
 ]
+# A fixed read-only command is a deterministic step (Tim, 19 Nov 2026: "low only for fetching abc, deterministic").
+RUN_READ_ONLY = ["Run `git log -5 --oneline` in /tmp/run-1119/checkout", "Run `df -h`", "Run `wc -l /tmp/run-1119/a.csv`"]
+# Commands that change state, chain, or read secrets are not.
+RUN_NOT_READ_ONLY = ["Run `git push origin main`", "Run `ls /tmp/x; rm -rf /tmp/x`", "Run `cat secrets.yaml`",
+                     "Run `find /tmp/run-1119 -delete`", "Run `sed -i s/a/b/ /tmp/run-1119/a.txt`"]
+# Deep work runs at xhigh whoever asked less: reviews, audits, QA, fact-checks, plans, debugging, synthesis.
+DEEP = [
+    ("Write an independent adversarial review of the Series A deck outline", "review"),
+    ("Audit the money figures in /tmp/run-1119/plan.md", "review"),
+    ("Verify the round-1 fixes actually hold and find new problems", "review"),
+    ("E2E functional QA of the desktop flows on the candidate build", "review"),
+    ("Re-score these sales leads from the latest evidence", "review"),
+    ("Evaluate whether the cache layer is safe under concurrent writers", "review"),
+    ("Plan the migration of the sessions table to the new store", "planning"),
+    ("Draft a rollout plan for the phone line", "planning"),
+    ("Design the architecture for the payout watcher", "planning"),
+    ("Debug the flaky launch-wave test", "debugging"),
+    ("Find the root cause of the 429s on wide launches", "debugging"),
+    ("Investigate why the nightly update fails on the Mac", "debugging"),
+    ("Research and synthesize what labs pay for egocentric video", "synthesis"),
+    ("Research and write a cited comparison of LiveKit and Pipecat", "synthesis"),
+    ("Recommend which GPU cloud to use for the VLA runs", "synthesis"),
+    ("Revisar o contrato e apontar os riscos", "review"),
+]
+# Not deep: a plain read of a review, a word used as a description, or a topic named late in a long brief.
+NOT_DEEP = [
+    "Read the review notes in /tmp/run-1119/review.md",
+    "Research GPU vendors Hub is buying or evaluating and write findings to /tmp/run-1119/gpu.md",
+    "Research what the Hermes community recommends for heavy multi-agent users",
+    "Lane A1: how commercial agent products architect the backend that serves a fast UI",
+    "Research what power users say about swarms: how many parallel subagents, effort per subagent, budgets, "
+    "orchestrator-worker patterns, worker sizing, launch pacing, observability, and finally cross-model review",
+]
+# One bounded read-only step without a concrete target: medium at most, never automatic.
+BOUNDED = ["Search the web for the street address of Figure AI headquarters", "List competitors of Hub"]
 # Read-only but not ONE mechanical operation, or not recognisably English: never auto-lowered.
 NOT_MECHANICAL = [
     "Get the README in /tmp/run-1119", "Show the last 20 lines of /tmp/run-1119/log.txt",
@@ -133,7 +169,8 @@ NOT_MECHANICAL = [
 
 def test_omitted_effort_easy_mechanical_goals_run_medium_and_say_why(home):
     home({"backend": "effort-router", "reasoning_effort": "high"})
-    assert _routes([{"goal": g} for g in EASY]) == [("medium", "effort medium (auto: mechanical)")] * len(EASY)
+    assert _routes([{"goal": g} for g in EASY + RUN_READ_ONLY]) == [
+        ("medium", "effort medium (auto: deterministic)")] * len(EASY + RUN_READ_ONLY)
 
 
 @pytest.mark.parametrize("goal", NOT_MECHANICAL)
@@ -159,7 +196,7 @@ def test_a_sensitive_context_floors_an_explicit_pick_on_a_neutral_goal(home, goa
     assert _routes([task])[0][0] == "high"
 
 
-def test_explicit_picks_win_on_neutral_tasks_and_xhigh_is_never_automatic(home):
+def test_explicit_picks_win_on_neutral_tasks_and_xhigh_is_never_automatic_for_them(home):
     home({"backend": "effort-router", "reasoning_effort": "high"})
     goal = "Fetch the page title of https://example.com/about"
     assert _routes([{"goal": goal, "effort": "low"}, {"goal": goal, "effort": "xhigh"},
@@ -221,5 +258,109 @@ def test_every_level_gets_the_effort_param_the_guidance_and_the_heuristic(home, 
     assert [b["override_reasoning_effort"] for b in recorded] == ["medium", "high", "low"]
     # Each result says what its child ran at and why; the call reports the swarm's effort mix.
     assert [r["route"]["label"] for r in out["results"]] == [
-        "effort medium (auto: mechanical)", "effort high (default)", "effort low"]
+        "effort medium (auto: deterministic)", "effort high (default)", "effort low"]
     assert out["effort_mix"] == {"medium": 1, "high": 1, "low": 1}
+
+
+@pytest.mark.parametrize("goal,kind", DEEP)
+def test_reviews_plans_debugging_and_synthesis_run_at_xhigh_whoever_asked_less(home, goal, kind):
+    home({"backend": "effort-router", "reasoning_effort": "high"})
+    assert _routes([{"goal": goal}]) == [("xhigh", f"effort xhigh (deep: default high, {kind})")]
+    for asked in ("low", "medium", "high"):
+        assert _routes([{"goal": goal, "effort": asked}]) == [("xhigh", f"effort xhigh (deep: asked {asked}, {kind})")]
+
+
+@pytest.mark.parametrize("goal", NOT_DEEP)
+def test_a_read_a_description_or_a_late_topic_is_not_deep_work(home, goal):
+    home({"backend": "effort-router", "reasoning_effort": "high"})
+    assert _routes([{"goal": goal}])[0][0] == "high"
+
+
+def test_low_is_only_for_deterministic_steps_and_medium_only_for_bounded_ones(home):
+    home({"backend": "effort-router", "reasoning_effort": "high"})
+    for goal in EASY + RUN_READ_ONLY:  # deterministic: an explicit low stands
+        assert _routes([{"goal": goal, "effort": "low"}]) == [("low", "effort low")]
+    for goal in BOUNDED:  # bounded but no concrete target: never automatic, low becomes medium, medium stands
+        assert _routes([{"goal": goal}]) == [("high", "effort high (default)")]
+        assert _routes([{"goal": goal, "effort": "low"}]) == [
+            ("medium", "effort medium (raised: asked low, not deterministic)")]
+        assert _routes([{"goal": goal, "effort": "medium"}]) == [("medium", "effort medium")]
+    goal = "Think through the three options for the onboarding flow and pick one"  # neither: a cheap pick is raised
+    assert _routes([{"goal": goal, "effort": "low"}, {"goal": goal, "effort": "medium"}]) == [
+        ("high", "effort high (raised: asked low, not deterministic)"),
+        ("high", "effort high (raised: asked medium, not one bounded read-only step)")]
+
+
+@pytest.mark.parametrize("goal", RUN_NOT_READ_ONLY)
+def test_a_command_that_writes_chains_or_reads_secrets_is_never_cheap(home, goal):
+    home({"backend": "effort-router", "reasoning_effort": "high"})
+    for asked in (None, "low", "medium"):
+        assert _routes([{"goal": goal, **({"effort": asked} if asked else {})}])[0][0] == "high"
+
+
+OPTIONS = [
+    {"name": "gpt", "description": "OpenAI GPT-6.2 Astra; independent reviewer.", "base_url": "https://api.openai.com/v1",
+     "api_key": "sk-test-gpt", "model": "gpt-6.2-astra", "fallback_providers": []},
+    {"name": "gemini", "description": "Google Gemini 4 Neon; claim checker.", "base_url": "https://vertex.example/v1",
+     "api_key": "test-gemini", "model": "google/gemini-4-neon", "fallback_providers": [], "reasoning_effort": "medium"},
+    {"name": "broken", "description": "no model"},
+]
+
+
+def test_options_add_an_option_param_with_their_descriptions_and_nothing_without_them(home):
+    from tools.registry import registry
+    home({"backend": "effort-router", "reasoning_effort": "high"})
+    props = registry.get_definitions({"delegate_task"})[0]["function"]["parameters"]["properties"]["tasks"]["items"]
+    assert "option" not in props["properties"]
+    home({"backend": "effort-router", "reasoning_effort": "high", "backends": {"effort-router": {"options": OPTIONS}}})
+    definition = registry.get_definitions({"delegate_task"})[0]["function"]
+    option = definition["parameters"]["properties"]["tasks"]["items"]["properties"]["option"]
+    assert option["enum"] == ["gpt", "gemini"]  # the malformed entry is skipped
+    assert "gpt: OpenAI GPT-6.2 Astra" in option["description"] and "Gemini 4 Neon" in option["description"]
+    assert "adversarial or multi-model review" in definition["description"]
+
+
+def test_an_option_routes_its_own_model_with_the_same_effort_tiers(home):
+    from agent.delegation_registry import get_active_provider
+    from tools.delegate_tool_config import _load_config
+    home({"backend": "effort-router", "reasoning_effort": "high", "provider": "anthropic", "model": "claude-opus-5-5",
+          "request_overrides": {"service_tier": "priority"},
+          "backends": {"effort-router": {"options": [*OPTIONS[:2],
+                                                     {"name": "astra", "description": "GPT via the API key.",
+                                                      "provider": "openai-api", "model": "gpt-6.2-astra"}]}}})
+    config, provider = _load_config(), get_active_provider(_load_config())
+    review = "Write an independent adversarial review of the Series A deck outline"
+    route = provider.route_task({"goal": review, "option": "astra", "inherited_effort": "high"}, config)
+    assert (route["provider"], route["model"], route["reasoning_effort"]) == ("openai-api", "gpt-6.2-astra", "xhigh")
+    assert "request_overrides" not in route and "base_url" not in route  # the default model's knobs stay behind
+    assert route["label"] == "astra · effort xhigh (deep: default high, review)"
+    # The option's own default level stands for neutral work, under the same tiers.
+    neutral = provider.route_task({"goal": "Think through the onboarding options", "option": "gemini"}, config)
+    assert (neutral["model"], neutral["reasoning_effort"], neutral["fallback_providers"]) == (
+        "google/gemini-4-neon", "medium", [])
+    # No option: the default route, untouched.
+    plain = provider.route_task({"goal": review}, config)
+    assert (plain["provider"], plain["model"], plain["reasoning_effort"]) == ("anthropic", "claude-opus-5-5", "xhigh")
+
+
+def test_an_adversarial_review_fans_one_brief_out_to_three_models_through_delegate_task(home, recorded):
+    """The multi-model recipe end to end through core: one brief, three options, each child built on its own
+    model and endpoint with no fallback, every reviewer at xhigh, and each result names the model it ran on."""
+    home({"backend": "effort-router", "reasoning_effort": "high",
+          "backends": {"effort-router": {"options": OPTIONS[:2]}}})
+    from tools.delegate_tool import delegate_task
+    brief = {"goal": "Write an independent adversarial review of the claims in /tmp/run-1119/REPORT.md",
+             "context": "Work blind: findings only, each with evidence."}
+    out = json.loads(delegate_task(tasks=[{**brief}, {**brief, "option": "gpt"}, {**brief, "option": "gemini"}],
+                                   parent_agent=_parent()))
+    assert [r["status"] for r in out["results"]] == ["completed"] * 3
+    # The plain task inherits the parent's model (no pin); the options pin theirs.
+    assert [(b["model"], b["override_base_url"], b["override_reasoning_effort"]) for b in recorded] == [
+        (None, None, "xhigh"), ("gpt-6.2-astra", "https://api.openai.com/v1", "xhigh"),
+        ("google/gemini-4-neon", "https://vertex.example/v1", "xhigh")]
+    assert [b["routing_cfg"].get("fallback_providers") for b in recorded[1:]] == [[], []]
+    assert [r["route"]["label"] for r in out["results"]] == [
+        "effort xhigh (deep: default high, review)", "gpt · effort xhigh (deep: default high, review)",
+        "gemini · effort xhigh (deep: default medium, review)"]  # its own medium default, raised like any other
+    assert [r["route"]["model"] for r in out["results"]][1:] == ["gpt-6.2-astra", "google/gemini-4-neon"]
+    assert out["effort_mix"] == {"xhigh": 3}
