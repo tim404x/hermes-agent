@@ -865,6 +865,12 @@ class ChangeSignalPayload(OpenPayload):
 
 event("cron.changed", ChangeSignalPayload, doc="cron/jobs.json moved; refetch the cron list.")
 event("sessions.changed", ChangeSignalPayload, doc="state.db moved; refetch the session list.")
+event("sessions.activity", ChangeSignalPayload,
+      doc="Only the message/tool counters of a turn running in this backend moved (its stream already carries "
+          "them); nothing to refetch.")
+event("jobs.changed", ChangeSignalPayload,
+      doc="A row only workers write moved (one-shot runs, kanban/tool workers and the delegate runs they start); "
+          "no session window lists or watches it. Floored at 15 s.")
 event("platforms.changed", ChangeSignalPayload, doc="gateway_state.json moved; refetch platform status.")
 event("projects.changed", ChangeSignalPayload, doc="projects.db moved; refetch the project list + tree.")
 event("pairing.changed", ChangeSignalPayload, doc="Pairing state moved; refetch pairing.")

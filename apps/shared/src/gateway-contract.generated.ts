@@ -7483,6 +7483,8 @@ export interface BackendGatewayEventMap {
   'gateway.ready': GatewayReadyPayload
   /** A Group Chat log, task or live status moved; an open room re-reads its log delta and groups.state. */
   'groups.changed': GroupsChangedPayload
+  /** A row only workers write moved (one-shot runs, kanban/tool workers and the delegate runs they start); no session window lists or watches it. Floored at 15 s. */
+  'jobs.changed': ChangeSignalPayload
   /** The turn ended: final text, usage and outcome. */
   'message.complete': MessageCompletePayload
   /** One streamed chunk of the assistant reply (null text: segment boundary). */
@@ -7553,6 +7555,8 @@ export interface BackendGatewayEventMap {
   'session.title': SessionTitlePayload
   /** Mid-turn usage tick; message.complete carries the authoritative final usage. */
   'session.usage': SessionUsagePayload
+  /** Only the message/tool counters of a turn running in this backend moved (its stream already carries them); nothing to refetch. */
+  'sessions.activity': ChangeSignalPayload
   /** state.db moved; refetch the session list. */
   'sessions.changed': ChangeSignalPayload
   /** The free-tier bootstrap finished (broadcast); the desktop's setup gate reads the record. */
@@ -7625,6 +7629,7 @@ export const GATEWAY_EVENT_TYPES = [
   'free_tier.challenge',
   'gateway.ready',
   'groups.changed',
+  'jobs.changed',
   'message.complete',
   'message.delta',
   'message.interim',
@@ -7660,6 +7665,7 @@ export const GATEWAY_EVENT_TYPES = [
   'session.resume_progress',
   'session.title',
   'session.usage',
+  'sessions.activity',
   'sessions.changed',
   'setup.ready',
   'skills.changed',
