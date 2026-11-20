@@ -422,6 +422,9 @@ class AIAgent(
             # reset (a cache keep-alive in flight) compares it to tell the old session from the new.
             self._session_reset_epoch = getattr(self, "_session_reset_epoch", 0) + 1
             self.session_estimated_cost_usd = 0.0
+            # The delegation tree's spend is session-scoped like the counters above; a background child that
+            # finishes after this reset is fenced out by the epoch it was built under.
+            self.delegation_tree_usage, self._delegation_tree_ids = None, set()
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
 
