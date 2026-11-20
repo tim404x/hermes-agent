@@ -105,11 +105,18 @@ describe('the registry row wins, always', () => {
     const { openBotCanonicalChat } = await loadModule()
 
     await expect(openBotCanonicalChat('ops', { intent: 'tab' })).resolves.toEqual({
-      openedId: 'tip', registryId: 'root'
+      openedId: 'tip',
+      registryId: 'root'
     })
-    expect(hostMock.openSession).toHaveBeenCalledWith('tip', expect.objectContaining({
-      intent: 'tab', profile: 'ops', workspaceMode: 'bots', workspaceOwnerKey: 'bot:ops'
-    }))
+    expect(hostMock.openSession).toHaveBeenCalledWith(
+      'tip',
+      expect.objectContaining({
+        intent: 'tab',
+        profile: 'ops',
+        workspaceMode: 'bots',
+        workspaceOwnerKey: 'bot:ops'
+      })
+    )
     expect(calls.map(call => call.method)).toEqual(['session.list'])
   })
 
@@ -338,10 +345,58 @@ describe('a failed lookup fails CLOSED — never "no chat exists"', () => {
     const bot = { canonical_session: { id: 'forever-chat' }, name: 'ops' } as RosterRow
     const { openBotCanonicalChat } = await loadModule()
 
+    // Paint-first (bot-switch-speed): the click opens the row the roster
+    // already names while the registry answers, and nothing else, ever. A
+    // registry that cannot confirm keeps that row on screen and never mints.
+    await expect(openBotCanonicalChat(bot)).resolves.toEqual({ openedId: 'forever-chat', registryId: 'forever-chat' })
+    expect(calls.some(call => call.method === 'session.create')).toBe(false)
+    expect(hostMock.openSession.mock.calls.map(([id]) => id)).toEqual(['forever-chat'])
+    expect(calls.find(call => call.method === 'session.info')?.params).toEqual({ session_id: 'forever-chat' })
+  })
+
+  it('rejects without minting when neither the registry nor the roster row opens', async () => {
+    hostMock.openSession.mockRejectedValue(new Error('backend restarting'))
+
+    const calls = respondWith(method => {
+      if (method === 'session.list') {
+        return { sessions: [] }
+      }
+
+      if (method === 'session.info') {
+        return { title: 'Bot Chat' }
+      }
+
+      throw new Error(`must not call ${method}`)
+    })
+
+    const bot = { canonical_session: { id: 'forever-chat' }, name: 'ops' } as RosterRow
+    const { openBotCanonicalChat } = await loadModule()
+
     await expect(openBotCanonicalChat(bot)).rejects.toThrow(/Could not confirm ops's Bot Chat registry/)
     expect(calls.some(call => call.method === 'session.create')).toBe(false)
+  })
+
+  it('keeps registry-first for a new-tab open', async () => {
+    const calls = respondWith(method => {
+      if (method === 'session.list') {
+        return { sessions: [] }
+      }
+
+      if (method === 'session.info') {
+        return { title: 'Bot Chat' }
+      }
+
+      return {}
+    })
+
+    const bot = { canonical_session: { id: 'forever-chat' }, name: 'ops' } as RosterRow
+    const { openBotCanonicalChat } = await loadModule()
+
+    await expect(openBotCanonicalChat(bot, { intent: 'tab' })).rejects.toThrow(
+      /Could not confirm ops's Bot Chat registry/
+    )
+    expect(calls.some(call => call.method === 'session.create')).toBe(false)
     expect(hostMock.openSession).not.toHaveBeenCalled()
-    expect(calls.find(call => call.method === 'session.info')?.params).toEqual({ session_id: 'forever-chat' })
   })
 
   it('refuses to mint when the roster-id probe itself throws', async () => {
@@ -364,8 +419,11 @@ describe('a failed lookup fails CLOSED — never "no chat exists"', () => {
     const bot = { canonical_session: { id: 'forever-chat' }, name: 'ops' } as RosterRow
     const { openBotCanonicalChat } = await loadModule()
 
-    await expect(openBotCanonicalChat(bot)).rejects.toThrow(/Could not confirm ops's Bot Chat registry/)
+    // Paint-first: the roster's own row opened, so a probe that throws keeps
+    // it on screen instead of reporting a failure over it. Still no mint.
+    await expect(openBotCanonicalChat(bot)).resolves.toEqual({ openedId: 'forever-chat', registryId: 'forever-chat' })
     expect(calls.some(call => call.method === 'session.create')).toBe(false)
+    expect(hostMock.openSession.mock.calls.map(([id]) => id)).toEqual(['forever-chat'])
   })
 })
 
