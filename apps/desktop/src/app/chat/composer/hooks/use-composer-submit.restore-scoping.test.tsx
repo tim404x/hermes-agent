@@ -358,7 +358,8 @@ it('restores text and attachments by the loaded draft owner, not an uncommitted 
     submission_id: expect.any(String),
     clientMessageId: SEND_ID.clientMessageId,
     attachments: [attachmentB],
-    composerScope: 'stored-B'
+    composerScope: 'stored-B',
+    onComposerScopeMoved: expect.any(Function)
   })
   act(() => navigate('A'))
 
@@ -397,7 +398,8 @@ it('restores text and attachments by the loaded draft owner, not an uncommitted 
     submission_id: expect.any(String),
     clientMessageId: SEND_ID.clientMessageId,
     attachments: [attachmentB],
-    composerScope: 'stored-B'
+    composerScope: 'stored-B',
+    onComposerScopeMoved: expect.any(Function)
   })
   expect(editorText()).toBe('draft B')
   expect(mainComposerScope.$attachments.get()).toEqual([attachmentB])

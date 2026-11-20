@@ -75,6 +75,15 @@ UNIQUE(title) index makes that pair a registry of at most one row. Clicking a bo
    never forked (`set_session_title` silently drops conflicting titles — returns 0 rows — which is how
    the 2026-08 infinite fork loop started).
 
+**Paint-first for in-place roster clicks** (bot-switch-speed, switch-fix-1119): an in-place row
+click opens the roster's server-resolved `canonical_session` at once and runs the registry lookup
+beside it, so a warm switch paints without a gateway round trip. The registry answer always wins (a
+different row is opened over it; confirmed absence creates as in step 2). New-tab and background
+opens, and any click while the roster poll is older than one cycle, stay registry-first. Paint-first
+never mints and never opens anything but the roster's own row, and sends wait for confirmation:
+`host.holdSubmitsUntilConfirmed` holds the composer's submit into the painted id and delivers it to
+the confirmed chat, or refuses it with the draft kept when the registry cannot answer.
+
 **There is NO session-id pin.** The old design stored a pointer in `ui_meta['hermes-bots'].chat`;
 five hardening waves (#88690, #90732, #90751, the #91791 revert, #92042) each guarded a new way it
 dangled or was stolen (rows[0] steals, `last_session` adoptions, transient clears, a pin re-anchored

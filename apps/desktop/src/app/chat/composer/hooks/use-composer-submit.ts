@@ -224,6 +224,12 @@ export function useComposerSubmit({
           ...(attachments ? { attachments } : {}),
           composerScope: submittedScope,
           ...assignment,
+          // A send held for an unconfirmed session can be replayed into the
+          // chat that replaced it; the words follow it there if it then fails.
+          onComposerScopeMoved: (scope: string) => {
+            restoreScope = scope
+            outgoing?.move(scope)
+          },
           ...(displayKind ? { displayKind } : {})
         })
       )
