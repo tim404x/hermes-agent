@@ -232,6 +232,12 @@ def _observed_turn_persist_message(run_message, override, live_text):
         return [{**first, "text": override + first["text"][len(live_text):]}, *run_message[1:]]
     return run_message
 
+
+def _is_bot_chat_agent(agent) -> bool:
+    """The Bot Chat surface, resolved as tui_gateway's turn does: the agent's session title hint."""
+    from tools.bot_mode_probe import BOT_CHAT_TITLE
+    return str(getattr(agent, "_session_title_hint", "") or "").strip() == BOT_CHAT_TITLE
+
 class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
     """Per-turn collaborator carrying ``GatewayRunner._run_agent_inner``'s tool-progress callbacks."""
 
@@ -361,6 +367,13 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         ]
         stream_delta_cb = None
         local_viewer_route = getattr(ctx.source, "platform", None) == Platform.LOCAL
+        # Whether this turn may end silent, bound before any callback is wired: only then does the live
+        # view hold or drop marker-looking text. A person's question answered "Silent" is an answer, and
+        # the delivery seam rejects a marker on that turn anyway. ``run_sync`` widens it for the Bot Chat
+        # before the agent runs (its title hint lives on the agent).
+        from gateway.response_filters import silence_allowed
+        silence_ok = self._turn_silence_ok = [silence_allowed(
+            getattr(ctx, "persist_user_display_kind", None), getattr(ctx, "reply_expected", None))]
         if delta_sinks or self._approval_owner is not None:
             def deliver_delta(text: Optional[str]) -> None:
                 delivered = bool(delta_sinks)
@@ -394,7 +407,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             def stream_delta_cb(text: Optional[str]) -> None:
                 if not ctx._run_still_current():
                     return
-                if hold is None:
+                if hold is None or not silence_ok[0]:
+                    # A turn that may not end silent (a person's question) streams its words as they come.
                     deliver_delta(text)
                 elif text is None:
                     release_held()
@@ -409,7 +423,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             if not ctx._run_still_current():
                 return
             unseen = False
-            if local_viewer_route and not already_streamed:
+            if local_viewer_route and not already_streamed and silence_ok[0]:
                 from gateway.response_filters import is_intentional_silence_response, strip_trailing_silence_marker
                 text = "" if is_intentional_silence_response(text) else strip_trailing_silence_marker(text)
             if local_viewer_route and not already_streamed and str(text or "").strip():
@@ -1174,6 +1188,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 # marker that follows a written reply on that reply, before transform/persistence.
                 agent._silence_marker_needs_reply = not silence_allowed(
                     ctx.persist_user_display_kind, ctx.reply_expected)
+                if _is_bot_chat_agent(agent) and (cell := getattr(self, "_turn_silence_ok", None)) is not None:
+                    # The Bot Chat may end any turn silent (tui_gateway/prompt_turn.py ``silence_ok``).
+                    cell[0] = True
                 try:
                     result = agent.run_conversation(api_message, **kwargs)
                     # The reply's last held line that never became a marker is part of it: deliver it.
@@ -1601,8 +1618,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             # A turn the delivery seam always lets end silent (a machinery wake, an unaddressed message)
             # and that did: the viewer raises no toast, sound or unread mark for it (message.complete
             # ``silent``, as tui_gateway/prompt_turn.py marks its own).
-            silent = silence_allowed(ctx.persist_user_display_kind, ctx.reply_expected) and \
-                is_intentional_silence_agent_result(result, final_response)
+            may_be_silent = (getattr(self, "_turn_silence_ok", None) or [False])[0] or silence_allowed(
+                ctx.persist_user_display_kind, ctx.reply_expected) or _is_bot_chat_agent(agent)
+            silent = may_be_silent and is_intentional_silence_agent_result(result, final_response)
             viewer_meta = {
                 "local_viewer": True,
                 **({"billing_block": result["billing_block"]} if isinstance(result.get("billing_block"), dict) else {}),
