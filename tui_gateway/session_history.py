@@ -331,7 +331,11 @@ def _history_to_messages(history: list[dict], *, profile_home=None, image_urls: 
             content_text = _coerce_message_text(m.get("content"), image_urls=image_urls)
         if _is_display_hidden_marker(role, content_text):
             continue
-        if isinstance(m.get("display_content"), str):
+        # A user row's display text (a cron delivery's output) rides beside its words: clients that re-role the row
+        # (desktop machine rows) paint it, a client that cannot (the TUI resume) keeps the frame naming its writer,
+        # never the bare output in the user's own bubble.
+        user_display_content = m["display_content"] if role == "user" and isinstance(m.get("display_content"), str) else None
+        if isinstance(m.get("display_content"), str) and role != "user":
             content_text = m["display_content"]
         if role == "user":
             content_text = _DISCORD_TRIGGERING_NOTE_RE.sub(r"\1", content_text)
@@ -382,6 +386,8 @@ def _history_to_messages(history: list[dict], *, profile_home=None, image_urls: 
             msg["display_kind"] = display_kind
         if m.get("display_metadata"):
             msg["display_metadata"] = m["display_metadata"]
+        if user_display_content is not None:
+            msg["display_content"] = user_display_content
         messages.append(msg)
     return _without_silent_turns(project_history_commentary(messages, home=profile_home), silence_ok_session)
 
