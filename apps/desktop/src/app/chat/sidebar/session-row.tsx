@@ -15,6 +15,7 @@ import { RowButton } from '@/components/ui/row-button'
 import { OverflowTip, Tip } from '@/components/ui/tooltip'
 import type { SessionInfo } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
+import { viewActionStart } from '@/lib/action-timing-view'
 import { sessionTitle } from '@/lib/chat-runtime'
 import { pathLeaf } from '@/lib/display-path'
 import { triggerHaptic } from '@/lib/haptics'
@@ -487,6 +488,7 @@ function SidebarSessionRowImpl({
             const action = resolveSessionRowClick(event, { canOpenWindow: true })
 
             if (action === 'resume') {
+              viewActionStart('open_chat', session.id, session.id)
               onResume()
 
               return
