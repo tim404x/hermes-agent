@@ -13,6 +13,7 @@ import {
 import { sessionCreatedThisRun } from '@/app/session/hooks/use-session-actions/created-this-run'
 import { preserveLocalPendingTurnMessages } from '@/app/session/hooks/use-session-actions/utils'
 import { getLatestSessionMessages, type ProfileScope } from '@/hermes'
+import { actionStart } from '@/lib/action-timing'
 import {
   type ChatMessage,
   preserveLocalAssistantErrors,
@@ -1488,6 +1489,8 @@ export function useBackgroundSync({
     }
 
     const unsubscribe = $sessionsChangeTick.listen(() => {
+      // Time from the FIRST unserved event to the next list refresh applied.
+      actionStart('sidebar_update', '', { replace: false })
       const since = Date.now() - lastRunAt
 
       if (since >= SESSIONS_LIST_TICK_GAP_MS) {

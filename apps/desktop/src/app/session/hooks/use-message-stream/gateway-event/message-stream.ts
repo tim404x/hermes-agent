@@ -3,6 +3,7 @@ import { type BillingBlock, mergeUsage } from '@hermes/shared'
 import { noteTurnSettled } from '@/app/session/hooks/use-session-actions/settled-turns'
 import { burstVibeHearts } from '@/components/chat/vibe-hearts'
 import { translateNow } from '@/i18n'
+import { actionEnd } from '@/lib/action-timing'
 import { type GatewayEventPayload, markQueuedPromptStarted } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText } from '@/lib/chat-runtime'
 import { playCompletionSound } from '@/lib/completion-sound'
@@ -276,7 +277,12 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
 
   if (event.type === 'message.delta') {
     if (sessionId) {
-      appendAssistantDelta(sessionId, coerceGatewayText(payload?.text), occurredAt, segmentStamp(payload))
+      const text = coerceGatewayText(payload?.text)
+      appendAssistantDelta(sessionId, text, occurredAt, segmentStamp(payload))
+
+      if (text) {
+        actionEnd('first_token', sessionId)
+      }
     }
 
     return true
