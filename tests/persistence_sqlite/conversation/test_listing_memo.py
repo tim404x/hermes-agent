@@ -270,6 +270,8 @@ def test_the_local_lineage_projection_is_shared_until_a_lineage_write(store, sco
     _write(scope_a, "UPDATE sessions SET end_reason='session_reset' WHERE id='owner'")
     _write(scope_a, "INSERT INTO state_meta(key,value) VALUES(?,?)",
            (POLICY_PREFIX + "owner", json.dumps({"session_id": "owner", "lineage": ["owner", "head"]})))
+    # A store without idx_state_meta_local_lineage (an indexed one seeks, nothing to share: add45).
+    _write(scope_a, "DROP INDEX IF EXISTS idx_state_meta_local_lineage")
     scans = _count_calls(monkeypatch, local_lineage_memo, "memoized_local_lineage_index")
     _quiet(scope_a)
     listed = _browse(scope_a, lambda r: _listed(r, limit=10))
