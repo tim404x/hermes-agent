@@ -185,6 +185,12 @@ export function viewActionBind(
       return
     }
 
+    // A paint-first bot switch can open the same chat twice for one click (the roster paint, then the
+    // registry's confirmation re-waiting on it): the first bind stands.
+    if (current.storedSessionId === storedSessionId) {
+      return
+    }
+
     const main = $messages.get()
 
     // Re-picking the bot tile already on screen (an open tab "fronted" again) is not a switch.

@@ -124,6 +124,19 @@ describe('action-timing-view (switch / open_chat painted)', () => {
     expect(flushed()?.a).toEqual({ switch: [300] })
   })
 
+  it('a second bind of the same chat for one click (paint-first, then confirmation) keeps the first', () => {
+    viewActionStart('switch', 'local::apex')
+    viewActionBind('switch', 'local::apex', 'apex-chat')
+    now += 200
+    $selectedStoredSessionId.set('apex-chat')
+    now += 100
+    viewActionBind('switch', 'local::apex', 'apex-chat') // the registry confirmed the painted chat
+    now += 150
+    $messages.set([msg('a1')])
+    runFrames()
+    expect(flushed()?.a).toEqual({ switch: [450] })
+  })
+
   it('re-picking the bot tile already on screen records nothing', () => {
     $sessionStates.set({ rt2: createClientSessionState('forge-chat', [msg('f')]) })
     setFocused('forge-chat')
