@@ -54,9 +54,16 @@ def retire_local_receipts(conn, session_ids):
     if not targets:
         return
     # Prefix scans (GLOB uses the key index), not one LIKE per id: a prune retires thousands.
-    gone = [key for key, value in conn.execute('SELECT key,value FROM state_meta WHERE key GLOB ?',
-                                               (POLICY_PREFIX + '*',))
-            if _policy_target(value) in targets]
+    from persistence.sqlite.conversation._store.receipt_scan_memo import enabled, receipt_projections
+    if enabled():
+        # apexfix: memoized retire_prunable receipt scan. Read-only use: this runs after the caller's
+        # own writes, so moved receipts are parsed fresh but never remembered.
+        gone = [key for key, (_ids, _derived, target) in receipt_projections(conn, remember=False)
+                if target in targets]
+    else:
+        gone = [key for key, value in conn.execute('SELECT key,value FROM state_meta WHERE key GLOB ?',
+                                                   (POLICY_PREFIX + '*',))
+                if _policy_target(value) in targets]
     gone += [key for key, value in conn.execute('SELECT key,value FROM state_meta WHERE key GLOB ?',
                                                 (API_DECLARED_PREFIX + '*',)) if value in targets]
     gone += [API_BINDING_PREFIX + sid for sid in targets]
