@@ -250,6 +250,21 @@ def _optional_list(values: Optional[Sequence[str]]) -> Optional[list[str]]:
     return list(values) if values is not None else None
 
 
+def _visible_listing(query) -> bool:
+    """Whether a listing of *query* can neither show nor be shaped by an internal row (``list_revision``): it hides
+    children and sub-agent runs, and its source scope leaves out every ``INTERNAL_LISTING_SOURCES`` source. Such a
+    listing is keyed on the store's visible list revision, which ignores the worker runs writing every second."""
+    from persistence.sqlite.conversation._store.list_revision import INTERNAL_SOURCES
+
+    if getattr(query, "include_children", False) or not getattr(query, "exclude_children", True):
+        return False
+    if query.include_subagents:
+        return False
+    if query.sources:  # an empty tuple filters nothing (``_listed``): it falls through to the deny-list
+        return not set(query.sources) & set(INTERNAL_SOURCES)
+    return set(INTERNAL_SOURCES) <= set(query.exclude_sources or ())
+
+
 def _query_key(query) -> tuple:
     """A hashable key of a frozen query dataclass: its type and every field, sequences as tuples."""
     from dataclasses import fields
@@ -903,6 +918,7 @@ class SQLiteSessionRepository:
                     compact_rows=compact_rows, include_pinned=query.include_pinned, session_key=query.session_key,
                     include_hidden=query.include_hidden, include_subagents=query.include_subagents,
                     local_created_sources=_optional_list(query.local_created_sources), workspace_key=query.workspace_key,
+                    recent_candidates=query.recent_candidates,
                 )
             return tuple(_list_entry(holder, row, compact=compact_rows) for row in rows)
 
@@ -910,7 +926,7 @@ class SQLiteSessionRepository:
             return read()  # full rows carry the system prompt (~50 KB each): never kept
         # A browse handle on a store that has not moved answers from the listing memo (``listing_memo``).
         return memoized(holder, "list_sessions", (_query_key(query), window.limit, window.offset), read,
-                        keep=shared_entries, weigh=len)
+                        keep=shared_entries, weigh=len, visible_only=_visible_listing(query))
 
     def search_sessions(
         self,
@@ -977,7 +993,7 @@ class SQLiteSessionRepository:
                     include_subagents=query.include_subagents, local_created_sources=_optional_list(query.local_created_sources),
                 ))
 
-        return memoized(holder, "count_sessions", _query_key(query), read)
+        return memoized(holder, "count_sessions", _query_key(query), read, visible_only=_visible_listing(query))
 
     def count_at_least(self, minimum: int = 1) -> bool:
         holder = self._store.holder()

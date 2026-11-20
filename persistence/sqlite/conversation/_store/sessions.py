@@ -3,6 +3,7 @@
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
@@ -1263,6 +1264,105 @@ def list_recent_sessions_bounded(
     return sessions
 
 
+_RECENT_WINDOW_DISABLE_ENV = "HERMES_LISTING_WINDOW"
+
+
+def _recent_window(conn, n: int, exclude_sources: Sequence[str] | None) -> Optional[tuple[list, Any]]:
+    """Candidate roots for a recency-ranked page, and the recency bound outside them (port of #151737's idea,
+    kept exact): ``(ids, bound)``, or None when no useful window exists (``list_sessions_rich`` then ranks every row).
+
+    Only rows that can shape the page count: rows the source scope admits and rows with a parent (chain members of
+    any source); a parentless row of an excluded source is neither listed nor walked. The window is the top *n* of
+    those by the indexed durable activity key ``COALESCE(last_activity_at, started_at)``, the top *n* rows that
+    have a parent by that key and the top *n* of those by ``started_at``; ``bound`` is the newest last key of those
+    slices that are full. Every such session with a message newer than ``bound`` joins it (one index seek per
+    session on ``idx_messages_session``: a heartbeat can lag messages by days), and each member is walked up every
+    parent edge to its root (ids deduplicated, so a cycle ends the walk). A row outside the window that can shape
+    the page therefore has its key, its ``started_at`` and its newest message at or below ``bound``, so its recency
+    (``_sql_freshest_of``) is too: a root outside it ranks at or below ``bound``. ``bound`` None: the window holds
+    every such row. Run it in the ranked query's read transaction."""
+    if os.environ.get(_RECENT_WINDOW_DISABLE_ENV, "1").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    n = max(1, min(int(n), 2048))
+    excluded, shaping, params = "", "", []
+    if exclude_sources:
+        marks = _session_ids_placeholders(exclude_sources)
+        excluded = f"WHERE s.source NOT IN ({marks})"
+        shaping = f"WHERE (s.source NOT IN ({marks}) OR s.parent_session_id IS NOT NULL)"
+        params.extend(exclude_sources)
+    key = "COALESCE(s.last_activity_at, s.started_at)"
+    slices = conn.execute(f"""
+            WITH by_activity(id, k) AS (SELECT s.id, {key} FROM sessions s {excluded}
+                                        ORDER BY {key} DESC, s.started_at DESC LIMIT ?),
+                 by_chain(id, k) AS (SELECT s.id, {key} FROM sessions s WHERE s.parent_session_id IS NOT NULL
+                                     ORDER BY {key} DESC, s.started_at DESC LIMIT ?),
+                 by_start(id, k) AS (SELECT s.id, s.started_at FROM sessions s {shaping}
+                                     ORDER BY s.started_at DESC LIMIT ?)
+            SELECT 0, id, NULL FROM by_activity UNION SELECT 0, id, NULL FROM by_chain
+            UNION SELECT 0, id, NULL FROM by_start
+            UNION ALL SELECT 1, COUNT(*), MIN(k) FROM by_activity
+            UNION ALL SELECT 1, COUNT(*), MIN(k) FROM by_chain
+            UNION ALL SELECT 1, COUNT(*), MIN(k) FROM by_start
+        """, params + [n, n] + params + [n]).fetchall()
+    seeds, bounds = [], []
+    for kind, value, last_key in slices:
+        if kind == 0:
+            seeds.append(value)
+        elif value >= n:  # a full slice: rows beyond it exist, none keyed above its last key
+            if not isinstance(last_key, (int, float)) or isinstance(last_key, bool):
+                return None  # a NULL or non-numeric key bounds nothing
+            bounds.append(last_key)
+    bound = max(bounds) if bounds else None
+    seed_sql = "SELECT value FROM json_each(?)"
+    seed_params: list[Any] = [json.dumps([sid for sid in seeds if sid is not None])]
+    if bound is not None:
+        scoped = f"{shaping} AND" if shaping else "WHERE"
+        seed_sql += (f" UNION SELECT s.id FROM sessions s {scoped} EXISTS (SELECT 1 FROM messages m INDEXED BY"
+                     " idx_messages_session WHERE m.session_id = s.id AND m.timestamp > ?)")
+        seed_params.extend([*params, bound])
+    walked = conn.execute(f"""
+            WITH RECURSIVE seed(id) AS ({seed_sql}),
+            up(id) AS (
+                SELECT id FROM seed
+                UNION
+                SELECT child.parent_session_id FROM up JOIN sessions child ON child.id = up.id
+                WHERE child.parent_session_id IS NOT NULL
+            )
+            SELECT id FROM up
+        """, seed_params).fetchall()
+    return sorted(sid for (sid,) in walked if sid is not None), bound
+
+
+def _windowed_page(conn, n: int, exclude_sources, limit: int, ranked) -> Optional[list]:
+    """The first page ranked over ``_recent_window``'s roots, in one read snapshot with the window, when it provably
+    equals the full ranking's page: full, and its last row strictly newer than any row outside the window can be.
+    None otherwise (the caller ranks every row)."""
+    own = not conn.in_transaction
+    if own:
+        conn.execute("BEGIN")
+    try:
+        window = _recent_window(conn, n, exclude_sources)
+        if window is None:
+            return None
+        ids, bound = window
+        query, ranked_params = ranked(ids)
+        rows = conn.execute(query, ranked_params).fetchall()
+        if bound is None:
+            return rows  # the window held every row
+        last = rows[limit - 1]["_effective_last_active"] if len(rows) >= limit else None
+        return rows if last is not None and _recency_after(last, bound) else None
+    finally:
+        if own and conn.in_transaction:
+            conn.execute("ROLLBACK")
+
+
+def _recency_after(value: Any, bound: Any) -> bool:
+    """*value* is a number strictly newer than the number *bound*."""
+    numeric = (int, float)
+    return (isinstance(value, numeric) and isinstance(bound, numeric) and not isinstance(value, bool)
+            and value > bound)
+
+
 def _list_row(row: sqlite3.Row) -> dict[str, Any]:
     """Project a list_sessions_rich row: shape the preview, drop internal ordering columns."""
     s = _session_row_dict(row)
@@ -1279,14 +1379,16 @@ def list_sessions_rich(
     id_query: str | None = None, search_query: str | None = None, compact_rows: bool = False,
     include_pinned: bool = False, session_key: str | None = None, include_hidden: bool = False,
     include_subagents: bool = False, local_created_sources: Sequence[str] | None = None,
-    workspace_key: str | None = None,
+    workspace_key: str | None = None, recent_candidates: int | None = None,
 ) -> list[dict[str, Any]]:
     """List sessions with preview and ``last_active`` in one query. ``order_by_last_active`` sorts
     by the chain TIP via a recursive CTE (the only path honouring ``id_query`` / ``search_query``);
     ``include_pinned`` back-fills pins the page missed, still obeying the other
     filters except archived: a pin is an explicit keep, so a pinned row stamped
     archived must still return. ``local_created_sources`` restricts ``source='local'``
-    rows to those surfaces before LIMIT/OFFSET. ``workspace_key``: the ``hermes -c`` folder rule."""
+    rows to those surfaces before LIMIT/OFFSET. ``workspace_key``: the ``hermes -c`` folder rule.
+    ``recent_candidates``: rank only the roots of a window of recently active rows first (``_recent_window``)
+    and keep that page only when it provably equals the full ranking's; otherwise rank every row."""
     holder.flush_for_read()  # rows carry token/cost totals
     where_clauses, params = _session_filter_where(
         exclude_children=not include_children, source=source, sources=sources, session_key=session_key,
@@ -1317,7 +1419,8 @@ def list_sessions_rich(
         "" if compact_rows else "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash"
     )
     from_sessions = f"FROM sessions s\n                {prompt_join}"
-    if order_by_last_active:
+    def ranked_query(clauses: list[str], params: list[Any]) -> tuple[str, list[Any]]:
+        where_sql = _where_sql(clauses)
         # The CTE walks compression-continuation edges forward from the admitted
         # rows; MAX over the chain gives effective_last_active in SQL. Do NOT
         # require child.started_at >= parent.ended_at: races insert the
@@ -1338,7 +1441,7 @@ def list_sessions_rich(
         # a child, at LIMIT 1 or 200.
         id_needle = (id_query or "").strip().lower()
         search_needle = (search_query or "").strip().lower()
-        seed_where = where_sql if (id_needle or search_needle) else _where_sql(where_clauses + [
+        seed_where = where_sql if (id_needle or search_needle) else _where_sql(clauses + [
             "EXISTS (SELECT 1 FROM sessions _seed_c WHERE _seed_c.parent_session_id = s.id)"])
         outer_where, id_params = _chain_search_where(where_sql, id_needle, search_needle)
         query = f"""
@@ -1379,7 +1482,19 @@ def list_sessions_rich(
                 {prompt_join}
                 ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
             """
-        params = params + params + id_params + [limit, offset]  # WHERE binds twice (seed + outer)
+        return query, params + params + id_params + [limit, offset]  # WHERE binds twice (seed + outer)
+
+    if order_by_last_active:
+        window_rows = None
+        if (recent_candidates and offset == 0 and limit > 0 and not source and not sources and not session_key
+                and not local_created_sources and not (id_query or "").strip() and not (search_query or "").strip()):
+            window_rows = holder._read_retrying_ioerr(lambda conn: _windowed_page(
+                conn, int(recent_candidates), exclude_sources, limit,
+                lambda ids: ranked_query(where_clauses + ["s.id IN (SELECT value FROM json_each(?))"],
+                                         params + [json.dumps(ids)])))
+        if window_rows is None:
+            query, ranked_params = ranked_query(where_clauses, params)
+            window_rows = holder._read_all(query, ranked_params)
     else:
         query = f"""
                 {select_head}{_sql_session_last_active("s")} AS last_active
@@ -1389,7 +1504,8 @@ def list_sessions_rich(
                 LIMIT ? OFFSET ?
             """
         params.extend([limit, offset])
-    sessions = [_list_row(row) for row in holder._read_all(query, params)]
+        window_rows = holder._read_all(query, params)
+    sessions = [_list_row(row) for row in window_rows]
     # Pinned back-fill runs BEFORE compression projection so a back-filled root
     # projects to its tip like any other row. Do not inherit the archived
     # constraint: the sidebar lists with include_archived=False, and a pin
