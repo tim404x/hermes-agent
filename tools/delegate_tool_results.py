@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import json
 import threading
+import uuid
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 from tools import delegate_tool_config
@@ -417,38 +418,74 @@ _TREE_COUNTERS = (("input_tokens", "session_input_tokens"), ("output_tokens", "s
 def _number(value: Any) -> float:
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
 
+def _session_epoch(agent) -> int:
+    """The agent's session generation (``AIAgent.reset_session_state`` bumps it on /new, /resume, /branch)."""
+    epoch = getattr(agent, "_session_reset_epoch", 0)
+    return epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else 0
+
+def _from_older_session(children, parent_agent) -> bool:
+    """True when a child was built in an earlier session of ``parent_agent`` (a background unit finishing after
+    /new): its spend belongs to that session, never to the new session's totals."""
+    current = _session_epoch(parent_agent)
+    for child in children:
+        origin = getattr(child, "_delegate_parent_epoch", None)
+        if isinstance(origin, int) and not isinstance(origin, bool) and origin != current:
+            return True
+    return False
+
+def _tree_ids(agent) -> set:
+    ids = getattr(agent, "_delegation_tree_ids", None)
+    return ids if isinstance(ids, set) else set()
+
+def _subagent_identity(child) -> str:
+    """The durable subagent id (the same across an action=continue rebuild), else a stable per-object token."""
+    sid = getattr(child, "_subagent_id", None)
+    if isinstance(sid, str) and sid:
+        return sid
+    token = getattr(child, "_delegation_usage_identity", None)
+    if not isinstance(token, str):
+        token = child._delegation_usage_identity = f"object-{uuid.uuid4().hex}"
+    return token
+
 def _child_tree_spend(child) -> dict[str, float]:
     """Everything ``child`` has spent so far: its own counters plus the tree it delegated to (its
     ``delegation_tree_usage``). Cost is its session cost, which the cost rollup already made tree-wide."""
     below = getattr(child, "delegation_tree_usage", None)
     below = below if isinstance(below, dict) else {}
-    spend = {"subagents": 1 + _number(below.get("subagents")),
-             **{key: _number(getattr(child, attr, 0)) + _number(below.get(key)) for key, attr in _TREE_COUNTERS},
-             "cost_usd": float(_number(getattr(child, "session_estimated_cost_usd", 0.0)))}
-    return spend
+    return {**{key: _number(getattr(child, attr, 0)) + _number(below.get(key)) for key, attr in _TREE_COUNTERS},
+            "cost_usd": float(_number(getattr(child, "session_estimated_cost_usd", 0.0)))}
 
 def _rollup_tree_usage(children, parent_agent) -> dict[str, float]:
     """This call's delegation-tree spend (the children and everything below them), folded into the parent's
-    ``delegation_tree_usage`` so it reaches the grandparent in turn. A child that reports again (continue)
-    adds only what it spent since its last report."""
+    ``delegation_tree_usage`` so it reaches the grandparent in turn. A child that reports again adds only what it
+    spent since its last report, and a subagent counts once per session by its durable id, so an
+    action=continue rebuild of the same subagent is not a new one. Children built in an earlier session of the
+    parent report their spend here but never fold into the current session's totals."""
+    children = [child for child in children if child is not None]
     usage = {"subagents": 0, **{key: 0 for key, _ in _TREE_COUNTERS}, "cost_usd": 0.0}
+    ids: set = set()
     for child in children:
-        if child is None:
-            continue
         spend, reported = _child_tree_spend(child), getattr(child, "_delegation_usage_reported", None)
         reported = reported if isinstance(reported, dict) else {}
         for key, value in spend.items():
             usage[key] += max(0, value - _number(reported.get(key)))
         child._delegation_usage_reported = spend
+        ids |= {_subagent_identity(child)} | _tree_ids(child)
     usage["cost_usd"] = round(usage["cost_usd"], 6)
     if parent_agent is None:  # the lifecycle API may run a child with no live parent: nothing to fold into
+        usage["subagents"] = len(ids)
         return usage
     from agent.prompt_cache_lifecycle import session_totals_lock
     with session_totals_lock(parent_agent):
+        known = _tree_ids(parent_agent)
+        usage["subagents"] = len(ids - known)
+        if _from_older_session(children, parent_agent):
+            return usage
         total = getattr(parent_agent, "delegation_tree_usage", None)
         total = total if isinstance(total, dict) else {}
         parent_agent.delegation_tree_usage = {key: round(_number(total.get(key)) + value, 6) if key == "cost_usd"
                                               else _number(total.get(key)) + value for key, value in usage.items()}
+        parent_agent._delegation_tree_ids = known | ids
     return usage
 
 def _finalize_child_results(
@@ -470,7 +507,9 @@ def _finalize_child_results(
                 entry["summary"] = parent_copy(entry["summary"], forced)
         _apply_summary_budget(results, parent_agent)
         _notify_memory_manager(results, task_list, child_by_index, parent_agent)
-        _rollup_children_cost(parent_agent, _fire_subagent_stop_hooks(results, child_by_index, parent_agent))
+        children_cost = _fire_subagent_stop_hooks(results, child_by_index, parent_agent)
+        if not _from_older_session(child_by_index.values(), parent_agent):  # /new since: not this session's spend
+            _rollup_children_cost(parent_agent, children_cost)
         return _rollup_tree_usage(child_by_index.values(), parent_agent)
 
 def _run_child_lifecycle(task_index: int, goal: str, child=None, parent_agent=None) -> dict[str, Any]:
