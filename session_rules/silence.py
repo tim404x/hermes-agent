@@ -250,4 +250,17 @@ def is_partial_silence_marker(text: Any) -> bool:
     return any(
         c and any(marker.startswith(c) for marker in markers)
         for c, markers in _canonical_silence_candidates(text)
-    )
+    ) or _awaits_signoff_sequence_end(text)
+
+
+# Code points that complete a sign-off sequence a stream can cut mid-way: a keycap's variation selector
+# and enclosing keycap (``1`` + U+FE0F + U+20E3), or the emoji a trailing zero-width joiner announces.
+_SEQUENCE_COMPLETIONS = ("\u20e3", "\ufe0f\u20e3", "\U0001F600")
+
+
+def _awaits_signoff_sequence_end(text: Any) -> bool:
+    """True while ``text`` is a marker whose sign-off sequence is still incomplete (``NO_REPLY 1`` on the way
+    to ``NO_REPLY 1\ufe0f\u20e3``): the next code points may make it a marker, so a stream holds it."""
+    if not isinstance(text, str) or not text.strip() or text.rstrip() != text:
+        return False
+    return any(is_intentional_silence_response(text + tail) for tail in _SEQUENCE_COMPLETIONS)
