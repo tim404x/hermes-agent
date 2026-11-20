@@ -231,6 +231,8 @@ const en: BotsMessages = {
     openUnreachableMessage: 'Check it is online and try again.',
     openChatFailedTitle: botName => `Could not open ${botName}’s chat`,
     openChatFailedMessage: 'Try again.',
+    openUnconfirmedTitle: botName => `Couldn’t confirm ${botName}’s chat`,
+    openUnconfirmedMessage: 'Showing the last saved copy. Sending is paused until it’s confirmed; your message stays in the box.',
     openGateways: 'Open Gateways',
     chatEmpty: 'Say something to get started.',
     kickoff: 'Hey, tell me about yourself!'
@@ -667,6 +669,8 @@ const ja: BotsMessages = {
     openUnreachableMessage: 'オンラインか確認して、もう一度お試しください。',
     openChatFailedTitle: botName => `${botName} のチャットを開けませんでした`,
     openChatFailedMessage: 'もう一度お試しください。',
+    openUnconfirmedTitle: botName => `${botName} のチャットを確認できませんでした`,
+    openUnconfirmedMessage: '最後に保存された内容を表示しています。確認できるまで送信は保留され、メッセージは入力欄に残ります。',
     openGateways: 'ゲートウェイを開く',
     chatEmpty: '何か書いて始めましょう。',
     kickoff: 'こんにちは、自己紹介をしてください！'
@@ -1096,6 +1100,8 @@ const zh: BotsMessages = {
     openUnreachableMessage: '请确认它在线后重试。',
     openChatFailedTitle: botName => `无法打开 ${botName} 的聊天`,
     openChatFailedMessage: '请重试。',
+    openUnconfirmedTitle: botName => `无法确认 ${botName} 的聊天`,
+    openUnconfirmedMessage: '正在显示上次保存的内容。确认之前暂停发送，你的消息会留在输入框中。',
     openGateways: '打开网关',
     chatEmpty: '说点什么开始吧。',
     kickoff: '你好，介绍一下你自己吧！'
@@ -1518,6 +1524,8 @@ const zhHant: BotsMessages = {
     openUnreachableMessage: '請確認它在線上後再試一次。',
     openChatFailedTitle: botName => `無法開啟 ${botName} 的聊天`,
     openChatFailedMessage: '請再試一次。',
+    openUnconfirmedTitle: botName => `無法確認 ${botName} 的聊天`,
+    openUnconfirmedMessage: '正在顯示上次儲存的內容。確認之前暫停傳送，你的訊息會留在輸入框中。',
     openGateways: '開啟閘道',
     chatEmpty: '說點什麼開始吧。',
     kickoff: '你好，介紹一下你自己吧！'
