@@ -4,7 +4,10 @@ The first message page of a lineage in a process dedupes the whole lineage (``li
 1.1 s of GIL-held CPU on a long Bot Chat, paid by the first switch to each bot after every update or restart.
 ``prewarm_bot_chat_page`` builds that projection off the request path; the Desktop's page read then reuses it.
 """
+import asyncio
 from pathlib import Path
+
+import pytest
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -85,3 +88,17 @@ def test_prewarm_builds_each_bot_chat_page_and_the_switch_reuses_it(tmp_path, mo
     assert neo_page["messages"][-1]["content"] == "reply 2.39"
     assert apex_page["messages"][-1]["content"] == "reply 1.9"
     assert len(built) == 2  # both pages came from the projections the prewarm built
+
+
+@pytest.mark.asyncio
+async def test_the_server_start_warms_every_profile_once_its_loop_is_serving(monkeypatch):
+    from hermes_cli import web_server
+    from hermes_cli.web_routers import sessions
+    from tests.waiting import async_wait_until
+
+    warmed = []
+    monkeypatch.setattr("hermes_cli.profiles.list_profile_names", lambda: ["default", "apex"])
+    monkeypatch.setattr(sessions, "prewarm_bot_chat_page", lambda name: warmed.append(name) or True)
+    web_server._start_bot_chat_prewarm(delay_s=0.01)
+    await async_wait_until(lambda: warmed == ["default", "apex"])
+
