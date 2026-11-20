@@ -273,11 +273,11 @@ def _age_window(profile_home: Path, session_id: str, seconds: float) -> None:
     then = time.time() - seconds
     conn = sqlite3.connect(profile_home / "state.db")
     try:
-        origin = json.loads(conn.execute("SELECT origin_json FROM sessions WHERE id = ?",
-                                          (session_id,)).fetchone()[0])
-        origin["side_window"]["at"] = then
-        conn.execute("UPDATE sessions SET started_at = ?, last_activity_at = ?, origin_json = ? WHERE id = ?",
-                     (then, then, json.dumps(origin), session_id))
+        stamp = json.loads(conn.execute("SELECT side_window_json FROM sessions WHERE id = ?",
+                                         (session_id,)).fetchone()[0])
+        stamp["at"] = then
+        conn.execute("UPDATE sessions SET started_at = ?, last_activity_at = ?, side_window_json = ? WHERE id = ?",
+                     (then, then, json.dumps(stamp), session_id))
         conn.execute("UPDATE messages SET timestamp = ? WHERE session_id = ?", (then, session_id))
         conn.commit()
     finally:
