@@ -25,6 +25,7 @@ __all__ = [
     "IMPORT_MAX_TOTAL_MESSAGES",
     "ORPHAN_REAP_END_REASON",
     "PRUNE_FILTER_NAMES",
+    "SESSION_COUNTER_FIELDS",
     "SESSION_PROJECTION_FIELDS",
     "ExportedMessage",
     "ForeignImportResult",
@@ -35,6 +36,7 @@ __all__ = [
     "PruneCriteria",
     "PruneReclaimEstimate",
     "PruneResult",
+    "SessionChangeDigests",
     "SessionExport",
     "SessionExportRow",
     "SessionLineageExport",
@@ -74,6 +76,35 @@ SESSION_PROJECTION_FIELDS: tuple[str, ...] = (
     "tool_call_count", "cwd", "git_branch", "git_repo_root", "title", "title_source", "profile_name", "archived", "pinned", "hidden",
     "last_read_at", "handoff_state", "project_pinned_at",
 )
+
+#: The projected counters every appended message moves: ``session_change_digests`` keeps them out of ``listed`` (only
+#: ``message_count``'s zero / non-zero edge stays there) and signs them on their own.
+SESSION_COUNTER_FIELDS: tuple[str, ...] = ("message_count", "tool_call_count")
+
+
+@dataclass(frozen=True, slots=True)
+class SessionChangeDigests:
+    """``session_change_digests``' answer: 16-byte digests over one store's ``sessions`` rows, split the way a client
+    lists them (tui_gateway/change_watcher.py signs ``sessions.changed`` / ``sessions.activity`` / ``jobs.changed``).
+
+    A *listed* row is one a human session list can show: its ``source`` is not one of ``INTERNAL_LISTING_SOURCES`` and
+    it is not a delegate run (``source`` ``subagent``, or a child whose ``model_config`` carries ``_delegate_from``)
+    unless ``include_subagents``. A *watched* row is a hidden delegate run (not listed, own source not internal) whose
+    delegate chain starts at a row with a non-internal source (a chat's subagent): no list shows it, but a window can
+    watch its transcript. Every other row is *internal* (worker rows, and delegate chains a worker started). Digests are
+    only ever compared with the same store's previous answer (row order is the store's own)."""
+
+    #: The ``SESSION_PROJECTION_FIELDS`` the store has.
+    fields: tuple[str, ...]
+    #: Listed rows: every projected column but the counters, plus whether ``message_count`` is above zero.
+    listed: bytes
+    #: Listed rows outside ``running_ids``: ``id`` and the counters; and watched rows: every projected column.
+    counts: bytes
+    #: Listed rows inside ``running_ids``: ``id`` and the counters.
+    running_counts: bytes
+    #: Internal rows: every projected column.
+    internal: bytes
+
 
 #: One exported transcript row: the stored row ``MessageRepository.read_transcript`` serves; ``as_wire_row()`` is its exported wire dict.
 ExportedMessage = TranscriptRow
@@ -383,6 +414,18 @@ class SessionMaintenance(Protocol):
 
     def session_projection_digest(self, *, busy_timeout_s: float = 0.05) -> Optional[tuple[tuple[str, ...], bytes]]:
         """The ``SESSION_PROJECTION_FIELDS`` the store has and a 16-byte digest over those columns of every row ordered by id (tui_gateway/change_watcher.py:205-262); None when the store has no sessions table. Contention past ``busy_timeout_s`` raises ``StoreContention``."""
+        ...
+
+    def session_change_digests(
+        self, *, include_subagents: bool = False, running_ids: Sequence[str] = (), busy_timeout_s: float = 0.05,
+    ) -> Optional[SessionChangeDigests]:
+        """:class:`SessionChangeDigests` over every ``sessions`` row, in one read. A heartbeat (``last_activity_at`` and
+        the other unprojected columns) moves nothing; a counter-only change to a listed row moves ``counts`` (or
+        ``running_counts`` when its id is in ``running_ids``) and leaves ``listed`` alone unless ``message_count``
+        crosses zero; any other projected change to a listed row, a listed row added or removed, moves ``listed``; any
+        projected change to a watched row moves ``counts`` only, and to an internal row ``internal`` only. A store without some of the columns signs the
+        ones it has (no ``source``: every row is listed). None when the store has no sessions table. Contention past
+        ``busy_timeout_s`` raises ``StoreContention``."""
         ...
 
     def retained_tree_is_live(self, worktree_path: str, *, pending_only: bool = False) -> bool:
