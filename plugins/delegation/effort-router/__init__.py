@@ -4,7 +4,8 @@ Same route as ``default`` (the ``delegation`` section), plus a per-task ``effort
 task. Two rules keep a cheap level away from work that matters:
 
 - **Floor.** Work whose goal or context touches money, legal, sends, code changes, destructive operations or
-  research synthesis, or names any write/action verb (en/pt/fr/es), never runs below ``high``: an explicit
+  research synthesis, or names any write/action verb (en/pt/fr/es), never runs below ``high``, hyphenated
+  compounds included (``wire-transfer``, ``re-send``): an explicit
   low/medium pick is raised, and so is a default that is empty, disabled or below high. The route then
   carries ``high`` explicitly, so the child can never inherit a low parent level.
 - **Auto.** When the parent omits ``effort``, the level drops to ``medium`` only for a positively identified
@@ -42,6 +43,9 @@ def _words(*alternatives: str) -> re.Pattern:
 
 # Floor triggers on accent-folded goal + context, first match names the category. A false positive only raises
 # a task to high (the safe direction), so the lists lean broad; ``\w*`` stems cover pt/fr/es conjugations.
+# Hyphens (and other dashes) separate words here: every one for the sensitive topics, so ``wire-transfer`` and
+# ``invoice-1023`` still name money; for the generic write verbs (``_LETTER_HYPHENS_ONLY``) only one between two
+# letters, so ``re-write`` is a write but a name like ``run-1119`` is not an action.
 _FLOOR = (
     ("money", re.compile(r"[$€£¥]\s?\d|\d\s?[$€£¥]|r\$")),
     ("money", _words(
@@ -110,6 +114,9 @@ _FLOOR = (
         r"planifi\w*", r"escrib\w*", r"modific\w*", r"cambi\w*", r"actualiz\w*", r"reemplaz\w*", r"cre(?:a|ar)",
         r"agreg\w*", r"anad\w*", r"renombr\w*", r"muev\w*", r"ejecut\w*", r"aprob\w*")),
 )
+_LETTER_HYPHENS_ONLY = frozenset({"write"})
+_DASHES = re.compile(r"[\u2010-\u2015\u2212]")  # hyphen, en/em dash, minus ... all read as "-"
+_LETTER_HYPHEN = re.compile(r"(?<=[^\W\d_])-(?=[^\W\d_])")
 
 # Auto level: the goal STARTS with one read-only verb ...
 _MECHANICAL = re.compile(
@@ -139,8 +146,10 @@ def _fold(text: str) -> str:
 def floor_reason(goal: str, context: str = "") -> Optional[str]:
     """The category (money, legal, send, code, destructive, research, write) that keeps a task at high or above,
     or None."""
-    text = _fold(f"{goal}\n{context}")
-    return next((category for category, pattern in _FLOOR if pattern.search(text)), None)
+    text = _DASHES.sub("-", _fold(f"{goal}\n{context}"))
+    split = {False: text.replace("-", " "), True: _LETTER_HYPHEN.sub(" ", text)}
+    return next((category for category, pattern in _FLOOR
+                 if pattern.search(split[category in _LETTER_HYPHENS_ONLY])), None)
 
 
 def is_mechanical(goal: str) -> bool:
