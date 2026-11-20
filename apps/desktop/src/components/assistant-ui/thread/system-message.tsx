@@ -212,10 +212,15 @@ export const SystemMessage: FC = () => {
   const multiline = text.includes('\n')
 
   // A one-line runtime notice (model changed, resumed interrupted turn) is an event like any other.
+  // Its label wraps in full with links clickable: a fallback reason or an approval-timeout hint is
+  // the whole message, so it is never truncated.
   if (!multiline) {
     return (
       <MessagePrimitive.Root className="w-full min-w-0 self-start" data-role="system" data-slot="aui_system-message-root">
-        <EventRow icon={<Codicon className={EVENT_GLYPH_CLASS} name="info" size="0.8125rem" />} label={text} />
+        <EventRow
+          icon={<Codicon className={EVENT_GLYPH_CLASS} name="info" size="0.8125rem" />}
+          label={<LinkifiedText explicitOnly pretty={false} text={text} />}
+        />
       </MessagePrimitive.Root>
     )
   }
