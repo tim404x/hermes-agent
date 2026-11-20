@@ -33,6 +33,7 @@ def _turn_runner(*, platform=Platform.TELEGRAM, display_kind=None, reply_expecte
     ctx.voice_turn = False
     ctx.agent_holder = [None]
     ctx.tools_holder = [None]
+    ctx.stream_consumer_holder = [None]
     runner = SimpleNamespace(
         _consume_pending_turn_sidecar_notes=lambda _key: (),
         _load_daybreak=lambda _source: False,
@@ -74,3 +75,45 @@ def test_a_bot_dm_into_a_chat_gets_no_ack():
     turn = _turn_runner(platform=Platform.LOCAL)
     turn._ctx.message = "Message from 🤖 Neo | Chief of Staff (@hermes): Tim's ask: review the model"
     assert _wire(turn, stale=ACK_FIRST_NOTE) == ""
+
+
+def _stream_is_the_message_consumer(*, stream_deltas: bool):
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    from tests.gateway.test_stream_final_contract import _make_draft_adapter
+
+    consumer = GatewayStreamConsumer(_make_draft_adapter(), "D1", StreamConsumerConfig(
+        transport="auto", chat_type="dm", edit_interval=0.01, buffer_threshold=1, cursor=""))
+    consumer.stream_deltas_enabled = stream_deltas
+    return consumer
+
+
+def test_a_stream_that_is_the_message_gets_no_ack_while_it_streams_the_reply():
+    # Slack native streaming: one append-only message per turn. A streamed ack only marks a segment break
+    # there (no new message), so the answer would extend the ack's own message.
+    turn = _turn_runner(platform=Platform.SLACK)
+    turn._ctx.stream_consumer_holder = [_stream_is_the_message_consumer(stream_deltas=True)]
+    assert _wire(turn, stale=ACK_FIRST_NOTE) == ""
+
+
+def test_the_same_transport_with_text_streaming_off_sends_the_ack_alone_and_arms_it():
+    # Unstreamed commentary goes out as its own send on a cumulative transport too.
+    turn = _turn_runner(platform=Platform.SLACK)
+    turn._ctx.stream_consumer_holder = [_stream_is_the_message_consumer(stream_deltas=False)]
+    assert _wire(turn) == ACK_FIRST_NOTE
+
+
+@pytest.mark.asyncio
+async def test_unstreamed_commentary_on_a_stream_that_is_the_message_is_its_own_send():
+    """The contract the arming above relies on, on the stream-is-the-message adapter fixture."""
+    import asyncio
+
+    consumer = _stream_is_the_message_consumer(stream_deltas=False)
+    task = asyncio.create_task(consumer.run())
+    consumer.on_commentary("Checking the build logs, about a minute.")
+    assert await asyncio.to_thread(consumer.flush_pending_sync)
+    consumer.finish("The build passed.")
+    await task
+    sends = [call["content"] for call in consumer.adapter.send_calls]
+    assert "Checking the build logs, about a minute." in sends
+    assert not any("The build passed." in s and "Checking" in s for s in sends + [
+        d["content"] for d in consumer.adapter.draft_calls])
