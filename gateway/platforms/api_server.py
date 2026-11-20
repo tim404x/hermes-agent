@@ -307,6 +307,25 @@ def _request_agent_overrides(
     return overrides
 
 
+TOOLSETS_HEADER, TOOLSETS_APPLIED_HEADER = "X-Hermes-Toolsets", "X-Hermes-Toolsets-Applied"
+
+
+def _requested_toolset_narrowing(header_value: Optional[str], *, authenticated: bool) -> Optional[frozenset[str]]:
+    """``X-Hermes-Toolsets`` -> the toolset names a caller narrows its request to, or None (no
+    narrowing). Honoured only for a request the configured API key authenticated; ``none`` is the
+    empty set (no tools). Narrowing only ever intersects the server's own selection."""
+    if header_value is None or not authenticated:
+        return None
+    names = frozenset(name.strip() for name in header_value.split(",") if name.strip())
+    return frozenset() if names == {"none"} else names
+
+
+def _narrow_toolsets(enabled: Any, narrowing: Any) -> list[str]:
+    """``enabled`` intersected with ``narrowing`` (sorted); never adds a toolset."""
+    allowed = set(narrowing)
+    return sorted(name for name in set(enabled or ()) if name in allowed)
+
+
 def _request_relay_metadata(body: Any) -> dict[str, Any]:
     """Extract Relay metadata from an OpenAI request body."""
     if not isinstance(body, dict):
@@ -1448,6 +1467,27 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         logger.warning("API server rejected invalid API key: %s", self._request_audit_log_suffix(request))
         return self._auth_failed_response()
 
+    def _request_toolsets_narrowing(self, request: web.Request) -> Optional[list[str]]:
+        """Effective toolsets for an authenticated ``X-Hermes-Toolsets`` request: the requested
+        names intersected with this profile's ``api_server`` toolsets. None when the header is
+        absent or not honoured (no API key configured), so the request runs exactly as before."""
+        narrowing = _requested_toolset_narrowing(
+            request.headers.get(TOOLSETS_HEADER),
+            authenticated=bool(self._expected_api_key()) and self._check_auth(request) is None)
+        if narrowing is None:
+            return None
+        from gateway.run import _load_gateway_config
+        from hermes_cli.tools_config import _get_platform_tools
+        with self._profile_scope(_api_request_profile.get()):
+            return _narrow_toolsets(_get_platform_tools(_load_gateway_config(), "api_server"), narrowing)
+
+    @staticmethod
+    def _toolsets_applied_headers(effective: Optional[list[str]]) -> dict[str, str]:
+        """``X-Hermes-Toolsets-Applied`` for an honoured narrowing (``none`` when empty), else {}."""
+        if effective is None:
+            return {}
+        return {TOOLSETS_APPLIED_HEADER: ",".join(effective) or "none"}
+
     @staticmethod
     def _normalize_callback_platform(value: str) -> str:
         normalized = (value or "").strip().lower().replace("-", "_")
@@ -2187,8 +2227,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         model_options: Optional[dict[str, Any]] = None, route: Optional[dict[str, Any]] = None,
         session_model: Optional[str] = None, confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[dict[str, Any]] = None,
-        room_execution_policy: Optional[dict[str, Any]] = None) -> Any:
+        room_execution_policy: Optional[dict[str, Any]] = None,
+        toolsets_narrowing: Optional[list[str]] = None) -> Any:
         """Create an AIAgent from the gateway runtime config + platform toolsets.
+        ``toolsets_narrowing`` (an authenticated ``X-Hermes-Toolsets``) intersects the final selection.
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
         session ``/model`` override, disables the fallback chain and fails closed."""
@@ -2225,6 +2267,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             policy = RoomExecutionPolicy.from_mapping(room_execution_policy or {})
             enabled_toolsets = list(policy.enabled_toolsets)
             max_iterations = policy.max_iterations
+        if toolsets_narrowing is not None:
+            # [] stays [] (AIAgent: no toolsets), never None (= every toolset).
+            enabled_toolsets = _narrow_toolsets(enabled_toolsets, toolsets_narrowing)
         # Reasoning resolves against the model that actually runs (per-model overrides), so only
         # after the precedence chain settles; an explicit request wins.
         if request_reasoning_config is None:
@@ -3639,7 +3684,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session_history_delivery: str = "", turn_author: Optional[dict[str, Any]] = None,
         relay_metadata: Optional[dict[str, Any]] = None, notification_category: str = "result",
         resume_unanswered_turn: bool = False, approval_notify_callback=None,
-        approval_session_key: Optional[str] = None, walked_from: Optional[str] = None) -> tuple:
+        approval_session_key: Optional[str] = None, walked_from: Optional[str] = None,
+        toolsets_narrowing: Optional[list[str]] = None) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``approval_notify_callback`` (with ``approval_session_key``) routes dangerous-command
         approval requests to the caller's stream, keyed like ``/v1/runs`` approvals (#51871).
@@ -3669,7 +3715,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 bind_declared_conversation=bind_declared_conversation, request_id=request_id, run_owner_scope=run_owner_scope,
                 history_from_session=history_from_session, session_history_delivery=session_history_delivery,
                 turn_author=turn_author, resume_unanswered_turn=resume_unanswered_turn, relay_metadata=relay_metadata,
-                approval_notify_callback=approval_notify_callback, approval_session_key=approval_session_key)
+                approval_notify_callback=approval_notify_callback, approval_session_key=approval_session_key,
+                toolsets_narrowing=toolsets_narrowing)
         loop = asyncio.get_running_loop()
         # ContextVars do not follow run_in_executor threads: capture here, re-enter in _run().
         request_profile = _api_request_profile.get()
@@ -3694,7 +3741,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         reasoning_callback=reasoning_callback, status_callback=status_callback,
                         gateway_session_key=gateway_session_key, requested_model=requested_model,
                         requested_provider=requested_provider, model_options=model_options, route=route,
-                        session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
+                        session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock,
+                        toolsets_narrowing=toolsets_narrowing)
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if resume_unanswered_turn:
