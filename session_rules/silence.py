@@ -325,16 +325,20 @@ def is_autonomous_silence_response(response: Any) -> bool:
     lines = [ln for ln in stripped.splitlines() if ln.strip()]
     # Models often wrap the literal marker in code formatting (`[SILENT]`, a fenced block);
     # only symmetric whole-value / own-line wrapping is peeled, so a mid-body mention still delivers.
-    candidates = (stripped, lines[0], lines[-1])
+    # An own line peels only to the bracketed sentinel: a bare token in a code span after a lead-in
+    # ("The literal value is:\n`NO_REPLY`") is a quoted value, not the lane going quiet.
+    peeled_lines = (_strip_code_wrap(ln) for ln in (lines[0], lines[-1]))
     # Bracketed form only for the prefix rule, so a bare "Silent retry succeeded" is NOT swallowed.
     # Same de-punctuating forms as the interactive rule, so ``【静默】`` / ``静默。`` cannot
     # be suppressed in chat yet delivered by cron.
     return (
         _canonical_silence_candidate(_strip_leading_code_span(stripped)).startswith(_BRACKETED_SILENCE_MARKERS)
         or _is_damaged_silent_marker(stripped)
+        or any(is_intentional_silence_response(c) for c in (stripped, lines[0], lines[-1]))
+        or is_intentional_silence_response(_strip_code_wrap(stripped))
         or any(
-            is_intentional_silence_response(c) or is_intentional_silence_response(_strip_code_wrap(c))
-            for c in candidates
+            _canonical_silence_candidate(p).startswith("[") and is_intentional_silence_response(p)
+            for p in peeled_lines
         )
     )
 
@@ -360,4 +364,17 @@ def is_partial_silence_marker(text: Any) -> bool:
     return any(
         c and any(marker.startswith(c) for marker in markers)
         for c, markers in _canonical_silence_candidates(text)
-    )
+    ) or _awaits_signoff_sequence_end(text)
+
+
+# Code points that complete a sign-off sequence a stream can cut mid-way: a keycap's variation selector
+# and enclosing keycap (``1`` + U+FE0F + U+20E3), or the emoji a trailing zero-width joiner announces.
+_SEQUENCE_COMPLETIONS = ("\u20e3", "\ufe0f\u20e3", "\U0001F600")
+
+
+def _awaits_signoff_sequence_end(text: Any) -> bool:
+    """True while ``text`` is a marker whose sign-off sequence is still incomplete (``NO_REPLY 1`` on the way
+    to ``NO_REPLY 1\ufe0f\u20e3``): the next code points may make it a marker, so a stream holds it."""
+    if not isinstance(text, str) or not text.strip() or text.rstrip() != text:
+        return False
+    return any(is_intentional_silence_response(text + tail) for tail in _SEQUENCE_COMPLETIONS)
