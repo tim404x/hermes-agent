@@ -18,6 +18,7 @@ from hermes_cli.observability.shared_metrics_loop import begin_delegation_run, f
 from tools.async_delegation import _new_delegation_id, record_unit_child
 from tools.delegate_tool_child_run import _attach_child, _close_child, _detach_child, _fabricated_entry, _signal_child_stop
 from tools.delegate_tool_config import _get_max_async_children
+from tools.delegate_tool_launch_waves import wait_for_launch_wave
 from tools.delegate_tool_progress import (
     SUBAGENT_FAILURE_STATUSES, _print_completion_line, _quiet, describe_subagent_failure, format_batch_tag,
 )
@@ -137,12 +138,20 @@ def _release_unstarted_child(batch: _Batch, child: Any) -> None:
     _detach_child(batch.parent_agent, child)
     _close_child(child, "Failed to close a subagent that never started")
 
+def _run_paced(batch: _Batch, honor_parent_interrupt: bool, i: int, task: dict[str, Any], child: Any) -> dict[str, Any]:
+    """``batch.run_child`` once the child's launch wave opens (delegation.launch_wave_size); a child stopped while it
+    waited never starts. A detached (background) unit ignores the parent's turn interrupt, as in ``_run_gated``."""
+    if wait_for_launch_wave(child, batch.parent_agent if honor_parent_interrupt else None):
+        return batch.run_child(i, task, child)
+    _release_unstarted_child(batch, child)
+    return _fabricated_entry(i, "interrupted", "Stopped while waiting for its launch wave", child)
+
 def _run_gated(batch: _Batch, gate: Any, honor_parent_interrupt: bool, i: int, task: dict[str, Any],
                child: Any) -> dict[str, Any]:
     """``batch.run_child`` behind the prompt-cache warm-up gate; a child stopped while it waited never starts.
     A detached (background) unit ignores the parent's turn interrupt, so only the child's own stop skips it."""
     parent = batch.parent_agent if honor_parent_interrupt else None
-    entry = gate.run(child, lambda: batch.run_child(i, task, child), parent=parent)
+    entry = gate.run(child, lambda: _run_paced(batch, honor_parent_interrupt, i, task, child), parent=parent)
     if entry is not None:
         return entry
     _release_unstarted_child(batch, child)
@@ -184,7 +193,8 @@ def _run_children_parallel(batch: _Batch, results: list, *, honor_parent_interru
         from tools.delegate_tool_config import _get_prefix_stagger_seconds
         from tools.delegate_tool_prefix_gate import PrefixCacheGate
         gate = PrefixCacheGate.for_children(batch.children, _get_prefix_stagger_seconds())
-        run = batch.run_child if gate is None else partial(_run_gated, batch, gate, honor_parent_interrupt)
+        run = (partial(_run_paced, batch, honor_parent_interrupt) if gate is None
+               else partial(_run_gated, batch, gate, honor_parent_interrupt))
         futures = {executor.submit(contextvars.copy_context().run, run, i, t, child): i for i, t, child in batch.children}
         pending = set(futures)
         while pending:
@@ -227,7 +237,7 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
     from tools.delegation_live_log import update_manifest_statuses
     results: list = []
     if len(batch.children) == 1:
-        results.append(batch.run_child(*batch.children[0]))
+        results.append(_run_paced(batch, honor_parent_interrupt, *batch.children[0]))
         # A one-child unit has no join to wait on, but everything after the child returns — host-owned finalize,
         # transcript, manifest, then the durable write — is still owner-lifetime: record before any of it (#116000).
         _record_finished_child(batch, results[-1], honor_parent_interrupt)

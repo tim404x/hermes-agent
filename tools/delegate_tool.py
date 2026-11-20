@@ -614,6 +614,17 @@ def _oneshot_spawn_budget(parent_agent: Any, requested: int) -> Optional[str]:
     return None
 
 
+def _child_fanout_error(n_tasks: int) -> Optional[str]:
+    """Refusal for a SUBAGENT's batch over delegation.max_children_per_child (the depth-2 fan-out bound)."""
+    from tools.delegate_tool_config import _get_max_children_per_child
+    cap = _get_max_children_per_child()
+    if not cap or n_tasks <= cap:
+        return None
+    return (f"Too many tasks for a subagent: {n_tasks} provided, but delegation.max_children_per_child is {cap}. "
+            f"Send at most {cap} tasks per delegate_task call (later calls can take the rest) or do the small "
+            "ones yourself.")
+
+
 def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[list[dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
@@ -672,6 +683,8 @@ def delegate_task(
         )
     max_children = _get_max_concurrent_children()
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
+    if not err and depth > 0:
+        err = _child_fanout_error(len(task_list))
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
     if not err:
@@ -750,10 +763,14 @@ def _build_top_level_description(*, independent_completions=None) -> str:
     # Mention recursion only where it's actually available. send_message is deliberately not named (gateway-internal
     # vocabulary); model_tools session-filters the list to tools the session has.
     if orchestration_available:
+        from tools.delegate_tool_config import _get_max_children_per_child
+        per_child = _get_max_children_per_child()
         restrictions_rule = (
             "- Children cannot call clarify, memory, or cronjob.\n"
             f"- Children can themselves delegate while depth remains (max_spawn_depth={_get_max_spawn_depth()}); the "
             "runtime derives this from depth automatically.\n"
+            + (f"- A subagent may put at most {per_child} tasks in one delegate_task call "
+               f"(delegation.max_children_per_child={per_child}).\n" if per_child else "")
         )
     else:
         restrictions_rule = "- Children cannot call delegate_task, clarify, memory, or cronjob.\n"
