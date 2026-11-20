@@ -5,19 +5,47 @@ import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
 
+/** A swap that settles faster than this never shows the overlay. A warm bot
+ *  switch paints its cached thread within a frame or two, and a "Waking up"
+ *  flash over a chat that is already on screen read as a reload on every
+ *  switch (bot-switch-speed). A real wake (cold backend, cold transcript)
+ *  still gets the overlay, a quarter second in. */
+export const SWAP_OVERLAY_GRACE_MS = 250
+
+/** The swap target once it has been pending for the grace period, else null. */
+function useSettledSwapTarget(profile: string | null): string | null {
+  const [settled, setSettled] = useState<null | string>(null)
+
+  useEffect(() => {
+    if (!profile) {
+      return
+    }
+
+    const timer = window.setTimeout(() => setSettled(profile), SWAP_OVERLAY_GRACE_MS)
+
+    return () => {
+      window.clearTimeout(timer)
+      setSettled(null)
+    }
+  }, [profile])
+
+  return profile && settled === profile ? settled : null
+}
+
 // Shown over the conversation while the live gateway swaps to another profile's
 // backend (lazily spawned). Keeps the last profile name through the fade-out so
 // the label doesn't blank. Purely visual — pointer-events-none.
 export function ChatSwapOverlay({ profile }: { profile: string | null }) {
   const { t } = useI18n()
   const onboarding = useOnboardingChatActive()
-  const [label, setLabel] = useState<null | string>(profile)
+  const shown = useSettledSwapTarget(profile)
+  const [label, setLabel] = useState<null | string>(shown)
 
   useEffect(() => {
-    if (profile) {
-      setLabel(profile)
+    if (shown) {
+      setLabel(shown)
     }
-  }, [profile])
+  }, [shown])
 
   // The first run may swap into the default profile, which the user did not ask for.
   // "Waking up default…" over the greeting reads as a stall in the moment that has to feel instant.
@@ -30,7 +58,7 @@ export function ChatSwapOverlay({ profile }: { profile: string | null }) {
       aria-hidden
       className={cn(
         'pointer-events-none absolute inset-0 z-50 flex items-center justify-center transition-opacity duration-150 ease-out',
-        profile ? 'opacity-100' : 'opacity-0'
+        shown ? 'opacity-100' : 'opacity-0'
       )}
     >
       <div className="flex items-center gap-2 bg-[color-mix(in_srgb,var(--dt-card)_92%,transparent)] px-4 py-2 font-mono text-[0.8125rem] text-foreground shadow-composer">
@@ -41,7 +69,7 @@ export function ChatSwapOverlay({ profile }: { profile: string | null }) {
             glyph left-aligned in its w-3 box the way the bare span was, and
             `paused` restores the old "no ticking once the swap is done"
             behaviour while the overlay fades out still mounted. */}
-        <GlyphSpinner className="w-3 justify-start text-(--ui-accent)" paused={!profile} spinner="braille" />
+        <GlyphSpinner className="w-3 justify-start text-(--ui-accent)" paused={!shown} spinner="braille" />
         {t.composer.wakingProfile(label ?? '')}
       </div>
     </div>
