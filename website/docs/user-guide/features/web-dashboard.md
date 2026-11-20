@@ -1070,6 +1070,8 @@ dashboard:
 
 When set, the OAuth callback URL becomes `<public_url>/auth/callback` verbatim — `X-Forwarded-Prefix` is ignored on that code path because the operator has explicitly declared the public URL. This is intentional: stacking the prefix on top would double-prefix the common case where the prefix is already baked into `public_url`.
 
+`dashboard.http_keep_alive` (seconds, default `120`) is how long the dashboard keeps an idle HTTP keep-alive connection open. Remote clients behind a relay or tunnel reuse their pooled connections across pauses instead of paying a fresh connect on the next request; keep it above your proxy's own idle timeout so the proxy closes first.
+
 The hostname in `public_url` is also accepted as an **exact** HTTP `Host` and
 WebSocket `Origin` value. This supports a reverse proxy that preserves the
 browser-facing hostname while forwarding to a dashboard bound to

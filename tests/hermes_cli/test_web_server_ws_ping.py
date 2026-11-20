@@ -399,3 +399,62 @@ def test_gateway_listener_compresses_only_for_remote_peers(host, auth_required, 
     config, _server = build_listener_server(lambda scope, receive, send: None, host, 0,
                                             auth_required=auth_required)
     assert config.ws_per_message_deflate is deflate
+
+
+def test_start_server_keeps_idle_http_sockets_for_remote_clients(monkeypatch):
+    """uvicorn's 5 s keep-alive default drops a remote Desktop's pooled sockets between clicks, so
+    the next REST call pays a fresh connect through the relay/tunnel (one extra ~70 ms round trip)
+    and can race the server's close. The dashboard keeps idle sockets longer than the proxies in
+    front of it (Go http.Transport behind tailscale serve, cloudflared: 90 s) so those close first."""
+    from hermes_cli.web_server_lifecycle import _DEFAULT_DASHBOARD_HTTP_KEEP_ALIVE_S
+
+    captured = _stub_uvicorn(monkeypatch)
+    monkeypatch.setattr(web_server, "load_config", dict)
+    web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+
+    assert captured["timeout_keep_alive"] == _DEFAULT_DASHBOARD_HTTP_KEEP_ALIVE_S
+    assert captured["timeout_keep_alive"] > 90
+
+
+def test_start_server_reads_dashboard_http_keep_alive(monkeypatch):
+    captured = _stub_uvicorn(monkeypatch)
+    monkeypatch.setattr(web_server, "load_config", lambda: {"dashboard": {"http_keep_alive": 30}})
+    web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+
+    assert captured["timeout_keep_alive"] == 30
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (None, 120),          # key present but empty in config.yaml
+    ("45", 45),           # YAML string
+    (7.9, 7),
+    (0, 1),               # clamped: 0 would close every socket at once
+    (-5, 1),
+    (99999, 3600),        # clamped: never effectively infinite
+    ("soon", 120),        # garbage falls back to the default
+    (True, 120),          # a YAML boolean is not a duration
+    ([30], 120),
+    (float("nan"), 120),
+    (float("inf"), 120),
+])
+def test_dashboard_http_keep_alive_bounds(raw, expected):
+    from hermes_cli.web_server_lifecycle import _dashboard_http_keep_alive
+
+    assert _dashboard_http_keep_alive({"http_keep_alive": raw}) == expected
+
+
+def test_dashboard_http_keep_alive_default_when_unset():
+    from hermes_cli.web_server_lifecycle import _DEFAULT_DASHBOARD_HTTP_KEEP_ALIVE_S, _dashboard_http_keep_alive
+
+    assert _dashboard_http_keep_alive({}) == _DEFAULT_DASHBOARD_HTTP_KEEP_ALIVE_S == 120
+
+
+def test_gateway_listener_keeps_idle_http_sockets(monkeypatch):
+    """``build_listener_server`` (the gateway's API/session listener) shares the same keep-alive."""
+    import hermes_cli.config as config_mod
+    from hermes_cli.web_server_lifecycle import _DEFAULT_DASHBOARD_HTTP_KEEP_ALIVE_S, build_listener_server
+
+    monkeypatch.setattr(config_mod, "load_config", dict)
+    config, _server = build_listener_server(lambda scope, receive, send: None, "127.0.0.1", 0,
+                                            auth_required=False)
+    assert config.timeout_keep_alive == _DEFAULT_DASHBOARD_HTTP_KEEP_ALIVE_S

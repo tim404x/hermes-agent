@@ -70,6 +70,7 @@ _log = logging.getLogger(__name__)
 from hermes_cli.web_server_lifecycle import (
     PORT_IN_USE_EXIT_CODE,
     _dashboard_forwarded_allow_ips,
+    _dashboard_http_keep_alive,
     _eager_reconcile_own_session_db,
     _maybe_open_browser,
     _port_bind_conflict,
@@ -1089,6 +1090,8 @@ def _build_uvicorn_server(host: str, port: int, *, ssh_isolated: bool = False):
         # Loopback-only unless the operator trusts a bounded upstream proxy, so
         # spoofed X-Forwarded-* from arbitrary callers is never honoured.
         forwarded_allow_ips=_dashboard_forwarded_allow_ips(_dash_cfg),
+        # Keep remote clients' pooled sockets warm across pauses (see _dashboard_http_keep_alive).
+        timeout_keep_alive=_dashboard_http_keep_alive(_dash_cfg),
         ws_ping_interval=ping_interval,
         ws_ping_timeout=ping_timeout,
         # Per-frame zlib on the loop buys nothing for a local client (build_listener_server); a peer

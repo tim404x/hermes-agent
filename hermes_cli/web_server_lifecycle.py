@@ -524,6 +524,35 @@ def _dashboard_forwarded_allow_ips(dashboard_config: dict[str, Any]) -> list[str
     return trusted
 
 
+# uvicorn closes an idle HTTP keep-alive socket after 5 s. A remote Desktop reaches the dashboard
+# through a per-connection relay or tunnel (~70 ms RTT SF <-> VPS); every REST call after a >5 s
+# pause then pays a fresh connect (one extra round trip through the relays) and can race the
+# server's close (ECONNRESET on a reused socket). Measured from the Mac: 150-174 ms after 6-45 s
+# idle vs 77 ms on a kept socket. 120 s outlives the idle timeouts of the proxies that sit in front
+# of a dashboard (Go http.Transport behind `tailscale serve`, cloudflared: 90 s), so those close
+# their side first and never race the server. Idle keep-alive sockets cost uvicorn nothing but an fd.
+_DEFAULT_DASHBOARD_HTTP_KEEP_ALIVE_S = 120
+_MAX_DASHBOARD_HTTP_KEEP_ALIVE_S = 3600
+
+
+def _dashboard_http_keep_alive(dashboard_config: dict[str, Any]) -> int:
+    """Seconds uvicorn keeps an idle HTTP keep-alive socket (``dashboard.http_keep_alive``).
+
+    Invalid values fall back to the default; the result is clamped to 1..3600 s.
+    """
+    raw = dashboard_config.get("http_keep_alive", _DEFAULT_DASHBOARD_HTTP_KEEP_ALIVE_S)
+    if raw is None:  # key present but empty in config.yaml
+        return _DEFAULT_DASHBOARD_HTTP_KEEP_ALIVE_S
+    try:
+        if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+            raise TypeError(type(raw).__name__)
+        value = int(float(raw))
+    except (TypeError, ValueError, OverflowError):
+        _log.warning("dashboard.http_keep_alive must be a number of seconds; ignoring %r", raw)
+        return _DEFAULT_DASHBOARD_HTTP_KEEP_ALIVE_S
+    return max(1, min(value, _MAX_DASHBOARD_HTTP_KEEP_ALIVE_S))
+
+
 def _uvicorn_console_logging() -> None:
     """uvicorn's default console logging, without its ``dictConfig``.
 
@@ -598,6 +627,7 @@ def build_listener_server(served_app, host: str, port: int, *, auth_required: bo
         # Loopback-only unless the operator trusts a bounded upstream proxy, so
         # spoofed X-Forwarded-* from arbitrary callers is never honoured.
         forwarded_allow_ips=_dashboard_forwarded_allow_ips(dash_cfg),
+        timeout_keep_alive=_dashboard_http_keep_alive(dash_cfg),
         ws_ping_interval=ws_ping[0],
         ws_ping_timeout=ws_ping[1],
         ws_per_message_deflate=per_message_deflate,
