@@ -312,6 +312,7 @@ class InMemoryLineageRepository:
             profile_name=child.profile_name or parent.get("profile_name") or self._backend.owner_profile, started_at=datetime.now(UTC), compression_fork=True,
             pinned=bool(parent["pinned"]) and continuation, archived=bool(parent["archived"]) and continuation,
             auto_archived=bool(parent.get("auto_archived")) and continuation,
+            side_window_json=parent.get("side_window_json") if continuation else None,
         )
         for name in ("git_branch", "git_repo_root", "user_id", "session_key", "chat_id", "chat_type", "thread_id", "display_name", "origin", "tool_pin"):
             row[name] = parent[name]

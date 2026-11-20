@@ -95,9 +95,10 @@ class _FakeSessions:
     def __init__(self, title: str):
         self._title = title
         self.origin = None
+        self.side_window_json = None
 
     def get(self, sid):
-        return SimpleNamespace(session_id=sid, origin=self.origin)
+        return SimpleNamespace(session_id=sid, origin=self.origin, side_window_json=self.side_window_json)
 
     def get_title(self, _sid):
         return self._title
@@ -217,6 +218,21 @@ def test_side_window_stays_tool_free_even_when_cli_attended(tmp_path, monkeypatc
     agent = _FakeAgent(home, title="Sales | Daily task build")
     agent.platform = "cli"
     agent.persistence.sessions.origin = {"side_window": {"at": 1.0, "by": "bot:default"}}
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is False
+    assert agent.tools == []
+
+
+def test_gateway_created_side_window_stays_tool_free(tmp_path, monkeypatch):
+    """Regression (P3b): a gateway-created window keeps its routing origin and carries the stamp in its own cell."""
+    import agent.session_source as ss
+
+    monkeypatch.setattr(ss, "session_source_for", lambda p: p)
+    monkeypatch.setattr("gateway.session_finite.finite_turn_required", lambda: None)
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="Sales | Deal heatmap")
+    agent.platform = "desktop"
+    agent.persistence.sessions.origin = {"platform": "local", "chat_id": "local-1"}
+    agent.persistence.sessions.side_window_json = json.dumps({"at": 1.0, "by": "bot:default", "key": "k"})
     assert bot_mode_dm.ensure_message_agent_tool(agent) is False
     assert agent.tools == []
 

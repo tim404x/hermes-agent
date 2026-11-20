@@ -3,8 +3,9 @@ so the desktop can open it as a tab, and nothing else ever is.
 
 The delivery runner stamps the session the CLI transport is about to run (creating the titled
 window first when it is new) on every DM turn, so a new DM into an existing window re-marks it.
-The stamp lives in ``sessions.origin_json`` under ``side_window`` and survives compression; the
-``"<title> (2)"`` retry window gets its own stamp. Plain CLI chats, crons and workers never carry it.
+The stamp lives in its own ``sessions.side_window_json`` cell (never ``origin_json``) and survives
+compression; the ``"<title> (2)"`` retry window gets its own stamp. Plain CLI chats, crons and workers
+never carry it.
 """
 
 import json
@@ -146,16 +147,18 @@ def test_plain_cli_chats_never_list(target):
     assert [w["title"] for w in _windows(target)] == ["micro1"]
 
 
-def test_a_gateway_routing_origin_is_never_overwritten(target):
-    origin = json.dumps({"platform": "telegram", "chat_id": "42"})
+def test_a_gateway_created_window_is_stamped_and_its_routing_origin_never_overwritten(target):
+    """Regression (P3b): a gateway-created chat (every desktop chat, Neo's own task tabs included) carries a
+    routing origin; the stamp used to refuse it, so the window never became a tab."""
+    origin = json.dumps({"platform": "local", "chat_id": "local-42", "user_id": "uid:1"})
     with _db(target) as store:
-        _new_session(store, "tg", source="telegram", title="micro1", origin=json.loads(origin))
+        _new_session(store, "gw", source="local", title="micro1", origin=json.loads(origin))
 
-    side.stamp_side_window(target, "micro1", author=AUTHOR)
+    assert side.stamp_side_window(target, "micro1", author=AUTHOR) == "gw"
 
     with _db(target) as store:
-        assert store.sessions.get("tg").origin_json == origin
-    assert _windows(target) == []
+        assert store.sessions.get("gw").origin_json == origin
+    assert [(w["id"], w["by"]) for w in _windows(target)] == [("gw", "bot:neo")]
 
 
 def test_a_stamp_failure_never_raises(tmp_path):
