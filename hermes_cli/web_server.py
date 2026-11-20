@@ -1208,14 +1208,20 @@ def _start_bot_chat_prewarm(delay_s: float = 20.0) -> None:
     loop = asyncio.get_running_loop()
 
     def run() -> None:
+        from hermes_cli.isolated_scope import scope_to_launch_profile
         from hermes_cli.profiles import list_profile_names
         from hermes_cli.web_routers.sessions import prewarm_bot_chat_page
 
-        for name in list_profile_names():  # "default" first, then every live named profile
+        outcomes = []
+        # "default" first, then every live named profile; an isolated backend warms only the profile it serves.
+        for name in scope_to_launch_profile(list_profile_names()):
+            started = time.monotonic()
             try:
-                prewarm_bot_chat_page(name)
+                outcome = "warm" if prewarm_bot_chat_page(name) else "no Bot Chat"
             except Exception as exc:  # health: allow BLE001 -- a cold page is only slower, never wrong
-                _log.debug("Bot Chat prewarm skipped for %s: %s", name, exc)
+                outcome = f"skipped ({type(exc).__name__}: {exc})"
+            outcomes.append(f"{name} {outcome} {(time.monotonic() - started) * 1000:.0f} ms")
+        _log.info("Bot Chat prewarm: %s", "; ".join(outcomes) or "no profiles")
 
     loop.call_later(delay_s, loop.run_in_executor, None, run)
 
