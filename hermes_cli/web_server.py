@@ -1205,10 +1205,12 @@ def _publish_host_rendezvous(host: str, port: int) -> None:
 
 
 def _start_bot_chat_prewarm(delay_s: float = 20.0) -> None:
-    """Build every served profile's Bot Chat page in the background, one profile at a time, after the Desktop's
-    reconnect burst (``web_routers.sessions.prewarm_bot_chat_page``)."""
+    """Build every served profile's Bot Chat page off the request path, one profile at a time, after the Desktop's
+    reconnect burst (``web_routers.sessions.prewarm_bot_chat_page``). Scheduled on the serving loop, so it only
+    runs while this process serves: a stub server (tests) ends its loop first and the timer dies with it."""
+    loop = asyncio.get_running_loop()
+
     def run() -> None:
-        time.sleep(delay_s)
         from hermes_cli.profiles import list_profile_names
         from hermes_cli.web_routers.sessions import prewarm_bot_chat_page
 
@@ -1218,7 +1220,7 @@ def _start_bot_chat_prewarm(delay_s: float = 20.0) -> None:
             except Exception as exc:  # health: allow BLE001 -- a cold page is only slower, never wrong
                 _log.debug("Bot Chat prewarm skipped for %s: %s", name, exc)
 
-    threading.Thread(target=run, name="bot-chat-prewarm", daemon=True).start()
+    loop.call_later(delay_s, loop.run_in_executor, None, run)
 
 
 def _on_server_started(
