@@ -17,9 +17,11 @@ from typing import Any, Dict, List, Optional
 
 from hermes_cli.observability.shared_metrics_loop import begin_delegation_run, finish_delegation_unit
 from tools.async_delegation import _new_delegation_id, record_unit_child
-from tools.delegate_tool_child_run import _attach_child, _close_child, _detach_child, _fabricated_entry, _signal_child_stop
+from tools.delegate_tool_child_run import (
+    _attach_child, _detach_child, _fabricated_entry, _signal_child_stop, release_unstarted_child,
+)
 from tools.delegate_tool_config import _get_max_async_children
-from tools.delegate_tool_launch_waves import wait_for_launch_wave
+from tools.delegate_tool_launch_waves import run_child_start
 from tools.delegate_tool_progress import (
     SUBAGENT_FAILURE_STATUSES, _print_completion_line, _quiet, describe_subagent_failure, format_batch_tag,
 )
@@ -134,18 +136,18 @@ def _waiting_on_resume(entry: dict[str, Any]) -> bool:
 
 def _release_unstarted_child(batch: _Batch, child: Any) -> None:
     """Teardown for a child whose run never started (``_run_single_child``'s finally never runs for it)."""
-    from tools.delegate_tool_resumable import release_unstarted
-    release_unstarted(child)
-    _detach_child(batch.parent_agent, child)
-    _close_child(child, "Failed to close a subagent that never started")
+    release_unstarted_child(batch.parent_agent, child)
 
 def _run_paced(batch: _Batch, honor_parent_interrupt: bool, i: int, task: dict[str, Any], child: Any) -> dict[str, Any]:
-    """``batch.run_child`` once the child's launch wave opens (delegation.launch_wave_size); a child stopped while it
-    waited never starts. A detached (background) unit ignores the parent's turn interrupt, as in ``_run_gated``."""
-    if wait_for_launch_wave(child, batch.parent_agent if honor_parent_interrupt else None):
-        return batch.run_child(i, task, child)
-    _release_unstarted_child(batch, child)
-    return _fabricated_entry(i, "interrupted", "Stopped while waiting for its launch wave", child)
+    """``batch.run_child`` through the common child-start boundary (``run_child_start``: the subagent fan-out cap,
+    then the launch wave); a child refused or stopped while it waited never starts. A detached (background) unit
+    ignores the parent's turn interrupt, as in ``_run_gated``."""
+    def refuse(refusal) -> dict[str, Any]:
+        _release_unstarted_child(batch, child)
+        return _fabricated_entry(i, refusal.status, refusal.reason, child)
+
+    return run_child_start(child, batch.parent_agent, lambda: batch.run_child(i, task, child), refuse,
+                           honor_parent_interrupt=honor_parent_interrupt)
 
 def _run_gated(batch: _Batch, gate: Any, honor_parent_interrupt: bool, i: int, task: dict[str, Any],
                child: Any) -> dict[str, Any]:
