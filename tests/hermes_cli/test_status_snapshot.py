@@ -169,11 +169,36 @@ async def test_past_max_stale_a_refresh_already_running_never_holds_the_poll(clo
     await snap.get(compute)
     clock.now += 5
     assert (await snap.get(maybe_wedged))["n"] == 1  # stale: served, and the refresh wedges
-    clock.now += 60
-    assert (await snap.get(maybe_wedged))["n"] == 1  # still the last body, not a hang
+    clock.now += 29  # 34 s old: past max_stale, refresh still running -> still the last body, not a hang
+    assert (await snap.get(maybe_wedged))["n"] == 1
     hang.set()
     await async_wait_until(lambda: snap._refresh.done())
     assert (await snap.get(compute))["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_probe_that_keeps_wedging_never_freezes_a_healthy_body(clock):
+    """Served stale only up to max_stale_s + compute_timeout_s: older than that, the poll waits for the
+    refresh (and gets its failure) instead of reporting a minutes-old healthy body."""
+    snap = StatusSnapshot(fresh_s=3.0, max_stale_s=30.0, compute_timeout_s=20.0, clock=clock)
+    snap.arm()
+    hang = asyncio.Event()
+
+    async def wedged():
+        await hang.wait()
+        return {"late": True}
+
+    async def healthy():
+        return {"ok": True}
+
+    await snap.get(healthy)
+    clock.now += 5
+    assert await snap.get(wedged) == {"ok": True}  # starts the refresh that wedges
+    clock.now += 46  # 51 s old, past 30 + 20
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(snap.get(wedged), 0.2)  # the caller now waits on the refresh, not served
+    hang.set()
+    await async_wait_until(lambda: snap._refresh.done())
 
 
 _CALLER_HOME = contextvars.ContextVar("caller_home", default="launch")
