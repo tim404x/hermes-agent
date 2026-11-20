@@ -31,7 +31,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RosterRow } from './types'
 
 const { hostMock, persistMock, requestForBotMock, saveBotMetaMock } = vi.hoisted(() => ({
-  hostMock: { openSession: vi.fn(), request: vi.fn() },
+  hostMock: { holdSubmitsUntilConfirmed: vi.fn(), notify: vi.fn(), openSession: vi.fn(), request: vi.fn() },
   persistMock: vi.fn(),
   requestForBotMock: vi.fn(),
   saveBotMetaMock: vi.fn()
@@ -39,7 +39,8 @@ const { hostMock, persistMock, requestForBotMock, saveBotMetaMock } = vi.hoisted
 
 vi.mock('@hermes/plugin-sdk', () => ({
   BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS: 15_000,
-  host: hostMock
+  host: hostMock,
+  translateNow: (key: string) => key
 }))
 
 vi.mock('./routing', () => ({
@@ -52,6 +53,10 @@ vi.mock('./routing', () => ({
 }))
 
 vi.mock('./data', () => ({
+  // Roster freshness gates paint-first (switch-fix-1119): a focused window's
+  // roster is at most one poll old.
+  ROSTER_POLL_INTERVAL_MS: 5000,
+  rosterSnapshotAgeMs: () => 0,
   $botMeta: { get: () => ({}), set: vi.fn() },
   botMetaKey: (bot: { name?: string }) => bot?.name ?? '',
   // Local bots carry no route, so everything resolves onto the ambient
@@ -424,6 +429,52 @@ describe('a failed lookup fails CLOSED — never "no chat exists"', () => {
     await expect(openBotCanonicalChat(bot)).resolves.toEqual({ openedId: 'forever-chat', registryId: 'forever-chat' })
     expect(calls.some(call => call.method === 'session.create')).toBe(false)
     expect(hostMock.openSession.mock.calls.map(([id]) => id)).toEqual(['forever-chat'])
+  })
+})
+
+describe('paint-first sends wait for the registry (switch-fix-1119)', () => {
+  it('holds sends on the painted roster row and releases them to the registry row', async () => {
+    respondWith(method => {
+      if (method === 'session.list') {
+        return { sessions: [{ id: 'current', message_count: 4, title: 'Bot Chat' }] }
+      }
+
+      return {}
+    })
+
+    const bot = { canonical_session: { id: 'displaced' }, name: 'ops' } as RosterRow
+    const { openBotCanonicalChat } = await loadModule()
+
+    await expect(openBotCanonicalChat(bot)).resolves.toEqual({ openedId: 'current', registryId: 'current' })
+
+    // Held BEFORE anything was opened, on the row that was painted...
+    const [heldId, confirmation] = hostMock.holdSubmitsUntilConfirmed.mock.calls[0]!
+    expect(heldId).toBe('displaced')
+    expect(hostMock.holdSubmitsUntilConfirmed.mock.invocationCallOrder[0]).toBeLessThan(
+      hostMock.openSession.mock.invocationCallOrder[0]!
+    )
+    // ...and confirmed as the registry's row, never the painted one.
+    await expect(confirmation).resolves.toBe('current')
+  })
+
+  it('never confirms the painted row when the registry cannot answer, and says so', async () => {
+    respondWith(method => {
+      if (method === 'session.list') {
+        throw new Error('database is locked')
+      }
+
+      return {}
+    })
+
+    const bot = { canonical_session: { id: 'forever-chat' }, name: 'ops' } as RosterRow
+    const { openBotCanonicalChat } = await loadModule()
+
+    // The thread stays on screen (no failure reported over it, no mint)...
+    await expect(openBotCanonicalChat(bot)).resolves.toEqual({ openedId: 'forever-chat', registryId: 'forever-chat' })
+    // ...but sends into it are refused, not released, and the user is told.
+    const [, confirmation] = hostMock.holdSubmitsUntilConfirmed.mock.calls[0]!
+    await expect(confirmation).rejects.toThrow(/Could not check ops's Bot Chat registry/)
+    expect(hostMock.notify).toHaveBeenCalledWith(expect.objectContaining({ kind: 'info' }))
   })
 })
 

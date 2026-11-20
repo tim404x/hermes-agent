@@ -952,14 +952,32 @@ async function reconcileBotMeta(rows: RosterRow[], fetchedAt: number): Promise<v
   )
 }
 
+/** The Bots pane's roster poll. */
+export const ROSTER_POLL_INTERVAL_MS = 5000
+
+/** How long ago the roster last landed, or null with no roster in the cache.
+ *  The poll stops while the window is hidden (TanStack polls only a focused
+ *  document, and nothing refetches on focus), so right after un-hiding the
+ *  rows can be hours old until the next poll lands. Never throws. */
+export function rosterSnapshotAgeMs(): null | number {
+  try {
+    const queries = queryClient?.getQueryCache?.().findAll({ queryKey: ROSTER_KEY }) ?? []
+    const landedAt = Math.max(0, ...queries.map(query => Number(query.state.dataUpdatedAt) || 0))
+
+    return landedAt > 0 ? Math.max(0, Date.now() - landedAt) : null
+  } catch {
+    return null
+  }
+}
+
 export function useRoster() {
   const activeConnectionId = useValue(host.state.connectionId)
 
   return useQuery({
     queryKey: [...ROSTER_KEY, activeConnectionId],
     queryFn: () => fetchRosterSnapshot(activeConnectionId),
-    refetchInterval: 5000,
-    staleTime: 5000,
+    refetchInterval: ROSTER_POLL_INTERVAL_MS,
+    staleTime: ROSTER_POLL_INTERVAL_MS,
     retry: ROSTER_QUERY_RETRY,
     retryDelay: attempt => Math.min(15000, 1000 * 2 ** attempt)
   })
