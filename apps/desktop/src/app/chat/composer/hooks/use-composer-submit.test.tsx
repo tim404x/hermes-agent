@@ -284,6 +284,7 @@ describe('useComposerSubmit external request routing', () => {
       attachments: [],
       clientMessageId: SEND_ID.clientMessageId,
       composerScope: 'stored-session',
+      onComposerScopeMoved: expect.any(Function),
       displayKind: 'hidden'
     })
     expect(onSteer).not.toHaveBeenCalled()
@@ -368,7 +369,8 @@ describe('useComposerSubmit external request routing', () => {
         submission_id: expect.any(String),
         attachments: [],
         clientMessageId: SEND_ID.clientMessageId,
-        composerScope: 'session-a'
+        composerScope: 'session-a',
+        onComposerScopeMoved: expect.any(Function)
       })
     )
     expect(visibleMain.onSubmit).toHaveBeenCalledTimes(1)
@@ -388,7 +390,8 @@ describe('useComposerSubmit external request routing', () => {
         submission_id: expect.any(String),
         attachments: [],
         clientMessageId: SEND_ID.clientMessageId,
-        composerScope: 'tile-session'
+        composerScope: 'tile-session',
+        onComposerScopeMoved: expect.any(Function)
       })
     )
     expect(main.onSubmit).not.toHaveBeenCalled()
@@ -405,7 +408,8 @@ describe('useComposerSubmit external request routing', () => {
         submission_id: expect.any(String),
         attachments: [],
         clientMessageId: SEND_ID.clientMessageId,
-        composerScope: 'session-second'
+        composerScope: 'session-second',
+        onComposerScopeMoved: expect.any(Function)
       })
     )
     expect(first.onSubmit).not.toHaveBeenCalled()
@@ -426,7 +430,8 @@ describe('useComposerSubmit external request routing', () => {
         submission_id: expect.any(String),
         attachments: [],
         clientMessageId: SEND_ID.clientMessageId,
-        composerScope: 'session-b'
+        composerScope: 'session-b',
+        onComposerScopeMoved: expect.any(Function)
       })
     )
     expect(hiddenA.onSubmit).not.toHaveBeenCalled()
@@ -620,7 +625,8 @@ describe('useComposerSubmit busy-turn routing', () => {
       expect(onSubmit).toHaveBeenCalledWith('/compress preserve context', {
         submission_id: expect.any(String),
         clientMessageId: SEND_ID.clientMessageId,
-        composerScope: 'stored-session'
+        composerScope: 'stored-session',
+        onComposerScopeMoved: expect.any(Function)
       })
     )
     expect(clearDraft).toHaveBeenCalledTimes(1)
@@ -673,7 +679,8 @@ describe('useComposerSubmit busy-turn routing', () => {
         submission_id: expect.any(String),
         clientMessageId: SEND_ID.clientMessageId,
         attachments: [],
-        composerScope: 'stored-session'
+        composerScope: 'stored-session',
+        onComposerScopeMoved: expect.any(Function)
       })
     )
     expect(onSteer).not.toHaveBeenCalled()
@@ -709,7 +716,8 @@ describe('useComposerSubmit busy-turn routing', () => {
         submission_id: expect.any(String),
         clientMessageId: SEND_ID.clientMessageId,
         attachments: [],
-        composerScope: 'stored-session'
+        composerScope: 'stored-session',
+        onComposerScopeMoved: expect.any(Function)
       })
     )
     expect(onSteer).not.toHaveBeenCalled()
@@ -1119,7 +1127,8 @@ describe('useComposerSubmit with a blocking prompt parked on the session', () =>
       expect(onSubmit).toHaveBeenCalledWith('/status', {
         submission_id: expect.any(String),
         clientMessageId: SEND_ID.clientMessageId,
-        composerScope: 'stored-session'
+        composerScope: 'stored-session',
+        onComposerScopeMoved: expect.any(Function)
       })
     )
     expect(queueCurrentDraft).not.toHaveBeenCalled()

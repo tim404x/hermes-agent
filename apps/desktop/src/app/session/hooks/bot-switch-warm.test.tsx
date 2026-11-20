@@ -25,6 +25,8 @@ import { ChatSwapOverlay } from '@/app/chat/chat-swap-overlay'
 import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
 import type * as OpenSessionModule from '@/app/open-session'
 import { getLatestSessionMessages, getSession } from '@/hermes'
+import { en } from '@/i18n/en'
+import { queryClient } from '@/lib/query-client'
 import type { RosterRow } from '@/plugins/hermes-bots/types'
 import {
   openGatewayForAgent,
@@ -32,6 +34,7 @@ import {
   requestGatewayForAgent,
   requestGatewayForProfile
 } from '@/store/gateway'
+import { $notifications } from '@/store/notifications'
 import { $gatewaySwapTarget, ensureGatewayAgent, ensureGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
@@ -50,8 +53,10 @@ import {
   setSessions,
   setUnlistedSessionOwnerRows
 } from '@/store/session'
+import { clearSubmitHolds } from '@/store/session-open-confirmation'
 import { clearAllSessionStates } from '@/store/session-states'
 
+import { useSubmitPrompt } from './use-prompt-actions/submit'
 import { useRouteResume } from './use-route-resume'
 import { useSessionActions } from './use-session-actions'
 import { useSessionStateCache } from './use-session-state-cache'
@@ -172,6 +177,26 @@ interface Trace {
 
 const trace: Trace = { calls: [], overlay: [], published: [] }
 
+/** Every toast raised since mount (info toasts auto-dismiss after 5 s). */
+const seenNotices: Array<{ action?: string; text: string }> = []
+
+/** prompt.submit calls the fake backend admitted. */
+const sent: Array<{ at: number; session_id: string; text: string }> = []
+
+/** Methods (RPC names, or 'rest') the fake backend fails, and how many more
+ *  times (Infinity = until cleared). */
+const failing = new Map<string, number>()
+
+function failIfInjected(method: string): void {
+  const left = failing.get(method) ?? 0
+
+  if (left > 0) {
+    failing.set(method, left - 1)
+
+    throw new Error(`backend unavailable: ${method}`)
+  }
+}
+
 function later<T>(ms: number, value: () => T): Promise<T> {
   return new Promise((resolve, reject) => {
     setTimeout(() => {
@@ -215,7 +240,7 @@ function sessionRow(bot: BotFixture) {
     live_message_count: bot.rows.length,
     source: 'desktop',
     started_at: 1,
-    last_active: bot.rows.at(-1)!.timestamp,
+    last_active: bot.rows.at(-1)?.timestamp ?? 1,
     ended_at: null,
     input_tokens: 0,
     output_tokens: 0,
@@ -229,6 +254,14 @@ function sessionRow(bot: BotFixture) {
 /** The one virtual backend every fake transport call goes through. */
 function backend(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
   trace.calls.push({ at: Date.now(), method, profile: String(params.profile ?? '') || undefined })
+
+  try {
+    failIfInjected(method)
+  } catch (error) {
+    return later(LATENCY.rpc, () => {
+      throw error
+    })
+  }
 
   switch (method) {
     case 'session.list': {
@@ -269,6 +302,18 @@ function backend(method: string, params: Record<string, unknown> = {}): Promise<
       }))
     }
 
+    case 'prompt.submit':
+      return later(LATENCY.rpc, () => {
+        sent.push({ at: Date.now(), session_id: String(params.session_id), text: String(params.text) })
+
+        return {
+          admission_id: String(params.submission_id),
+          session_id: params.session_id,
+          status: 'started',
+          submission_id: params.submission_id
+        }
+      })
+
     default:
       return later(LATENCY.rpc, () => ({}))
   }
@@ -293,13 +338,21 @@ function installTransport() {
   vi.mocked(getSession).mockImplementation(((id: string) => {
     trace.calls.push({ at: Date.now(), method: 'GET /api/sessions/:id' })
 
-    return later(LATENCY.restSession, () => sessionRow(botForSession(id)))
+    return later(LATENCY.restSession, () => {
+      failIfInjected('rest')
+
+      return sessionRow(botForSession(id))
+    })
   }) as never)
   vi.mocked(getLatestSessionMessages).mockImplementation(((id: string) => {
     trace.calls.push({ at: Date.now(), method: 'GET /api/sessions/:id/messages' })
-    const bot = botForSession(id)
 
-    return later(LATENCY.restPage, () => ({ messages: bot.rows.map(row => ({ ...row })), session_id: bot.storedId }))
+    return later(LATENCY.restPage, () => {
+      failIfInjected('rest')
+      const bot = botForSession(id)
+
+      return { messages: bot.rows.map(row => ({ ...row })), session_id: bot.storedId }
+    })
   }) as never)
 }
 
@@ -330,6 +383,11 @@ function AppHarness({ onReady }: { onReady: (cache: ReturnType<typeof useSession
   })
 
   const routedSessionId = path.startsWith('/') && path.length > 1 ? decodeURIComponent(path.slice(1)) : null
+  // Live, like the app shell's routedSessionIdRef (contrib/wiring.tsx): an
+  // in-flight submit reads the route as it is NOW, not as it was at its render.
+  const routedIdRef = useRef(routedSessionId)
+
+  routedIdRef.current = routedSessionId
 
   const actions = useSessionActions({
     activeSessionId,
@@ -338,7 +396,7 @@ function AppHarness({ onReady }: { onReady: (cache: ReturnType<typeof useSession
     creatingSessionRef,
     ensureSessionState: cache.ensureSessionState,
     getRouteToken: () => pathRef.current,
-    getRoutedStoredSessionId: () => routedSessionId,
+    getRoutedStoredSessionId: () => routedIdRef.current,
     holdSessionTranscriptView: cache.holdSessionTranscriptView,
     navigate: ((to: string) => harnessRoute.navigate(to)) as never,
     requestGateway: ((method: string, params?: Record<string, unknown>) => backend(method, params)) as never,
@@ -351,6 +409,24 @@ function AppHarness({ onReady }: { onReady: (cache: ReturnType<typeof useSession
     syncSessionStateToView: cache.syncSessionStateToView,
     updateSessionState: cache.updateSessionState
   })
+
+  submit = useSubmitPrompt({
+    activeSessionIdRef: cache.activeSessionIdRef,
+    busyRef,
+    copy: en.desktop,
+    createBackendSessionForSend: async () => {
+      throw new Error('a bot switch never creates a session for a send')
+    },
+    getRoutedStoredSessionId: () => routedIdRef.current,
+    getRuntimeIdForStoredSession: (id: string) => cache.runtimeIdByStoredSessionIdRef.current.get(id) ?? null,
+    getRouteToken: () => pathRef.current,
+    requestGateway: ((method: string, params?: Record<string, unknown>) => backend(method, params)) as never,
+    resumeStoredSession: actions.resumeSession,
+    runtimeIdByStoredSessionIdRef: cache.runtimeIdByStoredSessionIdRef,
+    selectedStoredSessionIdRef: cache.selectedStoredSessionIdRef,
+    syncAttachmentsForSubmit: async (id: string, attachments: never[]) => ({ attachments, sessionId: id }),
+    updateSessionState: cache.updateSessionState
+  } as never)
 
   useRouteResume({
     activeSessionId,
@@ -397,6 +473,30 @@ function useRoutePath(): string {
 
 const { openRosterBot } = await import('@/plugins/hermes-bots/roster-actions')
 const { $openBotChat, $pendingBotOpen } = await import('@/plugins/hermes-bots/bot-state')
+const { ROSTER_KEY } = await import('@/plugins/hermes-bots/data')
+
+let rosterPoll: ReturnType<typeof setInterval> | undefined
+
+/** The Bots pane's 5 s roster poll, as a focused window runs it. */
+function startRosterPoll() {
+  rosterPolled()
+  rosterPoll = setInterval(() => rosterPolled(), 5_000)
+}
+
+/** The window was hidden: TanStack stops polling an unfocused document. */
+function stopRosterPoll() {
+  clearInterval(rosterPoll)
+  rosterPoll = undefined
+}
+
+/** The roster poll last landed `ageMs` ago. */
+function rosterPolled(ageMs = 0) {
+  queryClient.setQueryData(
+    [...ROSTER_KEY, CONNECTION],
+    { fetchedAt: Date.now() - ageMs, profiles: Object.values(bots).map(roster) },
+    { updatedAt: Date.now() - ageMs }
+  )
+}
 
 function roster(bot: BotFixture): RosterRow {
   return {
@@ -414,6 +514,7 @@ const primaryIds = () => PRIMARY_SESSION_VIEW.$messages.get().map(message => Str
 const primaryText = () => JSON.stringify(PRIMARY_SESSION_VIEW.$messages.get())
 
 let cache!: ReturnType<typeof useSessionStateCache>
+let submit!: ReturnType<typeof useSubmitPrompt>
 let container: HTMLElement | null = null
 /** Virtual ms the rendered "Waking up" overlay was visible (opacity-100). */
 let overlayMs = 0
@@ -436,6 +537,21 @@ async function mount() {
   })
   unlisten = [
     $gatewaySwapTarget.listen(value => trace.overlay.push({ at: Date.now(), value })),
+    $notifications.listen(list => {
+      for (const notice of list) {
+        // The fake backend reports no contract version, so the update store's
+        // skew toast is harness noise, not part of a bot switch.
+        if (
+          notice.id !== 'backend-contract-skew' &&
+          !seenNotices.some(seen => seen.text === `${notice.kind}: ${notice.title ?? ''} ${notice.message}`)
+        ) {
+          seenNotices.push({
+            action: notice.action?.label,
+            text: `${notice.kind}: ${notice.title ?? ''} ${notice.message}`
+          })
+        }
+      }
+    }),
     PRIMARY_SESSION_VIEW.$messages.listen(messages =>
       trace.published.push({
         at: Date.now(),
@@ -519,9 +635,18 @@ beforeEach(() => {
   trace.published = []
   overlayMs = 0
   LATENCY = P95
+  sent.length = 0
+  seenNotices.length = 0
+  failing.clear()
   window.localStorage.clear()
   harnessRoute.path = '/'
+
+  for (const key of Object.keys(bots)) {
+    delete bots[key]
+  }
+
   Object.assign(bots, { atlas: makeBot('atlas'), apex: makeBot('apex') })
+  startRosterPoll()
   installTransport()
   setSessions([])
   setUnlistedSessionOwnerRows([])
@@ -544,6 +669,10 @@ afterEach(() => {
   setSessions([])
   setUnlistedSessionOwnerRows([])
   $gatewaySwapTarget.set(null)
+  $notifications.set([])
+  stopRosterPoll()
+  clearSubmitHolds()
+  queryClient.clear()
   vi.useRealTimers()
   vi.clearAllMocks()
 })
@@ -741,5 +870,231 @@ describe('bot switch A → B → A', () => {
     expect($selectedStoredSessionId.get()).toBe(atlas.storedId)
     expect(primaryText()).toContain('atlas row 5')
     expect(trace.calls.filter(call => call.method === 'session.list')).toHaveLength(1)
+  })
+})
+
+/** Another window displaced atlas's Bot Chat: the registry now names
+ *  `atlas-current`, while this window's roster row (and its warm cache) still
+ *  names the old chat, which the backend still serves as a LIVE session. */
+function displaceAtlasChat(): { old: BotFixture; oldRoster: RosterRow } {
+  const old = bots.atlas!
+  const oldRoster = roster(old)
+  bots.atlasOld = old
+  bots.atlas = {
+    ...old,
+    rows: old.rows.map(row => ({ ...row, content: `current ${row.content}` })),
+    runtimeId: 'rt-atlas-current',
+    storedId: 'atlas-current'
+  }
+
+  return { old, oldRoster }
+}
+
+function sendNow(text: string): { result: () => boolean | undefined } {
+  let result: boolean | undefined
+
+  act(() => {
+    void submit(text).then(value => {
+      result = value
+    })
+  })
+
+  return { result: () => result }
+}
+
+const notices = () => seenNotices.map(notice => notice.text)
+
+describe('paint-first never lets a send reach an unconfirmed chat (switch-fix-1119)', () => {
+  it('holds a send made before the registry answers and delivers it to the confirmed Bot Chat', async () => {
+    await mount()
+    await clickBot(bots.atlas!, 9_000)
+    await clickBot(bots.apex!, 9_000)
+    const { old, oldRoster } = displaceAtlasChat()
+    act(() => {
+      void openRosterBot(oldRoster)
+    })
+    await advance(100)
+    // The cached thread paints at once (the switch stays instant)...
+    expect(primaryText()).toContain('atlas row 5')
+    // ...but a send typed into it now waits for the registry.
+    const send = sendNow('this must reach the current Bot Chat')
+    await advance(40)
+    expect(sent).toEqual([])
+
+    await advance(9_000)
+
+    // Delivered once, to the registry's chat, never to the displaced one.
+    expect(sent.map(entry => entry.session_id)).toEqual(['rt-atlas-current'])
+    expect(sent.some(entry => entry.session_id === old.runtimeId)).toBe(false)
+    expect(send.result()).toBe(true)
+    expect($selectedStoredSessionId.get()).toBe('atlas-current')
+    expect(primaryText()).toContain('this must reach the current Bot Chat')
+  })
+
+  it('sends a held message as soon as the registry confirms the same chat', async () => {
+    await mount()
+    await clickBot(bots.atlas!, 9_000)
+    await clickBot(bots.apex!, 9_000)
+    const clickedAt = Date.now()
+
+    act(() => {
+      void openRosterBot(roster(bots.atlas!))
+    })
+    await advance(20)
+    const send = sendNow('hello atlas')
+    await advance(3_000)
+
+    expect(sent.map(entry => entry.session_id)).toEqual([bots.atlas!.runtimeId])
+    // Released by the registry answer (one session.list), not by a timeout.
+    expect(sent[0]!.at - clickedAt).toBeLessThan(LATENCY['session.list'] + 2 * LATENCY.rpc + 100)
+    expect(send.result()).toBe(true)
+  })
+
+  it('keeps the draft and offers a retry when the chat cannot be confirmed', async () => {
+    await mount()
+    await clickBot(bots.atlas!, 9_000)
+    await clickBot(bots.apex!, 9_000)
+    failing.set('session.list', Infinity)
+    let opened: boolean | undefined
+
+    act(() => {
+      void openRosterBot(roster(bots.atlas!)).then(value => {
+        opened = value
+      })
+    })
+    await advance(40)
+    const send = sendNow('do not lose me')
+    await advance(9_000)
+
+    // The cached thread stays on screen, the send is refused (the composer
+    // restores the draft on `false`), and the failure is not silent.
+    expect(primaryText()).toContain('atlas row 5')
+    expect(sent).toEqual([])
+    expect(send.result()).toBe(false)
+    expect(opened).toBe(true)
+    expect(seenNotices.some(notice => notice.action === 'Retry')).toBe(true)
+    expect(notices().join('\n')).toMatch(/confirm/i)
+
+    // Still unconfirmed: a later send is refused too, never delivered blind.
+    const later = sendNow('still holding')
+    await advance(1_000)
+    expect(later.result()).toBe(false)
+    expect(sent).toEqual([])
+  })
+
+  it('stays quiet on a single registry blip once the chat itself opened', async () => {
+    await mount()
+    await clickBot(bots.atlas!, 9_000)
+    await clickBot(bots.apex!, 9_000)
+    failing.set('session.list', 1)
+
+    act(() => {
+      void openRosterBot(roster(bots.atlas!))
+    })
+    await advance(40)
+    const send = sendNow('after a blip')
+    await advance(9_000)
+
+    expect(notices()).toEqual([])
+    expect(sent.map(entry => entry.session_id)).toEqual([bots.atlas!.runtimeId])
+    expect(send.result()).toBe(true)
+  })
+
+  it('tells the user when a warm switch lands on a backend that is down', async () => {
+    await mount()
+    await clickBot(bots.atlas!, 9_000)
+    await clickBot(bots.apex!, 9_000)
+
+    for (const method of ['session.list', 'session.info', 'session.activate', 'session.resume', 'rest']) {
+      failing.set(method, Infinity)
+    }
+
+    act(() => {
+      void openRosterBot(roster(bots.atlas!))
+    })
+    await advance(9_000)
+
+    expect(primaryText()).toContain('atlas row 5')
+    expect(notices().length).toBeGreaterThan(0)
+  })
+
+  it('opens registry-first when the roster poll is older than one poll cycle (window was hidden)', async () => {
+    await mount()
+    await clickBot(bots.atlas!, 9_000)
+    await clickBot(bots.apex!, 9_000)
+    const { old, oldRoster } = displaceAtlasChat()
+    stopRosterPoll()
+    rosterPolled(60_000)
+    const selected: Array<null | string> = []
+    const off = $selectedStoredSessionId.listen(value => selected.push(value))
+
+    act(() => {
+      void openRosterBot(oldRoster)
+    })
+    await advance(9_000)
+    off()
+
+    expect(selected).not.toContain(old.storedId)
+    expect($selectedStoredSessionId.get()).toBe('atlas-current')
+  })
+})
+
+describe('the open is judged on the target transcript (switch-fix-1119)', () => {
+  it('finishes a same-id open the registry reports as empty instead of stranding it', async () => {
+    // codex P2: the roster still promised history, the registry confirms the
+    // same id with zero paintable rows.
+    bots.atlas!.rows = []
+    await mount()
+
+    const promised = {
+      ...roster(bots.atlas!),
+      canonical_session: {
+        id: bots.atlas!.storedId,
+        live_message_count: 6,
+        message_count: 6,
+        resolved_id: bots.atlas!.storedId,
+        title: 'Bot Chat'
+      }
+    } as RosterRow
+
+    let opened: boolean | undefined
+
+    act(() => {
+      void openRosterBot(promised).then(value => {
+        opened = value
+      })
+    })
+    await advance(3_000)
+
+    expect(opened).toBe(true)
+    expect($activeSessionId.get()).toBe(bots.atlas!.runtimeId)
+    expect($gatewaySwapTarget.get()).toBeNull()
+    expect($pendingBotOpen.get()).toBeNull()
+    expect($resumeExhaustedSessionId.get()).toBeNull()
+  })
+
+  it('keeps the wake open on a cold switch until the NEW bot has painted', async () => {
+    // claude P3: the previous bot's rows still on screen must not count as
+    // the target's history.
+    await mount()
+    await clickBot(bots.atlas!, 9_000)
+    const clickedAt = Date.now()
+    let doneAt: null | number = null
+
+    act(() => {
+      void openRosterBot(roster(bots.apex!)).finally(() => {
+        doneAt = Date.now()
+      })
+    })
+    await advance(9_000)
+
+    const apexPainted = paintedAt(bots.apex!, clickedAt)
+    expect(apexPainted).not.toBeNull()
+    expect(doneAt).not.toBeNull()
+    expect(doneAt! - clickedAt).toBeGreaterThanOrEqual(apexPainted!)
+    // The swap target stayed up through the cold read, so the overlay showed.
+    const cleared = trace.overlay.find(entry => entry.at >= clickedAt && entry.value === null)
+    expect(cleared!.at - clickedAt).toBeGreaterThanOrEqual(apexPainted!)
+    expect(overlayMs).toBeGreaterThan(0)
   })
 })

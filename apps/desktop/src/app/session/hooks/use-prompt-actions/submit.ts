@@ -31,6 +31,7 @@ import { trackPendingSubmission } from '@/store/pending-submissions'
 import { isStoredTranscriptReadOnly } from '@/store/read-only-transcript'
 import {
   $activeSessionId,
+  $selectedStoredSessionId,
   $sessions,
   resolveComposerSessionKey,
   setActiveSessionId,
@@ -39,6 +40,7 @@ import {
   setMessages,
   touchSessionActivity
 } from '@/store/session'
+import { awaitSubmitConfirmation, hasSubmitHold } from '@/store/session-open-confirmation'
 import { profileScopeForSessionOwner } from '@/store/session-request-router'
 import { $sessionStates, $sessionTiles } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
@@ -191,6 +193,38 @@ export function rebindPaneToResumedRuntime({
   setActiveSessionId(resumedRuntimeId)
 }
 
+/** Ceiling on how long a held send waits for the confirmed chat to take the
+ *  screen (a corrected open is already hydrated when it confirms; a freshly
+ *  created Bot Chat lands a route frame later). */
+const CONFIRMED_SELECTION_WAIT_MS = 10_000
+
+/** Resolves true once `confirmedId` is the selected chat, false as soon as the
+ *  selection moves anywhere else (the user navigated) or the wait runs out. */
+function selectionSettlesOn(confirmedId: string, heldId: null | string): Promise<boolean> {
+  return new Promise(resolve => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let unlisten: () => void = () => undefined
+
+    const settle = (value: boolean) => {
+      clearTimeout(timer)
+      unlisten()
+      resolve(value)
+    }
+
+    const judge = (selected: null | string) => {
+      if (selected === confirmedId) {
+        settle(true)
+      } else if (selected !== null && selected !== heldId) {
+        settle(false)
+      }
+    }
+
+    timer = setTimeout(() => settle(false), CONFIRMED_SELECTION_WAIT_MS)
+    unlisten = $selectedStoredSessionId.listen(judge)
+    judge($selectedStoredSessionId.get())
+  })
+}
+
 /** The prompt submit pipeline, extracted from usePromptActions. */
 /** Canonical admission receipt; `user_row_id` binds the optimistic bubble to its durable row. */
 type SubmitReceipt = Pick<PromptSubmitResult, 'forwarded' | 'running' | 'user_row_id'> & {
@@ -313,6 +347,51 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // frequently not the session on screen, so the foreground flag would gate
       // one session's send on another session's turn.
       const hasSendable = Boolean(visibleText || attachments.length || hasImage)
+
+      if (!hasSendable) {
+        return false
+      }
+
+      // A session painted before its identity was confirmed (Bot Mode's
+      // paint-first click: the roster's last known Bot Chat opens at once, the
+      // registry answers beside it) takes no send until the verdict is in. A
+      // stale roster row names a chat another window or a messaging lane has
+      // since replaced; sent now, the words would land in that old
+      // conversation and the registry answer would navigate away from them
+      // (switch-fix-1119). Confirmed: deliver to the confirmed chat, moving
+      // the draft with it when the id changed. Unconfirmed: refuse, so the
+      // composer gives the words back; the opener explains and offers a retry.
+      const heldStoredSessionId = options?.storedSessionId ?? selectedStoredSessionIdRef.current
+
+      if (hasSubmitHold(heldStoredSessionId)) {
+        const verdict = await awaitSubmitConfirmation(heldStoredSessionId)
+
+        if (verdict.kind === 'unconfirmed') {
+          return false
+        }
+
+        if (verdict.kind === 'confirmed' && verdict.storedSessionId !== heldStoredSessionId) {
+          const confirmedId = verdict.storedSessionId
+
+          // Only once the confirmed chat is the one on screen: the user may
+          // have moved on while the send waited, and a send never follows the
+          // registry somewhere the user is not looking.
+          if (!(await selectionSettlesOn(confirmedId, heldStoredSessionId ?? null))) {
+            return false
+          }
+
+          const confirmedScope = resolveComposerSessionKey(confirmedId, $sessions.get()) ?? confirmedId
+
+          options = {
+            ...options,
+            ...(options?.storedSessionId ? { storedSessionId: confirmedId } : {}),
+            // The held runtime id belonged to the replaced chat.
+            sessionId: undefined,
+            ...(typeof options?.composerScope === 'string' ? { composerScope: confirmedScope } : {})
+          }
+          options.onComposerScopeMoved?.(confirmedScope)
+        }
+      }
 
       const guardSessionId = options?.sessionId ?? activeSessionIdRef.current
       const serverQueue = serverOwnsComposerQueue(options?.storedSessionId ?? guardSessionId)
