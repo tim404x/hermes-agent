@@ -486,6 +486,15 @@ display:
 
 `"steer"` has two automatic fallbacks: if the agent hasn't started yet, or if images are attached, the message falls back to `"queue"` behavior so nothing is lost.
 
+`display.steer_cancels_model_call` (default `false`) makes `"steer"` faster while the model is still thinking or writing. A steer sent during a model request that has not started a tool call cancels that request after `display.steer_cancel_debounce_seconds` (default `1.5`) and the turn retries with your message, the same way `"interrupt"` restarts generation. Each new message restarts the wait (capped at three times the debounce), so a burst of messages cancels the request once and all of them arrive together. While a tool runs, or once the model is streaming a tool call, the steer waits for the next tool boundary as usual.
+
+```yaml
+display:
+  busy_input_mode: "steer"
+  steer_cancels_model_call: true
+  steer_cancel_debounce_seconds: 1.5
+```
+
 Whatever the mode, `/queue <prompt>` queues a follow-up turn explicitly, and `/queue list`, `/queue rm N`, `/queue edit N …` and `/queue move A B` act on the pending queue immediately, even mid-run. The live work dock lists what is waiting.
 
 When the CLI runs on the gateway's session (the default local setup), a prompt queued while a turn runs, by `/queue` or by queue-mode Enter, goes into the gateway's own queue for the session. It survives a gateway restart and runs once, in the order you entered it. Image follow-ups still wait in the CLI. That queue is shared: `/queue list`, `rm`, `edit` and `clear` show and change every prompt queued on the session, including ones another window or an automation queued. The gateway runs its queue in order and cannot reorder it, so `/queue move` refuses to move a prompt the gateway holds. A slash command typed while busy after your own `/queue` prompt runs after that prompt's turn starts; it waits at most a couple of seconds, so a paused queue never blocks typing.
