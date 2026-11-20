@@ -43,6 +43,13 @@ def db(tmp_path):
     return StoreHolder(tmp_path / "state.db")
 
 
+def _changes(db):
+    """``total_changes`` less the visible list revision's own counter writes (``list_revision``: one per write of a
+    row a visible listing shows), so these counts stay the rows the display code itself rewrote."""
+    row = db._conn.execute("SELECT value FROM state_meta WHERE key = 'sessions_visible_list_revision'").fetchone()
+    return db._conn.total_changes - int(row[0] if row else 0)
+
+
 def _seed(db, sid="s1"):
     """Session with 4 archived (compacted) turns + 2 live turns + 1 rewound row."""
     create_session(db, sid, source="cli")
@@ -433,18 +440,18 @@ class TestDisplayDedupe:
             (sid,),
         ).fetchall()
 
-        changes = db._conn.total_changes
+        changes = _changes(db)
         set_message_reaction(db, sid, row_ids[1], "👍", author="user")
         # The reacted row and its session's transcript_revision (a transcript poller's cursor keys on it).
-        assert db._conn.total_changes - changes == 2
+        assert _changes(db) - changes == 2
         assert db._conn.execute(
             "SELECT id, display_order, display_identity FROM messages WHERE session_id = ? ORDER BY id",
             (sid,),
         ).fetchall() == before
 
-        changes = db._conn.total_changes
+        changes = _changes(db)
         get_messages(db, sid, include_compacted=True)
-        assert db._conn.total_changes == changes
+        assert _changes(db) == changes
 
     def test_display_backfill_rewrites_only_changed_identity_group(self, db):
         sid = "identity-update"
@@ -458,9 +465,9 @@ class TestDisplayDedupe:
         db._execute_write(lambda conn: conn.execute(
             "UPDATE messages SET content = ? WHERE id = ?", ('"changed"', first)))
 
-        changes = db._conn.total_changes
+        changes = _changes(db)
         get_messages(db, sid, include_compacted=True)
-        assert db._conn.total_changes - changes == 2
+        assert _changes(db) - changes == 2
         assert db._conn.execute(
             "SELECT COUNT(*) FROM messages WHERE session_id = ? "
             "AND (display_order IS NULL OR display_identity IS NULL)",
