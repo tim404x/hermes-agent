@@ -76,9 +76,10 @@ def test_marked_rows_list_newest_stamp_first_and_plain_rows_never(backend, scope
     assert windows[0].message_count == 1
     assert windows[1].message_count == 0
     assert windows[0].last_active > 0
-    # CONTRACT: the stamp rides its own cell; the row's origin stays untouched.
+    # CONTRACT: the stamp rides its own cell. While the cell is one release old an EMPTY origin also
+    # carries a mirror of the stamp (rollback safety); a routing origin is never touched.
     record = store.sessions.get(SessionId("sw-new"))
-    assert record.origin is None
+    assert record.origin in (None, {"side_window": {"at": 2000.0, "by": "bot:neo"}})
     assert record_side_window_stamp(record) == {"at": 2000.0, "by": "bot:neo"}
 
 

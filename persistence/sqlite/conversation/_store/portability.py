@@ -171,8 +171,11 @@ def _get_session_rich_rows_batch(holder: StoreHolder, session_ids, compact_rows:
         return result
     # Same read-your-writes guarantee as list_sessions_rich.
     holder.flush_token_counts()
+    from persistence.sqlite.conversation._store.side_windows import compact_session_cols
+    # A store on the previous schema (read-only, never migrated) has no side_window_json column yet.
+    cols = compact_session_cols(holder, _compact_session_cols(holder.db_path.parent)) if compact_rows else "s.*"
     query = _rich_select(
-        _compact_session_cols(holder.db_path.parent) if compact_rows else "s.*", f"s.id IN ({','.join('?' for _ in ids)})",
+        cols, f"s.id IN ({','.join('?' for _ in ids)})",
         prompt_select=None if compact_rows else f", {_PROMPT_RESOLVED_SQL}",
     )
     return {s["id"]: s for s in map(_rich_row, _read_rows(holder, query, ids))}

@@ -1327,8 +1327,14 @@ def list_sessions_rich(
         heads = exclude_superseded_segments(holder, where_clauses, params)
     where_sql = _where_sql(where_clauses)
     # Shared projection head of the three list queries (whitespace is part of the SQL text).
+    compact_cols = "s.*"
+    if compact_rows:
+        # The compact list names every DDL column; a store still on the schema before the side-window cell
+        # (an unmigrated profile read through open_persistence_reader) reads that cell as NULL.
+        from persistence.sqlite.conversation._store.side_windows import compact_session_cols
+        compact_cols = compact_session_cols(holder, _compact_session_cols(holder.db_path.parent))
     select_head = (
-        f"SELECT {_compact_session_cols(holder.db_path.parent) if compact_rows else 's.*'}"
+        f"SELECT {compact_cols}"
         + ("" if compact_rows else ", COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved")
         + f",\n                    {_sql_preview_raw()},\n                    "
     )
