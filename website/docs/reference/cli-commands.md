@@ -1896,6 +1896,7 @@ Subcommands:
 | `repair-profiles` | Settle session, routing, Telegram-topic and voice-mode state that landed under the wrong profile (rows in another profile's store, labels disagreeing with the session key, parent links crossing profiles, index rows for deleted profiles). Dry-run by default; `--apply` performs the repairs after snapshotting every store (stop the gateway first); `--legacy-main rekey\|move` decides what `agent:main` rows inside a named profile's store are; `--json` for automation. See [Sessions → Repair State Crossed Between Profiles](../user-guide/sessions.md#repair-state-crossed-between-profiles). |
 | `recover` | Offline, non-destructive recovery of a damaged `state.db` into a separate clean database. |
 | `retitle-skills` | Regenerate titles for sessions opened with a `/skill`, using what the user actually typed; lists changes unless `--apply` is passed. |
+| `open-tab <session-id> [--title T] [--by BOT]` | Show a chat as a Desktop task tab under this profile's Bot (the side-window stamp `message_agent` writes); `--title` also sets the tab label, `--by` records the Bot that opened it. The chat's routing is unchanged. See [Sessions → Open a Chat as a Desktop Task Tab](../user-guide/sessions.md#open-a-chat-as-a-desktop-task-tab). |
 
 ## `hermes insights`
 

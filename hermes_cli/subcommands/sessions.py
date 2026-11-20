@@ -323,6 +323,16 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
     sessions_unpin.add_argument(
         "session_ids", nargs="+", help="Session ID(s) or unique prefix(es) to unpin")
 
+    sessions_open_tab = sessions_subparsers.add_parser(
+        "open-tab", help="Show a chat as a task tab beside its Bot in the Desktop",
+        description="Stamp a session as a side window, the same stamp message_agent puts on a "
+            "teammate's DM window, so the Desktop opens it as a tab under this profile's Bot. "
+            "Works on any chat; its routing origin is never changed. Run it under the Bot's "
+            "profile (hermes -p <bot> sessions open-tab <id>).")
+    sessions_open_tab.add_argument("session_id", help="Session ID or unique prefix")
+    sessions_open_tab.add_argument("--title", help="Also set the chat's title (the tab label)")
+    sessions_open_tab.add_argument("--by", default="", help="The Bot opening it (profile name), stamped as bot:<name>")
+
     sessions_pinned = sessions_subparsers.add_parser("pinned", help="List pinned sessions")
     add_json_flag(sessions_pinned, "Emit machine-readable JSON (for backup/restore scripting)")
 
