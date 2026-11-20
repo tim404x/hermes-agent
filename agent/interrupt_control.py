@@ -6,6 +6,7 @@ Extracted from ``run_agent.py``; every method resolves through ``AIAgent``'s MRO
 import contextlib
 import logging
 import threading
+import time
 from typing import Optional
 
 from agent.interrupt_compat import request_hard_interrupt
@@ -126,6 +127,19 @@ def _ic_codex_method(agent, name: str):
         return None
     method = getattr(getattr(agent, "_codex_session", None), name, None)
     return method if callable(method) else None
+
+
+def _steer_cancel_eligible(agent) -> bool:
+    """A steer may cancel the request only while a model request is in flight, no tool is running
+    and the response has not started a tool call (``_model_streaming_tool_call``, set by
+    ``_fire_tool_gen_started`` and reset per request): those calls are kept, the post-tool drain
+    delivers the steer. Codex app-server runs its own loop and is never cancelled from here."""
+    if _ic_codex_method(agent, "request_steer") is not None:
+        return False
+    if getattr(agent, "_executing_tools", False) or getattr(agent, "_model_streaming_tool_call", False):
+        return False
+    active = getattr(agent, "_model_request_active", None)
+    return active is not None and active.is_set()
 
 
 def _ic_abort_active_request(agent, reason: str, failure_log: str) -> None:
@@ -318,6 +332,75 @@ class InterruptControlMixin:
             _set_steer_parts(self, _steer_parts(self) + [(ticket, cleaned)])
         # The turn no longer ran on its own (first-task-done detection reads this off the result).
         self._turn_user_intervened = True
+        self._maybe_arm_steer_cancel()
+        return True
+
+    # apexfix: steer upgrades to a debounced redirect while a model call is in flight
+    def _maybe_arm_steer_cancel(self) -> bool:
+        """``display.steer_cancels_model_call``: a steer buffered while a model request is in flight
+        (no tool running, no tool call streaming yet) arms a trailing debounce timer. When it fires the
+        whole steer buffer is handed to the redirect machinery at once, so a burst of messages cancels the
+        request ONCE and the loop retries with every text. Called by ``steer()`` and when a model request
+        starts with steers still buffered. Off by default; True when a timer was (re)armed."""
+        if not getattr(self, "_steer_cancels_model_call", False):
+            return False
+        if not _steer_cancel_eligible(self):
+            return False
+        with _ic_lock(self, "_pending_steer_lock"):
+            if not _steer_parts(self):
+                return False
+        try:
+            debounce = max(0.0, float(getattr(self, "_steer_cancel_debounce_s", 1.5)))
+        except (TypeError, ValueError):
+            debounce = 1.5
+        now = time.monotonic()
+        with _ic_lock(self, "_steer_cancel_lock"):
+            first = vars(self).get("_steer_cancel_first_at") or now
+            # Trailing debounce (each message restarts the wait) capped at 3x from the burst's first
+            # message, so a steady stream of messages cannot postpone delivery forever.
+            fire_at = min(now + debounce, first + 3 * debounce)
+            gen = int(vars(self).get("_steer_cancel_gen") or 0) + 1
+            previous = vars(self).get("_steer_cancel_timer")
+            if previous is not None:
+                previous.cancel()
+            timer = threading.Timer(max(0.0, fire_at - now), self._fire_steer_cancel, args=(gen,))
+            timer.daemon = True
+            self._steer_cancel_gen = gen
+            self._steer_cancel_first_at = first
+            self._steer_cancel_timer = timer
+            timer.start()
+        return True
+
+    def _fire_steer_cancel(self, gen: int) -> bool:
+        """Debounce expiry: move the buffered steers into a redirect of the in-flight request. When the
+        request already finished, a tool started or a tool call is streaming, the steers stay buffered
+        for the normal drains (nothing is lost; at most nothing is gained). True when it cancelled."""
+        with _ic_lock(self, "_steer_cancel_lock"):
+            if gen != vars(self).get("_steer_cancel_gen"):
+                return False  # superseded by a later message's timer
+            self._steer_cancel_timer = None
+            self._steer_cancel_first_at = None
+        if not _steer_cancel_eligible(self):
+            return False
+        # Lock order steer -> redirect (no path takes them the other way round): the buffer is emptied
+        # only when the redirect was accepted, so a drain can never see the text twice or not at all.
+        with _ic_lock(self, "_pending_steer_lock"):
+            parts = _steer_parts(self)
+            if not parts:
+                return False
+            from agent.prompt_builder import format_steer_marker
+
+            joined = "\n".join(part_text for _, part_text in parts)
+            if not self._redirect_model_request(format_steer_marker(joined).lstrip()):
+                return False
+            _set_steer_parts(self, [])
+            for ticket, _ in parts:
+                if ticket is not None:
+                    _steer_fates(self)[ticket] = True
+        logger.info(
+            "Steer upgraded to redirect: cancelled the in-flight model request to deliver %d message(s)",
+            len(parts),
+        )
         return True
 
     def redirect(self, text: str) -> bool:
@@ -359,6 +442,11 @@ class InterruptControlMixin:
                         _request_yield(tid)
             return accepted
 
+        return self._redirect_model_request(cleaned)
+
+    def _redirect_model_request(self, cleaned: str) -> bool:
+        """Cancel only the in-flight model request and queue ``cleaned`` as the correction the loop
+        rebuilds with; False when no model request is in flight (or a hard stop is pending)."""
         _model_active = getattr(self, "_model_request_active", None)
         with _ic_lock(self, "_pending_redirect_lock"):
             if _model_active is None or not _model_active.is_set():

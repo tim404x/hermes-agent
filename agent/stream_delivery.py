@@ -113,6 +113,8 @@ class StreamDeliveryMixin:
         # Inline <think> text is forwarded to the reasoning pane only while no native reasoning delta
         # arrived for this model response (#89647).
         self._native_reasoning_streamed = False
+        # Set by _fire_tool_gen_started; a new response has not started a tool call yet.
+        self._model_streaming_tool_call = False
         # Next stream re-reads plugins.stream_reasoning_deltas (config edits land per request).
         self._stream_reasoning_hooks_enabled = None
 
@@ -426,6 +428,8 @@ class StreamDeliveryMixin:
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify the display layer that the model is generating tool call arguments (spinner for large payloads)."""
+        # The response is committing to a tool call: a steer must not cancel it (interrupt_control).
+        self._model_streaming_tool_call = True
         self._call_quietly(self.tool_gen_callback, tool_name)
 
     def _has_stream_consumers(self) -> bool:

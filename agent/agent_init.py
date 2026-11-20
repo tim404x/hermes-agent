@@ -440,6 +440,12 @@ _CONTROL_STATE: dict[str, Any] = {
     # rebuild the tail with the correction. Drained at a role-safe boundary.
     "_pending_redirect": None,
     "_pending_redirect_lock": threading.Lock,
+    # display.steer_cancels_model_call: debounce timer that upgrades buffered steers to a redirect.
+    "_steer_cancel_lock": threading.Lock,
+    "_steer_cancel_timer": None,
+    "_steer_cancel_gen": 0,
+    "_steer_cancel_first_at": None,
+    "_model_streaming_tool_call": False,
     # Concurrent-tool worker tids: `_set_interrupt` on `_execution_thread_id` alone doesn't
     # reach ThreadPoolExecutor workers, so interrupt()/clear_interrupt() fan out to these.
     "_tool_worker_threads": set,
@@ -1100,6 +1106,18 @@ def _init_session_state(agent, session_id, session_db, parent_session_id, reason
 def _apply_display_config(agent, _agent_cfg, platform):
     # show_commentary: Codex phase=commentary → interim path (true) or reasoning channel.
     agent.show_commentary = bool(_cfg_dict(_agent_cfg, "display").get("show_commentary", True))
+
+    # display.steer_cancels_model_call: a steer that arrives while a model request is in flight
+    # cancels that request after a short debounce and the loop retries with the text (off by default).
+    _display = _cfg_dict(_agent_cfg, "display")
+    _steer_cancel = _display.get("steer_cancels_model_call", False)
+    if isinstance(_steer_cancel, str):
+        _steer_cancel = _steer_cancel.strip().lower() in ("1", "true", "yes", "on")
+    agent._steer_cancels_model_call = bool(_steer_cancel)
+    try:
+        agent._steer_cancel_debounce_s = max(0.0, float(_display.get("steer_cancel_debounce_seconds", 1.5)))
+    except (TypeError, ValueError):
+        agent._steer_cancel_debounce_s = 1.5
 
     # Window (seconds) for the bounded /fast auto|cold modes (agent.fast_mode).
     agent.fast_auto_seconds = (_agent_cfg.get("agent") or {}).get("fast_auto_seconds", 60)
