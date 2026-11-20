@@ -152,6 +152,35 @@ def job_has_monitor(job: dict) -> bool:
     return bool(_field(job, "monitor_script") or _field(job, "monitor_url"))
 
 
+@dataclass
+class MonitorPeek:
+    """One read-only monitor evaluation (``peek_monitor``): nothing is persisted."""
+
+    ok: bool
+    unchanged: bool = False
+    first_run: bool = False
+    output_hash: Optional[str] = None
+    error: Optional[str] = None
+
+
+def peek_monitor(job: dict) -> MonitorPeek:
+    """Run the monitor source and compare its hash with the stored one WITHOUT persisting.
+
+    Same source run (``_run_monitor_source``) and the same comparison ``check_monitor`` makes, so
+    ``unchanged`` is True exactly when ``check_monitor`` would return ``changed=False`` for this
+    output. The firer uses it before admission (cron/monitor_preadmit.py); a changed or failed
+    source is left to the owner's ``check_monitor``, which re-runs it and persists as before.
+    """
+    ok, output = _run_monitor_source(job)
+    if not ok:
+        return MonitorPeek(ok=False, error=output)
+    new_hash = hash_monitor_output(output)
+    raw_state = job.get("monitor_state")
+    last_hash = raw_state.get("last_output_hash") if isinstance(raw_state, dict) else None
+    return MonitorPeek(ok=True, unchanged=last_hash is not None and new_hash == last_hash,
+                       first_run=last_hash is None, output_hash=new_hash)
+
+
 def check_monitor(job: dict) -> MonitorOutcome:
     """Run the monitor source and decide whether the agent should run.
 

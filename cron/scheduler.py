@@ -1516,6 +1516,16 @@ def _run_no_agent_job(
     return True, f"{header}\n---\n\n{output}\n", output, None
 
 
+def _monitor_no_change_result(job_id: str, job_name: str) -> tuple[bool, str, str, None]:
+    """The silent no_change run of a monitor tick whose output matches the stored hash: the
+    owner's gate (``_apply_monitor_gate``) and the firer's pre-admission peek
+    (``cron/monitor_preadmit.py``) both return exactly this, so the bookkeeping cannot drift."""
+    header = _job_doc_header(job_name, job_id, _hermes_now().strftime("%Y-%m-%d %H:%M:%S"), "monitor")
+    # Unchanged: silent no_change tick (ledger doc kept; SILENT_MARKER blocks delivery).
+    logger.info("Job '%s': monitor output unchanged — suppressing agent run", job_id)
+    return True, f"{header}**Status:** no_change (agent run suppressed)\n", SILENT_MARKER, None
+
+
 def _apply_monitor_gate(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str],
 ) -> tuple[Optional[tuple], Optional[str], Optional[str]]:
@@ -1544,11 +1554,7 @@ def _apply_monitor_gate(
             False, f"{header}**Status:** monitor source failed\n\n{_mon.error}\n", _mon_alert, _mon.error,
         ), extra_prompt, None
     if not _mon.changed:
-        # Unchanged: silent no_change tick (ledger doc kept; SILENT_MARKER blocks delivery).
-        logger.info("Job '%s': monitor output unchanged — suppressing agent run", job_id)
-        return (
-            True, f"{header}**Status:** no_change (agent run suppressed)\n", SILENT_MARKER, None,
-        ), extra_prompt, None
+        return _monitor_no_change_result(job_id, job_name), extra_prompt, None
     # Changed (or first run): pass monitor output through the runtime-data seam. Keep any manual
     # per-run prompt separate: it remains user input and is therefore still strict-scanned.
     return None, extra_prompt, _mon.context_block
@@ -2524,6 +2530,12 @@ def run_job(
     if owner_execution is not None and owner_execution[2:] != (job['id'], execution_id):
         owner_execution = None
     if not job.get("no_agent") and owner_execution is None:
+        # apexfix: monitor gate runs before admission. An unchanged scheduled monitor tick returns
+        # the owner's own no_change result here, so it never reserves a session or a policy receipt.
+        from cron.monitor_preadmit import preadmit_monitor_gate
+        _unchanged = preadmit_monitor_gate(job, extra_prompt=extra_prompt, cancel_event=cancel_event)
+        if _unchanged is not None:
+            return _unchanged
         from cron.scheduler_authority import run_canonical_job
         return run_canonical_job(job, extra_prompt=extra_prompt, cancel_event=cancel_event,
                                  execution_id=execution_id)
