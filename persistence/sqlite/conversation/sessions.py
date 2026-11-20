@@ -638,10 +638,10 @@ class SQLiteSessionRepository:
             return bool(set_session_read(holder, session_id, read))
 
     def mark_side_window(self, session_id: SessionId, *, by: Optional[str] = None, at: Optional[float] = None,
-                         key: Optional[str] = None) -> bool:
+                         key: Optional[str] = None, dm: bool = False) -> bool:
         holder = self._store.holder()
         with refusals(holder, session_id):
-            return mark_side_window(holder, session_id, by=by, at=at, key=key)
+            return mark_side_window(holder, session_id, by=by, at=at, key=key, dm=dm)
 
     def unarchive_recoverable(self, session_id: SessionId) -> bool:
         holder = self._store.holder()
