@@ -413,30 +413,68 @@ const WAKE_DISPLAY_KINDS: ReadonlySet<string> = new Set([
   RUNTIME_NOTICE_KIND
 ])
 
-const storedRowText = (message: SessionMessage): string => {
-  const text = message.display_content !== undefined ? message.display_content : message.content
+const stringOrEmpty = (value: unknown) => (typeof value === 'string' ? value : '')
 
-  return typeof text === 'string' ? text : ''
-}
+/** The reply an assistant row paints, resolved as the painter below resolves it: the projected
+ *  `display_content` when the backend set one, else the row's own text, else the Responses-API reply. */
+const replyText = (message: SessionMessage): string =>
+  message.display_content !== undefined
+    ? stringOrEmpty(message.display_content)
+    : stringOrEmpty(message.content) || stringOrEmpty(message.text) || codexMessageItemText(message).reply
 
 const hasStoredToolCalls = (message: SessionMessage) =>
   Array.isArray(message.tool_calls) && message.tool_calls.length > 0
 
-/** An assistant row whose whole reply is a silence marker (`NO_REPLY`, `[SILENT]`): the bot chose to
- *  say nothing. The gateway swallows it on delivery; the stored row keeps the model's text. */
+/** Public commentary painted beside the reply (a marker there is not commentary). */
+const hasPublicCommentary = (message: SessionMessage) =>
+  Array.isArray(message.display_commentary) &&
+  message.display_commentary.some(part => typeof part === 'string' && part.trim() && !isSilenceMarkerText(part))
+
+/** Whether an assistant row paints any words, from the same carriers the painter reads. */
+const rowSpeaks = (message: SessionMessage) => Boolean(replyText(message).trim() || hasPublicCommentary(message))
+
+/** An assistant row whose every public carrier holds nothing but a silence marker (`NO_REPLY`): the bot
+ *  chose to say nothing. A failed or interrupted turn's boundary row is Hermes reporting, never silence. */
 function isSilentReplyRow(message: SessionMessage): boolean {
-  return message.role === 'assistant' && !hasStoredToolCalls(message) && isSilenceMarkerText(storedRowText(message))
+  if (message.role !== 'assistant' || hasStoredToolCalls(message) || message.display_kind === 'failed_turn') {
+    return false
+  }
+
+  const metadata = parseDisplayMetadata(message.display_metadata)
+
+  return (
+    !metadata?.error_surface &&
+    metadata?.interrupted !== true &&
+    !hasPublicCommentary(message) &&
+    isSilenceMarkerText(replyText(message))
+  )
+}
+
+/** `silence_allowed` read from a turn's stored opener: a machinery wake, or a message nobody addressed
+ *  to the bot. A person's own turn may not end silent, so its reply paints as the live view showed it. */
+const opensSilentTurn = (message: SessionMessage) =>
+  Boolean(message.display_kind && WAKE_DISPLAY_KINDS.has(message.display_kind)) ||
+  parseDisplayMetadata(message.display_metadata)?.reply_expected === false
+
+interface SilentTurns {
+  /** Stored positions that paint nothing. */
+  hidden: Set<number>
+  /** Assistant rows inside a turn that may end silent: a bare marker there paints nothing. */
+  silenceOk: Set<number>
 }
 
 /**
- * Stored positions a silent turn leaves nothing to paint for: each silent reply row, and the wake
- * row ("Background Process Finished: …") of a machinery turn that ended silent without running a
- * tool or saying anything, so a silent wake leaves no trace in the thread. A wake whose turn spoke,
- * ran tools or is not stored yet stays visible.
+ * Twin of `session_rules/silent_turns.py` for backends older than it. A turn may vanish where its live
+ * delivery let it (a machinery wake, an unaddressed message; the Bot Chat as a whole is known to the
+ * backend only, which marks those rows `silent_turn`). Hidden: each silent reply row, and the wake row
+ * ("Background Process Finished: …") of a turn that said nothing else and ran no tool. A wake whose
+ * turn spoke, ran tools or is not stored yet stays visible.
  */
-function silentTurnRows(rows: readonly { index: number; message: SessionMessage }[]): Set<number> {
+function silentTurnRows(rows: readonly { index: number; message: SessionMessage }[]): SilentTurns {
   const hidden = new Set<number>()
+  const silenceOk = new Set<number>()
   let wake: null | number = null
+  let turnSilenceOk = false
   let quiet = false
   let silent = false
 
@@ -447,28 +485,49 @@ function silentTurnRows(rows: readonly { index: number; message: SessionMessage 
   }
 
   for (const { index, message } of rows) {
+    if (message.silent_turn === true) {
+      hidden.add(index)
+    }
+
     if (message.role === 'user') {
       closeTurn()
-      wake = message.display_kind && WAKE_DISPLAY_KINDS.has(message.display_kind) ? index : null
+      // A cron delivery's row carries the job's output for the reader (agent/display_row_typing.py):
+      // the bot's silence about it never hides the delivery itself.
+      wake =
+        message.display_kind &&
+        WAKE_DISPLAY_KINDS.has(message.display_kind) &&
+        !parseDisplayMetadata(message.display_metadata)?.cron_delivery
+          ? index
+          : null
+      turnSilenceOk = opensSilentTurn(message)
       quiet = true
       silent = false
-    } else if (isSilentReplyRow(message)) {
+    } else if ((turnSilenceOk || message.silent_turn === true) && isSilentReplyRow(message)) {
       hidden.add(index)
       silent = true
-    } else if (message.role !== 'assistant' || hasStoredToolCalls(message) || storedRowText(message).trim()) {
+    } else if (message.role !== 'assistant' || hasStoredToolCalls(message) || rowSpeaks(message)) {
       quiet = false
+    }
+
+    if ((turnSilenceOk || message.silent_turn === true) && message.role === 'assistant') {
+      silenceOk.add(index)
     }
   }
 
   closeTurn()
 
-  return hidden
+  return { hidden, silenceOk }
 }
 
-/** The reply text an assistant row paints: a bare marker paints nothing, a marker closing a real
- *  reply on its own line is dropped (gateway/response_filters.py strip_trailing_silence_marker). */
-function paintedAssistantReply(reply: null | string | undefined): null | string | undefined {
-  return reply && (isSilenceMarkerText(reply) ? '' : stripTrailingSilenceMarker(reply))
+/** The reply text an assistant row paints. Only in a turn that may end silent does a bare marker paint
+ *  nothing and a marker closing the reply on its own line drop (gateway/response_filters.py
+ *  strip_trailing_silence_marker); a person's answer shows as the live view showed it, last line included. */
+function paintedAssistantReply(reply: null | string | undefined, silenceOk: boolean): null | string | undefined {
+  if (!reply || !silenceOk) {
+    return reply
+  }
+
+  return isSilenceMarkerText(reply) ? '' : stripTrailingSilenceMarker(reply)
 }
 
 /** The disclosure body and kind a background/machine event row carries (result, output, brief). */
@@ -659,9 +718,21 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   )
 
   const silent = silentTurnRows(stored)
-  const painted = stored.filter(({ index }) => !silent.has(index))
+  // Hidden rows paint nothing but are still backend rows: each one counts toward the message painted
+  // just before it (the next one when none is), so serverRowSpan sums to the page's row count.
+  let leadingHiddenRows = 0
 
-  painted.forEach(({ message, index }) => {
+  stored.forEach(({ message, index }) => {
+    if (silent.hidden.has(index)) {
+      if (result.length) {
+        absorbRows(result[result.length - 1], 1)
+      } else {
+        leadingHiddenRows += 1
+      }
+
+      return
+    }
+
     if (message.role === 'assistant') {
       nearestAssistant = message
     } else if (message.role === 'user' || message.role === 'system') {
@@ -744,7 +815,10 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     }
 
     const storedReply = message.display_content !== undefined ? displayContent : displayContent || codexText?.reply
-    const reply = displayRole === 'assistant' ? paintedAssistantReply(storedReply) : storedReply
+
+    const reply =
+      displayRole === 'assistant' ? paintedAssistantReply(storedReply, silent.silenceOk.has(index)) : storedReply
+
     // Some providers also persist the joined commentary as canonical content.
     // Keep that authoritative copy once, without treating unrelated final text
     // as a reason to discard the earlier public messages.
@@ -882,6 +956,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     drawnRow(result[result.length - 1])
   })
   flushPendingTools(messages.length)
+  absorbRows(result[0], leadingHiddenRows)
 
   const withoutGeneratedImageEchoes = result.map(message =>
     message.role === 'assistant'
