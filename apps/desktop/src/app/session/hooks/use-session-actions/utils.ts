@@ -24,6 +24,7 @@ import {
   $currentCwd,
   $messagingSessions,
   $sessions,
+  $unlistedSessionOwnerRows,
   commitWorkspaceCwdForSelectedSession,
   getSessionOwnerHint,
   knownSessionOwner,
@@ -1973,6 +1974,30 @@ function projectTreeSessions(): SessionInfo[] {
     ])
 }
 
+// A hidden row (the canonical Bot Chat) a by-id resolve parked off-list
+// (upsertResolvedSession). It is never listed, so `cachedSessionRow` cannot
+// see it: every bot switch re-read it over the network before the session
+// could bind, and the warm refresh's ownership check (display-hydration) found
+// no row and dropped the fresh page, so rows that landed while the user was on
+// another bot never painted (bot-switch-speed). Kept out of `cachedSessionRow`
+// on purpose: gone-session and remembered-owner checks keep their reads. Draft
+// stubs share the atom but carry no `hidden` flag and never match.
+export function parkedHiddenSessionRow(
+  storedSessionId: string,
+  owner?: Pick<SessionProfileRoute, 'connectionId' | 'profile'>
+): SessionInfo | undefined {
+  return $unlistedSessionOwnerRows
+    .get()
+    .find(
+      session =>
+        session.hidden === true &&
+        sessionMatchesStoredId(session, storedSessionId) &&
+        (!owner ||
+          (session.connection_id === owner.connectionId &&
+            normalizeProfileKey(session.profile) === normalizeProfileKey(owner.profile)))
+    )
+}
+
 // The best cached row for a stored id, across every list that can hold one.
 // "Best" means self-describing: the same conversation can appear both as an
 // ownerless legacy Recents copy and as a profile-stamped project-tree row, and
@@ -2040,13 +2065,28 @@ export async function probeStoredSession(
       return { status: 'found', session: cached }
     }
 
-    try {
+    const readOwnedRow = async () => {
       const session = await getSession(storedSessionId, scope)
       session.profile = normalizeProfileKey(ownerRoute.profile)
       session.connection_id = ownerRoute.connectionId
       upsertResolvedSession(session, storedSessionId, tombstoneGenerationsAtRequestStart)
 
-      return { status: 'found', session }
+      return session
+    }
+
+    // The parked hidden row answers at once; the read still runs, off the
+    // switch's critical path, so the parked copy never goes stale (listed rows
+    // get the same from the sidebar's list refresh).
+    const parked = parkedHiddenSessionRow(storedSessionId, ownerRoute)
+
+    if (parked) {
+      void readOwnedRow().catch(() => undefined)
+
+      return { status: 'found', session: parked }
+    }
+
+    try {
+      return { status: 'found', session: await readOwnedRow() }
     } catch (error) {
       // An explicit owner is fail-closed. Probing the ambient or another
       // profile would turn a stale route into a cross-connection open.
