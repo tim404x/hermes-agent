@@ -28,7 +28,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from gateway.response_filters import is_intentional_silence_response, strip_trailing_silence_marker
+from session_rules.silence import is_intentional_silence_response, strip_trailing_silence_marker
 from session_rules.turns import (
     LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX, _MERGED_PRIOR_CONTEXT_HEADER, _SUMMARY_END_MARKER, describe_skill_invocation,
     sanitize_context,
