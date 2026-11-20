@@ -3454,6 +3454,7 @@ dashboard:
   drain_auth:                 # Drain-control service-credential gate (dashboard_auth/drain plugin)
     scope: "drain"            # capability label on the verified principal
     min_secret_chars: 43      # entropy bar (url-safe-b64 chars; 43 ≈ 256 bits)
+  http_keep_alive_s: 75       # Idle HTTP keep-alive socket lifetime (seconds; uvicorn default 5)
   ws_ping_interval: 20.0      # Non-loopback WebSocket keepalive ping interval (seconds)
   ws_ping_timeout: 20.0       # Non-loopback WebSocket keepalive pong timeout (seconds)
   ws_orphan_reap_grace_s: 20.0 # Grace before a WS-detached session is reaped (seconds)
