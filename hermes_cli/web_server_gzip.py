@@ -8,12 +8,16 @@ from starlette.types import Message, Receive, Scope, Send
 def _compressible(message: Message, minimum_size: int) -> bool:
     headers = Headers(raw=message["headers"])
     media_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    try:
+        length = int(headers.get("content-length", "0"))
+    except ValueError:  # a malformed length is not ours to rewrite
+        return False
     # BaseHTTPMiddleware re-chunks even finite responses. Content-Length
     # preserves their size; real streams omit it. FileResponse advertises
     # ranges, and downloads may also declare Content-Disposition.
     return (
         (media_type == "application/json" or media_type.startswith("text/"))
-        and int(headers.get("content-length", "0")) >= minimum_size
+        and length >= minimum_size
         and message["status"] != 206
         and not any(name in headers for name in (
             "content-range", "content-disposition", "accept-ranges", "content-encoding",
@@ -22,12 +26,22 @@ def _compressible(message: Message, minimum_size: int) -> bool:
 
 
 class _DashboardGZipResponder(GZipResponder):
+    """Starlette's responder for what _compressible() accepts; everything else passes through as sent.
+
+    Decided on ``http.response.start``, before the base class sees it. Starlette 1.9 forwards the start
+    of a response it excludes at once and then its body as-is, so flipping the base class's exclusion
+    flag after it buffered the start (what worked on 1.3) sent the body with no start at all.
+    """
+
+    _passthrough = False
+
     async def send_with_compression(self, message: Message) -> None:
+        if message["type"] == "http.response.start" and not _compressible(message, self.minimum_size):
+            self._passthrough = True
+        if self._passthrough:
+            await self.send(message)
+            return
         await super().send_with_compression(message)
-        if message["type"] == "http.response.start":
-            self.content_type_is_excluded = (
-                self.content_type_is_excluded or not _compressible(message, self.minimum_size)
-            )
 
 
 def _accepts_gzip(accept_encoding: str) -> bool:
@@ -53,7 +67,9 @@ class DashboardGZipMiddleware(GZipMiddleware):
             await self.app(scope, receive, send)
             return
         if _accepts_gzip(headers.get("accept-encoding", "")):
-            responder = _DashboardGZipResponder(self.app, self.minimum_size, self.compresslevel)
+            # Starlette >= 1.9 compresses big bodies in a worker thread, off the event loop.
+            extra = {"thread_minimum_size": self.thread_minimum_size} if hasattr(self, "thread_minimum_size") else {}
+            responder = _DashboardGZipResponder(self.app, self.minimum_size, self.compresslevel, **extra)
             await responder(scope, receive, send)
             return
 
