@@ -11,7 +11,7 @@ import { sanitizePreviewText } from './preview-text'
 const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), '../../../../tests/fixtures/preview_text_cases.json')
 
 const { cases } = JSON.parse(readFileSync(FIXTURE, 'utf8')) as {
-  cases: { expected: string; input: string; name: string }[]
+  cases: { expected: string; input: string; name: string; silence_ok?: boolean }[]
 }
 
 describe('sanitizePreviewText', () => {
@@ -20,7 +20,7 @@ describe('sanitizePreviewText', () => {
   })
 
   it.each(cases.map(c => [c.name, c] as const))('%s', (_name, c) => {
-    expect(sanitizePreviewText(c.input)).toBe(c.expected)
+    expect(sanitizePreviewText(c.input, { silenceOk: c.silence_ok })).toBe(c.expected)
   })
 
   it('reads non-strings as empty', () => {
