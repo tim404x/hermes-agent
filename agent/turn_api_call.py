@@ -135,6 +135,14 @@ def perform_api_call(
     with _bracket:
         if _model_request_active is not None:
             _model_request_active.set()
+    # A steer still buffered when the request starts (requeued by the pre-API drain) gets the
+    # same debounced cancel as one sent mid-call (display.steer_cancels_model_call).
+    _arm_steer_cancel = getattr(agent, "_maybe_arm_steer_cancel", None)
+    if callable(_arm_steer_cancel):
+        try:
+            _arm_steer_cancel()
+        except Exception:
+            logger.debug("steer-cancel arm at request start failed", exc_info=True)
     try:
         response = run_llm_execution_middleware(
             api_kwargs, _perform_api_call, original_request=_original_api_kwargs,
