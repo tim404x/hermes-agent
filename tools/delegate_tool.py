@@ -56,7 +56,8 @@ from tools.delegate_tool_toolsets import (
     DELEGATE_BLOCKED_TOOLS, _expand_parent_toolsets, _resolve_child_toolsets, _strip_blocked_tools,
 )
 from tools.delegate_tool_results import (
-    _apply_summary_budget, _build_child_preserving_parent_tools, _run_child_lifecycle, _summarize_tool_arguments,
+    _apply_summary_budget, _build_child_preserving_parent_tools, _run_child_lifecycle, _session_epoch,
+    _summarize_tool_arguments,
 )
 
 _ROLES = frozenset({"leaf", "orchestrator"})
@@ -369,6 +370,9 @@ def _build_child_agent(
     child._delegate_context = context  # rides the first user turn, not the system prompt
     child._inherited_cache_scope = sibling_cache_scope(parent_agent)
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
+    # The parent session it was built in: a background child finishing after /new keeps its spend out of the
+    # new session's totals (delegate_tool_results._from_older_session).
+    child._delegate_parent_epoch = _session_epoch(parent_agent)
     _apply_child_compression_cap(child, delegation_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
