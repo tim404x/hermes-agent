@@ -17,7 +17,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from agent.ack_first import consume_ack_first_note
+from agent.ack_first import consume_ack_first_note, list_api_content, with_api_only_note
 from agent.conversation_compression import recover_rotated_compression_session
 from agent.iteration_budget import IterationBudget
 from agent.memory_context import build_memory_context_block, sanitize_context
@@ -29,7 +29,7 @@ from agent.skills_index_delta import stage_skills_index_note
 from agent.prompt_refresh import refresh_warm_prompt
 from agent.prompt_cache_lifecycle.tier import maybe_upgrade_cache_tier
 from agent.message_metadata import (
-    PERSISTENCE_ONLY_MESSAGE_FIELDS, PRE_LLM_BLOCK_WITHHELD_PROMPT, append_message, stamp_message_timestamp,
+    API_TAIL_NOTE, PERSISTENCE_ONLY_MESSAGE_FIELDS, PRE_LLM_BLOCK_WITHHELD_PROMPT, append_message, stamp_message_timestamp,
     TYPED_ASK, stamp_typed_ask, typed_ask_fields, typed_ask_text, REQUEST_REASONING_TOKENS, stamped_reasoning_tokens,
 )
 from agent.model_metadata import (
@@ -984,25 +984,30 @@ def _merge_gateway_notes(
     """Must-deliver per-turn notes ride the user-message injection channel (one-shot) so the
     ephemeral system prompt stays byte-stable: the gateway's staged notes, plugin go-live notices no
     tool result carried, then the surface-switch correction, last the ack-first ask. Multimodal (list)
-    content can't take the string sidecar — append a durable text part instead."""
+    content can't take the string sidecar — append a durable text part instead; the ack-first ask is
+    held API-only there (``agent.ack_first``), never in the person's stored message."""
     forward_lsp_verdicts(agent)  # late LSP verdicts on last turn's edits ride the plugin-notice queue
     _turn_notes = "\n\n".join(
         part for part in (consume_gateway_turn_context_notes(agent), pop_plugin_notices(agent),
                           consume_surface_switch_note(agent),
-                          consume_skills_index_note(agent), consume_ack_first_note(agent)) if part
+                          consume_skills_index_note(agent)) if part
     )
-    if not _turn_notes:
+    _ack = consume_ack_first_note(agent)
+    if not (_turn_notes or _ack):
         return plugin_user_context
-    _gw_turn_content = (
-        messages[current_turn_user_idx].get("content")
-        if 0 <= current_turn_user_idx < len(messages)
-        and isinstance(messages[current_turn_user_idx], dict)
+    _turn_msg = (
+        messages[current_turn_user_idx]
+        if 0 <= current_turn_user_idx < len(messages) and isinstance(messages[current_turn_user_idx], dict)
         else None
     )
-    if isinstance(_gw_turn_content, list):
-        _stamp_typed_ask_once(agent, messages[current_turn_user_idx])
-        append_notes_to_multimodal_content(_gw_turn_content, _turn_notes)
+    if _turn_msg is not None and isinstance(_turn_msg.get("content"), list):
+        if _turn_notes:
+            _stamp_typed_ask_once(agent, _turn_msg)
+            append_notes_to_multimodal_content(_turn_msg["content"], _turn_notes)
+        if _ack:
+            _turn_msg[API_TAIL_NOTE] = _ack
         return plugin_user_context
+    _turn_notes = "\n\n".join(part for part in (_turn_notes, _ack) if part)
     return (
         plugin_user_context + "\n\n" + _turn_notes if plugin_user_context else _turn_notes
     )
@@ -1169,9 +1174,12 @@ def _append_multimodal_context(
         _stamp_typed_ask_once(agent, turn_user_msg)
     # A stamp means injected context landed on the parts (here or as gateway notes): backfill either way.
     appended = append_notes_to_multimodal_content(turn_user_msg.get("content"), _mm_ctx)
-    if not appended and typed_ask_text(turn_user_msg) is None:
+    rewrite = appended or typed_ask_text(turn_user_msg) is not None
+    # An API-only ack-first note never enters the row's content; it rides the row's api_content sidecar.
+    api_sidecar = list_api_content(turn_user_msg)
+    if not rewrite and api_sidecar is None:
         return
-    from agent.session_persistence import _persist_lock
+    from agent.session_persistence import _persist_lock, durable_user_row_content
     from session_rules.turns import _durable_content
 
     with _persist_lock(agent):
@@ -1183,11 +1191,20 @@ def _append_multimodal_context(
         _store = agent_interface(agent)
         _db = _store.messages if _store is not None else _db
         _in_place_compacted = preflight_compressed and bool(getattr(agent, "_last_compaction_in_place", False))
-        content = turn_user_msg["content"] if _in_place_compacted else _durable_content(turn_user_msg["content"])
-        try:
-            _db.set_user_message_content(agent.session_id, _row_id, content, typed_ask_fields(turn_user_msg))
-        except Exception:
-            logger.warning("multimodal context backfill failed for session=%s", agent.session_id or "none", exc_info=True)
+        if rewrite:
+            content = turn_user_msg["content"] if _in_place_compacted else _durable_content(turn_user_msg["content"])
+            try:
+                _db.set_user_message_content(agent.session_id, _row_id, content, typed_ask_fields(turn_user_msg))
+            except Exception:
+                logger.warning("multimodal context backfill failed for session=%s", agent.session_id or "none", exc_info=True)
+        else:
+            # The row as its writer stored it: the person's message (an adopted submit row holds the override).
+            content = _durable_content(durable_user_row_content(agent, turn_user_msg, turn_user_msg["content"], None)[0])
+        if api_sidecar is not None:
+            try:
+                _db.set_message_api_content(agent.session_id, _row_id, content, api_sidecar)
+            except Exception:
+                logger.warning("api_content backfill failed for session=%s", agent.session_id or "none", exc_info=True)
 
 
 def _persist_turn_start(
@@ -1542,6 +1559,9 @@ def build_api_messages(
             # prefix stays byte-stable. User rows carry the injection sidecar; user
             # and assistant rows may carry a sanitize-divergence sidecar.
             api_msg["content"] = _api_content
+        # A list user message holds its ack-first note API-only: every request (live and warm) adds it back.
+        if isinstance(api_msg.get("content"), list) and isinstance(_note := msg.get(API_TAIL_NOTE), str) and _note:
+            api_msg["content"] = with_api_only_note(api_msg["content"], _note)
 
         # Replay stored reasoning on every carrier the active route reads (and strip the
         # rest): message_sanitization.reasoning_replay_route owns the decision.

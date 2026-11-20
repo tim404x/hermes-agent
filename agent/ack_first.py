@@ -6,19 +6,27 @@ event). Claude models rarely write any before their first tool call, so a person
 "working" indicator. A surface that will deliver that text stages this note for a turn a person
 typed; ``agent.turn_context`` consumes it once, on the user-message channel (never the system
 prompt, so the cached prefix stays byte-stable). The note only asks: the words are the model's own.
+The shared soul carries the full rule, so the note is a short recency nudge (it replays with every
+armed historical turn).
+
+The note is API-only on every path. A text turn carries it in the ``api_content`` sidecar. A
+multimodal (list) turn holds it under ``API_TAIL_NOTE`` on the live message: each request adds it
+back (``with_api_only_note``) and the stored row keeps it only in its ``api_content`` sidecar
+(``list_api_content``), never in ``content``, which feeds transcripts, search, exports and
+compaction.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Mapping, Optional
+
+from agent.message_metadata import API_TAIL_NOTE
+from session_rules.turns import _durable_content
 
 ACK_FIRST_NOTE = (
-    "[Ack first: if this needs tools or more than a few seconds of work, open your response with one "
-    "short line in your own words (what you are about to do, rough ETA), then make your tool calls in "
-    "that same response. That line reaches the user at once as its own message. Write it once, before "
-    "your first tool call only, with no narration before later calls. Skip it when you can answer "
-    "directly or may stay silent. Your final answer must still stand on its own.]"
+    "[If this takes several tool calls or ~20+ s, open with one short line on what you'll do; "
+    "skip it for a quick lookup.]"
 )
 
 # Machine-written turns that reach a surface as a plain prompt get no ack: a bot's DM (the attribution
@@ -56,3 +64,23 @@ def consume_ack_first_note(agent: Any) -> str:
             or getattr(agent, "_hold_stream", False)):
         return ""
     return note
+
+
+def with_api_only_note(parts: list, note: str) -> list:
+    """The parts a request sends for a list user message holding an API-only note: the note joins the
+    trailing text part, or follows a trailing image as its own part. That is exactly the shape a replay
+    of the row's text projection rebuilds (``agent.image_replay``), so the request bytes for that turn
+    are the same live, warm and rebuilt from the store."""
+    last = parts[-1] if parts else None
+    if isinstance(last, dict) and last.get("type") == "text" and isinstance(last.get("text"), str):
+        return [*parts[:-1], {**last, "text": last["text"] + "\n\n" + note}]
+    return [*parts, {"type": "text", "text": note}]
+
+
+def list_api_content(message: Mapping[str, Any]) -> Optional[str]:
+    """The stored row's ``api_content`` sidecar for a list user message holding an API-only note: the
+    text projection of what the request sent. ``None`` without such a note."""
+    content, note = message.get("content"), message.get(API_TAIL_NOTE)
+    if not (isinstance(content, list) and isinstance(note, str) and note):
+        return None
+    return _durable_content(with_api_only_note(content, note))
