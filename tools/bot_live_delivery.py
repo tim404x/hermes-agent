@@ -80,40 +80,82 @@ def _configured_cron_chat_title(path: Path) -> str:
 
 
 def door_accepts_title(profile_home: Path | str, title: Any) -> bool:
-    """Whether the authority door may admit into ``title``: the Bot Chat, the receiving
-    profile's own ``cron.bot_chat_title``, or a title a cron job on this machine pins for its
-    ``bot-chat`` delivery into this profile (the job's ``bot_chat_title``). Anything else is
-    refused, so a producer can never steer a turn into an arbitrary titled conversation of the
-    profile. A ``message_agent`` side window of this profile (its row carries the side-window stamp,
-    ``is_side_window_title``) is accepted too: a DM to a window the app holds live is admitted INTO
-    it through its owner instead of opening a ``"<title> (2)"`` sibling."""
-    return isinstance(title, str) and (title in (BOT_CHAT_TITLE, cron_chat_title(profile_home))
-                                       or title in _job_chat_titles(profile_home)
-                                       or is_side_window_title(profile_home, title))
+    """Whether the authority door may admit into ``title`` (``door_title_kind`` is not None): the Bot
+    Chat, the receiving profile's own ``cron.bot_chat_title``, a title a cron job on this machine pins
+    for its ``bot-chat`` delivery into this profile (the job's ``bot_chat_title``), or one of this
+    profile's own DM side windows (``is_side_window_title``). Anything else is refused, so a producer
+    can never steer a turn into an arbitrary titled conversation of the profile."""
+    return door_title_kind(profile_home, title) is not None
+
+
+def door_title_kind(profile_home: Path | str, title: Any) -> str | None:
+    """``"bot_chat"``, ``"cron"`` (a dedicated cron chat title), ``"side_window"`` (a DM side window
+    the app holds live: a DM is admitted INTO it through its owner instead of opening a
+    ``"<title> (2)"`` sibling), or None when the door refuses the title. The cron titles win over a
+    side-window stamp, so cron delivery semantics never change."""
+    if not isinstance(title, str):
+        return None
+    if title == BOT_CHAT_TITLE:
+        return "bot_chat"
+    if title == cron_chat_title(profile_home) or title in _job_chat_titles(profile_home):
+        return "cron"
+    return "side_window" if is_side_window_title(profile_home, title) else None
+
+
+def is_dm_side_window_stamp(stamp: Any) -> bool:
+    """Whether a side-window stamp was written by the DM runner (``message_agent``): it carries the
+    conversation ``key`` (the ``side_window`` route) or the ``dm`` flag (every runner stamp). A stamp
+    without either (``hermes sessions open-tab``, a hand stamp) only shows a tab and is never a
+    door target."""
+    return isinstance(stamp, dict) and bool(stamp.get("key") or stamp.get("dm") is True)
+
+
+def resolve_side_window_id(store, title: str) -> str | None:
+    """The physical session a ``chat -c <title>`` transport runs in (exact id, then title with its
+    newest ``"<title> #N"`` continuation, then the compression tip) when it is one of this profile's
+    DM side windows (``is_dm_side_window_stamp`` on the tip or the titled row); else None."""
+    from persistence.conversation.sessions import record_side_window_stamp
+    from tools.bot_mode_dm_side_window import _resolve_window
+
+    if not isinstance(title, str) or not title or title == BOT_CHAT_TITLE:
+        return None
+    session_id = _resolve_window(store, title)
+    if not session_id:
+        return None
+    tip = store.sessions.get(session_id)
+    if tip is None:
+        return None
+    root = store.sessions.get((store.lineage.lineage(session_id) or [session_id])[0])
+    if (getattr(tip, "title", None) == BOT_CHAT_TITLE or getattr(root, "title", None) == BOT_CHAT_TITLE):
+        return None
+    if is_dm_side_window_stamp(record_side_window_stamp(tip)) or is_dm_side_window_stamp(
+            record_side_window_stamp(root)):
+        return session_id
+    return None
 
 
 def is_side_window_title(profile_home: Path | str, title: Any) -> bool:
-    """Whether ``title`` names one of this profile's ``message_agent`` side windows: the titled chat
-    (or its compression tip) carries the side-window stamp in the profile's own store. Read from that
-    store, never the producer's word; never raises."""
+    """Whether ``title`` names one of this profile's ``message_agent`` side windows: the chat the
+    transport resolves for it (``resolve_side_window_id``) carries a DM runner's side-window stamp in
+    the profile's own store. Read from that store, never the producer's word; never raises."""
+    return side_window_target_id(profile_home, title) is not None
+
+
+def side_window_target_id(profile_home: Path | str, title: Any) -> str | None:
+    """``resolve_side_window_id`` against the profile's own store; None when it has none. Never raises."""
     if not isinstance(title, str) or not title or title == BOT_CHAT_TITLE:
-        return False
+        return None
     try:
-        from persistence.conversation.sessions import record_side_window_stamp
         from persistence_assembly import open_persistence_reader, profile_scope, store_exists
 
         home = Path(profile_home).resolve()
         if not store_exists(profile_scope(home=home)):
-            return False
+            return None
         with open_persistence_reader(home) as store:
-            row = store.sessions.get_by_title(title)
-            if row is None:
-                return False
-            tip = store.sessions.get(store.lineage.tip(row.session_id))
-            return record_side_window_stamp(tip or row) is not None or record_side_window_stamp(row) is not None
+            return resolve_side_window_id(store, title)
     except Exception:
-        log.debug("is_side_window_title: unreadable store for %s", profile_home, exc_info=True)
-        return False
+        log.debug("side_window_target_id: unreadable store for %s", profile_home, exc_info=True)
+        return None
 
 
 def _job_chat_titles(profile_home: Path | str) -> frozenset[str]:
@@ -190,6 +232,27 @@ def find_canonical_live_owner(profile_home: Path | str, title: str = BOT_CHAT_TI
     return dict(profile_home=str(home), session_id=tip or '', canonical=True,
                 lease_id=discovery.endpoint.instance_id, live_session_id=tip or '',
                 **({'title': title} if title != BOT_CHAT_TITLE else {}))
+
+
+def find_side_window_live_owner(profile_home: Path | str, title: str) -> dict[str, Any] | None:
+    """The profile authority and the physical DM side window ``title`` resolves to, the same session
+    the transport's ``chat -c <title>`` runs in (``resolve_side_window_id``). The owner pins that id,
+    and the door admits into exactly that session or refuses. None when the title names no DM side
+    window of the profile (or there is no store)."""
+    from hermes_cli.gateway_runtime import discover_gateway_endpoint
+    from persistence_assembly import profile_scope, store_exists
+
+    home = Path(profile_home).resolve()
+    discovery = discover_gateway_endpoint(home, timeout=5)
+    if discovery.state != 'ready' or discovery.endpoint is None:
+        raise ValueError('profile authority is not ready')
+    if not store_exists(profile_scope(home=home)):
+        return None
+    session_id = side_window_target_id(home, title)
+    if not session_id:
+        return None
+    return dict(profile_home=str(home), session_id=session_id, canonical=True,
+                lease_id=discovery.endpoint.instance_id, live_session_id=session_id, title=title)
 
 
 class PreDialError(ValueError):
