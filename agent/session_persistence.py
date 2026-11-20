@@ -15,6 +15,7 @@ from agent.context_compressor import (
 )
 from session_rules.turns import user_originated_turn_view, sanitize_context
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static
+from agent.ack_first import list_api_content
 
 from agent.trajectory import save_trajectory as _save_trajectory_to_file
 from agent.message_metadata import (
@@ -188,6 +189,8 @@ def _db_flush_row(agent, msg: dict, is_current_turn_user: bool) -> dict[str, Any
         content, api_content = durable_user_row_content(agent, msg, content, api_content)
         ov_timestamp = getattr(agent, "_persist_user_message_timestamp", None)
         timestamp = timestamp if ov_timestamp is None else ov_timestamp
+    if role == "user" and (list_sidecar := list_api_content(msg)) is not None:
+        api_content = list_sidecar  # an API-only note on a list message rides the sidecar, never the content
     if api_content == content:
         api_content = None
     # get_messages_as_conversation replays rows through sanitize_context().strip(); capture the sent bytes

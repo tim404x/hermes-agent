@@ -45,12 +45,15 @@ ABSORBED_MESSAGE_UIDS = "_absorbed_message_uids"
 # (``messages.tool_call_uid``). The provider-facing ``id`` is untouched; these never reach the wire.
 TOOL_CALL_UIDS = "_tool_call_uids"
 TOOL_CALL_UID = "_tool_call_uid"
+# An API-only note on a multimodal (list) user message (``agent.ack_first``): every request appends it, the
+# stored row keeps it only in its ``api_content`` sidecar, never in ``content``.
+API_TAIL_NOTE = "_api_tail_note"
 PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset(
     # Membership is the real contract, NOT the leading underscore: the chat-completions transport happens
     # to sweep underscore keys, but turn_context.py pops this set from every outgoing copy and a strict
     # backend 400s on any key it does not know.
     {"timestamp", "display_kind", "display_metadata", "_row_id", "_submit_row_session_id",
-     MERGED_TURN_PREFIX, MESSAGE_UID, ABSORBED_MESSAGE_UIDS, TOOL_CALL_UIDS, TOOL_CALL_UID,
+     MERGED_TURN_PREFIX, MESSAGE_UID, ABSORBED_MESSAGE_UIDS, TOOL_CALL_UIDS, TOOL_CALL_UID, API_TAIL_NOTE,
      # The alternation repair's row counts: an in-place compaction reads them off the live dict.
      MERGED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS, RETIRED_DURABLE_ROWS}
 ) | REPAIR_BOOKKEEPING_FIELDS
