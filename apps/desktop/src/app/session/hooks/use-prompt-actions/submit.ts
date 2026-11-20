@@ -3,6 +3,7 @@ import { type MutableRefObject, useCallback } from 'react'
 
 import { getSession, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { translateNow, type Translations } from '@/i18n'
+import { actionAbandon, actionEnd, actionStart } from '@/lib/action-timing'
 import { type ChatMessage, finalizeInterruptedMessages, textPart } from '@/lib/chat-messages'
 import { optimisticAttachmentRef } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
@@ -1295,8 +1296,32 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
                 const params: Record<string, unknown> = { ...prepared.params, session_id: liveId }
 
                 try {
-                  return await requestGateway<SubmitReceipt>('prompt.submit', params, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+                  actionStart('send_ack', liveId)
+
+                  // A send into a busy session steers or queues behind the running turn, whose
+                  // next delta is not this send's first token: time only sends that start a turn.
+                  if (!queueAdmission) {
+                    actionStart('first_token', liveId)
+                  }
+
+                  const receipt = await requestGateway<SubmitReceipt>(
+                    'prompt.submit',
+                    params,
+                    PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
+                  )
+
+                  actionEnd('send_ack', liveId)
+
+                  // A dedupe (terminal) or an unknown admission runs no new turn.
+                  if (receipt?.status === 'terminal' || receipt?.status === 'unknown') {
+                    actionAbandon('first_token', liveId)
+                  }
+
+                  return receipt
                 } catch (error) {
+                  actionAbandon('send_ack', liveId)
+                  actionAbandon('first_token', liveId)
+
                   // A retry whose payload no longer matches its admitted original (an attachment send
                   // offered back as text) is that original: settled as the dedupe it is, no new turn.
                   if (isAdmittedSubmissionConflict(error)) {
