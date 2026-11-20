@@ -42,6 +42,20 @@ describe('ChatSwitchIndicator', () => {
     expect(screen.getByText(/will wait and go to this agent/)).toBeTruthy()
   })
 
+  it('never shows for a switch that settles inside the grace period', () => {
+    // A warm bot switch paints its cached thread within a frame or two; chrome
+    // flashing over it read as a reload on every switch.
+    const rendered = render(<ChatSwitchIndicator failure={null} syncing={null} target="turqoise" />)
+    root = rendered.container
+
+    act(() => vi.advanceTimersByTime(SWITCH_SLOW_MS - 1))
+    rendered.rerender(<ChatSwitchIndicator failure={null} syncing={null} target={null} />)
+    act(() => vi.advanceTimersByTime(SWITCH_STALLED_MS))
+
+    expect(indicator().getAttribute('data-switch-state')).toBe('idle')
+    expect(screen.queryByText(/turqoise/)).toBeNull()
+  })
+
   it('restarts the clock for a new target and goes idle when the switch settles', () => {
     const rendered = render(<ChatSwitchIndicator failure={null} syncing={null} target="turqoise" />)
     root = rendered.container
