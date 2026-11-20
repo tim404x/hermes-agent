@@ -300,6 +300,9 @@ class MessageCompletePayload(Payload):
     error_surface: ErrorSurface | None = None
     partial: bool | None = None
     persisted_turn: PersistedTurn | None = None
+    #: The turn chose silence where it may (a machinery wake, the Bot Chat): it shows nothing, so a
+    #: client raises no completion toast, sound or unread mark for it either.
+    silent: bool | None = None
 
 
 event("message.complete", MessageCompletePayload, doc="The turn ended: final text, usage and outcome.")
