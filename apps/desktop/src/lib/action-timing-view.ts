@@ -32,6 +32,10 @@ interface PendingView {
   startedAt: number
   mainAtStart: ChatMessage[]
   focusedAtStart: null | string
+  /** `$messages` when the selection first showed the target: the open path flips the selection BEFORE it
+   *  replaces the transcript, so only a later write is the target's (a streaming chat being left keeps
+   *  writing `$messages` until then). */
+  mainAtSelect?: ChatMessage[]
   storedSessionId: null | string
 }
 
@@ -106,10 +110,14 @@ function check() {
 
     const main = $messages.get()
 
-    if ($selectedStoredSessionId.get() === id && main.length > 0 && main !== current.mainAtStart) {
-      finish(current)
+    if ($selectedStoredSessionId.get() === id) {
+      if (current.mainAtSelect === undefined) {
+        current.mainAtSelect = main
+      } else if (main.length > 0 && main !== current.mainAtSelect && main !== current.mainAtStart) {
+        finish(current)
 
-      return
+        return
+      }
     }
 
     if (stateMessagesFor(id) && $focusedStoredSessionId.get() === id && $selectedStoredSessionId.get() !== id) {
@@ -177,13 +185,22 @@ export function viewActionBind(
       return
     }
 
+    const main = $messages.get()
+
+    // Re-picking the bot tile already on screen (an open tab "fronted" again) is not a switch.
+    if (current.focusedAtStart === storedSessionId) {
+      view = null
+      unsubscribe()
+      actionAbandon(action, key)
+
+      return
+    }
+
     if (options?.painted) {
       finish(current)
 
       return
     }
-
-    const main = $messages.get()
 
     // Re-picking the chat that is already on screen is not an open: nothing loads, and a
     // one-frame sample would drag the p50 of real opens down. Not counted at all.
