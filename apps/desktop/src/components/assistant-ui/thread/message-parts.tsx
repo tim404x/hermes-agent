@@ -32,6 +32,7 @@ import { mcpTargets, toolLabels } from '@/lib/connector-tools'
 import { generatedImageFromResult } from '@/lib/generated-images'
 import { separateGluedReasoningBlocks } from '@/lib/reasoning-blocks'
 import { isTodoToolName } from '@/lib/todos'
+import { isPlumbingToolCall } from '@/lib/tool-plumbing'
 import { type CardToolName, isCardTool, isCardToolName } from '@/lib/tool-render-class'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
@@ -151,8 +152,9 @@ const failedCallNeedsUser = (part: TimelineToolCallProps): boolean => {
 const ChainToolFallback: FC<TimelineToolCallProps> = props => {
   const showToolActivity = useStore($showToolActivity)
 
-  // todo parts are hoisted to a dedicated panel above the message content.
-  if (isTodoToolName(props.toolName)) {
+  // todo parts are hoisted to a dedicated panel above the message content; tool plumbing (finding,
+  // describing or polling the agent's own tools) is never the user's business.
+  if (isTodoToolName(props.toolName) || isPlumbingToolCall(props.toolName, props.args)) {
     return null
   }
 
@@ -186,15 +188,15 @@ const ChainToolFallback: FC<TimelineToolCallProps> = props => {
     return <ThemeToolPart {...props} />
   }
 
-  if (toolLabels(props.args).length > 0) {
-    return <ConnectorExecution {...props} />
-  }
-
-  // The tool feed (reads, searches, commands) follows display.tool_progress,
-  // never show_reasoning. Cards, approvals, and failed calls the user must act
-  // on remain regardless.
+  // The tool feed (reads, searches, commands, connector calls) follows
+  // display.tool_progress, never show_reasoning. Cards, approvals, and failed
+  // calls the user must act on remain regardless.
   if (!showToolActivity && !failedCallNeedsUser(props) && !isCardTool(props.toolName)) {
     return null
+  }
+
+  if (toolLabels(props.args).length > 0) {
+    return <ConnectorExecution {...props} />
   }
 
   return <ToolFallback {...props} />
