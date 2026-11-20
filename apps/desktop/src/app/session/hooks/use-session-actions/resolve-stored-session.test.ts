@@ -172,6 +172,43 @@ describe('resolveStoredSession profile ownership', () => {
     expect(cachedSessionRow('s1')).toBeUndefined()
   })
 
+  it('drops a parked hidden row once its background read says the session is gone', async () => {
+    // A Bot Chat deleted from another surface (CLI, dashboard, another
+    // window): the parked copy must not keep answering "found" for the run.
+    const owner = { connectionId: 'remote-1', profile: 'meta', targetProfile: 'meta' } as never
+    mockGetSession.mockResolvedValueOnce(session({ hidden: true, id: 's1', title: 'Bot Chat' }))
+    await resolveStoredSession('s1', owner)
+
+    mockGetSession.mockRejectedValueOnce(new Error('404 Not Found: Session not found'))
+    await resolveStoredSession('s1', owner)
+    await vi.waitFor(() => expect(parkedHiddenSessionRow('s1', owner)).toBeUndefined())
+
+    mockGetSession.mockRejectedValueOnce(new Error('404 Not Found: Session not found'))
+    await expect(resolveStoredSession('s1', owner)).resolves.toBeUndefined()
+  })
+
+  it('drops a parked hidden row once its background read returns it archived', async () => {
+    const owner = { connectionId: 'remote-1', profile: 'meta', targetProfile: 'meta' } as never
+    mockGetSession.mockResolvedValueOnce(session({ hidden: true, id: 's1', title: 'Bot Chat' }))
+    await resolveStoredSession('s1', owner)
+
+    mockGetSession.mockResolvedValueOnce(session({ archived: true, hidden: true, id: 's1', title: 'Bot Chat' }))
+    await resolveStoredSession('s1', owner)
+    await vi.waitFor(() => expect(parkedHiddenSessionRow('s1', owner)).toBeUndefined())
+  })
+
+  it('keeps a parked hidden row through a transient background read failure', async () => {
+    const owner = { connectionId: 'remote-1', profile: 'meta', targetProfile: 'meta' } as never
+    mockGetSession.mockResolvedValueOnce(session({ hidden: true, id: 's1', title: 'Bot Chat' }))
+    await resolveStoredSession('s1', owner)
+
+    mockGetSession.mockRejectedValueOnce(new Error('502 Bad Gateway'))
+    await resolveStoredSession('s1', owner)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(parkedHiddenSessionRow('s1', owner)).toBeDefined()
+  })
+
   it('never serves an unlisted draft stub as a resolved row', async () => {
     // Draft stubs ride the same atom for owner lookup only; they carry no
     // `hidden` flag and must not short-circuit a by-id resolve.
