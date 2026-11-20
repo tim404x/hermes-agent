@@ -18,11 +18,18 @@ rows do. Render time only: nothing here writes the database.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Mapping, Optional
 
+logger = logging.getLogger(__name__)
+
 PROCESS_COMPLETE_DISPLAY_KIND = "process_complete"
 BOT_BRIEF_DISPLAY_KIND = "bot_brief"
+# Machine user rows a side window can carry before its first written prompt (notices, wakes, scaffolding).
+_MACHINE_USER_KINDS = frozenset({"internal_notification", "process_complete", "async_delegation_complete", "hidden",
+                                 "auto_continue"})
+_BRIEF_SCAN_ROWS = 40
 _CRON_FRAME_KINDS = (None, "", "internal_notification")
 
 # Interrupt text the agent closes a stopped turn with (agent/conversation_loop.py
@@ -83,13 +90,14 @@ def bot_brief_author(author_id: Any, profile_root: Any = None) -> Optional[dict]
 def _bot_short_name(profile: str) -> str:
     if not profile or "/" in profile:  # a bot on another install: no local profile to read
         return ""
+    from hermes_cli.profiles import get_profile_dir
+    from tools.bot_mode_probe import _friendly_names
+
     try:
-        from hermes_cli.profiles import get_profile_dir
-        from tools.bot_mode_probe import _friendly_names
-        names = _friendly_names(get_profile_dir(profile))
-    except Exception:
+        profile_dir = get_profile_dir(profile)
+    except ValueError:  # not a valid profile id: no local profile to read
         return ""
-    name = next((n for n in names if n), "")
+    name = next((n for n in _friendly_names(profile_dir) if n), "")
     return name.split(" | ", 1)[0].strip()
 
 
@@ -101,6 +109,50 @@ def is_bot_brief_candidate(row: Mapping[str, Any]) -> bool:
 
 def bot_brief_row(row: Mapping[str, Any], author: Mapping[str, Any]) -> dict:
     """*row* typed as the brief *author* (``{"id", "name"}``) seeded its side window with."""
-    meta = row.get("display_metadata") if isinstance(row.get("display_metadata"), Mapping) else {}
+    meta = row.get("display_metadata")
     return {**row, "display_kind": BOT_BRIEF_DISPLAY_KIND,
-            "display_metadata": {**meta, "author": {"id": author["id"], "name": author["name"]}}}
+            "display_metadata": {**(dict(meta) if isinstance(meta, Mapping) else {}),
+                                 "author": {"id": author["id"], "name": author["name"]}}}
+
+
+def self_brief_author(turn_author: Any, own_profile: Optional[str], text: Any) -> Optional[dict]:
+    """The ``{"id", "name"}`` to type a turn's user row ``bot_brief`` with, when a bot wrote it into its OWN
+    profile (a task tab it opened for itself through ``bot_mode_dm.py --run-delivery --author bot:<self>``); None for
+    a human turn, a teammate's DM, or an attributed ``Message from ...`` delivery."""
+    if not isinstance(turn_author, Mapping) or not turn_author.get("is_bot") or not own_profile:
+        return None
+    if turn_author.get("id") != f"bot:{own_profile}" or _text(text).lstrip().startswith("Message from "):
+        return None
+    return bot_brief_author(turn_author["id"])
+
+
+def find_bot_brief(store: Any, session_id: str) -> Optional[dict]:
+    """``{"row_id", "author"}`` of the brief a bot seeded the side window *session_id* with: the session's
+    side-window stamp names a bot (``by = "bot:<profile>"``) and the lineage's first written user row is an untyped
+    prompt, not an attributed ``Message from ...`` DM. None otherwise (also when *store* cannot answer). A read: the
+    projections type that row at render time and nothing is written back."""
+    from persistence.conversation.messages import TranscriptRead
+    from persistence.conversation.sessions import side_window_stamp
+
+    try:
+        record = store.sessions.get(session_id)
+        author = bot_brief_author((side_window_stamp(record.origin) or {}).get("by")) if record else None
+        if author is None:
+            return None
+        rows = store.messages.read_transcript(session_id, TranscriptRead(limit=_BRIEF_SCAN_ROWS, include_lineage=True))
+        users = [row.as_wire_row() for row in rows if row.role == "user"]
+    except Exception:  # a display hint: a store that cannot answer leaves the rows as stored
+        logger.debug("bot brief lookup failed for %s", session_id, exc_info=True)
+        return None
+    for row in users:
+        if row.get("display_kind") in _MACHINE_USER_KINDS:
+            continue
+        return {"row_id": row["id"], "author": author} if is_bot_brief_candidate(row) else None
+    return None
+
+
+def mark_bot_brief(row: dict, brief: Optional[Mapping[str, Any]], row_id: Any) -> dict:
+    """*row* (stored id *row_id*) typed ``bot_brief`` when it is *brief*'s row (``find_bot_brief``), else as is."""
+    if not brief or row_id is None or row_id != brief["row_id"] or not is_bot_brief_candidate(row):
+        return row
+    return bot_brief_row(row, brief["author"])
