@@ -120,14 +120,14 @@ _PROFILE_IMPLICIT = frozenset({'session.create', 'session.list', 'session.info',
                                'approval.respond', 'clarify.respond'})
 
 
-def display_projection(history, profile_home, image_urls=True):
+def display_projection(history, profile_home, image_urls=True, bot_brief=None):
     """Main's TUI display rows for a snapshot's stored rows: the sidecar's own
     ``_history_to_messages`` (compaction handoffs stripped, ``/steer`` unwrapped, tool rows
     labelled from the paired assistant ``tool_calls``), never a re-implementation. ``image_urls=False``:
-    image parts read ``[image]``."""
+    image parts read ``[image]``. ``bot_brief``: the session's ``agent.display_row_typing.find_bot_brief``."""
     from tui_gateway import server
     rows = [{**row, '_row_id': row['row_id']} if 'row_id' in row else row for row in history]
-    return server._history_to_messages(rows, profile_home=profile_home, image_urls=image_urls)
+    return server._history_to_messages(rows, profile_home=profile_home, image_urls=image_urls, bot_brief=bot_brief)
 
 
 def model_only(row):
@@ -764,9 +764,11 @@ class AuthorityConnection:
         from gateway.session_server_requests import open_requests
         history, display = list(snapshot.history), {}
         if params.get('display_projection'):
+            from agent.display_row_typing import find_bot_brief
+            brief = await asyncio.to_thread(find_bot_brief, authority_persistence(self.authority), ref.session_id)
             # A micro-compaction merge stays in ``messages`` (an undo target); its originals are what shows.
             display['display_messages'] = display_projection(
-                [row for row in history if not model_only(row)], self.authority.profile_id)
+                [row for row in history if not model_only(row)], self.authority.profile_id, bot_brief=brief)
         return {'session_id': ref.session_id, 'stored_session_id': ref.session_id,
                 **await _resume_transcript(self.authority, ref, snapshot, history, omit), **display,
                 'running': snapshot.handle.execution_state == 'running',
