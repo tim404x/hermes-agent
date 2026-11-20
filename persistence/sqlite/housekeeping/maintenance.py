@@ -8,21 +8,24 @@ them over the ids ``prune_sessions`` and ``prune_empty_ghost_sessions`` return."
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
-from persistence.conversation.sessions import CANONICAL_BOT_CHAT_TITLE
+from persistence.conversation.sessions import CANONICAL_BOT_CHAT_TITLE, INTERNAL_LISTING_SOURCES
 from persistence.core.errors import ExportTooLarge
 from persistence.core.identity import SessionId
 from persistence.housekeeping.maintenance import (
-    SESSION_PROJECTION_FIELDS, PruneCandidate, PruneCriteria, PruneReclaimEstimate, PruneResult, TreeServeFacts,
+    SESSION_COUNTER_FIELDS, SESSION_PROJECTION_FIELDS, PruneCandidate, PruneCriteria, PruneReclaimEstimate, PruneResult,
+    SessionChangeDigests, TreeServeFacts,
 )
 
 from .._backend import SQLiteStore, register_repository, translated
+from .._schema_ddl import _sql_json_extract, _sql_literal
 from ..conversation._store.core import _delete_unreferenced_system_prompts
 from ..conversation._store.retirement import retire_prunable
 from ..conversation._store.sessions import _cwd_prefix_clause, _set_lineage_column_in_transaction
@@ -229,6 +232,79 @@ _SERVED_TREE_SQL = (
     "SELECT 1 FROM sessions s WHERE hermes_inside_tree(s.cwd) AND (s.ended_at IS NULL OR EXISTS ("
     "SELECT 1 FROM state_meta m WHERE m.key IN ('loop:'||s.id, 'heartbeat:'||s.id, 'goal:'||s.id) "
     "AND (json_valid(m.value)=0 OR COALESCE(json_extract(m.value,'$.status'),'active')='active'))) LIMIT 1")
+
+
+def _delegate_sql(available: set[str], alias: str) -> str:
+    """Whether ``alias``'s row is a delegate run (``source`` subagent, or a child carrying ``_delegate_from``); ``0``
+    when the store has neither column. A missing row (a LEFT JOIN miss) is not one."""
+    terms = ([f"coalesce({alias}.source, '') = 'subagent'"] if "source" in available else []) + (
+        [f"({alias}.parent_session_id IS NOT NULL AND "
+         f"{_sql_json_extract(f'{alias}.model_config', '$._delegate_from')} IS NOT NULL)"]
+        if {"parent_session_id", "model_config"} <= available else [])
+    return f"({' OR '.join(terms)})" if terms else "0"
+
+
+def _change_partition_sql(available: set[str], include_subagents: bool) -> tuple[str, str, str, str]:
+    """``(with, listed, watched, running)`` for ``session_change_digests``, over ``sessions s``.
+
+    ``listed``: the human session lists' own cut (no internal source; no delegate run unless ``include_subagents``).
+    ``watched``: a hidden delegate run whose chain starts at a listed row (a Desktop chat's subagent): no list shows
+    it, but a window can watch its transcript. A delegate chain started by a worker (a one-shot, kanban or tool run)
+    is internal like its root. ``with`` is the recursive chain walk they need (empty when there is none);
+    ``running`` binds ``:running`` (a JSON array of ids)."""
+    internal = ", ".join(_sql_literal(source) for source in INTERNAL_LISTING_SOURCES)
+    internal_source = f"coalesce(s.source, '') IN ({internal})" if "source" in available else "0"
+    delegate = _delegate_sql(available, "s")
+    listed = f"NOT ({internal_source})" + ("" if include_subagents or delegate == "0" else f" AND NOT {delegate}")
+    running = "s.id IN (SELECT value FROM json_each(:running))" if "id" in available else "0"
+    if include_subagents or delegate == "0" or not {"id", "parent_session_id"} <= available:
+        return "", listed, "0", running
+    # Each delegate run's chain root: the first row up its parent links that is not a delegate run. UNION (not
+    # UNION ALL) ends a corrupt cycle; a chain with no such root is watched (the safe side).
+    with_sql = (
+        "WITH RECURSIVE _delegate_root(id, root_source) AS ("
+        f"SELECT s.id, coalesce(p.source, '') FROM sessions s LEFT JOIN sessions p ON p.id = s.parent_session_id "
+        f"WHERE {delegate} AND NOT {_delegate_sql(available, 'p')} "
+        "UNION SELECT s.id, r.root_source FROM sessions s JOIN _delegate_root r ON s.parent_session_id = r.id "
+        f"WHERE {delegate}) ")
+    watched = (f"NOT ({internal_source}) AND {delegate} AND s.id NOT IN "
+               f"(SELECT id FROM _delegate_root WHERE id IS NOT NULL AND root_source IN ({internal}))")
+    return with_sql, listed, watched, running
+
+
+def _change_digest_columns(fields: tuple[str, ...], declared: Optional[dict[str, str]] = None,
+                           ) -> tuple[list[str], list[str], list[str]]:
+    """``(listed, counts, internal)`` cell expressions; NULL renders as char(0), apart from ''. REAL-declared
+    columns render a real with 17 significant digits, as ``session_projection_digest`` (before SQLite 3.52 the
+    text conversion keeps 15: a timestamp moved by microseconds would not move the digest)."""
+    declared = declared or {}
+
+    def cell(field: str) -> str:
+        kind = declared.get(field, "")
+        if "REAL" in kind or "FLOA" in kind or "DOUB" in kind:
+            return (f"CASE typeof(s.{field}) WHEN 'real' THEN printf('%!.17g', s.{field}) WHEN 'null' THEN char(0) "
+                    f"ELSE s.{field} END")
+        return f"coalesce(s.{field}, char(0))"
+
+    listed = [cell(field) for field in fields if field not in SESSION_COUNTER_FIELDS]
+    if "message_count" in fields:
+        listed.append("(coalesce(s.message_count, 0) > 0)")
+    counts = [cell(field) for field in ("id", *SESSION_COUNTER_FIELDS) if field in fields]
+    return listed, counts, [cell(field) for field in fields]
+
+
+def _change_digest_plan(available: set[str], fields: tuple[str, ...], include_subagents: bool,
+                        declared: Optional[dict[str, str]] = None):
+    """``(with, digests)``: per ``SessionChangeDigests`` digest, its ``(where, cells)`` branches in order."""
+    with_sql, listed, watched, running = _change_partition_sql(available, include_subagents)
+    listed_cells, count_cells, all_cells = _change_digest_columns(fields, declared)
+    return with_sql, (
+        ((listed, listed_cells),),
+        # ``running`` first where it can cut a partition short: it holds for a handful of rows at most.
+        ((f"({listed}) AND NOT ({running})", count_cells), (watched, all_cells)),
+        ((f"({running}) AND ({listed})", count_cells),),
+        ((f"NOT ({listed}) AND NOT ({watched})", all_cells),),
+    )
 
 
 class SQLiteSessionMaintenance(SessionPortability):
@@ -502,6 +578,45 @@ class SQLiteSessionMaintenance(SessionPortability):
                 digest.update(repr(tuple(row)).encode("utf-8", "backslashreplace"))
                 digest.update(b"\0")
             return fields, digest.digest()
+
+    def session_change_digests(
+        self, *, include_subagents: bool = False, running_ids: Sequence[str] = (), busy_timeout_s: float = 0.05,
+    ) -> Optional[SessionChangeDigests]:
+        with translated(), self._store.holder()._read_ctx_with_timeout(busy_timeout_s) as conn:
+            declared = {row[1]: str(row[2] or "").upper() for row in conn.execute("PRAGMA table_info(sessions)")}
+            available = set(declared)
+            fields = tuple(field for field in SESSION_PROJECTION_FIELDS if field in available)
+            if not fields:
+                return None
+            with_sql, plan = _change_digest_plan(available, fields, include_subagents, declared)
+            params = {"running": json.dumps(sorted(str(sid) for sid in running_ids))}
+            if sqlite3.sqlite_version_info >= _CONCAT_WS_SQLITE:
+                # One pass inside SQLite (GIL released), as session_projection_digest: each partition's rows joined
+                # into one buffer that hashlib digests (it releases the GIL too for a large one).
+                aggregates = ", ".join(
+                    "CAST(group_concat(CASE " + " ".join(
+                        f"WHEN {where} THEN concat_ws(char(31), {', '.join(cells)})" for where, cells in branches)
+                    + " END, char(30)) AS BLOB)" for branches in plan)
+                rendered = conn.execute(f"{with_sql}SELECT {aggregates} FROM sessions s", params).fetchone()
+                digests = [hashlib.blake2b(blob or b"", digest_size=16).digest() for blob in rendered]
+            else:
+                # Older library (no concat_ws): each digest's branch flagged in SQL, its cells hashed per row in Python.
+                flags = ", ".join(
+                    "CASE " + " ".join(f"WHEN {where} THEN {index}" for index, (where, _cells) in enumerate(branches, 1))
+                    + " ELSE 0 END" for branches in plan)
+                select = ", ".join(cell for branches in plan for _where, cells in branches for cell in cells)
+                hashers = [hashlib.blake2b(digest_size=16) for _ in plan]
+                for row in conn.execute(f"{with_sql}SELECT {flags}, {select} FROM sessions s", params):
+                    offset = len(plan)
+                    for index, branches in enumerate(plan):
+                        for branch, (_where, cells) in enumerate(branches, 1):
+                            if row[index] == branch:
+                                hashers[index].update(
+                                    repr(tuple(row[offset:offset + len(cells)])).encode("utf-8", "backslashreplace"))
+                                hashers[index].update(b"\0")
+                            offset += len(cells)
+                digests = [hasher.digest() for hasher in hashers]
+            return SessionChangeDigests(fields, *digests)
 
     def retained_tree_is_live(self, worktree_path: str, *, pending_only: bool = False) -> bool:
         inside = _inside_tree(worktree_path)

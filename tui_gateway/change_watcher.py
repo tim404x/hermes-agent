@@ -197,18 +197,19 @@ _sessions_db_sig_cache: dict[str, tuple[object, tuple | None, bool]] = {}
 _MTIME_FALLBACK = "mtime-fallback"
 
 
-def _db_content_sig(db_path: Path, cache: dict, read, *, fallback=lambda mtime: None):
+def _db_content_sig(db_path: Path, cache: dict, read, *, fallback=lambda mtime: None, salt=None):
     """``read(db_path, mtime)``, cached behind the DB/WAL mtime so a watch pass stays stat-only until another
     process commits. ``read`` returns ``(signature, is_fallback)``. A failed read after a good answer keeps it and
     leaves the cached mtime stale so the next pass re-reads (answer -> fallback -> answer would broadcast twice);
-    otherwise the answer is ``fallback(mtime)``."""
+    otherwise the answer is ``fallback(mtime)``. A ``salt`` (anything else the answer depends on) joins the cache key:
+    when it moves the store is read again although nothing committed."""
     mtime = _newest_mtime_ns((db_path, db_path.with_name(f"{db_path.name}-wal")))
     cache_key = str(db_path)
     cached = cache.get(cache_key)
-    if cached is not None and cached[0] == mtime:
+    if cached is not None and cached[0] == (mtime if salt is None else (mtime, salt)):
         return cached[1]
     if not db_path.exists():
-        cache[cache_key] = (mtime, None, True)
+        cache[cache_key] = (mtime if salt is None else (mtime, salt), None, True)
         return None
     try:
         signature, is_fallback = read(db_path, mtime)
@@ -216,34 +217,59 @@ def _db_content_sig(db_path: Path, cache: dict, read, *, fallback=lambda mtime: 
         if cached is not None and not cached[2]:
             return cached[1]
         signature, is_fallback = fallback(mtime), True
-    cache[cache_key] = (_settled_mtime(mtime), signature, is_fallback)
+    settled = _settled_mtime(mtime)
+    cache[cache_key] = (settled if salt is None else (settled, salt), signature, is_fallback)
     return signature
 
 
-def _session_rows_sig(db_path: Path, mtime):
+def _running_session_ids() -> frozenset:
+    """Stored ids of the sessions whose turn runs in THIS process right now. Their appends reach every window
+    attached to them over the turn's own stream, so their counter moves need no list refresh (``sessions.activity``);
+    a turn starting or ending moves the row between the two counter digests, which ``sessions.changed`` signs."""
+    with _sessions_lock:
+        live = list(_sessions.items())
+    ids = set()
+    for sid, session in live:
+        with contextlib.suppress(Exception):  # health: allow BLE001 -- a half-built session must not stop the watcher
+            if session.get("running") and (key := _session_lookup_key(session, fallback=sid)):
+                ids.add(str(key))
+    return frozenset(ids)
+
+
+def _session_rows_sig(db_path: Path, mtime, *, include_subagents=False, running_ids=frozenset()):
+    """``session_change_digests`` of one store: its listed rows (what a human session list can show) apart from
+    the rows only workers write (one-shot runs, kanban workers, tool integrations and the delegate runs they start;
+    a chat's delegate runs while that profile's ``sessions.show_subagents`` is off are watched), counters apart from
+    structure (tui_gateway/change_watcher.py ``_CHANGE_WATCHES``)."""
     from persistence_assembly import open_persistence_reader
 
     with open_persistence_reader(db_path) as persistence:
-        projection = persistence.maintenance.session_projection_digest(busy_timeout_s=0.05)
-    if projection is None:
+        digests = persistence.maintenance.session_change_digests(
+            include_subagents=include_subagents, running_ids=sorted(running_ids), busy_timeout_s=0.05)
+    if digests is None:
         # A state.db without a readable sessions table (foreign schema, legacy or transient file): keep
         # the old mtime contract so any move still wakes the sidebar instead of silently never broadcasting.
         return (_MTIME_FALLBACK, mtime), True
-    return projection, False
+    return digests, False
 
 
-def _session_db_content_sig(db_path: Path):
+def _session_db_content_sig(db_path: Path, include_subagents=False, running_ids=frozenset()):
     """Digest list/transcript-relevant session rows, excluding unrelated tables.
 
     ``gateway_heartbeats`` shares state.db and writes every minute. Using the
     database mtime directly therefore emits sessions.changed while no session
-    changed (#98005). Cache behind the DB/WAL mtime, then inspect only the
-    sessions columns that drive Desktop projections. Legacy stores safely use
-    the subset of columns they have. A failed read after a good digest keeps it:
-    digest -> mtime -> digest would broadcast twice.
+    changed (#98005). Cache behind the DB/WAL mtime (and what the split depends on), then
+    inspect only the sessions columns that drive Desktop projections. Legacy
+    stores safely use the subset of columns they have. A failed read after a
+    good digest keeps it: digest -> mtime -> digest would broadcast twice.
+    The answer is a ``SessionChangeDigests``, or ``(_MTIME_FALLBACK, mtime)``.
     """
+    from functools import partial
+
     return _db_content_sig(
-        db_path, _sessions_db_sig_cache, _session_rows_sig, fallback=lambda mtime: (_MTIME_FALLBACK, mtime))
+        db_path, _sessions_db_sig_cache,
+        partial(_session_rows_sig, include_subagents=include_subagents, running_ids=running_ids),
+        fallback=lambda mtime: (_MTIME_FALLBACK, mtime), salt=(running_ids, include_subagents))
 
 
 # Filesystem timestamps come from a coarse clock (~4 ms ticks; whole seconds on some filesystems) and
@@ -266,17 +292,65 @@ def _watched_homes() -> tuple[Path, ...]:
     return (_watcher_home(), *_served_profile_homes)
 
 
+# The watch pass in progress (``_broadcast_watched_changes``) and the store digests it already read: the three session
+# events sign the same per-store read, so a pass reads each store at most once (a store that committed in the last
+# 2 s is re-read every pass: utils.RACY_MTIME_WINDOW_NS).
+_watch_pass: list = [None]
+_watch_pass_seq = itertools.count(1)
+_session_store_sigs_memo: dict = {}
+
+
+def _session_store_sigs() -> tuple:
+    """One ``_session_db_content_sig`` per watched store (None where a home has no store), once per watch pass."""
+    pass_id = _watch_pass[0]
+    if pass_id is not None and _session_store_sigs_memo.get("pass") == pass_id:
+        return _session_store_sigs_memo["sigs"]
+    from hermes_cli.session_listing import show_subagent_sessions
+    from persistence_assembly import profile_scope, store_location
+    running = _running_session_ids()
+    stores = ((root, store_location(profile_scope(home=root))) for root in _watched_homes())
+    sigs = tuple(None if location is None else _session_db_content_sig(location, show_subagent_sessions(root), running)
+                 for root, location in stores)
+    if pass_id is not None:
+        _session_store_sigs_memo.update({"pass": pass_id, "sigs": sigs})
+    return sigs
+
+
+def _session_sig_part(signature, part: str):
+    """``part`` of one store's digests; a fallback (mtime) signature is the ``listed`` part only."""
+    from persistence.housekeeping.maintenance import SessionChangeDigests
+    if isinstance(signature, SessionChangeDigests):
+        if part == "listed":
+            return signature.fields, signature.listed, signature.counts, signature.running_counts
+        return getattr(signature, part)
+    return signature if part == "listed" else None
+
+
 def _sessions_sig():
-    """Session-table content across the active and served profile stores.
+    """``sessions.changed``: what a human session list shows, across the active and served profile stores.
 
     Messaging-gateway turns and cron runs are written by other processes that
     never touch this gateway's transports, so their session rows are the shared
     change signal. Hashing only those rows avoids false Desktop refreshes from
-    unrelated state.db writes such as gateway heartbeats.
+    unrelated state.db writes such as gateway heartbeats. Rows only workers write (one-shot
+    runs, kanban and tool workers and their delegate runs: ~80% of row moves on a busy host)
+    sign ``jobs.changed`` instead. Floors (``_sessions_changed_floor``): a structural move
+    2 s; counter moves from any other writer (a Telegram turn, a phone call, a cron delivery
+    into a tab: how a window learns about them), a chat's hidden delegate runs and a turn
+    here starting or ending 10 s; the counters of a turn running here (its attached windows
+    get the stream; ``sessions.activity`` carries them at 2 s) 30 s, for every other window.
     """
-    from persistence_assembly import profile_scope, store_location
-    locations = (store_location(profile_scope(home=root)) for root in _watched_homes())
-    return tuple(None if location is None else _session_db_content_sig(location) for location in locations)
+    return tuple(_session_sig_part(signature, "listed") for signature in _session_store_sigs())
+
+
+def _sessions_activity_sig():
+    """``sessions.activity``: message/tool counters of listed rows whose turn runs in this process."""
+    return tuple(_session_sig_part(signature, "running_counts") for signature in _session_store_sigs())
+
+
+def _jobs_sig():
+    """``jobs.changed``: rows no human session list shows (workers, one-shot runs, hidden delegate runs)."""
+    return tuple(_session_sig_part(signature, "internal") for signature in _session_store_sigs())
 
 
 def _projects_sig():
@@ -458,7 +532,13 @@ def _skills_sig():
 _CHANGE_WATCHES: dict[str, tuple[float, Any, Any] | tuple[float, Any, Any, Any]] = {
     "pet.changed": (2.0, _pet_sig, _pet_changed_payload),
     "cron.changed": (1.0, lambda: _home_mtime_ns("cron", "jobs.json"), dict),
-    "sessions.changed": (0.5, _sessions_sig, dict),
+    # Checked once a second: the split digests cost ~2-3x the old single digest in SQLite (GIL released), and a
+    # store that committed in the last 2 s is re-read every check; the 2 s floor bounds latency anyway.
+    "sessions.changed": (1.0, _sessions_sig, dict),
+    # The same store reads (one per pass, cached behind each store's mtime), split: counter moves of turns running
+    # here, and the rows only workers write. Neither makes a window re-pull its lists.
+    "sessions.activity": (1.0, _sessions_activity_sig, dict),
+    "jobs.changed": (1.0, _jobs_sig, dict),
     # Projects created/switched by CLI or agent tooling write projects.db without any
     # state.db movement, so sessions.changed never fires and the desktop Projects
     # sidebar goes stale until a manual refresh (#56757).
@@ -475,7 +555,34 @@ _CHANGE_WATCHES: dict[str, tuple[float, Any, Any] | tuple[float, Any, Any, Any]]
 # state.db moves on every append of a streaming turn and gateway_state.json on
 # in-flight bookkeeping; the floor coalesces bursts to one broadcast per window,
 # trailing edge included (a floored change keeps its old signature, re-fires later).
-_CHANGE_BROADCAST_FLOOR_S = {"sessions.changed": 2.0, "platforms.changed": 5.0, "groups.changed": 1.0}
+_CHANGE_BROADCAST_FLOOR_S = {"sessions.changed": 2.0, "sessions.activity": 2.0, "jobs.changed": 15.0,
+                             "platforms.changed": 5.0, "groups.changed": 1.0}
+
+# sessions.changed when ONLY counters moved (another process appending to a listed row: a Telegram or CLI turn,
+# a cron delivery into a tab), a chat's hidden delegate run moved or a turn here started/ended: coalesced to one per
+# window, the cadence the Desktop re-pulls its lists at anyway (use-background-sync.ts SESSIONS_LIST_TICK_GAP_MS).
+# Only the counters of turns running here (their attached windows get the stream): one per 30 s, so a window NOT
+# attached (a second window, the webapp, the phone) still sees a long turn's count and order move. A structural move
+# (a row added, removed, renamed, ended, pinned, archived, read, its first message) keeps the 2 s floor.
+_SESSIONS_COUNTERS_FLOOR_S = 10.0
+_SESSIONS_RUNNING_COUNTERS_FLOOR_S = 30.0
+
+
+def _sessions_changed_floor(before, after) -> float:
+    """The floor for a ``sessions.changed`` move from ``before`` to ``after`` (``_sessions_sig`` tuples: per store
+    ``(fields, listed, counts, running_counts)``, or a fallback signature, which is structural)."""
+    def part(signature, index):
+        return tuple(store[index] if isinstance(store, tuple) and len(store) == 4 else store
+                     for store in signature or ())
+    if len(before or ()) != len(after or ()) or part(before, 1) != part(after, 1):
+        return _CHANGE_BROADCAST_FLOOR_S["sessions.changed"]
+    if part(before, 2) != part(after, 2):
+        return _SESSIONS_COUNTERS_FLOOR_S
+    return _SESSIONS_RUNNING_COUNTERS_FLOOR_S
+
+
+# event -> fn(signature at the last broadcast, current signature) -> floor, where the floor depends on what moved.
+_CHANGE_BROADCAST_FLOOR_FN = {"sessions.changed": _sessions_changed_floor}
 
 _change_sigs: dict[str, Any] = {}
 _change_checked_at: dict[str, float] = {}
@@ -486,6 +593,15 @@ def _broadcast_watched_changes(now: float | None = None) -> None:
     """One pass: recompute due signatures, broadcast events whose signature moved.
     First sighting seeds silently so a gateway boot never fires a refresh storm."""
     now = time.monotonic() if now is None else now
+    _watch_pass[0] = next(_watch_pass_seq)
+    try:
+        _broadcast_watched_pass(now)
+    finally:
+        _watch_pass[0] = None
+        _session_store_sigs_memo.clear()
+
+
+def _broadcast_watched_pass(now: float) -> None:
     for event, (interval, sig_fn, payload_fn, *diff_fn) in _CHANGE_WATCHES.items():
         if now - _change_checked_at.get(event, -interval) < interval:
             continue
@@ -497,9 +613,10 @@ def _broadcast_watched_changes(now: float | None = None) -> None:
         if event not in _change_sigs:
             _change_sigs[event] = sig
             continue
-        floor = _CHANGE_BROADCAST_FLOOR_S.get(event, 0.0)
         if sig == _change_sigs[event]:
             continue
+        floor_fn = _CHANGE_BROADCAST_FLOOR_FN.get(event)
+        floor = floor_fn(_change_sigs[event], sig) if floor_fn else _CHANGE_BROADCAST_FLOOR_S.get(event, 0.0)
         if floor and now - _change_broadcast_at.get(event, -floor) < floor:
             continue  # floored: old signature stays so it re-fires when the window opens
         before, _change_sigs[event] = _change_sigs[event], sig
