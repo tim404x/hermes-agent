@@ -388,8 +388,42 @@ export function isRemoteGateway(): boolean {
 // (workspace, skills, ~/.hermes/cache, etc.); /api/media is intentionally
 // narrower and rejects non-images plus images outside its media roots.
 export async function gatewayMediaDataUrl(path: string): Promise<string> {
-  return readDesktopFileDataUrl(filePathFromMediaPath(path))
+  const filePath = filePathFromMediaPath(path)
+
+  if (!IMMUTABLE_UPLOAD_RE.test(filePath)) {
+    return readDesktopFileDataUrl(filePath)
+  }
+
+  // A pasted screenshot is written ONCE under a unique mkstemp name
+  // (tui_gateway/prompt_attachments.py: `<home>/images/upload_XXXX.png`), so a
+  // copy fetched this window stays right for its lifetime. Without the cache
+  // every chat switch re-downloaded each screenshot in view (a 439 KB PNG is
+  // ~585 KB of base64 over the Mac relay, and gzip cannot shrink it). Keyed by
+  // connection: another gateway is another disk. Failures are not cached.
+  const key = `${desktopFsCacheKey()}\u0000${filePath}`
+  const cached = uploadDataUrls.get(key)
+
+  if (cached) {
+    return cached
+  }
+
+  const read = readDesktopFileDataUrl(filePath)
+
+  uploadDataUrls.set(key, read)
+  read.catch(() => {
+    if (uploadDataUrls.has(key) && uploadDataUrls.get(key) === read) {
+      uploadDataUrls.delete(key)
+    }
+  })
+
+  return read
 }
+
+// Attach-pipeline uploads only: other gateway paths (generated charts, QA
+// screenshots) are rewritten in place under the same name and must be re-read.
+const IMMUTABLE_UPLOAD_RE = /[\\/]images[\\/]upload_[^\\/]+\.(?:gif|jpe?g|png|webp)$/i
+// ~0.1-1.5 MB of base64 each; bounded so a window open for days cannot grow.
+const uploadDataUrls = new LruCache<string, Promise<string>>(48)
 
 /** Retry an inline remote image through the gateway's authenticated proxy
  * (#74564). A client on a restricted network cannot reach the image CDN
