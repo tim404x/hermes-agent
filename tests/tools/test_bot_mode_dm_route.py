@@ -297,7 +297,10 @@ def test_after_six_hours_a_new_tab_opens(tmp_path, spawned, monkeypatch):
     assert _send(home, topic="micro1")["window"] == "micro1 (2)"
 
 
-def test_a_busy_reused_tab_opens_a_numbered_tab(tmp_path, spawned, monkeypatch):
+def test_a_busy_reused_tab_keeps_the_conversation_in_one_tab(tmp_path, spawned, monkeypatch):
+    """Regression (P5, 19 Nov 2026): a follow-up 9 s after the first DM opened "<title> (2)" because the first
+    turn was still running. The conversation stays in its tab; the runner queues the DM into it through the
+    window's live owner (``tests/tools/test_bot_mode_side_window_marker.py``)."""
     home, target = _install(tmp_path)
     _send(home, topic="micro1")
     _deliver(home, spawned[0], monkeypatch)
@@ -305,19 +308,14 @@ def test_a_busy_reused_tab_opens_a_numbered_tab(tmp_path, spawned, monkeypatch):
     with _profile_store(target) as store:
         _append(store, window_id, "user", "mid-turn", timestamp=time.time())
 
-    result = _send(home, topic="micro1")
-
-    assert result["window"] == "micro1 (2)"
-    # The numbered tab joins the conversation: once it exists and the first is still busy, it is reused.
-    _deliver(home, spawned[1], monkeypatch)
-    assert _send(home, topic="micro1")["window"] == "micro1 (2)"
+    assert _send(home, topic="micro1")["window"] == "micro1"
 
 
-def test_a_tab_whose_turn_lock_is_held_counts_as_busy(tmp_path, spawned, monkeypatch):
+def test_a_tab_whose_turn_lock_is_held_keeps_the_conversation_in_one_tab(tmp_path, spawned, monkeypatch):
     home, _ = _install(tmp_path)
     _send(home, topic="micro1")
     _deliver(home, spawned[0], monkeypatch)
 
     with bot_relay.acquire_turn_lock(home, side.side_window_lock_name("researcher", "micro1"), timeout_seconds=0):
-        assert _send(home, topic="micro1")["window"] == "micro1 (2)"
+        assert _send(home, topic="micro1")["window"] == "micro1"
     assert _send(home, topic="micro1")["window"] == "micro1"

@@ -84,9 +84,36 @@ def door_accepts_title(profile_home: Path | str, title: Any) -> bool:
     profile's own ``cron.bot_chat_title``, or a title a cron job on this machine pins for its
     ``bot-chat`` delivery into this profile (the job's ``bot_chat_title``). Anything else is
     refused, so a producer can never steer a turn into an arbitrary titled conversation of the
-    profile."""
+    profile. A ``message_agent`` side window of this profile (its row carries the side-window stamp,
+    ``is_side_window_title``) is accepted too: a DM to a window the app holds live is admitted INTO
+    it through its owner instead of opening a ``"<title> (2)"`` sibling."""
     return isinstance(title, str) and (title in (BOT_CHAT_TITLE, cron_chat_title(profile_home))
-                                       or title in _job_chat_titles(profile_home))
+                                       or title in _job_chat_titles(profile_home)
+                                       or is_side_window_title(profile_home, title))
+
+
+def is_side_window_title(profile_home: Path | str, title: Any) -> bool:
+    """Whether ``title`` names one of this profile's ``message_agent`` side windows: the titled chat
+    (or its compression tip) carries the side-window stamp in the profile's own store. Read from that
+    store, never the producer's word; never raises."""
+    if not isinstance(title, str) or not title or title == BOT_CHAT_TITLE:
+        return False
+    try:
+        from persistence.conversation.sessions import record_side_window_stamp
+        from persistence_assembly import open_persistence_reader, profile_scope, store_exists
+
+        home = Path(profile_home).resolve()
+        if not store_exists(profile_scope(home=home)):
+            return False
+        with open_persistence_reader(home) as store:
+            row = store.sessions.get_by_title(title)
+            if row is None:
+                return False
+            tip = store.sessions.get(store.lineage.tip(row.session_id))
+            return record_side_window_stamp(tip or row) is not None or record_side_window_stamp(row) is not None
+    except Exception:
+        log.debug("is_side_window_title: unreadable store for %s", profile_home, exc_info=True)
+        return False
 
 
 def _job_chat_titles(profile_home: Path | str) -> frozenset[str]:
