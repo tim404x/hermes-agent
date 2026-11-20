@@ -24984,6 +24984,18 @@
             ],
             "default": null,
             "title": "Paused"
+          },
+          "silent": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Silent"
           }
         },
         "title": "MessageCompletePayload",

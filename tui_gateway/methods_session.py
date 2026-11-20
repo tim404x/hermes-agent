@@ -510,6 +510,7 @@ class _Resume:
 
     inline_images = True  # class default so a ``__new__``-built ctx (tests) projects the full form
     persistence = None  # the storage handle beside ``db``, released by the handler unless handed on
+    found = None  # the stored row ``_resume_locate`` resolved (its title says Bot Chat)
 
     def __init__(self, rid, params: dict, target: str) -> None:
         self.rid, self.params, self.target = rid, params, target
@@ -572,8 +573,10 @@ class _Resume:
             self.target, ConversationRequest(repair_alternation=repair, include_row_ids=True))]
 
     def messages(self, display: list) -> list:
+        from tools.bot_mode_probe import BOT_CHAT_TITLE
         return [] if self.omit_messages else _history_to_messages(
-            display, profile_home=self.profile_home, image_urls=self.inline_images)
+            display, profile_home=self.profile_home, image_urls=self.inline_images,
+            silence_ok_session=((self.found or {}).get("title") or "").strip() == BOT_CHAT_TITLE)
 
     def read_history(self) -> tuple:
         """One lineage SELECT, two projections: model-fed copy alternation-repaired (healed once
@@ -1901,7 +1904,8 @@ def _(rid, params: dict, session: dict) -> dict:
                     # use. See #87059.
                     history = [m.as_openai_message() for m in persistence.messages.read_conversation(
                         row_session, ConversationRequest(include_lineage=True, include_row_ids=True))]
-    return _ok(rid, {"count": len(history), "messages": _history_to_messages(history, profile_home=session.get("profile_home"))})
+    return _ok(rid, {"count": len(history), "messages": _history_to_messages(
+        history, profile_home=session.get("profile_home"), silence_ok_session=_is_bot_mode_session(session))})
 
 
 @_session_method("session.undo", live=True)
