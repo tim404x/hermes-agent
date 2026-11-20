@@ -178,3 +178,11 @@ def receipt_projections(conn, *, remember: bool) -> list[tuple[str, tuple]]:
         if remember:
             memo.rows = rows
     return [(key, entry[3]) for key, entry in rows.items()]
+
+
+def warm(conn) -> None:
+    """Teach the memo *conn*'s receipts. Only for a caller that has written no receipt in its open
+    transaction yet (explicit deletes call it right before ``retire_sessions``), so the remembered
+    rows are committed ones; ``retire_local_receipts`` then serves from the memo."""
+    if enabled():
+        receipt_projections(conn, remember=True)
