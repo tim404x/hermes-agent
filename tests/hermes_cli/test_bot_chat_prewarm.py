@@ -102,3 +102,17 @@ async def test_the_server_start_warms_every_profile_once_its_loop_is_serving(mon
     web_server._start_bot_chat_prewarm(delay_s=0.01)
     await async_wait_until(lambda: warmed == ["default", "apex"])
 
+
+
+@pytest.mark.asyncio
+async def test_an_isolated_backend_warms_only_the_profile_it_serves(monkeypatch):
+    from hermes_cli import isolated_scope, web_server
+    from hermes_cli.web_routers import sessions
+    from tests.waiting import async_wait_until
+
+    warmed = []
+    monkeypatch.setattr("hermes_cli.profiles.list_profile_names", lambda: ["default", "apex", "kepler"])
+    monkeypatch.setattr(isolated_scope, "_LAUNCH_PROFILE", "kepler")
+    monkeypatch.setattr(sessions, "prewarm_bot_chat_page", lambda name: warmed.append(name) or True)
+    web_server._start_bot_chat_prewarm(delay_s=0.01)
+    await async_wait_until(lambda: warmed == ["kepler"])
