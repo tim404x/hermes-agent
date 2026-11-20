@@ -75,7 +75,7 @@ describe('session transcript pagination ownership', () => {
       // Resolve the owner for lookup, but replay the exact ambient read route.
       expect(api).toHaveBeenLastCalledWith({
         ...(connectionId ? { connectionId } : {}),
-        path: `/api/sessions/stored-session/messages?limit=${LATEST_SESSION_MESSAGES_LIMIT}&offset=${tail.length}&order=latest&include_compacted=true`
+        path: `/api/sessions/stored-session/messages?limit=${LATEST_SESSION_MESSAGES_LIMIT}&offset=${tail.length}&order=latest&include_compacted=true&image_refs=true&replay_fields=false`
       })
       expect(messages.map(message => message.rowId)).toEqual([...older, ...tail].map(message => message.id))
       expect(transcriptBackfillAvailable('stored-session', owner)).toBe(false)
@@ -111,7 +111,7 @@ describe('session transcript pagination ownership', () => {
     expect(authoritative.pagination).toBeUndefined()
     expect(transcriptBackfillAvailable('stored-session', owner)).toBe(false)
     expect(api).toHaveBeenLastCalledWith({
-      path: '/api/sessions/stored-session/messages?limit=500&offset=0&order=oldest&include_compacted=true'
+      path: '/api/sessions/stored-session/messages?limit=500&offset=0&order=oldest&include_compacted=true&image_refs=true&replay_fields=false'
     })
   })
 
@@ -131,7 +131,7 @@ describe('session transcript pagination ownership', () => {
     // (#103375); the compatibility read inherits that.
     expect(api).toHaveBeenCalledTimes(2)
     expect(api).toHaveBeenLastCalledWith({
-      path: '/api/sessions/stored-session/messages?limit=500&offset=0&order=oldest&include_compacted=true',
+      path: '/api/sessions/stored-session/messages?limit=500&offset=0&order=oldest&include_compacted=true&image_refs=true&replay_fields=false',
       passive: true
     })
   })
@@ -184,7 +184,7 @@ describe('session transcript pagination ownership', () => {
     // An explicit local pin would bypass Electron's per-profile remote override.
     expect.soft(api).toHaveBeenLastCalledWith({
       profile,
-      path: `/api/sessions/stored-session/messages?profile=${profile}&limit=${LATEST_SESSION_MESSAGES_LIMIT}&order=latest&include_compacted=true`
+      path: `/api/sessions/stored-session/messages?profile=${profile}&limit=${LATEST_SESSION_MESSAGES_LIMIT}&order=latest&include_compacted=true&image_refs=true&replay_fields=false`
     })
     expect(transcriptBackfillAvailable('stored-session', owner)).toBe(true)
 
@@ -201,7 +201,7 @@ describe('session transcript pagination ownership', () => {
 
     expect(api).toHaveBeenLastCalledWith({
       profile,
-      path: `/api/sessions/stored-session/messages?profile=${profile}&limit=${LATEST_SESSION_MESSAGES_LIMIT}&offset=${tail.length}&order=latest&include_compacted=true`
+      path: `/api/sessions/stored-session/messages?profile=${profile}&limit=${LATEST_SESSION_MESSAGES_LIMIT}&offset=${tail.length}&order=latest&include_compacted=true&image_refs=true&replay_fields=false`
     })
     expect(applyOlderPage).toHaveBeenCalledWith(toChatMessages([row(1)]))
     expect(transcriptTailState('stored-session', owner)).toMatchObject({
@@ -259,7 +259,7 @@ describe('session transcript pagination ownership', () => {
     // Serving-profile metadata selects the cache entry, not the request route.
     expect(api).toHaveBeenLastCalledWith({
       connectionId: 'source-a',
-      path: `/api/sessions/stored-session/messages?limit=${LATEST_SESSION_MESSAGES_LIMIT}&offset=${tail.messages.length}&order=latest&include_compacted=true`
+      path: `/api/sessions/stored-session/messages?limit=${LATEST_SESSION_MESSAGES_LIMIT}&offset=${tail.messages.length}&order=latest&include_compacted=true&image_refs=true&replay_fields=false`
     })
     expect(applyOlderPage).toHaveBeenCalledWith(toChatMessages([row(0)]))
     expect(transcriptTailState('stored-session', ownerA)).toEqual({
