@@ -341,6 +341,8 @@ function ToolTitle({
 }
 
 interface ToolEntryProps {
+  /** Starts expanded (a failed call whose row is the only record of the failure). */
+  defaultOpen?: boolean
   part: ToolPart
 }
 
@@ -368,7 +370,7 @@ function ToolRunningMeta({ seconds, toolCallId = '' }: { seconds: number; toolCa
   )
 }
 
-function ToolEntry({ part }: ToolEntryProps) {
+function ToolEntry({ defaultOpen: openByDefault = false, part }: ToolEntryProps) {
   const { t } = useI18n()
   const copy = t.assistant.tool
   const statusCopy = t.statusStack
@@ -429,7 +431,7 @@ function ToolEntry({ part }: ToolEntryProps) {
   const isPending = messageRunning && result === undefined && completedAt === undefined
   const inlineDiff = inlineDiffFromResult(toolResultRecord(stablePart))
   const isFileEdit = isFileEditTool(toolName)
-  const defaultOpen = Boolean(inlineDiff) && !hideCodeDiffs
+  const defaultOpen = openByDefault || (Boolean(inlineDiff) && !hideCodeDiffs)
   const disclosureOpen = useDisclosureOpen(disclosureId, defaultOpen)
   const canDismiss = !isPending && !embedded
   // Only animate entries that mount while their message is actively
@@ -1141,13 +1143,16 @@ export const ToolGroupSlot: FC<PropsWithChildren<{ endIndex: number; startIndex:
  * group-shape changes.
  */
 type TimelineToolCallProps = ToolCallMessagePartProps &
-  Pick<ToolPart, 'completedAt' | 'innerToolName' | 'interrupted' | 'timestamp' | 'toolResultMetadata'>
+  Pick<ToolPart, 'completedAt' | 'innerToolName' | 'interrupted' | 'timestamp' | 'toolResultMetadata'> & {
+    defaultOpen?: boolean
+  }
 
 export const ToolFallback = ({
   toolCallId,
   toolName,
   args,
   completedAt,
+  defaultOpen,
   innerToolName,
   interrupted,
   isError,
@@ -1169,5 +1174,5 @@ export const ToolFallback = ({
     type: 'tool-call'
   }
 
-  return <ToolEntry part={part} />
+  return <ToolEntry defaultOpen={defaultOpen} part={part} />
 }
