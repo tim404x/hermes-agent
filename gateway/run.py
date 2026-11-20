@@ -4031,6 +4031,7 @@ class GatewayRunner(
     # (section, key) config values baked into the agent at construction: a change MUST invalidate the
     # cached agent or a mid-gateway edit is silently ignored. Add new baked-in settings here.
     # _MAX_INTERRUPT_DEPTH = 3  # Cap recursive interrupt handling (#816)
+    # apexfix: compression.prepare_ahead busts the cached agent (it is baked in at construction)
     _CACHE_BUSTING_CONFIG_KEYS: tuple = (
         ("model", "context_length"), ("compression", "enabled"),
         ("compression", "progress_notices"), ("compression", "threshold"),
@@ -4045,7 +4046,8 @@ class GatewayRunner(
         ("compression", "proactive_prune_tokens"),
         ("compression", "proactive_prune_min_result_chars"),
         ("compression", "proactive_prune_min_reclaim_tokens"),
-        ("compression", "min_tail_user_messages"), ("agent", "disabled_toolsets"),
+        ("compression", "min_tail_user_messages"), ("compression", "prepare_ahead"),
+        ("agent", "disabled_toolsets"),
         ("memory", "provider"), ("checkpoints", "enabled"), ("checkpoints", "max_snapshots"),
         ("checkpoints", "max_total_size_mb"), ("checkpoints", "max_file_size_mb"))
 
