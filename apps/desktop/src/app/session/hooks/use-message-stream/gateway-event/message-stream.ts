@@ -423,7 +423,10 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
     const silent = payload?.silent === true
 
     if (silent) {
-      noteSilentCompletion(sessionId)
+      // A complete receipt names every row the turn committed: exactly what the unread watermark
+      // skips. Anything less proves no count, and the store assumes the bare wake + reply pair.
+      const receipt = payload?.persisted_turn
+      noteSilentCompletion(sessionId, receipt?.complete ? receipt.row_ids.length : undefined)
     } else {
       // Keyed by session so only one window beeps when several are open.
       playCompletionSound(sessionId)
