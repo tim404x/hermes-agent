@@ -794,7 +794,8 @@ export function useMessageStream({
       responseTransformed?: boolean,
       status?: string,
       responseReused?: boolean,
-      failureReason?: string
+      failureReason?: string,
+      silent = false
     ) => {
       let shouldHydrate = false
 
@@ -1183,6 +1184,10 @@ export function useMessageStream({
 
       if (shouldHydrate) {
         void hydrateFromStoredSession(3, completedState.storedSessionId, sessionId)
+      }
+
+      if (silent) {
+        return
       }
 
       dispatchNativeNotification({

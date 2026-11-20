@@ -97,7 +97,12 @@ import {
   type SessionProfileRoute
 } from './session-request-router'
 import { orderTilesByTree } from './session-tile-order'
-import { ackStoredSessionId, isMessagingCompletion, markSessionUnreadFinished } from './session-unread'
+import {
+  ackStoredSessionId,
+  isMessagingCompletion,
+  markSessionUnreadFinished,
+  noteSilentTurnSettled
+} from './session-unread'
 import { migrateTranscriptTailsForProfile } from './transcript-tail-cache'
 import { isBrowserWindow, isSecondaryWindow } from './windows'
 
@@ -734,6 +739,8 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
   const wasWorking = previous?.busy ?? false
 
   if (next.busy && !wasWorking) {
+    // A silent note belongs to the turn that ended; a new turn never inherits it.
+    silentSettles.delete(runtimeId)
     clearSettled(storedId)
     // The turn is live (or a new one starts): a reconnect downgrade that was
     // waiting for the snapshot's verdict was a socket blip, not a completion.
@@ -745,6 +752,14 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
     clearReadBaseline(storedId)
   } else if (!next.busy && wasWorking) {
     markSettled(storedId)
+
+    // A turn that chose silence showed nothing: no green dot now, and the rows it stored do not
+    // count as unread when the list next reports them.
+    if (silentSettles.delete(runtimeId)) {
+      noteSilentTurnSettled(storedId)
+
+      return
+    }
 
     // A PRIMARY reconnect reconcile is not a terminal event: it downgrades
     // EVERY busy claim on the socket, live turns included, so lighting the dot
@@ -763,6 +778,14 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
 
     lightUnreadCompletion(storedId, runtimeId)
   }
+}
+
+/** Runtime ids whose live turn just completed silent (`message.complete` with `silent: true`), consumed
+ *  by that turn's busy->idle edge. Set before the completion publishes the idle state. */
+const silentSettles = new Set<string>()
+
+export function noteSilentCompletion(runtimeId: string): void {
+  silentSettles.add(runtimeId)
 }
 
 /** Mark a completed turn unread unless the user is already looking at it. */
