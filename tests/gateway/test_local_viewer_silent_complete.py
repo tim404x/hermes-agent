@@ -53,3 +53,13 @@ def test_a_silent_wake_completes_marked_silent():
 def test_a_real_reply_or_a_persons_marker_is_not_marked():
     assert "silent" not in _settle("process_complete", "Build failed: 3 tests.")
     assert "silent" not in _settle(None, "NO_REPLY")
+
+
+def test_a_bot_chat_turn_that_ended_silent_is_marked_silent():
+    # The Bot Chat may end any turn silent (tui_gateway/prompt_turn.py): its completion raises no toast.
+    _ReplyAgent._session_title_hint = "Bot Chat"
+    try:
+        assert _settle(None, "NO_REPLY \u26a1")["silent"] is True
+        assert "silent" not in _settle(None, "Paris.")
+    finally:
+        del _ReplyAgent._session_title_hint
