@@ -1,0 +1,5 @@
+name: effort-router
+version: 1.1.0
+description: "Delegation strategy: each subagent's reasoning effort is picked per task (effort=low|medium|high|xhigh). Omitted = a cheap heuristic: short mechanical goals run medium, anything touching money, legal, sends, code changes or research synthesis never runs below high; otherwise delegation.reasoning_effort."
+author: tim404x
+kind: backend
