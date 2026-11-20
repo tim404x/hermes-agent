@@ -489,6 +489,24 @@ export function getSession(id: string, profile?: ProfileScope): Promise<SessionI
   })
 }
 
+/**
+ * Lean transcript pages. The Desktop renders a user row's `@image:<path>`
+ * reference itself (loaded on demand through the authenticated media route),
+ * so the backend may drop the row's inline base64 copy of that same image; it
+ * also drops the opaque provider replay blobs (thinking `signature`, redacted
+ * `data`, `encrypted_content`) that hydration never reads (chat-messages/parts.ts).
+ * Without this every page read re-shipped each pasted screenshot: Kepler's Bot
+ * Chat page was 590 KB gzip for one 439 KB PNG, 175 KB lean. Display-only: the
+ * stored rows the agent replays are untouched, a reference whose file is gone
+ * keeps its bytes, and older backends ignore the unknown params.
+ */
+export function setLeanTranscriptParams(query: URLSearchParams): URLSearchParams {
+  query.set('image_refs', 'true')
+  query.set('replay_fields', 'false')
+
+  return query
+}
+
 // Reads another profile's transcript. For a remote profile Electron reroutes
 // this GET to the remote backend (which serves its own state.db); for a local
 // profile the primary opens that profile's state.db via ?profile=. Omit for
@@ -523,6 +541,8 @@ export function getSessionMessages(
   if (page.includeCompacted !== undefined) {
     query.set('include_compacted', String(page.includeCompacted))
   }
+
+  setLeanTranscriptParams(query)
 
   const suffix = query.size ? `?${query.toString()}` : ''
 

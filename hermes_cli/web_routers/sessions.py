@@ -734,7 +734,8 @@ def _is_untyped_scaffold_notice(message) -> bool:
 
 
 def _project_for_display(messages: list, *, home=None, inline_images: bool = True, bot_brief=None,
-                         silence_ok_session: bool = False, opener: Optional[dict] = None) -> list:
+                         silence_ok_session: bool = False, opener: Optional[dict] = None,
+                         image_refs: bool = False, replay_fields: bool = True) -> list:
     """Replace compaction summaries with their display-only projection and hide untyped
     gateway-scaffold notices.
 
@@ -766,9 +767,13 @@ def _project_for_display(messages: list, *, home=None, inline_images: bool = Tru
                 return {**message, "content": _coerce_message_text(message["content"], image_urls=False)}
             return message
 
+    from hermes_cli.session_page_lean import lean_page_message
+
     projected_messages = []
     for message in messages:
         message = _with_tool_call_labels(message)
+        # Opt-in lean page (the Desktop): no inline copy of a referenced image, no replay blobs.
+        message = lean_page_message(message, image_refs=image_refs, replay_fields=replay_fields)
         if coerce is not None:
             message = coerce(message)
         # Machine rows typed for display (job titles, cron deliveries, interrupt sentinels), as session.resume does;
@@ -882,7 +887,8 @@ def prewarm_bot_chat_page(profile: Optional[str]) -> bool:
 async def get_session_messages(
     session_id: str, profile: Optional[str] = None, limit: Optional[int] = Query(None, ge=0),
     offset: int = Query(0, ge=0), order: Optional[str] = Query(None),
-    include_compacted: bool = Query(False), inline_images: bool = Query(True)):
+    include_compacted: bool = Query(False), inline_images: bool = Query(True),
+    image_refs: bool = Query(False), replay_fields: bool = Query(True)):
     if order not in (None, "oldest", "latest"):
         raise HTTPException(status_code=400, detail="order must be one of: oldest, latest")
 
@@ -920,7 +926,8 @@ async def get_session_messages(
     sid, _limit, messages, brief, bot_chat, opener = result
     projected_messages = await asyncio.to_thread(
         _project_for_display, messages, home=_history_profile_home(profile),
-        inline_images=inline_images, bot_brief=brief, silence_ok_session=bot_chat, opener=opener)
+        inline_images=inline_images, bot_brief=brief, silence_ok_session=bot_chat, opener=opener,
+        image_refs=image_refs, replay_fields=replay_fields)
     return {
         "session_id": sid,
         # The same stamp list rows carry, so the Desktop keys a page under the
@@ -977,6 +984,7 @@ async def get_session_timeline(
 async def get_session_messages_around(
     session_id: str, row_id: int = Query(..., ge=1), profile: Optional[str] = None,
     limit: int = Query(120, ge=1, le=120),
+    image_refs: bool = Query(False), replay_fields: bool = Query(True),
 ):
     """Bounded display page starting at a timeline prompt; no intervening payloads."""
     owner = _serving_profile(profile)
@@ -996,7 +1004,8 @@ async def get_session_messages_around(
     result = await asyncio.to_thread(_with_db, profile, _read, read_only=True)
     brief = result.pop("bot_brief", None)
     result["messages"] = await asyncio.to_thread(
-        _project_for_display, result["messages"], home=_history_profile_home(profile), bot_brief=brief)
+        _project_for_display, result["messages"], home=_history_profile_home(profile), bot_brief=brief,
+        image_refs=image_refs, replay_fields=replay_fields)
     return result
 
 
