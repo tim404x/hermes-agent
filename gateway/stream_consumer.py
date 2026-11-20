@@ -256,6 +256,16 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         except Exception:
             return False
 
+    def stream_absorbs_commentary(self) -> bool:
+        """Whether text streamed before a tool call stays inside this turn's one append-only message (native
+        streaming, a stream-is-the-message draft) instead of arriving as its own message: the boundary is
+        only a segment break there. Answerable before ``run()`` picks the transport (same probes)."""
+        if not self.stream_deltas_enabled:
+            return False
+        if self._use_native_streaming or self._resolve_native_streaming():
+            return True
+        return self._stream_is_message() and (self._use_draft_streaming or self._resolve_draft_streaming())
+
     @property
     def accepts_tool_progress(self) -> bool:
         """True only when native streaming is active (gates in-stream tool progress)."""

@@ -80,7 +80,11 @@ def test_the_note_asks_for_the_models_own_words_and_never_supplies_them():
     # The ack is the bot's own sentence: the note must not hand it canned filler to repeat.
     for canned in ('"On it"', "On it.", "Working on it"):
         assert canned not in ACK_FIRST_NOTE
-    assert "own words" in ACK_FIRST_NOTE and "once" in ACK_FIRST_NOTE
+
+
+def test_the_note_is_a_short_recency_nudge():
+    # The shared soul carries the full rule; this note replays with every armed historical turn.
+    assert len(ACK_FIRST_NOTE) <= 120
 
 
 def test_goal_continuations_heartbeats_and_bot_dms_written_by_hermes_get_no_ack():
