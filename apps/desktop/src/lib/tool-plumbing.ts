@@ -2,7 +2,9 @@
  * Tool plumbing: calls the agent makes to find or poll its own tools, never work the user asked
  * for. "Reading tool details · 3 tools" or a process poll under a reply is the agent narrating its
  * own wiring, so the thread never paints these, live or reloaded, whatever
- * `display.tool_progress` says. A failed plumbing call is not something the user can act on either.
+ * `display.tool_progress` says. Only SUCCESSFUL plumbing is hidden: a failed call or one awaiting
+ * approval still renders (message-parts.tsx ChainToolFallback), since it may be the only record of
+ * a failure.
  */
 
 const PLUMBING_TOOL_NAMES: ReadonlySet<string> = new Set([
