@@ -10,6 +10,15 @@ import { isTodoToolName } from '@/lib/todos'
 import type { MessageReaction, SessionMessage } from '@/types/hermes'
 
 import {
+  BOT_BRIEF_KIND,
+  CRON_DELIVERY_KIND,
+  MACHINE_EVENT_KINDS,
+  machineEventLabel,
+  machineRowMetadata,
+  RUNTIME_NOTICE_KIND,
+  typeMachineRow
+} from './machine-rows'
+import {
   assistantTextPart,
   chatMessageText,
   dedupeRepeatedTextInParts,
@@ -186,7 +195,12 @@ const NOTICE_DISPLAY_KINDS = [
   'failed_turn',
   // A safety-refused turn retained for display: the user's own message, shown
   // greyed with a notice. Rendered through the system path, never a user bubble.
-  'content_refused'
+  'content_refused',
+  // Runtime-written user rows (machine-rows.ts): a scheduled job's output, a bot's task brief,
+  // a runtime notification. The runtime wrote them, so they never paint as the user's bubble.
+  CRON_DELIVERY_KIND,
+  BOT_BRIEF_KIND,
+  RUNTIME_NOTICE_KIND
 ] as const
 
 // agent/turn_failure_copy.py::CONTENT_REFUSED_DISPLAY_KIND. The retained turn
@@ -370,7 +384,13 @@ function timelineDisplayContent(message: SessionMessage, content: string): strin
   }
 
   if (message.display_kind === 'process_complete') {
-    return timelineDisplayText(message.display_metadata) ?? 'background process finished'
+    return timelineDisplayText(message.display_metadata) ?? 'Background job finished'
+  }
+
+  const machineEvent = message.display_kind ? MACHINE_EVENT_KINDS[message.display_kind] : undefined
+
+  if (machineEvent) {
+    return machineEventLabel(machineEvent, machineRowMetadata(message))
   }
 
   return content
@@ -381,7 +401,10 @@ function timelineDisplayContent(message: SessionMessage, content: string): strin
 const WAKE_DISPLAY_KINDS: ReadonlySet<string> = new Set([
   'async_delegation_complete',
   'internal_notification',
-  'process_complete'
+  'process_complete',
+  // The same wakes once machine-rows.ts typed them (cron output, other runtime notifications).
+  CRON_DELIVERY_KIND,
+  RUNTIME_NOTICE_KIND
 ])
 
 const storedRowText = (message: SessionMessage): string => {
@@ -440,6 +463,21 @@ function silentTurnRows(rows: readonly { index: number; message: SessionMessage 
  *  reply on its own line is dropped (gateway/response_filters.py strip_trailing_silence_marker). */
 function paintedAssistantReply(reply: null | string | undefined): null | string | undefined {
   return reply && (isSilenceMarkerText(reply) ? '' : stripTrailingSilenceMarker(reply))
+}
+
+/** The disclosure body and kind a background/machine event row carries (result, output, brief). */
+function asyncResultFields(message: SessionMessage, content: string): Pick<ChatMessage, 'asyncResult' | 'asyncResultKind'> {
+  const kind = message.display_kind
+
+  if (kind === 'async_delegation_complete' || kind === 'process_complete') {
+    const asyncResult = asyncResultBody(displayContentForMessage(message.role, message.content || content))
+
+    return kind === 'process_complete' ? { asyncResult, asyncResultKind: 'process' } : { asyncResult }
+  }
+
+  const machineEvent = kind ? MACHINE_EVENT_KINDS[kind] : undefined
+
+  return machineEvent ? { asyncResult: content.trim() || undefined, asyncResultKind: machineEvent } : {}
 }
 
 export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
@@ -610,7 +648,10 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   }
 
   // `index` stays the stored row position (it keys tool-part and message ids), so skipped merges shift nothing.
-  const stored = messages.flatMap((message, index) => (isPainted(message) ? [{ index, message }] : []))
+  const stored = messages.flatMap((message, index) =>
+    isPainted(message) ? [{ index, message: typeMachineRow(message) }] : []
+  )
+
   const silent = silentTurnRows(stored)
   const painted = stored.filter(({ index }) => !silent.has(index))
 
@@ -820,10 +861,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       role: displayRole,
       parts,
       ...(message.role === 'assistant' && durableComplete !== undefined ? { durableComplete } : {}),
-      ...(message.display_kind === 'async_delegation_complete' || message.display_kind === 'process_complete'
-        ? { asyncResult: asyncResultBody(displayContentForMessage(message.role, message.content || content)) }
-        : {}),
-      ...(message.display_kind === 'process_complete' ? { asyncResultKind: 'process' as const } : {}),
+      ...asyncResultFields(message, typeof content === 'string' ? content : ''),
       timestamp: earliestTimestamp(message.timestamp, ...parts.map(part => part.timestamp)),
       ...(rowId !== undefined ? { rowId } : {}),
       ...(pendingAbsorbedRows > 0 ? { serverRowSpan: pendingAbsorbedRows + 1 } : {}),
