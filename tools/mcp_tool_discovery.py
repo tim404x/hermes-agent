@@ -516,17 +516,31 @@ def _run_discovery_pass(new_servers: dict[str, dict]) -> None:
             _set_interrupt(True)
 
 
+def _unconnected_reason(key) -> str:
+    """Why *key* has no live session when no connect error is recorded: read from the ledgers,
+    never assumed. Caller holds ``_core._lock``."""
+    if key in _core._server_connecting:
+        return "still connecting"
+    deadline = _core._server_connect_retry_after.get(key)
+    if deadline is not None and time.monotonic() < deadline:
+        return "not attempted (in retry cooldown)"
+    return "not connected (no connect attempt recorded)"
+
+
 def _connected_summary(names, *, lazy_tools: int = 0,
                        lazy_servers: int = 0) -> tuple[int, int, list[tuple[str, str]]]:
     """(tool count, connected count, ``[(failed name, reason)]``) for candidate names, plus lazy
-    servers. The reason is the recorded connect error; a candidate this pass never attempted (still
-    inside its retry cooldown from an earlier failure) has none."""
+    servers. A name this scope adopted from another profile's live connection (same route and
+    credentials, ``register_connected_into_current_scope``) is connected: it lives under the
+    owner's key, so the scope's own key alone read every adopted server as failed and "in retry
+    cooldown" while its tools served the profile. The reason is the recorded connect error, else
+    the state the ledgers show."""
     with _core._lock:
-        keys = {n: _server_key(n) for n in names}
+        keys = {n: _resolve_server_key(n) for n in names}
         connected = [n for n in names
                      if keys[n] in _core._servers and keys[n] not in _core._server_connect_errors]
         tool_count = sum(len(getattr(_core._servers[keys[n]], "_registered_tool_names", [])) for n in connected)
-        failed = [(n, _core._server_connect_errors.get(keys[n]) or "not attempted (in retry cooldown)")
+        failed = [(n, _core._server_connect_errors.get(keys[n]) or _unconnected_reason(keys[n]))
                   for n in names if n not in connected]
     return tool_count + lazy_tools, len(connected) + lazy_servers, failed
 
