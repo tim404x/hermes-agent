@@ -3,7 +3,6 @@ warming, the first-miss stop), the cache-edge claim, and the agent-facing seams.
 
 from __future__ import annotations
 
-import contextlib
 import contextvars
 import copy
 import logging
@@ -167,8 +166,9 @@ class PromptCacheWarmer:
 
     def __init__(self, agent: Any):
         self.agent = agent
-        # Guards ``_run`` ownership: the timer thread and the loop both replace or stop it.
-        self._lock = threading.RLock()
+        # Guards ``_run`` ownership: the timer thread and the loop both replace or stop it. It is the
+        # agent's session accounting lock, so a keep-alive's epoch check and add exclude a reset.
+        self._lock = session_totals_lock(agent)
         self._run: Optional[_Run] = None
         self._inactive_reason = "waiting for first request"
         self._logged_reason: Optional[str] = None
@@ -912,12 +912,28 @@ def get_prompt_cache_warmer(agent: Any) -> PromptCacheWarmer:
     return warmer
 
 
+_SESSION_TOTALS_GUARD = threading.Lock()
+_SESSION_TOTALS_FALLBACK = threading.RLock()  # an agent that takes no attribute: one shared lock, still exclusive
+_RLOCK_TYPE = type(threading.RLock())
+
+
 def session_totals_lock(agent: Any) -> Any:
-    """What ``reset_session_state`` holds while it zeroes the running totals and advances the
-    reset epoch: the lock a keep-alive holds across its epoch check and its add. With no warmer
-    there is no keep-alive in flight, so nothing to exclude."""
-    warmer = getattr(agent, "_prompt_cache_warmer", None)
-    return warmer._lock if warmer is not None else contextlib.nullcontext()
+    """The agent's session accounting lock, one real RLock per agent whether or not it has a warmer
+    (the warmer adopts it as its own ``_lock``). ``reset_session_state`` holds it while it zeroes the
+    running totals and advances the reset epoch; every writer that checks the epoch (a keep-alive
+    reply, a finishing subagent batch) holds it across that check and its add."""
+    lock = getattr(agent, "_session_totals_lock", None)
+    if isinstance(lock, _RLOCK_TYPE):
+        return lock
+    with _SESSION_TOTALS_GUARD:
+        lock = getattr(agent, "_session_totals_lock", None)
+        if not isinstance(lock, _RLOCK_TYPE):
+            lock = threading.RLock()
+            try:
+                agent._session_totals_lock = lock
+            except (AttributeError, TypeError):
+                return _SESSION_TOTALS_FALLBACK
+    return lock
 
 
 def reset_prompt_cache_session(agent: Any) -> None:
