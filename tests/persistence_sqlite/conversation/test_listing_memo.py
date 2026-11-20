@@ -314,7 +314,8 @@ def test_signature_ignores_an_empty_wal_and_refuses_a_racy_or_missing_store(tmp_
     assert listing_memo.store_signature(db) is None  # just written: racy
     clock["skew"] = 10_000_000_000
     sig = listing_memo.store_signature(db)
-    assert sig is not None and sig[1] == ()  # no -wal
+    assert sig is not None and sig[2] == ()  # no -wal
+    assert sig[0] == (os.stat(db).st_dev, os.stat(db).st_ino)
     wal = tmp_path / "state.db-wal"
     wal.write_bytes(b"")
     assert listing_memo.store_signature(db) == sig  # an empty -wal carries no frames
@@ -355,3 +356,51 @@ def test_kept_rows_are_bounded(store, scope_a, monkeypatch):
     _browse(scope_a, lambda r: _listed(r, limit=9))  # an answer heavier than the whole bound is never kept
     _browse(scope_a, lambda r: _listed(r, limit=9))
     assert len(reads) == 5
+
+
+def test_a_holder_whose_file_identity_is_unknown_never_uses_the_memo(monkeypatch, tmp_path):
+    listing_memo = _listing_memo()
+    monkeypatch.setattr(listing_memo, "_now_ns", lambda: time.time_ns() + 10_000_000_000)
+    db = tmp_path / "state.db"
+    db.write_bytes(b"x" * 10)
+    st = os.stat(db)
+    computed = []
+
+    def compute():
+        computed.append(1)
+        return 7
+
+    for identity, reads in ((None, 2), ((st.st_dev, st.st_ino + 1), 2), ((st.st_dev, st.st_ino), 1)):
+        listing_memo.clear()
+        computed.clear()
+        holder = _holder(db_path=str(db), _db_file_identity=identity)
+        assert [listing_memo.memoized(holder, "k", (), compute) for _ in range(2)] == [7, 7]
+        assert len(computed) == reads, identity
+
+
+def test_only_answers_kept_while_the_wal_held_frames_expire(monkeypatch):
+    listing_memo = _listing_memo()
+    monkeypatch.setattr(listing_memo, "_MAX_AGE_S", 15.0)
+    db_parts = (1, 2, 3, 4, 5)
+    no_wal, with_wal = ((1, 4), db_parts, ()), ((1, 4), db_parts, (1, 9, 9, 9, 9))
+    for signature, expires in ((no_wal, False), (with_wal, True)):
+        kept = (signature, "answer", 1, 100.0)
+        assert listing_memo._fresh(kept, signature, 110.0)
+        assert listing_memo._fresh(kept, signature, 130.0) is not expires
+        assert not listing_memo._fresh(kept, (signature[0], db_parts, (1, 1, 1, 1, 1)), 101.0)
+
+
+def test_a_read_only_compact_listing_is_immutable_even_when_not_kept(store, scope_a):
+    """Racy (just written) stores are read every time; their entries still refuse mutation, so a consumer that
+    mutates a listing fails in a test, not only once a store settles in production."""
+    _write(scope_a, "UPDATE sessions SET model_config=? WHERE id='a'", (json.dumps({"k": 1}),))
+    entries = _browse(scope_a, lambda r: r.sessions.list_sessions(SessionQuery(), SessionWindow(limit=10),
+                                                                   compact_rows=True))
+    config = next(e for e in entries if str(e.session.session_id) == "a").session.model_config
+    assert config == {"k": 1}
+    with pytest.raises(TypeError):
+        config["k"] = 2
+    # A writer's own listings keep their plain mappings.
+    mine = next(e for e in store.sessions.list_sessions(SessionQuery(), SessionWindow(limit=10), compact_rows=True)
+                if str(e.session.session_id) == "a")
+    mine.session.model_config["k"] = 2
