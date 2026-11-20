@@ -314,6 +314,36 @@ describe('gatewayMediaDataUrl', () => {
       path: '/api/fs/read-data-url?path=%2Fhome%2Fu%2F.hermes%2Fskills%2Fdemo%2Fimages%2Fa%20b.png'
     })
   })
+
+  // A pasted screenshot's file is written once under a unique name, so a chat
+  // switch must not download it again (a 439 KB PNG per switch, uncompressible).
+  it('reads an attach-pipeline upload once per window', async () => {
+    const shot = '/home/u/.hermes/profiles/kepler/images/upload_zj9f2sl5.png'
+
+    await expect(gatewayMediaDataUrl(shot)).resolves.toBe('data:image/png;base64,ZHVtbXk=')
+    await expect(gatewayMediaDataUrl(`file://${shot}`)).resolves.toBe('data:image/png;base64,ZHVtbXk=')
+
+    expect(api).toHaveBeenCalledTimes(1)
+  })
+
+  it('re-reads any other gateway image, which can be rewritten in place', async () => {
+    const chart = '/home/u/.hermes/work/qa/images/chart.png'
+
+    await gatewayMediaDataUrl(chart)
+    await gatewayMediaDataUrl(chart)
+
+    expect(api).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not keep a failed upload read', async () => {
+    const shot = '/home/u/.hermes/images/upload_failsonce.png'
+
+    api.mockRejectedValueOnce(new Error('relay dropped'))
+    await expect(gatewayMediaDataUrl(shot)).rejects.toThrow('relay dropped')
+    await expect(gatewayMediaDataUrl(shot)).resolves.toBe('data:image/png;base64,ZHVtbXk=')
+
+    expect(api).toHaveBeenCalledTimes(2)
+  })
 })
 
 describe('gatewayImageProxyDataUrl (#74564)', () => {

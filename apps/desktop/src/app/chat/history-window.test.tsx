@@ -121,6 +121,9 @@ describe('bounded direct history runtime', () => {
     expect(url.pathname).toBe('/api/sessions/stored/messages/around')
     expect(url.searchParams.get('row_id')).toBe('40')
     expect(url.searchParams.get('limit')).toBe('120')
+    // Lean page, like every transcript read: image refs, not inline base64 copies.
+    expect(url.searchParams.get('image_refs')).toBe('true')
+    expect(url.searchParams.get('replay_fields')).toBe('false')
     expect(mounted.view.$messages.get()).toBe(live)
     expect(mounted.runtime.thread.getState().messages).toHaveLength(120)
     expect(mounted.runtime.thread.getState().messages.some(message => message.id === id)).toBe(true)
