@@ -99,15 +99,22 @@ def _chain_internal(parent_expr: str, hops: int) -> str:
     are 3.45.1, macOS ships older still) from 4 hops on, and SQLite parses the whole schema on first use: such a
     store becomes unreadable to every one of those builds (scripts, skills, the recovery salvage CLI).
     ``test_visible_list_revision`` bounds the nesting and parses the DDL on an old SQLite when one is present."""
-    joins, whens, prev = [], [f"WHEN {parent_expr} IS NULL THEN 1"], parent_expr
+    joins, whens, prev, prev_alias = [], [], parent_expr, None
     for hop in range(1, hops + 1):
         a = f"_lra{hop}"
-        # ``id`` is the PRIMARY KEY: each LEFT JOIN matches at most one row, so the subquery yields exactly one.
-        joins.append(f" LEFT JOIN sessions {a} ON {a}.id = {prev}")
+        # ``id`` is the PRIMARY KEY: each LEFT JOIN matches at most one row, so the subquery yields exactly one. A hop
+        # past a non-internal ancestor is never read (the CASE already answered 0): its join is gated off, so the
+        # walk stops early like the nested one did.
+        gate = "" if prev_alias is None else f" AND {_internal_source(f'{prev_alias}.source')}"
+        joins.append(f" LEFT JOIN sessions {a} ON {a}.id = {prev}{gate}")
         whens.append(f"WHEN {a}.id IS NULL OR NOT {_internal_source(f'{a}.source')} THEN 0"
                      f" WHEN {a}.parent_session_id IS NULL THEN 1")
-        prev = f"{a}.parent_session_id"
-    return f"(SELECT CASE {' '.join(whens)} ELSE 0 END FROM (SELECT 1) _lra0{''.join(joins)})"
+        prev, prev_alias = f"{a}.parent_session_id", a
+    if not joins:
+        return f"(CASE WHEN {parent_expr} IS NULL THEN 1 ELSE 0 END)"
+    # A root row (most rows) answers without running the joins.
+    return (f"(CASE WHEN {parent_expr} IS NULL THEN 1 ELSE (SELECT CASE {' '.join(whens)} ELSE 0 END"
+            f" FROM (SELECT 1) _lra0{''.join(joins)}) END)")
 
 
 def _ancestors_internal(alias: str) -> str:
