@@ -237,29 +237,25 @@ interface PaneTabLabelProps extends React.ComponentProps<'button'> {
   as?: 'button' | 'span'
 }
 
-/** Truncating label inside a `PaneTab`. `className` merges into the text span
- *  (e.g. `normal-case tracking-normal` for filenames). On a closeable tab the
- *  text clips instead of ellipsizing, so the hover mask can fade its right edge. */
+/** Truncating label inside a `PaneTab`. `className` merges into the text span.
+ *  A title reads as typed (sentence case, never shouted in caps) and a long one
+ *  ends in an ellipsis, closeable or not (the hover mask fades over it); the
+ *  full title is the hover tooltip, so a cut label never hides which chat it is. */
 export const PaneTabLabel = React.forwardRef<HTMLElement, PaneTabLabelProps>(function PaneTabLabel(
-  { as = 'span', className, children, ...props },
+  { as = 'span', className, children, title, ...props },
   ref
 ) {
   const Comp = as as React.ElementType
+  const fullTitle = title ?? (typeof children === 'string' ? children : undefined)
 
   return (
     <Comp
       className="flex h-full min-w-0 max-w-full items-center overflow-hidden px-2 text-left outline-none group-data-[vertical]/tab:h-auto group-data-[vertical]/tab:w-full group-data-[vertical]/tab:justify-center group-data-[vertical]/tab:py-2"
       ref={ref}
+      title={fullTitle}
       {...props}
     >
-      <span
-        className={cn(
-          'block min-w-0 truncate font-medium tracking-wide uppercase group-data-[closeable]/tab:text-clip',
-          className
-        )}
-      >
-        {children}
-      </span>
+      <span className={cn('block min-w-0 truncate font-medium', className)}>{children}</span>
     </Comp>
   )
 })
