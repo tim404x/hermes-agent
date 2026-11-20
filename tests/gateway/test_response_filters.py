@@ -7,6 +7,7 @@ from gateway.response_filters import (
     is_autonomous_silence_response,
     is_intentional_silence_agent_result,
     is_intentional_silence_response,
+    strip_trailing_silence_marker,
 )
 
 
@@ -57,3 +58,8 @@ def test_shared_silence_marker_cases(case):
     """Shared with the desktop twin (``apps/desktop/src/lib/silence-marker.test.ts``): a bot's
     sign-off emoji after the marker (``NO_REPLY ⚡``) is still silence, a sentence naming it is not."""
     assert is_intentional_silence_response(case["input"]) is case["silent"]
+    if "strip" in case:
+        assert strip_trailing_silence_marker(case["input"]) == case["strip"]
+    if "autonomous" in case:
+        # Cron and webhook output: a real answer closing on "No reply 😕" is delivered.
+        assert is_autonomous_silence_response(case["input"]) is case["autonomous"]
