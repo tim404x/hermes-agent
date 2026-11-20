@@ -8,7 +8,7 @@ import { $cronSessions, $messagingSessions, $sessions, $unlistedSessionOwnerRows
 import { $removedSessionIds, tombstoneSessions, untombstoneSessions } from '@/store/session-removal'
 import type { SessionInfo } from '@/types/hermes'
 
-import { cachedSessionRow, resolveStoredSession } from './utils'
+import { cachedSessionRow, parkedHiddenSessionRow, resolveStoredSession } from './utils'
 
 vi.mock('@/hermes', async importActual => ({
   ...(await importActual<typeof HermesModule>()),
@@ -145,6 +145,42 @@ describe('resolveStoredSession profile ownership', () => {
     expect($sessions.get()).toEqual([])
     // owner resolution still finds the row on the off-list stub atom
     expect($unlistedSessionOwnerRows.get().find(s => s.id === 's1')?.hidden).toBe(true)
+  })
+
+  it('reuses a parked hidden row on the next owner-routed resolve (bot-switch-speed)', async () => {
+    // Every bot switch resolves the canonical Bot Chat with its owner route.
+    // The parked row is the cache for it: re-reading it over the network on
+    // every switch delayed the bind, and the warm refresh's ownership check
+    // (which reads this cache) dropped the fresh page.
+    const owner = { connectionId: 'remote-1', profile: 'meta', targetProfile: 'meta' } as never
+    mockGetSession.mockResolvedValueOnce(session({ hidden: true, id: 's1', message_count: 4, title: 'Bot Chat' }))
+
+    await expect(resolveStoredSession('s1', owner)).resolves.toMatchObject({ id: 's1', profile: 'meta' })
+
+    // The next resolve answers from the parked row even while the network
+    // read is still out; that read refreshes the parked copy behind it.
+    let refresh!: (row: SessionInfo) => void
+    mockGetSession.mockReturnValueOnce(new Promise<SessionInfo>(resolve => (refresh = resolve)))
+
+    await expect(resolveStoredSession('s1', owner)).resolves.toMatchObject({ connection_id: 'remote-1', id: 's1' })
+    expect(parkedHiddenSessionRow('s1', owner)).toMatchObject({ message_count: 4 })
+
+    refresh(session({ hidden: true, id: 's1', message_count: 6, title: 'Bot Chat' }))
+    await vi.waitFor(() => expect(parkedHiddenSessionRow('s1', owner)).toMatchObject({ message_count: 6 }))
+    // Never listed, and not a cachedSessionRow hit (gone/owner checks keep their reads).
+    expect($sessions.get()).toEqual([])
+    expect(cachedSessionRow('s1')).toBeUndefined()
+  })
+
+  it('never serves an unlisted draft stub as a resolved row', async () => {
+    // Draft stubs ride the same atom for owner lookup only; they carry no
+    // `hidden` flag and must not short-circuit a by-id resolve.
+    $unlistedSessionOwnerRows.set([session({ connection_id: 'remote-1', id: 'draft-1', profile: 'meta' })])
+    mockGetSession.mockResolvedValueOnce(session({ id: 'draft-1' }))
+
+    expect(parkedHiddenSessionRow('draft-1')).toBeUndefined()
+    await resolveStoredSession('draft-1', { connectionId: 'remote-1', profile: 'meta', targetProfile: 'meta' } as never)
+    expect(mockGetSession).toHaveBeenCalledTimes(1)
   })
 
   it('returns an internal delegate child without promoting it into regular sessions', async () => {
