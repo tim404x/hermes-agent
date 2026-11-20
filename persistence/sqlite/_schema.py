@@ -39,6 +39,7 @@ from ._schema_ddl import (
     _ephemeral_child_sql, _sql_json_extract, base_index_recognised, base_source_view_is_stale,
     fts_layout_current, fts_layout_drift, fts_trigram_session_sql,
 )
+from .conversation._store.list_revision import drop_visible_list_triggers
 
 if TYPE_CHECKING:
     from ._holder import StoreHolder
@@ -911,6 +912,10 @@ def _rebuild_table(cursor: sqlite3.Cursor, table: str, legacy_name: str, ddl: st
 
 
 def _rebuild_table_statements(cursor, table, legacy_name, ddl, copy_sql, indexes) -> None:
+    # The visible-list revision triggers (any version) read sessions/messages/state_meta by name: a RENAME rewrites
+    # them to the legacy name and the DROP leaves them dangling, failing every later write to the tables they fire
+    # on. Drop them first, in this transaction; the next writable open of a current build re-creates the set.
+    drop_visible_list_triggers(cursor, table)
     cursor.execute(f"ALTER TABLE {table} RENAME TO {legacy_name}")
     cursor.execute(ddl)
     cursor.execute(copy_sql)
