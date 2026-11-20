@@ -1,23 +1,34 @@
 """effort-router delegation strategy (``delegation.backend: effort-router``).
 
-Same route as ``default`` (the ``delegation`` section), plus a per-task ``effort``. The parent picks it per
-task. Two rules keep a cheap level away from work that matters:
+Same route as ``default`` (the ``delegation`` section), plus a per-task ``effort`` and, when
+``delegation.backends.effort-router.options`` lists models, a per-task ``option`` (another model for that
+subagent). The parent picks the effort per task. Strict tiers keep a cheap level away from work that matters:
 
-- **Floor.** Work whose goal or context touches money, legal, sends, access grants or permission changes, code
-  changes, destructive operations or research synthesis, or names any write/action verb (en/pt/fr/es), never
+- **Deep floor (xhigh).** A goal that is a review, audit, red-team, QA or fact-check, a plan or design, a debugging
+  or root-cause hunt, or a synthesis/comparison/recommendation runs at ``xhigh`` (en/pt/fr/es), whoever asked
+  less. A goal that is one plain read (``Read the review notes in /tmp/x``) is not deep work.
+- **Floor (high).** Work whose goal or context touches money, legal, sends, access grants or permission changes,
+  code changes, destructive operations or research synthesis, or names any write/action verb (en/pt/fr/es), never
   runs below ``high``, hyphenated compounds included (``wire-transfer``, ``re-send``); so does a goal that hands
-  something to someone (``Get the deck to Armin``, ``Show Jackson the dashboard``). The floor only ever raises:
-  an explicit low/medium pick becomes ``high``, a default below high becomes ``high`` and an empty default
-  keeps the level the child would inherit when that is already high or above (``task["inherited_effort"]``),
-  else carries ``high`` explicitly, so the child can never inherit a low parent level.
-- **Auto.** When the parent omits ``effort``, the level drops to ``medium`` only for a positively identified
-  mechanical goal: one read-only verb first (fetch, list, read, look up, grep ...; never the light verbs
-  ``get`` / ``show``, which also mean "deliver" or "make happen"), one operation, no second clause, plain
-  English. Compound, ambiguous or other-language goals keep ``delegation.reasoning_effort``.
+  something to someone (``Get the deck to Armin``, ``Show Jackson the dashboard``). Floors only ever raise:
+  an explicit cheaper pick is raised, a default below the floor is raised and an empty default keeps the level the
+  child would inherit when that already meets it (``task["inherited_effort"]``), else carries the floor
+  explicitly, so the child can never inherit a low parent level.
+- **Cheap tiers.** ``low`` only for a deterministic task: one read-only step on a concrete target (a path, URL,
+  id, file, row, field, or a fixed read-only command such as ``Run `git log -5` ``). ``medium`` only for one
+  bounded read-only step (one read-only verb first, one operation, plain English). A cheaper explicit pick on
+  anything else is raised (low -> medium for a bounded step, else high). When the parent omits ``effort`` the
+  level drops to ``medium`` only for a deterministic task; everything else keeps ``delegation.reasoning_effort``.
 
-``xhigh`` is never chosen automatically. The schema, guidance and rules are the same at every depth, so an
-orchestrator child tiers its own sub-subtasks the same way. Each child's route label says what was picked and
-why (``effort medium (auto: mechanical)``, ``effort high (floor: asked low, money)``).
+The schema, guidance and rules are the same at every depth and on every option, so an orchestrator child tiers
+its own sub-subtasks the same way and a GPT or Gemini reviewer gets the same tier as an Opus one. Each child's
+route label says what was picked and why (``effort medium (auto: deterministic)``, ``effort high (floor: asked
+low, money)``, ``gpt · effort xhigh (deep: review)``).
+
+Options use the official ``model_map`` entry shape (``advanced-delegation``): ``name``, ``description``,
+``provider`` and/or ``base_url``, ``model``, optional ``api_key``, ``api_mode``, ``service_tier``,
+``reasoning_effort`` (that option's default level, still under the tiers) and ``fallback_providers`` (absent =
+``delegation.fallback_providers``; ``[]`` = none, so a GPT reviewer never quietly becomes another model).
 """
 
 from __future__ import annotations
@@ -33,10 +44,20 @@ logger = logging.getLogger(__name__)
 
 LEVELS = ("low", "medium", "high", "xhigh")
 FLOOR = "high"
+DEEP = "xhigh"
 _AUTO = "medium"
-_AT_OR_ABOVE_FLOOR = frozenset({"high", "xhigh", "max", "ultra"})
 _AT_OR_BELOW_AUTO = frozenset({"minimal", "low", "medium", "none", "false", "disabled"})
+_RANK = {"none": 0, "false": 0, "disabled": 0, "minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5,
+         "ultra": 6}
 _MAX_MECHANICAL_GOAL = 160
+#: Deep work is read from the goal's head: a long brief names its task first, and words further on are topics
+#: (``... cross-model review, and stop conditions``), not the job.
+_DEEP_HEAD = 200
+OPTION_PARAMETER = "option"
+#: Option entry keys copied into the route (same meaning as the matching core route fields and ``model_map``).
+_OPTION_ROUTE_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "service_tier")
+#: Default-route keys an option replaces: its model identity and the request knobs tuned for the default model.
+_MODEL_KEYS = frozenset({"provider", "model", "base_url", "api_key", "api_mode", "request_overrides"})
 
 
 def _words(*alternatives: str) -> re.Pattern:
@@ -139,6 +160,8 @@ _HANDOFF = re.compile(
 _MECHANICAL = re.compile(
     r"^\s*(?:fetch|list|read|look ?up|lookup|find|search|grep|count|extract|print|display|query|locate|view)\b",
     re.IGNORECASE)
+# A plain read (not find/search/look up, which also start investigations: "Find the root cause of ...").
+_PLAIN_READ = re.compile(r"^\s*(?:fetch|list|read|grep|count|extract|print|display|view)\b", re.IGNORECASE)
 # ... holds no second clause, sequencing word or judgment once URLs and paths are blanked ...
 _COMPOUND = re.compile(r"[,;&+|]|->|=>|\.\s+\S|\n|:\s|" + _words(
     r"and", r"then", r"also", r"after\w*", r"before", r"if", r"unless", r"when\w*", r"while", r"but", r"so", r"plus",
@@ -154,6 +177,65 @@ _OTHER_LANGUAGE = _words(
     r"las", r"con", r"del", r"al", r"por", r"que", r"en", r"es", r"arquivos?", r"fichiers?", r"archivos?")
 _URL_OR_PATH = re.compile(r"(?:[a-z][a-z0-9+.-]*://|www\.)\S+|\S*[/\\~]\S*|\S+@\S+|\S+\.\w{1,8}\b", re.IGNORECASE)
 
+# Deep floor (xhigh): the GOAL is a review, a plan, a debugging hunt or a synthesis. Read on the accent-folded goal
+# with URLs and paths blanked and dashes as spaces, so a file named plan-v2.md or a red-team folder decides nothing.
+_DEEP = (
+    ("review", _words(
+        r"review\w*", r"audit\w*", r"red ?team\w*", r"adversar\w*", r"critiqu\w*", r"cross ?examin\w*",
+        r"fact ?check\w*", r"scrutin\w*", r"second opinion", r"sanity ?check\w*", r"re ?scor\w*", r"qa",
+        r"revis(?:ar|ao|oes|e|er|ion|iones)", r"revue", r"relis\w*", r"auditor\w*", r"canonical check\w*")),
+    # evaluate / assess / judge as the task, never as a description (``vendors Hub is evaluating``).
+    ("review", re.compile(
+        r"(?:^|[.;:!?]\s+|\band\s+|\bthen\s+)(?:evaluate|assess|judge|grade|rank|score|avali\w*|evalu\w*)\b"
+        r"|\b(?:evaluat\w*|assess\w*|judg\w*|avali\w*)\s+(?:the|a|an|our|these|this|each|every|whether|how|which"
+        r"|its|their)\b|\b(?:evaluation|assessment)\s+of\b")),
+    ("review", re.compile(r"\bverif\w*\b.{0,60}\b(?:fix|fixes|claims?|findings?|facts?|figures?|numbers?|results?"
+                          r"|statements?|assumptions?|estimates?|math)\b")),
+    ("planning", _words(
+        r"plann\w*", r"roadmap\w*", r"system design", r"design doc\w*", r"planej\w*",
+        r"planific\w*", r"planeac\w*")),
+    ("planning", re.compile(
+        r"^\s*(?:plan|design|architect|strategi[sz]e)\b|\b(?:write|draft|make|build|create|produce|propose|prepare|"
+        r"design)\s+(?:\w+\s+){0,3}(?:plan|strategy|spec|design|architecture)\b|\b(?:implementation|migration|rollout|execution|"
+        r"action|project|test|launch|go to market|gtm|research|hiring|pricing)\s+(?:plan|strategy)\b|\bdesign\s+"
+        r"(?:the|a|an|our)\s+(?:system|architecture|pipeline|schema|api|approach|flow|protocol|algorithm)\b")),
+    ("debugging", _words(
+        r"debug\w*", r"root ?caus\w*", r"diagnos\w*", r"troubleshoot\w*", r"bisect\w*", r"post ?mortem\w*",
+        r"depur\w*", r"debogu\w*", r"causa raiz", r"cause racine")),
+    ("debugging", re.compile(
+        r"\bwhy\b.{0,80}\b(?:fail\w*|break\w*|broke|broken|crash\w*|hang\w*|stuck|slow\w*|errors?|wrong|missing|lost|"
+        r"drop\w*|flak\w*|leak\w*|timeout\w*|timing out)\b|\binvestigat\w*\b.{0,60}\b(?:bugs?|crash\w*|failures?|"
+        r"errors?|regressions?|outages?|leaks?|flak\w*|incidents?|issues?|slowness|latency)\b")),
+    ("synthesis", _words(
+        r"synthes\w*", r"sintetiz\w*", r"synthetis\w*", r"consolidat\w*", r"cross ?check\w*", r"compar\w*",
+        r"trade ?offs?", r"due diligence", r"verdicts?")),
+    # recommend as the deliverable, never as reported speech (``what the community recommends``).
+    ("synthesis", re.compile(
+        r"^\s*(?:recommend|recomend|recommand)\w*\b|\brecommend\s+(?:a|an|the|one|which|what|whether|how|our|your)\b"
+        r"|\b(?:give|make|write|with|plus|and)\s+(?:a\s+|an\s+|your\s+|one\s+|clear\s+)?recommendations?\b"
+        r"|\b(?:decision|recommendation|investment)\s+memos?\b")),
+    ("synthesis", re.compile(r"\bsummar\w*\b.{0,40}\b(?:findings|lanes|reports|results|research|reviews|sources)\b")),
+)
+# A concrete target makes a read-only step deterministic: a URL, path, address, file name, quoted string, hash or
+# id, or a named record-like object.
+_TARGET = re.compile(r"(?:[a-z][a-z0-9+.-]*://|www\.)\S+|\S*[/\\~]\S*|\S+@\S+|\S+\.\w{1,8}\b|`[^`]+`|\"[^\"]+\""
+                     r"|\b[0-9a-f]{7,40}\b|\b\d{4,}\b|\b[a-z]{2,}-\d+\b|" + _words(
+                         r"files?", r"folders?", r"director(?:y|ies)", r"dirs?", r"logs?", r"logfiles?", r"rows?",
+                         r"columns?", r"fields?", r"tables?", r"sheets?", r"cells?", r"records?", r"entr(?:y|ies)",
+                         r"lines?", r"headers?", r"json", r"csv", r"yaml", r"yml", r"toml", r"xml", r"pdfs?",
+                         r"env vars?", r"process(?:es)?", r"ports?", r"pids?", r"shas?", r"hash(?:es)?").pattern,
+                     re.IGNORECASE)
+# A fixed read-only shell command in backticks is a deterministic step: ``Run `git log -5 --oneline` in /repo``.
+_RUN_COMMAND = re.compile(r"^\s*(?:run|execute)\s+`(?P<cmd>[^`]+)`", re.IGNORECASE)
+_READ_ONLY_PROGRAMS = frozenset({
+    "ls", "cat", "head", "tail", "wc", "grep", "rg", "stat", "du", "df", "ps", "pwd", "date", "uname", "whoami",
+    "uptime", "free", "which", "file", "tree", "jq", "sha256sum", "md5sum", "nproc", "lsblk", "hostname"})
+_READ_ONLY_SUBCOMMANDS = {
+    "git": frozenset({"log", "status", "show", "diff", "rev-parse", "ls-files", "blame", "describe", "shortlog"}),
+    "systemctl": frozenset({"status", "is-active", "is-enabled", "show", "list-units", "list-timers"}),
+}
+_SHELL_OPERATORS = re.compile(r"[;&|<>$`()]|\s-(?:delete|exec|execdir|i|ok)\b|\s--(?:in-place|output|write)\b")
+
 
 def _fold(text: str) -> str:
     """Casefolded with accents stripped (``é`` -> ``e``), so one pattern serves accented and plain spellings."""
@@ -162,7 +244,8 @@ def _fold(text: str) -> str:
 
 def floor_reason(goal: str, context: str = "") -> Optional[str]:
     """The category (money, legal, send, access, code, destructive, research, write) that keeps a task at high or
-    above, or None."""
+    above, or None. A fixed read-only command (``Run `git log -5` ``) is read without its verb and program."""
+    goal = _without_read_only_command(goal)
     text = _DASHES.sub("-", _fold(f"{goal}\n{context}"))
     split = {False: text.replace("-", " "), True: _LETTER_HYPHEN.sub(" ", text)}
     return next((category for category, pattern in _FLOOR
@@ -170,13 +253,58 @@ def floor_reason(goal: str, context: str = "") -> Optional[str]:
                 "send" if _HANDOFF.match(goal) else None)
 
 
+def deep_reason(goal: str) -> Optional[str]:
+    """The kind of deep work (review, planning, debugging, synthesis) the goal asks for, which runs at xhigh, or
+    None. One plain read (read, fetch, list ...) is never deep work, whatever it reads."""
+    if is_mechanical(goal) and _PLAIN_READ.match(_without_read_only_command(goal)):
+        return None
+    text = _DASHES.sub(" ", _URL_OR_PATH.sub(" ", _fold(goal))).replace("-", " ")[:_DEEP_HEAD]
+    return next((category for category, pattern in _DEEP if pattern.search(text)), None)
+
+
+def _read_only_command(goal: str) -> Optional[re.Match]:
+    """The ``Run `<cmd>` `` match when cmd is one fixed read-only command (allowlisted program or subcommand, no
+    shell operators), else None."""
+    match = _RUN_COMMAND.match(goal)
+    if not match or _SHELL_OPERATORS.search(f" {match['cmd']} "):
+        return None
+    words = match["cmd"].split()
+    if not words:
+        return None
+    program, sub = words[0].rsplit("/", 1)[-1], next((w for w in words[1:] if not w.startswith("-")), "")
+    if program in _READ_ONLY_PROGRAMS or sub in _READ_ONLY_SUBCOMMANDS.get(program, ()):
+        return match
+    return None
+
+
+def _without_read_only_command(goal: str) -> str:
+    """The goal with a fixed read-only command's verb and program blanked (its arguments stay, so ``git log
+    --grep=password`` still reads as secrets)."""
+    match = _read_only_command(goal)
+    if not match:
+        return goal
+    words = match["cmd"].split()
+    keep = words[2:] if words[0].rsplit("/", 1)[-1] in _READ_ONLY_SUBCOMMANDS else words[1:]
+    return "List " + " ".join(keep) + goal[match.end():]
+
+
 def is_mechanical(goal: str) -> bool:
     """True only for a positively identified single read-only operation in plain English: one mechanical verb
-    first, no second clause, sequencing word or judgment, no other-language words."""
+    first (or one fixed read-only command), no second clause, sequencing word or judgment, no other-language
+    words. The bounded step ``medium`` is for."""
+    goal = _without_read_only_command(goal)
     if not goal.isascii() or len(goal) > _MAX_MECHANICAL_GOAL or not _MECHANICAL.match(goal):
         return False
     shape = _URL_OR_PATH.sub(" ", _fold(goal)).strip().rstrip(".")
     return not (_COMPOUND.search(shape) or _OTHER_LANGUAGE.search(shape))
+
+
+def is_deterministic(goal: str) -> bool:
+    """A mechanical step on a concrete target (path, URL, id, file, row, field ...) or a fixed read-only command:
+    the only work ``low`` is for, and the only work an omitted effort sends to ``medium``."""
+    if _read_only_command(goal):
+        return is_mechanical(goal)
+    return is_mechanical(goal) and bool(_TARGET.search(goal.split(None, 1)[1] if " " in goal.strip() else ""))
 
 
 def _level(value: Any) -> str:
@@ -186,25 +314,93 @@ def _level(value: Any) -> str:
     return value.strip().lower() if isinstance(value, str) else ""
 
 
+def _cheapest(goal: str) -> str:
+    """The lowest level this goal may run at when nothing floors it: low (deterministic), medium (bounded), high."""
+    return "low" if is_deterministic(goal) else "medium" if is_mechanical(goal) else FLOOR
+
+
+def _floor(goal: str, context: str) -> tuple[Optional[str], Optional[str]]:
+    """``(level, why)`` the task may not run below: xhigh for deep work, high for sensitive or write work."""
+    deep = deep_reason(goal)
+    if deep:
+        return DEEP, f"deep: {deep}"
+    reason = floor_reason(goal, context)
+    return (FLOOR, f"floor: {reason}") if reason else (None, None)
+
+
 def choose_effort(goal: str, context: str, asked: Optional[str], default: Any,
                   inherited: Any = "") -> tuple[Optional[str], str]:
-    """``(effort, why)`` for one task: the parent's pick, else the auto level or the default, under the floor.
-    ``inherited`` is the level the child gets when the route sets none (``""`` = unknown or the provider default);
-    the floor only ever raises it."""
-    reason, configured = floor_reason(goal, context), _level(default)
+    """``(effort, why)`` for one task: the parent's pick, else the auto level or the default, under the floors and
+    the cheap-tier rules. ``inherited`` is the level the child gets when the route sets none (``""`` = unknown or
+    the provider default); floors only ever raise it."""
+    floor, why = _floor(goal, context)
+    configured = _level(default)
     if asked in LEVELS:
-        if reason and asked not in _AT_OR_ABOVE_FLOOR:
-            return FLOOR, f"floor: asked {asked}, {reason}"
+        if floor and _RANK[asked] < _RANK[floor]:
+            return floor, why.replace(": ", f": asked {asked}, ", 1)
+        cheapest = _cheapest(goal)
+        if _RANK[asked] < _RANK[cheapest]:
+            reason = "not deterministic" if asked == "low" else "not one bounded read-only step"
+            return cheapest, f"raised: asked {asked}, {reason}"
         return asked, ""
-    if reason:
-        if configured in _AT_OR_ABOVE_FLOOR:
+    if floor:
+        if _RANK.get(configured, -1) >= _RANK[floor]:
             return configured, "default"
-        if not configured and _level(inherited) in _AT_OR_ABOVE_FLOOR:
-            return None, f"floor met: {_level(inherited)}, {reason}"
-        return FLOOR, f"floor: default {configured or 'inherited'}, {reason}"
-    if configured not in _AT_OR_BELOW_AUTO and is_mechanical(goal):
-        return _AUTO, "auto: mechanical"
+        if not configured and _RANK.get(_level(inherited), -1) >= _RANK[floor]:
+            return None, why.replace(": ", f" met: {_level(inherited)}, ", 1)
+        return floor, why.replace(": ", f": default {configured or 'inherited'}, ", 1)
+    if configured not in _AT_OR_BELOW_AUTO and is_deterministic(goal):
+        return _AUTO, "auto: deterministic"
     return configured or None, "default"
+
+
+def configured_options(settings: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """``{name: {"description", "route", "effort"}}`` from ``delegation.backends.effort-router.options`` in config
+    order (``model_map``'s entry shape). Malformed entries and repeated names are skipped with one warning each."""
+    raw = settings.get("options") if isinstance(settings, Mapping) else None
+    if not isinstance(raw, list):
+        if raw is not None:
+            _warn_once("delegation.backends.effort-router.options must be a list; ignoring it.")
+        return {}
+    options: dict[str, dict[str, Any]] = {}
+    for i, entry in enumerate(raw):
+        problem = _option_problem(entry)
+        name = _text(entry, "name") if not problem else ""
+        if problem or name in options:
+            _warn_once(f"delegation.backends.effort-router.options[{i}] {problem or 'repeats ' + repr(name)}; skipped.")
+            continue
+        route = {key: entry[key].strip() for key in _OPTION_ROUTE_FIELDS
+                 if isinstance(entry.get(key), str) and entry[key].strip()}
+        if isinstance(entry.get("fallback_providers"), list):
+            route["fallback_providers"] = list(entry["fallback_providers"])
+        options[name] = {"description": _text(entry, "description"), "route": route,
+                         "effort": _text(entry, "reasoning_effort")}
+    return options
+
+
+def _text(entry: Any, key: str) -> str:
+    value = entry.get(key) if isinstance(entry, Mapping) else None
+    return " ".join(value.split()) if isinstance(value, str) else ""
+
+
+def _option_problem(entry: Any) -> str:
+    if not isinstance(entry, Mapping):
+        return "is not a mapping"
+    if not _text(entry, "name") or " " in _text(entry, "name") or not _text(entry, "description"):
+        return "needs a one-word name and a description"
+    if not _text(entry, "model") or not (_text(entry, "provider") or _text(entry, "base_url")):
+        return "needs a model and a provider or base_url"
+    return ""
+
+
+_warned: set[str] = set()
+
+
+def _warn_once(message: str) -> None:
+    # task_parameters / route_task run on every session build and every task: say each problem once.
+    if message not in _warned:
+        _warned.add(message)
+        logger.warning(message)
 
 
 class EffortRouterProvider(DelegationProvider):
@@ -218,30 +414,48 @@ class EffortRouterProvider(DelegationProvider):
 
     @property
     def summary(self) -> str:
-        return "Default route; each subagent's effort is tiered per task (medium for one read-only step, high floor)."
+        return ("Default route with strict per-task effort tiers (xhigh for reviews, plans, debugging and synthesis; "
+                "high floor; low only for deterministic reads), plus optional per-task model options.")
 
     def task_parameters(self, config: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         default = str((config or {}).get("reasoning_effort") or "the parent's level")
-        return {"effort": {"type": "string", "enum": list(LEVELS), "description": (
-            f"Reasoning effort for this subagent. low/medium only for clearly easy read-only mechanical work "
-            f"(a lookup, fetch-and-extract, a listing, a single API read). Omitted = medium for one plain "
-            f"read-only step, else {default}. xhigh only for genuinely hard work (deep multi-source research, "
-            f"tricky debugging, architecture). Work touching money, legal, sends, code changes, deletes or research "
-            f"synthesis, or that writes or changes anything, runs never below high.")}}
+        params = {"effort": {"type": "string", "enum": list(LEVELS), "description": (
+            f"Reasoning effort for this subagent. low ONLY for a deterministic step (read a known file, fetch a "
+            f"known URL, run a fixed read-only command, extract fields); medium only for one bounded read-only "
+            f"step with an objective answer. Omitted = {default} (medium for a deterministic step). Reviews, "
+            f"audits, QA, plans, debugging and synthesis run at xhigh; money, legal, sends, code changes, deletes "
+            f"and any write never below high. A cheaper pick is raised.")}}
+        options = configured_options(self.settings(config))
+        if options:
+            lines = ["Which configured model runs this subagent. Omit for the default subagent model. Same effort "
+                     "tiers on every option.", *(f"{name}: {option['description']}" for name, option in options.items())]
+            params[OPTION_PARAMETER] = {"type": "string", "enum": list(options), "description": "\n".join(lines)}
+        return params
 
     def description(self, config: Mapping[str, Any]) -> str:
-        return ("Effort tiering: give each task an `effort`. Easy read-only mechanical subtasks get low or medium; "
-                "omitted = medium for one plain read-only step, else the default; money, legal, sends, code "
-                "changes, deletes, research synthesis and any write are never below high. Your own subagents "
-                "follow the same rule.")
+        text = ("Effort tiering: give each task an `effort`. low only for deterministic reads, medium only for one "
+                "bounded read-only step, else the default; reviews, plans, debugging and synthesis run xhigh; money, "
+                "legal, sends, code changes, deletes and any write never below high. Your own subagents follow the "
+                "same rule.")
+        if configured_options(self.settings(config)):
+            text += (" `option` runs a subagent on another model; for an adversarial or multi-model review give "
+                     "each option the same brief, blind to the others, then cross-examine where they disagree.")
+        return text
 
     def route_task(self, task: Mapping[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
         route = {k: v for k, v in config.items() if k != "service_tier"}
+        default, chosen = config.get("reasoning_effort"), task.get(OPTION_PARAMETER)
+        if chosen:
+            # Core already refused a value outside the enum; the option replaces the default route's model.
+            option = configured_options(self.settings(config))[chosen]
+            route = {k: v for k, v in route.items() if k not in _MODEL_KEYS} | option["route"]
+            default = option["effort"] or default
         effort, why = choose_effort(str(task.get("goal") or ""), str(task.get("context") or ""),
-                                    task.get("effort"), config.get("reasoning_effort"), task.get("inherited_effort"))
+                                    task.get("effort"), default, task.get("inherited_effort"))
         if effort:
             route["reasoning_effort"] = effort
-        route["label"] = f"effort {effort or 'inherited'}" + (f" ({why})" if why else "")
+        label = f"effort {effort or 'inherited'}" + (f" ({why})" if why else "")
+        route["label"] = f"{chosen} · {label}" if chosen else label
         logger.info("effort-router: task %s -> %s", task.get("index"), route["label"])
         return route
 
