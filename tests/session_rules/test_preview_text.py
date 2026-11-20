@@ -18,7 +18,7 @@ _CASES = _CASES["cases"]
 
 @pytest.mark.parametrize("case", _CASES, ids=[case["name"] for case in _CASES])
 def test_shared_preview_cases(case):
-    assert display_preview_text(case["input"]) == case["expected"]
+    assert display_preview_text(case["input"], silence_ok=case.get("silence_ok", False)) == case["expected"]
 
 
 def test_shared_cases_use_the_live_steer_marker():

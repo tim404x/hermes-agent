@@ -295,10 +295,14 @@ def _remember_tool_call_args(tool_calls: list, tool_call_args: dict) -> None:
 
 
 def _history_to_messages(history: list[dict], *, profile_home=None, image_urls: bool = True,
-                         bot_brief: dict | None = None) -> list[dict]:
+                         bot_brief: dict | None = None, silence_ok_session: bool = False) -> list[dict]:
     """``image_urls=False`` is the ``inline_images=false`` projection (#116511): image parts render ``[image]``
     so a remote client's history read stays kilobytes instead of re-transmitting every stored attachment.
-    ``bot_brief`` (``agent.display_row_typing.find_bot_brief``) types a bot's self-seeded task brief."""
+    ``bot_brief`` (``agent.display_row_typing.find_bot_brief``) types a bot's self-seeded task brief.
+
+    A turn that chose silence shows nothing, as it showed nothing live (``session_rules.silent_turns``):
+    its marker row and a quiet wake row are dropped, and a marker closing such a turn's reply leaves the text.
+    ``silence_ok_session``: the session itself may end turns silent (the Bot Chat)."""
     from agent.display_row_typing import mark_bot_brief, type_display_row
     from agent.history_commentary import project_history_commentary
     from session_rules.turns import withheld_prompt_text
@@ -379,7 +383,25 @@ def _history_to_messages(history: list[dict], *, profile_home=None, image_urls: 
         if m.get("display_metadata"):
             msg["display_metadata"] = m["display_metadata"]
         messages.append(msg)
-    return project_history_commentary(messages, home=profile_home)
+    return _without_silent_turns(project_history_commentary(messages, home=profile_home), silence_ok_session)
+
+
+def _without_silent_turns(messages: list[dict], silence_ok_session: bool) -> list[dict]:
+    from gateway.response_filters import strip_trailing_silence_marker
+    from session_rules.silent_turns import silent_turns
+
+    turns = silent_turns(messages, silence_ok_session=silence_ok_session)
+    kept = []
+    for index, msg in enumerate(messages):
+        if index in turns.hidden:
+            continue
+        if index in turns.silence_ok:
+            # Only where the live turn could end silent does a closing marker line drop; a person's
+            # answer keeps its last line ("The literal value is:\nNO_REPLY").
+            msg = {**msg, **{key: strip_trailing_silence_marker(msg[key])
+                             for key in ("text", "display_content") if isinstance(msg.get(key), str)}}
+        kept.append(msg)
+    return kept
 
 
 def _coerce_seed_history(value: Any) -> list[dict]:

@@ -664,3 +664,44 @@ def test_subagent_roster_survives_a_parent_rebuild():
     finally:
         for sid in ('live-child', 'other-profile', 'other-conv'):
             _unregister_subagent(sid)
+
+
+# A local viewer (the desktop on the canonical gateway) paints and speaks every published delta at
+# once, ahead of the delivery seam that swallows a silence marker; emptying message.complete cannot
+# take back text a viewer already painted. So the viewer stream is held exactly as tui_gateway's turn
+# holds it (gateway.response_filters.SilenceMarkerStreamHold): nothing that could still become a marker
+# is published, a held line that never became one is released at the segment boundary or turn end.
+def test_a_silent_turn_never_publishes_its_marker_to_the_local_viewer():
+    published = []
+    delta_cb = _delta_cb(_turn(Platform.LOCAL, published))
+    delta_cb('NO_')
+    delta_cb('REPLY \u26a1')
+    delta_cb(None)
+    assert published == [('message.delta', {'text': None})]
+
+
+def test_a_held_start_that_never_became_a_marker_is_released():
+    published = []
+    delta_cb = _delta_cb(_turn(Platform.LOCAL, published))
+    delta_cb('NO')
+    delta_cb(' problem, done.')
+    assert published == [('message.delta', {'text': 'NO problem, done.'})]
+
+
+def test_a_closing_marker_line_is_dropped_and_a_held_word_released_at_the_turn_end():
+    published = []
+    turn = _turn(Platform.LOCAL, published)
+    delta_cb = _delta_cb(turn)
+    delta_cb('Build is green.\n\nNO_')
+    delta_cb('REPLY')
+    delta_cb(None)
+    delta_cb('NO')
+    turn._flush_local_silence_hold()
+    assert [p for _k, p in published] == [{'text': 'Build is green.'}, {'text': None}, {'text': 'NO'}]
+
+
+def test_a_messaging_route_stream_is_not_held():
+    published = []
+    delta_cb = _delta_cb(_turn(Platform.TELEGRAM, published))
+    delta_cb('NO_')
+    assert published == [('message.delta', {'text': 'NO_'})]
