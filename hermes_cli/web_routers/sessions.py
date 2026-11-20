@@ -31,7 +31,8 @@ from hermes_cli.web_routers._common import (
     is_transient_store_error,
 )
 from persistence.conversation.messages import TranscriptRead, TranscriptView
-from persistence.conversation.sessions import SessionCountQuery, SessionOrder, SessionQuery, SessionWindow
+from persistence.conversation.sessions import (
+    CANONICAL_BOT_CHAT_TITLE, SessionCountQuery, SessionOrder, SessionQuery, SessionWindow)
 from persistence.core.errors import CorruptStoreError, PersistenceError, SearchIndexCorrupt, StoreReplaced
 from persistence.core.health import StorageState
 from persistence.housekeeping.maintenance import PruneCriteria
@@ -855,6 +856,26 @@ def _page_opener(store, sid: str, page: list, read) -> Optional[dict]:
         return None
     rows = [row.as_wire_row() for row in store.messages.read_transcript(sid, before)]
     return next((row for row in reversed(rows) if row.get("role") == "user"), None)
+
+
+# The Desktop's Bot Chat page: GET /api/sessions/<id>/messages?limit=120&order=latest&include_compacted=true.
+_BOT_CHAT_PAGE = TranscriptRead(view=TranscriptView.DISPLAY, limit=120, offset=0, latest=True, include_lineage=True)
+
+
+def prewarm_bot_chat_page(profile: Optional[str]) -> bool:
+    """Read *profile*'s canonical Bot Chat page once, off any request, so its display projection is built.
+
+    The first message page of a lineage in a process dedupes the whole lineage (``lineage_page.py``): 0.14 to
+    1.1 s of GIL-held CPU on Tim's Bot Chats, paid by the first bot switch after every update or restart. Every
+    later page reuses the projection (9 to 23 ms). True when a page was read."""
+    def _read(store):
+        record = store.sessions.get_by_title(CANONICAL_BOT_CHAT_TITLE)
+        if record is None:
+            return False
+        store.messages.read_transcript(store.lineage.resolve_resume_target(record.session_id), _BOT_CHAT_PAGE)
+        return True
+
+    return bool(_with_db(profile, _read, read_only=True))
 
 
 @manage_router.get("/api/sessions/{session_id}/messages")
