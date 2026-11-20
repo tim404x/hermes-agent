@@ -170,6 +170,14 @@ def _detach_child(parent_agent: Any, child: Any) -> None:
     except (ValueError, UnboundLocalError) as e:
         logger.debug("Could not remove child from active_children: %s", e)
 
+def release_unstarted_child(parent_agent: Any, child: Any) -> None:
+    """Teardown for a built child whose run never started (``_run_single_child``'s finally never runs for it):
+    hand back a continued child's claim, detach it from the parent's stop fan-out, close its resources."""
+    from tools.delegate_tool_resumable import release_unstarted
+    release_unstarted(child)
+    _detach_child(parent_agent, child)
+    _close_child(child, "Failed to close a subagent that never started")
+
 def _signal_child_stop(child: Any, *reason: str, tool_reason: str = "parent delegation ended") -> None:
     """Cooperative interrupt so the child's worker thread can exit cleanly. ``tool_reason`` is the
     fixed cause the child's tools see (a pending approval wait reports it instead of a user deny)."""
