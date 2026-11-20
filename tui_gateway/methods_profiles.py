@@ -108,21 +108,36 @@ def _latest_message_preview(persistence, session_id):
     on that path)."""
     from session_rules.preview_text import display_preview_text
     try:
-        text = display_preview_text(persistence.messages.latest_dialogue_message(session_id))
-        if not text:
+        raw = persistence.messages.latest_dialogue_message(session_id)
+        text = display_preview_text(raw)
+        if not text or _may_be_silence(raw):
             text = _older_dialogue_preview(persistence, session_id, display_preview_text)
     except Exception:
         return ""
     return text[:80] + "..." if len(text) > 80 else text
 
 
+def _may_be_silence(raw) -> bool:
+    """The newest text reads like a silence marker (bare or closing a reply): only its turn can tell whether
+    the bot chose silence or a person wrote it, so the bounded walk below decides."""
+    from gateway.response_filters import is_intentional_silence_response, strip_trailing_silence_marker
+    return isinstance(raw, str) and (is_intentional_silence_response(raw) or strip_trailing_silence_marker(raw) != raw)
+
+
 def _older_dialogue_preview(persistence, session_id, project):
+    """Newest user/assistant row that shows text, read through the silent-turn projection: a turn that chose
+    silence (``session_rules.silent_turns``) is skipped, a person's words and a reply shown live are kept."""
     from persistence.conversation.messages import TranscriptRead
+    from session_rules.silent_turns import silent_turns
     from session_rules.turns import flatten_message_text
+    from tools.bot_mode_probe import BOT_CHAT_TITLE
     rows = persistence.messages.read_transcript(session_id, TranscriptRead(limit=_PREVIEW_FALLBACK_ROWS, latest=True))
-    for row in reversed(rows):
-        if row.role in ("user", "assistant"):
-            text = project(flatten_message_text(row.content, sep=" "))
+    turns = silent_turns([row.as_wire_row() for row in rows], silence_ok_session=(
+        persistence.sessions.get_title(session_id) or "").strip() == BOT_CHAT_TITLE)
+    for index in reversed(range(len(rows))):
+        row = rows[index]
+        if row.role in ("user", "assistant") and index not in turns.hidden:
+            text = project(flatten_message_text(row.content, sep=" "), silence_ok=index in turns.silence_ok)
             if text:
                 return text
     return ""

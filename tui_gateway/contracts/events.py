@@ -302,6 +302,9 @@ class MessageCompletePayload(Payload):
     persisted_turn: PersistedTurn | None = None
     #: An interrupted turn its interrupter will continue (``session.interrupt`` ``resume``): not stopped for good.
     paused: bool | None = None
+    #: The turn chose silence where it may (a machinery wake, the Bot Chat): it shows nothing, so a
+    #: client raises no completion toast, sound or unread mark for it either.
+    silent: bool | None = None
 
 
 event("message.complete", MessageCompletePayload, doc="The turn ended: final text, usage and outcome.")

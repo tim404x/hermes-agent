@@ -732,7 +732,8 @@ def _is_untyped_scaffold_notice(message) -> bool:
     return isinstance(content, str) and content.lstrip().startswith("[System:")
 
 
-def _project_for_display(messages: list, *, home=None, inline_images: bool = True, bot_brief=None) -> list:
+def _project_for_display(messages: list, *, home=None, inline_images: bool = True, bot_brief=None,
+                         silence_ok_session: bool = False) -> list:
     """Replace compaction summaries with their display-only projection and hide untyped
     gateway-scaffold notices.
 
@@ -807,7 +808,26 @@ def _project_for_display(messages: list, *, home=None, inline_images: bool = Tru
             if projected.get("display_kind") != CONTENT_REFUSED_DISPLAY_KIND:
                 projected.pop("display_kind", None)
         projected_messages.append(projected)
-    return project_history_commentary(projected_messages, home=home)
+    return _mark_silent_turns(project_history_commentary(projected_messages, home=home), silence_ok_session)
+
+
+def _mark_silent_turns(messages: list, silence_ok_session: bool) -> list:
+    """Rows a silent turn showed nothing for (``session_rules.silent_turns``) are marked ``silent_turn``,
+    not dropped: the Desktop pages these transcripts by backend row offset and counts every row. A reply in
+    a turn that may end silent carries its closing-marker-free text as ``display_content``."""
+    from gateway.response_filters import strip_trailing_silence_marker
+    from session_rules.silent_turns import reply_text, silent_turns
+
+    turns = silent_turns(messages, silence_ok_session=silence_ok_session)
+    projected = []
+    for index, message in enumerate(messages):
+        if index in turns.hidden:
+            message = {**message, "silent_turn": True}
+        elif index in turns.silence_ok and (text := reply_text(message)) != (
+                stripped := strip_trailing_silence_marker(text)):
+            message = {**message, "display_content": stripped}
+        projected.append(message)
+    return projected
 
 
 @manage_router.get("/api/sessions/{session_id}/messages")
@@ -837,15 +857,18 @@ async def get_session_messages(
         rows = store.messages.read_transcript(sid, TranscriptRead(
             view=TranscriptView.DISPLAY if include_compacted else TranscriptView.ACTIVE, limit=_limit,
             offset=offset, latest=latest_page, include_lineage=True))
-        return sid, _limit, [row.as_wire_row() for row in rows], find_bot_brief(store, sid)
+        # The Bot Chat may end any turn silent, like its live delivery (tui_gateway/prompt_turn.py).
+        bot_chat = (store.sessions.get_title(sid) or "").strip() == BOT_CHAT_TITLE
+        return sid, _limit, [row.as_wire_row() for row in rows], find_bot_brief(store, sid), bot_chat
 
+    from tools.bot_mode_probe import BOT_CHAT_TITLE
     result = await asyncio.to_thread(_with_db, profile, _read, read_only=True)
     if result is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
-    sid, _limit, messages, brief = result
+    sid, _limit, messages, brief, bot_chat = result
     projected_messages = await asyncio.to_thread(
         _project_for_display, messages, home=_history_profile_home(profile),
-        inline_images=inline_images, bot_brief=brief)
+        inline_images=inline_images, bot_brief=brief, silence_ok_session=bot_chat)
     return {
         "session_id": sid,
         # The same stamp list rows carry, so the Desktop keys a page under the
