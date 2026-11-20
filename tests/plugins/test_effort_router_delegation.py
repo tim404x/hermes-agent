@@ -58,16 +58,16 @@ def recorded(monkeypatch):
     return built
 
 
-def _parent(depth=0):
+def _parent(depth=0, reasoning_config=None):
     return types.SimpleNamespace(session_id="root", model="parent-model", provider="openrouter", tool_progress_callback=None,
                                  _delegate_spinner=None, request_overrides={}, _safe_print=lambda line: None,
-                                 _delegate_depth=depth)
+                                 _delegate_depth=depth, reasoning_config=reasoning_config)
 
 
-def _routes(tasks, depth=0):
+def _routes(tasks, depth=0, parent=None):
     from tools.delegate_tool_config import _load_config
     from tools.delegate_tool_routes import resolve_task_routes
-    routes, err = resolve_task_routes(tasks, _load_config(), _parent(depth))
+    routes, err = resolve_task_routes(tasks, _load_config(), parent or _parent(depth))
     assert err is None and not any(r.error for r in routes), [r.error for r in routes]
     return [(r.reasoning_effort, r.label) for r in routes]
 
@@ -112,8 +112,18 @@ HYPHENATED = [
     "Read the research-synthesis brief", "Read the code-review checklist", "Read invoice-1023",
     "Read the wire\u2013transfer instructions", "Re-write the README in /tmp/run-1119",
 ]
+# `get` / `show` are light verbs, not read-only ones: a goal that also names an access grant, a send to someone,
+# a destructive op or a restart never runs below high, and an explicit low is floored (round-2 review N1, 19 Nov 2026).
+LIGHT_VERBS = [
+    "Get rid of the old backups", "Get rid of the duplicate rows in the contributors table",
+    "Get Loic access to the AWS console", "Get Dani admin access to Mercury",
+    "Get everyone on the team onboarded to 1Password", "Get the deck to Armin", "Get Theo the deck",
+    "Get the contributors their Scout codes", "Show Jackson the dashboard", "Get the server back up",
+    "Show the payout and send it", "Give Maxence edit permissions on the finance folder",
+]
 # Read-only but not ONE mechanical operation, or not recognisably English: never auto-lowered.
 NOT_MECHANICAL = [
+    "Get the README in /tmp/run-1119", "Show the last 20 lines of /tmp/run-1119/log.txt",
     "List the files in /tmp/run-1119/out and count them", "Fetch the page title, then the meta description",
     "Find which of the three vendors is cheapest", "Liste os arquivos em /tmp/run-1119/out",
     "List les fichiers dans /tmp/run-1119/out", "ファイルの一覧を表示して",
@@ -132,7 +142,7 @@ def test_compound_write_or_unrecognised_goals_keep_the_default(home, goal):
     assert _routes([{"goal": goal}])[0][0] == "high"
 
 
-@pytest.mark.parametrize("goal", SENSITIVE + REVIEWED + MULTILINGUAL + HYPHENATED)
+@pytest.mark.parametrize("goal", SENSITIVE + REVIEWED + MULTILINGUAL + HYPHENATED + LIGHT_VERBS)
 def test_money_legal_sends_code_writes_and_research_never_run_below_high(home, goal):
     home({"backend": "effort-router", "reasoning_effort": "high"})
     [(effort, label)] = _routes([{"goal": goal}])
@@ -174,6 +184,25 @@ def test_a_cheap_empty_or_disabled_default_is_still_floored_for_sensitive_work(h
 def test_an_xhigh_default_stays_xhigh_for_sensitive_work(home):
     home({"backend": "effort-router", "reasoning_effort": "xhigh"})
     assert _routes([{"goal": "Send the Slack update to Theo"}]) == [("xhigh", "effort xhigh (default)")]
+
+
+@pytest.mark.parametrize("default", ["", None])
+def test_the_floor_only_raises_an_inherited_level(home, default):
+    """An empty default inherits the parent's level: sensitive work gets max(high, parent), never less than
+    neutral work gets (round-2 review N2, 19 Nov 2026: an xhigh parent's send ran at high, its neutral work at xhigh)."""
+    from tools.delegate_tool_config import _child_reasoning, _load_config
+    home({"backend": "effort-router", "reasoning_effort": default})
+    tasks = [{"goal": "Send the Slack update to Theo"}, {"goal": "Send the Slack update to Theo", "effort": "low"},
+             {"goal": "Think through the three options for the onboarding flow and pick one"}]
+    for level, sensitive in (("xhigh", "xhigh"), ("high", "high"), ("medium", "high"), ("low", "high")):
+        parent = _parent(reasoning_config={"enabled": True, "effort": level})
+        children = [_child_reasoning(parent, _load_config(), effort) for effort, _ in _routes(tasks, parent=parent)]
+        # an explicit low is the parent's pick, so the floor lifts it to high, never to the parent's level
+        assert children == [{"enabled": True, "effort": e} for e in (sensitive, "high", level)], level
+    disabled = _parent(reasoning_config={"enabled": False})
+    [(effort, label)] = _routes(tasks[:1], parent=disabled)
+    assert effort == "high" and label.startswith("effort high (floor: default")
+    assert _child_reasoning(disabled, _load_config(), effort) == {"enabled": True, "effort": "high"}
 
 
 def test_every_level_gets_the_effort_param_the_guidance_and_the_heuristic(home, recorded):
