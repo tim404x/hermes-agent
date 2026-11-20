@@ -19,6 +19,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 
+from agent.display_row_typing import find_bot_brief
 from hermes_cli.session_listing import subagent_listing_scope, with_internal_listing_excludes
 from hermes_cli.web_deps import late
 from hermes_cli.web_server_gateway import _strip_session_list_rows
@@ -731,7 +732,7 @@ def _is_untyped_scaffold_notice(message) -> bool:
     return isinstance(content, str) and content.lstrip().startswith("[System:")
 
 
-def _project_for_display(messages: list, *, home=None, inline_images: bool = True) -> list:
+def _project_for_display(messages: list, *, home=None, inline_images: bool = True, bot_brief=None) -> list:
     """Replace compaction summaries with their display-only projection and hide untyped
     gateway-scaffold notices.
 
@@ -744,7 +745,7 @@ def _project_for_display(messages: list, *, home=None, inline_images: bool = Tru
     Desktop collapses other display-only rows; typed notices stay for the timeline.
     """
     from agent.compaction_display import project_compaction_message_for_display
-    from agent.display_row_typing import type_display_row
+    from agent.display_row_typing import mark_bot_brief, type_display_row
     from session_rules.turns import is_compaction_summary_message, withheld_prompt_text
     from agent.conversation_compression import _extract_steer_text_from_message
     from agent.history_commentary import project_history_commentary
@@ -768,8 +769,9 @@ def _project_for_display(messages: list, *, home=None, inline_images: bool = Tru
         message = _with_tool_call_labels(message)
         if coerce is not None:
             message = coerce(message)
-        # Machine rows typed for display (job titles, cron deliveries, interrupt sentinels), as session.resume does.
-        message = type_display_row(message)
+        # Machine rows typed for display (job titles, cron deliveries, interrupt sentinels), as session.resume does;
+        # ``bot_brief`` (``find_bot_brief``) types a bot's self-seeded task brief.
+        message = mark_bot_brief(type_display_row(message), bot_brief, message.get("id"))
         # Same read-side typing as session.resume (tui_gateway/session_history.py).
         failed_turn = not message.get("display_kind") and untyped_failed_turn_display_kind(
             message.get("role"), message.get("content"))
@@ -835,15 +837,15 @@ async def get_session_messages(
         rows = store.messages.read_transcript(sid, TranscriptRead(
             view=TranscriptView.DISPLAY if include_compacted else TranscriptView.ACTIVE, limit=_limit,
             offset=offset, latest=latest_page, include_lineage=True))
-        return sid, _limit, [row.as_wire_row() for row in rows]
+        return sid, _limit, [row.as_wire_row() for row in rows], find_bot_brief(store, sid)
 
     result = await asyncio.to_thread(_with_db, profile, _read, read_only=True)
     if result is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
-    sid, _limit, messages = result
+    sid, _limit, messages, brief = result
     projected_messages = await asyncio.to_thread(
         _project_for_display, messages, home=_history_profile_home(profile),
-        inline_images=inline_images)
+        inline_images=inline_images, bot_brief=brief)
     return {
         "session_id": sid,
         # The same stamp list rows carry, so the Desktop keys a page under the
@@ -911,13 +913,15 @@ async def get_session_messages_around(
             raise HTTPException(status_code=404, detail="Prompt not found")
         return {"session_id": sid, "profile": owner,
                 "messages": [row.as_wire_row() for row in page.messages],
+                "bot_brief": find_bot_brief(store, sid),
                 "pagination": {"row_id": page.row_id, "limit": page.limit, "returned": page.returned,
                                "order": "oldest", "offset": page.offset, "total": page.total,
                                "has_older": page.has_older, "has_newer": page.has_newer}}
 
     result = await asyncio.to_thread(_with_db, profile, _read, read_only=True)
+    brief = result.pop("bot_brief", None)
     result["messages"] = await asyncio.to_thread(
-        _project_for_display, result["messages"], home=_history_profile_home(profile))
+        _project_for_display, result["messages"], home=_history_profile_home(profile), bot_brief=brief)
     return result
 
 

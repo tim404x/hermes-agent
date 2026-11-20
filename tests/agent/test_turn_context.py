@@ -799,3 +799,32 @@ def test_prologue_names_a_subagent_run_through_the_writer_handle():
     agent.persistence.sessions.set_auto_title.assert_called_once_with(
         "sess-1", "Subagent: Audit the billing module", source=TitleSource.DERIVED)
     assert not agent._session_db.set_auto_title.called
+
+
+def _own_profile_author():
+    from hermes_constants import get_hermes_home, profile_name_for_home
+    return f"bot:{profile_name_for_home(get_hermes_home())}"
+
+
+def test_a_bot_seeding_its_own_tab_stores_an_attributed_brief_not_a_human_prompt():
+    """``bot_mode_dm.py --run-delivery --author bot:<self>`` (a task tab a bot opens for itself): the seed prompt
+    is the bot's brief, typed ``bot_brief`` with its author, never a plain user row a client paints as the human's."""
+    author_id = _own_profile_author()
+    ctx = _build(_FakeAgent(), user_message="Tim asked for a dedicated working tab for this task. Post the TLDR.",
+                 turn_author={"id": author_id, "name": "hermes", "is_bot": True})
+    row = ctx.messages[ctx.current_turn_user_idx]
+    assert row["display_kind"] == "bot_brief"
+    assert row["display_metadata"]["author"]["id"] == author_id
+    assert row["display_metadata"]["author"]["name"]
+
+
+@pytest.mark.parametrize("author, text", [
+    (None, "a human prompt"),
+    ({"id": "bot:some-teammate", "name": "Teammate", "is_bot": True}, "a teammate's DM"),
+    ("self", "Message from 🤖 Neo (@hermes): a DM header"),
+])
+def test_only_a_self_seeded_bot_turn_is_a_brief(author, text):
+    if author == "self":
+        author = {"id": _own_profile_author(), "name": "hermes", "is_bot": True}
+    ctx = _build(_FakeAgent(), user_message=text, turn_author=author)
+    assert "display_kind" not in ctx.messages[ctx.current_turn_user_idx]
