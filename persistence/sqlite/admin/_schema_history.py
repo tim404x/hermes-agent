@@ -220,6 +220,9 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
         # Fork carry (tim404x, "pin in project", c5d207fc69): the pin time, NULL = unpinned. Fork-only:
         # when upstream ships its own 34, renumber this one to the end, never reorder upstream's.
         ('34 2026-09-03T23:21Z fork/1f1dde8220', (('+', 'project_pinned_at', 'prompt_cache_clock'),)),
+        # Fork carry (tim404x, "bot-mode side windows"): the side-window stamp moved out of origin_json. Fork-only,
+        # renumber to the end like 34 when upstream ships its own.
+        ('35 2026-11-19T23:59Z fork/side-window-json', (('+', 'side_window_json', 'project_pinned_at'),)),
         ),
     ),
     "messages": _TableHistory(
