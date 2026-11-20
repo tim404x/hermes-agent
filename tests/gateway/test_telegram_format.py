@@ -537,6 +537,20 @@ class TestFormatMessageBlockquote:
         assert result == "**> Step 1\\.\n> Done \\(ok\\)\\!||"
 
 
+    def test_bare_quote_line_keeps_the_quote_open(self, adapter):
+        """A lone ``>`` is markdown's blank line INSIDE a quote (a quoted draft's paragraph break).
+        Telegram's MarkdownV2 accepts it as an empty quote line; escaping it painted a literal
+        ``>`` between the paragraphs and split one quote into several."""
+        text = "> Hey team,\n>\n> - **Email:** sent\n>\n> Thanks"
+        result = adapter.format_message(text)
+        assert result == "> Hey team,\n>\n> \\- *Email:* sent\n>\n> Thanks"
+
+
+    def test_bare_gt_outside_a_quote_stays_literal(self, adapter):
+        result = adapter.format_message("Before\n>\nAfter")
+        assert result == "Before\n\\>\nAfter"
+
+
 # =========================================================================
 # format_message - mixed/complex
 # =========================================================================
