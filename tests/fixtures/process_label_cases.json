@@ -1,0 +1,42 @@
+{
+  "_doc": "Shared cases for the human title of a background-process completion row. Pinned by BOTH twins: tools/process_registry_notifications.py (process_job_label / process_completion_display_text / relabel_legacy_process_title, tests/tools/test_process_completion_title.py) and apps/desktop/src/lib/process-title.ts (vitest). A title never carries the shell command, a path or a job id.",
+  "labels": [
+    { "command": "W=/home/hermes/.hermes/work/asim-short-1119; for i in $(seq 1 90); do grep -q done $W/log; done", "label": "Asim short" },
+    { "command": "D=/home/hermes/.hermes/cache/scratch/task-tabs-1119; cd /home/hermes/.hermes/hermes-agent && npx vitest run", "label": "Task tabs" },
+    { "command": "W=/home/hermes/.hermes/work/desktop-thread-top-pad-1119; for i in $(seq 1 130); do sleep 10; done", "label": "Desktop thread top pad" },
+    { "command": "W=~/.hermes/work/brain-lab-review-1119; while ! grep -q \"conductor end\" $W/log; do sleep 5; done", "label": "Brain lab review" },
+    { "command": "cd ~/.hermes/work/brain-lab-review-1119 && timeout 1500 bash republish.sh > log 2>&1", "label": "Brain lab review" },
+    { "command": "cd ~/.hermes/work/deal-heatmap/element; timeout 900 python3 build.py closing", "label": "Deal heatmap" },
+    { "command": "W=/home/hermes/.hermes/work/oai-delivery-qa-1118; for i in $(seq 1 160); do sleep 5; done", "label": "Oai delivery qa" },
+    { "command": "/home/hermes/.hermes/tools/python-3.14.9+20261021-linux-x64/bin/python3 /home/hermes/.hermes/scripts/fetch_figure_hours.py --week 47", "label": "Fetch figure hours" },
+    { "command": "python3 scripts/oai_intake_report.py", "label": "Oai intake report" },
+    { "command": "bash /tmp/run.sh", "label": null },
+    { "command": "sleep 60", "label": null },
+    { "command": "npm run build", "label": null },
+    { "command": "cd ~ && ls", "label": null },
+    { "command": "cd ~/.hermes/work && ls", "label": null },
+    { "command": "", "label": null }
+  ],
+  "titles": [
+    { "events": [{ "command": "W=/home/hermes/.hermes/work/asim-short-1119; for i in $(seq 1 90); do grep -q done $W/log; done", "completion_reason": "exited", "exit_code": 0 }], "title": "Asim short finished" },
+    { "events": [{ "command": "cd ~/.hermes/work/deal-heatmap/element; timeout 900 python3 build.py closing", "completion_reason": "exited", "exit_code": 2 }], "title": "Deal heatmap failed, exit 2" },
+    { "events": [{ "command": "sleep 60", "completion_reason": "exited", "exit_code": 0 }], "title": "Background job finished" },
+    { "events": [{ "command": "sleep 60", "completion_reason": "exited", "exit_code": 1 }], "title": "Background job failed, exit 1" },
+    { "events": [{ "command": "W=/home/hermes/.hermes/work/asim-short-1119; sleep 5", "completion_reason": "killed", "exit_code": -15 }], "title": "Asim short stopped" },
+    { "events": [{ "command": "sleep 60", "completion_reason": "exited", "exit_code": 0 }, { "command": "sleep 70", "completion_reason": "exited", "exit_code": 0 }], "title": "2 background jobs finished" }
+  ],
+  "legacy": [
+    { "display_text": "Background Process Finished: W=/home/hermes/.hermes/work/asim-short-1119; for i in $(seq 1 90); do grep -q...", "title": "Asim short finished" },
+    { "display_text": "Background Process Finished: D=/home/hermes/.hermes/cache/scratch/task-tabs-1119; cd /home/hermes/.hermes/...", "title": "Task tabs finished" },
+    { "display_text": "Background Process Finished: /home/hermes/.hermes/tools/python-3.14.9+20261021-linux-x64/bin/python3 /home...", "title": "Background job finished" },
+    { "display_text": "Background Process Finished: W=~/.hermes/work/brain-lab-review-1119; while ! grep -q \"conductor end\" $W/lo...", "title": "Brain lab review finished" },
+    { "display_text": "Background Process Finished: cd ~/.hermes/work/deal-heatmap/element; timeout 900 python3 build.py closing ...", "title": "Deal heatmap finished" },
+    { "display_text": "Background Process Finished: W=/home/hermes/.hermes/work/very-long-work-directory-name-that-got-cu...", "title": "Background job finished" },
+    { "display_text": "Background Process Failed (exit 2): cd ~/.hermes/work/deal-heatmap/element; timeout 900 python3 build.py", "title": "Deal heatmap failed, exit 2" },
+    { "display_text": "Background Process Terminated: sleep 600", "title": "Background job stopped" },
+    { "display_text": "Background Process Lost: W=/home/hermes/.hermes/work/asim-short-1119; sleep 5", "title": "Asim short lost" },
+    { "display_text": "Background Process Finished", "title": "Background job finished" },
+    { "display_text": "3 Background Processes Finished", "title": "3 background jobs finished" },
+    { "display_text": "Asim short finished", "title": "Asim short finished" }
+  ]
+}

@@ -30,6 +30,7 @@ import {
   messageContentText,
   pickPrimaryPreviewTarget
 } from '@/components/assistant-ui/thread/content'
+import { EventRow, shortBotName } from '@/components/assistant-ui/thread/event-row'
 import { MessageHoverTime } from '@/components/assistant-ui/thread/message-hover-time'
 import { MESSAGE_PARTS_COMPONENTS } from '@/components/assistant-ui/thread/message-parts'
 import { ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
@@ -187,20 +188,16 @@ export const AssistantMessage: FC<AssistantMessageProps> = props => {
 /** The compact stand-in a settled inter-agent reply collapses to (Grok-bots
  *  parity — the transcript shows the event; the text is one click away). */
 const InterAgentCollapsedNotice: FC<{ sender: string }> = ({ sender }) => (
-  <div className="flex max-w-[min(86%,44rem)] flex-col gap-0.5 self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/60">
-    <span className="flex items-center justify-center gap-1.5">
-      <Codicon className="shrink-0 text-muted-foreground/55" name="arrow-small-right" size="0.8125rem" />
-      <span className="wrap-anywhere">Replied to {sender}</span>
-    </span>
-    <details className="self-center">
-      <summary className="cursor-pointer select-none text-center text-muted-foreground/45 hover:text-muted-foreground/70">
-        show reply
-      </summary>
-      <div className="mt-1 max-w-[36rem] rounded-lg border border-(--ui-stroke-tertiary) px-3 py-2 text-left text-[0.75rem] leading-5 text-foreground/85">
+  <EventRow
+    detail={() => (
+      <div className="max-w-[36rem] rounded-lg border border-(--ui-stroke-tertiary) px-3 py-2 text-left text-[0.75rem] leading-5 text-foreground/85">
         {MESSAGE_PARTS}
       </div>
-    </details>
-  </div>
+    )}
+    icon={<Codicon className="text-(--ui-text-tertiary)" name="arrow-small-right" size="0.8125rem" />}
+    label={`Replied to ${shortBotName(sender)}`}
+    slot="aui_inter-agent-reply"
+  />
 )
 
 /**

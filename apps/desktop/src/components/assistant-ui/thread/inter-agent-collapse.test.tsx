@@ -120,7 +120,7 @@ describe('inter-agent collapse gate', () => {
 
     await screen.findByText('here is the list hermes sent')
     expect(screen.queryByText(/Replied to/)).toBeNull()
-    expect(screen.queryByText('show reply')).toBeNull()
+    expect(screen.queryByRole('button', { name: /Replied to/ })).toBeNull()
   })
 
   it('still collapses the reply to an unsolicited delivery (dispatch went to another teammate)', async () => {
@@ -129,7 +129,8 @@ describe('inter-agent collapse gate', () => {
     )
 
     expect(await screen.findByText(/Replied to/)).toBeTruthy()
-    expect(screen.getByText('show reply')).toBeTruthy()
+    // The folded reply is one event row whose label opens it.
+    expect(screen.getByRole('button', { name: /Replied to/ }).getAttribute('aria-expanded')).toBe('false')
   })
 
   it('collapses the reply to a LATER unsolicited delivery from a teammate dispatched to earlier', async () => {
@@ -153,21 +154,23 @@ describe('inter-agent collapse gate', () => {
 
     expect(await screen.findByText(/Replied to/)).toBeTruthy()
     expect(screen.getAllByText(/Replied to/)).toHaveLength(1)
-    expect(screen.getByText('show reply')).toBeTruthy()
+    // The folded reply is one event row whose label opens it.
+    expect(screen.getByRole('button', { name: /Replied to/ }).getAttribute('aria-expanded')).toBe('false')
   })
 
   it('collapses a settled reply to an inter-agent delivery', async () => {
     render(<Harness messages={[user('u1', DELIVERY), assistant('a1', 'build is green', false)]} />)
 
     expect(await screen.findByText(/Replied to/)).toBeTruthy()
-    expect(screen.getByText('show reply')).toBeTruthy()
+    // The folded reply is one event row whose label opens it.
+    expect(screen.getByRole('button', { name: /Replied to/ }).getAttribute('aria-expanded')).toBe('false')
   })
 
   it('does NOT collapse while that reply is still streaming', async () => {
     const { container } = render(<Harness messages={[user('u1', DELIVERY), assistant('a1', 'working on it', true)]} />)
 
     await screen.findByText('working on it')
-    expect(screen.queryByText('show reply')).toBeNull()
+    expect(screen.queryByRole('button', { name: /Replied to/ })).toBeNull()
     // Expanded => the full body root, which carries the streaming marker.
     expect(container.querySelector('[data-message-streaming="true"]')).toBeTruthy()
   })
@@ -183,11 +186,13 @@ describe('inter-agent collapse gate', () => {
 
     await screen.findByText('Heatmap shipped, here is the wrap-up')
     expect(screen.queryByText(/Replied to/)).toBeNull()
-    expect(screen.queryByText('show reply')).toBeNull()
+    expect(screen.queryByRole('button', { name: /Replied to/ })).toBeNull()
     // The delivery itself is a compact one-line header, still expandable.
     expect(screen.getByText('Neo asked: Post Tim a short wrap-up on the deal heatmap')).toBeTruthy()
     expect(screen.queryByText(/Message from/)).toBeNull()
-    expect(screen.getByText('show message')).toBeTruthy()
+    expect(
+      screen.getByRole('button', { name: /Neo asked: Post Tim/ }).getAttribute('aria-expanded')
+    ).toBe('false')
   })
 
   it('keeps folding an ordinary delivery that only mentions the main chat in its text', async () => {
