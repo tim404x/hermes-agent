@@ -997,6 +997,9 @@ DEFAULT_CONFIG = {
         # IPs / bounded CIDRs of reverse proxies trusted to supply X-Forwarded-Proto/-For. Loopback
         # always trusted; wildcards and /0 rejected (spoofing guard).
         "trusted_proxies": [],
+        # Seconds an idle HTTP keep-alive socket stays open (uvicorn's default is 5). A remote
+        # Desktop's pooled REST socket then survives normal pauses instead of re-handshaking.
+        "http_keep_alive_s": 75,
         # WebSocket keepalive (seconds), NON-loopback binds only: loopback always disables the
         # protocol ping so an event-loop stall never kills a healthy local connection.
         "ws_ping_interval": 20.0,
