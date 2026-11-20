@@ -96,6 +96,13 @@ def api_turn_toolsets(enabled_toolsets):
     return _narrow_toolsets(enabled_toolsets, narrowing)
 
 
+def api_turn_narrowed():
+    """True while an API admission carrying an honoured ``X-Hermes-Toolsets`` narrowing executes.
+    Phone line third-party calls: a narrowed agent never sees Tim's memory, profile or context files."""
+    current = api_execution.get()
+    return bool(current) and current['settings'].get('toolsets_narrowing') is not None
+
+
 def check_api_settings(adapter, settings):
     dispatch = settings.get('room_dispatch')
     # A room policy is only ever issued with the dispatch it was verified for; a policy-only
