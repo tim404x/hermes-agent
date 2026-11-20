@@ -19,12 +19,15 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 from persistence import Conflict, ExportTooLarge, ProfileScope, RowVisibility, SessionId
 from persistence.conversation.messages import NewMessage, TranscriptRead, TranscriptRow, TranscriptView
-from persistence.conversation.sessions import CANONICAL_BOT_CHAT_TITLE, END_REASON_COMPRESSION, SessionLineageKind, SessionRecord
+from persistence.conversation.sessions import (
+    CANONICAL_BOT_CHAT_TITLE, END_REASON_COMPRESSION, INTERNAL_LISTING_SOURCES, SessionLineageKind, SessionRecord,
+)
 from persistence.housekeeping.maintenance import (
     GHOST_SESSION_MIN_AGE,
     GHOST_SESSION_SOURCE,
     IMPORT_MAX_SESSIONS,
     ORPHAN_REAP_END_REASON,
+    SESSION_COUNTER_FIELDS,
     SESSION_PROJECTION_FIELDS,
     ForeignImportResult,
     ForeignOrigin,
@@ -34,6 +37,7 @@ from persistence.housekeeping.maintenance import (
     PruneCriteria,
     PruneReclaimEstimate,
     PruneResult,
+    SessionChangeDigests,
     SessionExport,
     SessionExportRow,
     SessionLineageExport,
@@ -645,6 +649,51 @@ class InMemoryMaintenance:
             digest.update(repr(tuple(values[field] for field in SESSION_PROJECTION_FIELDS)).encode("utf-8", "backslashreplace"))
             digest.update(b"\0")
         return SESSION_PROJECTION_FIELDS, digest.digest()
+
+    def session_change_digests(
+        self, *, include_subagents: bool = False, running_ids: Sequence[str] = (), busy_timeout_s: float = 0.05,
+    ) -> Optional[SessionChangeDigests]:
+        running = {str(sid) for sid in running_ids}
+        listed, counts, running_counts, internal = (hashlib.blake2b(digest_size=16) for _ in range(4))
+
+        def sign(digest, cells: tuple) -> None:
+            digest.update(repr(cells).encode("utf-8", "backslashreplace"))
+            digest.update(b"\0")
+
+        rows = self._rows()
+        records = {sid: self._record(rows[sid]) for sid in rows}
+
+        def delegate(record) -> bool:
+            return (record.source or "") == "subagent" or (
+                record.parent_session_id is not None and (record.model_config or {}).get("_delegate_from") is not None)
+
+        def chain_root_source(sid) -> Optional[str]:
+            """The source of the first non-delegate row up the parent links ('' when it is missing), None on a cycle."""
+            seen = set()
+            while sid in records and delegate(records[sid]) and sid not in seen:
+                seen.add(sid)
+                sid = records[sid].parent_session_id
+            if sid in seen:
+                return None
+            return (records[sid].source or "") if sid in records else ""
+
+        for sid in sorted(rows):
+            record = records[sid]
+            values = _export_row(record).as_dict()
+            source = values["source"] or ""
+            if source in INTERNAL_LISTING_SOURCES:
+                sign(internal, tuple(values[field] for field in SESSION_PROJECTION_FIELDS))
+                continue
+            if delegate(record) and not include_subagents:
+                root = chain_root_source(sid)
+                target = internal if root in INTERNAL_LISTING_SOURCES else counts
+                sign(target, tuple(values[field] for field in SESSION_PROJECTION_FIELDS))
+                continue
+            sign(listed, (*(values[field] for field in SESSION_PROJECTION_FIELDS if field not in SESSION_COUNTER_FIELDS),
+                          (values["message_count"] or 0) > 0))
+            sign(running_counts if sid in running else counts, (sid, *(values[field] for field in SESSION_COUNTER_FIELDS)))
+        return SessionChangeDigests(SESSION_PROJECTION_FIELDS, listed.digest(), counts.digest(), running_counts.digest(),
+                                    internal.digest())
 
     def _inside(self, worktree_path: str) -> list[Mapping[str, Any]]:
         inside = _inside_tree(worktree_path)

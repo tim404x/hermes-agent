@@ -267,9 +267,20 @@ def _collect_profile_gateway_topology_cached() -> dict[str, Any]:
         cached = _topology_cache_get(fn)
         if cached is not None:
             return cached
+        generation = _TOPOLOGY_CACHE.get("generation")
         data = fn()
-        _TOPOLOGY_CACHE.update(data=data, fn=fn, ts=time.monotonic())
+        # A write retired the cache while this collect ran (invalidate_topology_cache): answer, but keep it stale.
+        fresh = _TOPOLOGY_CACHE.get("generation") == generation
+        _TOPOLOGY_CACHE.update(data=data, fn=fn, ts=time.monotonic() if fresh else 0.0)
         return data
+
+
+def invalidate_topology_cache() -> None:
+    """A gateway, profile or config write in this process: the next /api/status collects the topology again
+    instead of reading the TTL entry (hermes_cli/web_routers/status_snapshot.py ``invalidate_status``). Lock-free
+    on purpose (called from the event loop): the generation makes a collect already running store a stale entry."""
+    _TOPOLOGY_CACHE["generation"] = object()
+    _TOPOLOGY_CACHE["ts"] = 0.0
 
 
 def _load_configured_gateway_platforms() -> set[str]:
