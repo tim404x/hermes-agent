@@ -9,7 +9,8 @@ healthy. The serving process therefore answers from the last body:
 - younger than ``fresh_s``: returned as is, no compute;
 - older (up to ``max_stale_s``): returned at once AND one background refresh starts;
 - none yet, or older than ``max_stale_s``: the caller waits for the refresh (one compute however
-  many callers are waiting); while a refresh is already running, the last body answers instead.
+  many callers are waiting); while a refresh is already running, the last body answers instead, up
+  to ``max_stale_s + compute_timeout_s`` old.
 
 Only the real server arms it (``web_server._start_server_runtime``); unarmed (tests, in-process and
 embedded callers) every call computes, exactly as before. Each caller gets its own deep copy, so the
@@ -57,9 +58,11 @@ class StatusSnapshot:
         if not self.armed:
             return await compute()
         body, age = self._body, self._clock() - self._at
-        if body is not None and (age < self.max_stale_s or self._in_flight()):
-            # Past max_stale_s with a refresh already running (a slow or wedged probe), the last body
-            # still answers: awaiting that refresh would hold every poll until compute_timeout_s.
+        if body is not None and (age < self.max_stale_s
+                                 or (self._in_flight() and age < self.max_stale_s + self.compute_timeout_s)):
+            # Just past max_stale_s with a refresh already running (a slow probe), the last body still
+            # answers rather than holding the poll. Never older than one refresh's timeout beyond that:
+            # a probe that keeps wedging must surface as a failing status, not as a frozen healthy one.
             if age >= self.fresh_s:
                 self._start(compute)
             return copy.deepcopy(body)
