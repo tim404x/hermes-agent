@@ -126,3 +126,32 @@ def test_a_cron_delivery_stays_when_the_bot_answers_it_with_silence():
     assert [m["role"] for m in messages] == ["user"]
     assert "Apex morning run is done." in (messages[0].get("display_content") or messages[0]["text"])
 
+
+def test_a_page_cut_after_a_wake_still_hides_its_silent_reply(tmp_path):
+    """A latest page of one row holds only the reply; its opener (the wake) is just outside the page. The
+    REST projection judges the reply by that real opener, keeping pagination counts, and a person's
+    literal answer on the same kind of cut page stays visible."""
+    from hermes_cli.web_routers.sessions import _page_opener
+    from persistence.conversation.messages import TranscriptRead, TranscriptView
+    from persistence_assembly import open_persistence, profile_scope
+    from tests.fixtures.storage_seed import seed_messages, seed_session
+
+    def latest_page(store, sid, limit, offset=0):
+        read = TranscriptRead(view=TranscriptView.ACTIVE, limit=limit, offset=offset, latest=True,
+                              include_lineage=True)
+        page = [row.as_wire_row() for row in store.messages.read_transcript(sid, read)]
+        return page, _project_for_display(page, opener=_page_opener(store, sid, page, read))
+
+    with open_persistence(profile_scope(home=tmp_path)) as store:
+        seed_session(store, "wake", "desktop")
+        seed_messages(store, "wake", _user("hi"), _bot("hello"), WAKE, _bot("NO_REPLY"))
+        page, projected = latest_page(store, "wake", 1)
+        assert [r["content"] for r in page] == ["NO_REPLY"] and len(projected) == 1
+        assert projected[0].get("silent_turn") is True
+        oldest = TranscriptRead(view=TranscriptView.ACTIVE, limit=1, offset=3, include_lineage=True)
+        page = [row.as_wire_row() for row in store.messages.read_transcript("wake", oldest)]
+        assert _project_for_display(page, opener=_page_opener(store, "wake", page, oldest))[0].get("silent_turn")
+        seed_session(store, "person", "desktop")
+        seed_messages(store, "person", _user("Reply with exactly the word NO_REPLY."), _bot("NO_REPLY"))
+        _page, projected = latest_page(store, "person", 1)
+        assert "silent_turn" not in projected[0]
