@@ -90,6 +90,9 @@ def _baseline(home, monkeypatch, observed):
     _install_agent_stubs(monkeypatch, observed)
     run_job(job)  # no _scheduled_instant: a manual-like first run, always admitted
     assert observed["agent_runs"] == 1
+    # The owner re-checked just now (revalidation clock), as after any admitted scheduled tick.
+    from cron.monitor_preadmit import _update_state
+    _update_state(job["id"], last_admit_at=__import__("time").time())
     return get_job(job["id"])
 
 
@@ -151,6 +154,54 @@ def test_changed_tick_is_admitted_once_and_the_agent_runs(hermes_env, monkeypatc
     run_job(_scheduled(get_job(job["id"])))
     assert len(admissions) == admitted_before + 1
     assert _ledger(hermes_env)[-1]["decision"] == "skip"
+
+
+def test_revalidation_admits_at_least_every_max_skip_window(hermes_env, monkeypatch, admissions):
+    import time as _time
+
+    from cron.jobs import get_job
+    from cron.monitor_preadmit import _update_state
+    from cron.scheduler import run_job
+
+    observed: dict = {}
+    job = _baseline(hermes_env, monkeypatch, observed)
+    _update_state(job["id"], last_admit_at=_time.time() - 31 * 60)
+    before = len(admissions)
+    result = run_job(_scheduled(get_job(job["id"])))
+    assert len(admissions) == before + 1 and result[2] == "[SILENT]"  # owner re-checked: still no_change
+    assert _ledger(hermes_env)[-1]["reason"] == "revalidate"
+    run_job(_scheduled(get_job(job["id"])))  # clock reset by the admission: skipped again
+    assert len(admissions) == before + 1
+    assert _ledger(hermes_env)[-1]["decision"] == "skip"
+
+
+def test_divergence_latches_the_gate_off_for_that_job(hermes_env, monkeypatch, admissions):
+    """If the owner sees a change the firer's peek did not, the job always admits from then on."""
+    import time as _time
+
+    import cron.monitor as mon
+    from cron.jobs import get_job
+    from cron.monitor_preadmit import _load_state, _update_state
+    from cron.scheduler import run_job
+
+    observed: dict = {}
+    job = _baseline(hermes_env, monkeypatch, observed)
+    _counting_script(hermes_env, "echo 'state B'")  # the real source changed...
+    real_peek = mon.peek_monitor
+    stored = get_job(job["id"])["monitor_state"]["last_output_hash"]
+    # ...but the firer's environment keeps reporting the old output (the reviewer's env-mismatch case).
+    monkeypatch.setattr(mon, "peek_monitor", lambda j: mon.MonitorPeek(ok=True, unchanged=True, output_hash=stored))
+    before = len(admissions)
+    run_job(_scheduled(get_job(job["id"])))
+    assert len(admissions) == before  # skipped (within the window): the bounded-delay case
+    _update_state(job["id"], last_admit_at=_time.time() - 31 * 60)
+    run_job(_scheduled(get_job(job["id"])))  # revalidation: the owner runs the agent on the change
+    assert len(admissions) == before + 1 and observed["agent_runs"] == 2
+    assert _load_state()[job["id"]]["disabled"] == "divergence"
+    run_job(_scheduled(get_job(job["id"])))
+    assert len(admissions) == before + 2  # latched: admits every tick, like the old path
+    assert _ledger(hermes_env)[-1]["reason"] == "disabled:divergence"
+    monkeypatch.setattr(mon, "peek_monitor", real_peek)
 
 
 def test_first_run_is_admitted(hermes_env, monkeypatch, admissions):
