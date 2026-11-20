@@ -9,6 +9,7 @@ import contextvars
 import json
 import logging
 import time
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, wait as _cf_wait
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -249,7 +250,7 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
         sid = getattr(children_by_index.get(entry.get("task_index")), "_subagent_id", None)
         if isinstance(sid, str) and sid:
             entry["subagent_id"] = sid
-    _finalize_child_results(results, batch.task_list, batch.children, batch.parent_agent)
+    usage_total = _finalize_child_results(results, batch.task_list, batch.children, batch.parent_agent)
     total_duration = round(time.monotonic() - batch.overall_start, 2)
     for entry in results:
         _idx = entry.get("task_index", -1)
@@ -265,6 +266,13 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
     finish_delegation_unit(batch.task_list, results, background=not honor_parent_interrupt)
 
     combined: dict[str, Any] = {"results": results, "total_duration_seconds": total_duration}
+    # Real spend of this call: the children AND everything they delegated to (a child's own counters miss its
+    # subtree, #92004), plus the effort each child ran at, so a swarm report shows its mix.
+    combined["usage_total"] = usage_total
+    efforts = Counter(entry["route"].get("reasoning_effort") or "inherited" for entry in results
+                      if isinstance(entry.get("route"), dict) and not entry["route"].get("refused"))
+    if efforts:
+        combined["effort_mix"] = dict(efforts)
     # The desktop delegate card joins live subagent state by this id; without it
     # a repeated goal string lets an older card claim this call's children (#136532).
     if batch.live_deleg_id:
