@@ -24,6 +24,9 @@ def db(tmp_path):
     database._conn.execute("UPDATE sessions SET end_reason='session_reset' WHERE id='owner'")
     database._conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (
         POLICY_PREFIX + 'owner', json.dumps({'session_id': 'owner', 'lineage': ['owner', 'head']})))
+    # The once-per-unchanged-store reuse pinned here serves a store WITHOUT idx_state_meta_local_lineage; an
+    # indexed store seeks the few multi-segment receipts on every listing (test_visible_list_revision).
+    database._conn.execute('DROP INDEX IF EXISTS idx_state_meta_local_lineage')
     database._conn.commit()
     yield database
     database.close()
