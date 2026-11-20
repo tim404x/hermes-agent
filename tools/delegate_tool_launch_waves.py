@@ -112,14 +112,17 @@ _SCHEDULES = LaunchSchedules()
 
 
 def _account_key(child: Any) -> tuple[str, str, str]:
-    """The provider rate-limit identity a child starts on: provider, endpoint, and its credential pool or key
-    (hashed, never kept in clear)."""
+    """The provider rate-limit identity a child starts on: provider, endpoint, and its credential pool's name
+    (``custom:account-a``; named providers at one gateway URL each own a pool) or its key (hashed, never kept
+    in clear). The pool's name, never the object: a rebuilt view of the same pool is the same account."""
     provider = getattr(child, "provider", "")
     base_url = getattr(child, "base_url", "")
     provider = provider if isinstance(provider, str) else ""
     base_url = base_url.rstrip("/").lower() if isinstance(base_url, str) else ""
-    if getattr(child, "_credential_pool", None) is not None:
-        return provider, base_url, "pool"
+    pool = getattr(child, "_credential_pool", None)
+    if pool is not None:
+        name = getattr(pool, "provider", "")
+        return provider, base_url, f"pool:{name if isinstance(name, str) else ''}"
     api_key = getattr(child, "api_key", None)
     key = hashlib.sha256(api_key.encode()).hexdigest()[:16] if isinstance(api_key, str) and api_key else ""
     return provider, base_url, key
