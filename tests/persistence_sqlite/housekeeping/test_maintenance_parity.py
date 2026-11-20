@@ -103,6 +103,7 @@ def test_session_projection_digest_matches_legacy_probe(seeded):
     ("UPDATE sessions SET archived = 0 WHERE id = 'old-b'", True),
     ("UPDATE sessions SET handoff_state = 'running' WHERE id = 'old-a'", True),
     ("DELETE FROM sessions WHERE id = 'recent-g'", True),
+    ("UPDATE sessions SET started_at = started_at + 0.000001 WHERE id = 'old-a'", True),  # 1 us, 17th digit
     ("UPDATE sessions SET last_activity_at = 1 WHERE id = 'old-a'", False),       # the heartbeat's column
 ])
 def test_the_projection_digest_sees_every_listed_change_on_both_paths(seeded, monkeypatch, path, change):
