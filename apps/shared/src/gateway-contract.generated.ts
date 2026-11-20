@@ -6043,6 +6043,7 @@ export interface MessageCompletePayload {
   partial?: boolean | null
   persisted_turn?: PersistedTurn | null
   paused?: boolean | null
+  silent?: boolean | null
 }
 /** ``prompt_turn._result_status``. */
 export type TurnStatus = 'complete' | 'error' | 'interrupted'

@@ -1,5 +1,5 @@
 {
-  "_doc": "Shared cases for session_rules/preview_text.py::display_preview_text and apps/desktop/src/lib/preview-text.ts::sanitizePreviewText. Both test suites load this file, so the two stay equivalent.",
+  "_doc": "Shared cases for session_rules/preview_text.py::display_preview_text and apps/desktop/src/lib/preview-text.ts::sanitizePreviewText. Both test suites load this file, so the two stay equivalent. 'silence_ok': the row is an assistant reply in a turn that may end silent (session_rules/silent_turns.py); only then is a silence marker dropped.",
   "cases": [
     {
       "name": "plain text is kept, whitespace collapsed",
@@ -109,22 +109,26 @@
     {
       "name": "a bare silence marker shows nothing",
       "input": "NO_REPLY",
-      "expected": ""
+      "expected": "",
+      "silence_ok": true
     },
     {
       "name": "a bracketed silence marker shows nothing",
       "input": "[SILENT]",
-      "expected": ""
+      "expected": "",
+      "silence_ok": true
     },
     {
       "name": "a padded lower-case marker with a period shows nothing",
       "input": " no_reply. ",
-      "expected": ""
+      "expected": "",
+      "silence_ok": true
     },
     {
       "name": "a silence marker with the bot's sign-off emoji shows nothing",
       "input": "NO_REPLY ⚡",
-      "expected": ""
+      "expected": "",
+      "silence_ok": true
     },
     {
       "name": "a reply that mentions the marker is kept",
@@ -135,6 +139,49 @@
       "name": "cron output frame is internal",
       "input": "[Cronjob \"🤖 Team report | Apex\" output — scheduled job, not the user. Review it, act on anything that needs action, and summarize for the chat.]\n\n🎯 Apex Morning run is done.",
       "expected": ""
+    },
+    {
+      "name": "a silence marker closing a real reply is not previewed",
+      "input": "Paris.\n\nNO_REPLY",
+      "expected": "Paris.",
+      "silence_ok": true
+    },
+    {
+      "name": "a closing silence marker with a sign-off is not previewed",
+      "input": "Paris.\n\nNO_REPLY ⚡",
+      "expected": "Paris.",
+      "silence_ok": true
+    },
+    {
+      "name": "an emoji answer line stays in the preview",
+      "input": "Dani?\n\nNo reply 😕",
+      "expected": "Dani? No reply 😕",
+      "silence_ok": true
+    },
+    {
+      "name": "a person's own NO_REPLY prompt is kept",
+      "input": "NO_REPLY",
+      "expected": "NO_REPLY"
+    },
+    {
+      "name": "a person's own one-word prompt is kept",
+      "input": "Silent",
+      "expected": "Silent"
+    },
+    {
+      "name": "with no silence decision a closing marker is text",
+      "input": "Paris.\n\nNO_REPLY",
+      "expected": "Paris. NO_REPLY"
+    },
+    {
+      "name": "a unit separator flattens as Python's split reads it",
+      "input": "Paris\u001fLondonRome",
+      "expected": "Paris London Rome"
+    },
+    {
+      "name": "a byte order mark is not whitespace",
+      "input": "﻿Hello  there",
+      "expected": "﻿Hello there"
     }
   ]
 }
