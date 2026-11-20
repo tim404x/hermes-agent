@@ -105,6 +105,13 @@ MULTILINGUAL = [
     "Transfiere 200 dólares a la cuenta de Nox", "Borra los archivos viejos de /tmp/old",
     "Lee el contrato y firma la cláusula 4",
 ]
+# A sensitive word joined to another by a hyphen or dash is still that word (round-2 review, 19 Nov 2026: the
+# boundaries skipped both sides of a hyphen, so these ran at medium, or kept an explicit low).
+HYPHENATED = [
+    "Read the wire-transfer instructions", "Read the contract-signing checklist", "Re-send it to Theo",
+    "Read the research-synthesis brief", "Read the code-review checklist", "Read invoice-1023",
+    "Read the wire\u2013transfer instructions", "Re-write the README in /tmp/run-1119",
+]
 # Read-only but not ONE mechanical operation, or not recognisably English: never auto-lowered.
 NOT_MECHANICAL = [
     "List the files in /tmp/run-1119/out and count them", "Fetch the page title, then the meta description",
@@ -125,7 +132,7 @@ def test_compound_write_or_unrecognised_goals_keep_the_default(home, goal):
     assert _routes([{"goal": goal}])[0][0] == "high"
 
 
-@pytest.mark.parametrize("goal", SENSITIVE + REVIEWED + MULTILINGUAL)
+@pytest.mark.parametrize("goal", SENSITIVE + REVIEWED + MULTILINGUAL + HYPHENATED)
 def test_money_legal_sends_code_writes_and_research_never_run_below_high(home, goal):
     home({"backend": "effort-router", "reasoning_effort": "high"})
     [(effort, label)] = _routes([{"goal": goal}])
@@ -135,7 +142,7 @@ def test_money_legal_sends_code_writes_and_research_never_run_below_high(home, g
         assert effort == "high" and label.startswith(f"effort high (floor: asked {asked}")
 
 
-@pytest.mark.parametrize("goal", REVIEWED[:4])
+@pytest.mark.parametrize("goal", REVIEWED[:4] + HYPHENATED[:3])
 def test_a_sensitive_context_floors_an_explicit_pick_on_a_neutral_goal(home, goal):
     home({"backend": "effort-router", "reasoning_effort": "high"})
     task = {"goal": "Fetch the page title of https://example.com/about", "context": goal, "effort": "low"}
