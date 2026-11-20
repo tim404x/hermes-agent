@@ -772,6 +772,9 @@ export interface SessionMessage {
    */
   row_id?: number
   id?: number
+  /** Backend display projection (`session_rules/silent_turns.py`): this row belongs to a turn that
+   *  chose silence and paints nothing. The row still counts toward page offsets. */
+  silent_turn?: boolean
   text?: unknown
   timestamp?: number
   tool_call_id?: null | string

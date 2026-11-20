@@ -512,6 +512,28 @@ export function forgetSessionUnread(
   }
 }
 
+/** Stored ids whose last live turn completed silent (a wake answered NO_REPLY). The rows it stored
+ *  paint nothing, so the next list refresh that reports MORE rows than the watermark moves the
+ *  watermark over them instead of reading them as unread. A refresh still carrying the old count
+ *  (already in flight at the settle) leaves the note for the next one. */
+const silentTurnSettles = new Set<string>()
+
+export function noteSilentTurnSettled(storedSessionId: string): void {
+  silentTurnSettles.add(storedSessionId)
+}
+
+function takeSilentTurnSettle(row: SessionInfo): boolean {
+  for (const id of silentTurnSettles) {
+    if (sessionMatchesStoredId(row, id)) {
+      silentTurnSettles.delete(id)
+
+      return true
+    }
+  }
+
+  return false
+}
+
 /** Seed/refresh watermarks from freshly loaded lists: the SELECTED session
  *  tracks its live count (it's on screen — nothing there is unread), and a
  *  session never seen before seeds at its current count instead of lighting
@@ -540,6 +562,9 @@ function ingestRows(rows: readonly SessionInfo[]): void {
     const bucket = next?.[profile] ?? seen[profile]
 
     if (profile === selectedProfile && isSelected(row, selected)) {
+      // On screen: its count is tracked below, so a pending silent note has nothing left to do.
+      takeSilentTurnSettle(row)
+
       if (bucket?.[durableId] !== row.message_count) {
         write(profile, durableId, row.message_count)
       }
@@ -555,6 +580,8 @@ function ingestRows(rows: readonly SessionInfo[]): void {
         }
       }
     } else if (!bucket || !(durableId in bucket)) {
+      write(profile, durableId, row.message_count)
+    } else if (row.message_count > bucket[durableId] && silentTurnSettles.size && takeSilentTurnSettle(row)) {
       write(profile, durableId, row.message_count)
     }
   }

@@ -274,6 +274,8 @@ export type GatewayEventPayload = {
   response_reused?: MessageCompletePayload['response_reused']
   // message.complete — an interrupted turn its interrupter continues by itself (store/paused-replies.ts).
   paused?: MessageCompletePayload['paused']
+  // message.complete — the turn chose silence where it may: nothing to show, toast, beep or mark unread.
+  silent?: MessageCompletePayload['silent']
   persisted_turn?: PersistedTurn | null
   // message.complete — history-commit note the gateway surfaced instead of dropping.
   warning?: string
