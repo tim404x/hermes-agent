@@ -35,6 +35,10 @@ vi.mock('./routing', () => ({
   requestForBot: vi.fn()
 }))
 vi.mock('./data', () => ({
+  // Roster freshness gates paint-first (switch-fix-1119): a focused window's
+  // roster is at most one poll old.
+  ROSTER_POLL_INTERVAL_MS: 5000,
+  rosterSnapshotAgeMs: () => 0,
   $botMeta: { get: () => ({}), set: vi.fn() },
   botMetaKey: () => '',
   botOwner: (owner: string) => ({ bot: { name: owner }, key: owner, name: owner, route: null }),
