@@ -1204,6 +1204,23 @@ def _publish_host_rendezvous(host: str, port: int) -> None:
     hr.cleanup_on_exit(role)
 
 
+def _start_bot_chat_prewarm(delay_s: float = 20.0) -> None:
+    """Build every served profile's Bot Chat page in the background, one profile at a time, after the Desktop's
+    reconnect burst (``web_routers.sessions.prewarm_bot_chat_page``)."""
+    def run() -> None:
+        time.sleep(delay_s)
+        from hermes_cli.profiles import list_profile_names
+        from hermes_cli.web_routers.sessions import prewarm_bot_chat_page
+
+        for name in list_profile_names():  # "default" first, then every live named profile
+            try:
+                prewarm_bot_chat_page(name)
+            except Exception as exc:  # health: allow BLE001 -- a cold page is only slower, never wrong
+                _log.debug("Bot Chat prewarm skipped for %s: %s", name, exc)
+
+    threading.Thread(target=run, name="bot-chat-prewarm", daemon=True).start()
+
+
 def _on_server_started(
     server,
     *,
@@ -1241,6 +1258,8 @@ def _on_server_started(
     # Same sweep for stdio MCP helpers (#61514): positive identity only (spawn
     # ledger + spawner provably dead); anything alive or unprovable is untouched.
     _best_effort("orphan MCP helper reap", _reap_mcp_helpers)
+    # The first bot switch after this start reads a warm Bot Chat page instead of rebuilding its projection.
+    _best_effort("Bot Chat page prewarm", _start_bot_chat_prewarm)
 
     # No-op for standalone `hermes serve` (no HERMES_PARENT_PID).
     _start_parent_death_watchdog()
