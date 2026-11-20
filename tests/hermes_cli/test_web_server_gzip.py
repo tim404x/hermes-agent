@@ -89,7 +89,10 @@ def test_excluded_responses_stay_unencoded(dashboard, kind):
     response = client.get(f"/api/_gzip/{kind}", headers={"Accept-Encoding": "gzip"})
     assert response.status_code == identity.status_code
     assert "content-encoding" not in response.headers
-    assert "vary" not in identity.headers and "vary" not in response.headers
+    # The fork's CORS layer adds ``Vary: Origin`` to every response; what matters here is that an
+    # excluded response never claims to vary on the encoding it was never given.
+    assert "accept-encoding" not in identity.headers.get("vary", "").lower()
+    assert "accept-encoding" not in response.headers.get("vary", "").lower()
     assert bytes(raw) == expected
 
 
@@ -116,8 +119,13 @@ def test_large_text_is_compressed(dashboard):
     assert gzip.decompress(bytes(raw)) == PLAIN
 
 
-def test_cors_preflight_preserves_existing_status_and_headers(dashboard):
+def test_cors_preflight_preserves_existing_status_and_headers(dashboard, monkeypatch):
+    from hermes_cli.web_server import app
+
     client, _raw = dashboard
+    # The fork's CORS trusts only the backend's own loopback origin (web_server_boundary).
+    monkeypatch.delenv("HERMES_DESKTOP_DEV_SERVER", raising=False)
+    monkeypatch.setattr(app.state, "bound_port", 5174, raising=False)
     response = client.options("/api/_gzip/large", headers={
         "Origin": "http://localhost:5174",
         "Access-Control-Request-Method": "GET",
@@ -148,3 +156,24 @@ def test_gzip_follows_accept_encoding_q_values(dashboard, accept_encoding, compr
     assert ("content-encoding" in response.headers) is compressed
     assert "Accept-Encoding" in response.headers["vary"]
     assert (gzip.decompress(bytes(raw)) if compressed else bytes(raw)) == PLAIN
+
+
+def test_every_excluded_kind_still_sends_its_start_to_a_gzip_client(dashboard):
+    """Starlette 1.9 forwards the start of a response it excludes at once; the 1.3-era responder flipped
+    its exclusion flag after the start was buffered and sent a body with no start (500 / broken reply)
+    for every small or non-JSON answer to a client that accepts gzip (iPhone, browsers, the new app)."""
+    client, raw = dashboard
+    for kind in ("small", "stream", "sse", "file", "partial", "content-range", "media", "encoded"):
+        response = client.get(f"/api/_gzip/{kind}", headers={"Accept-Encoding": "gzip, deflate, br"})
+        assert response.status_code in (200, 206), kind
+        assert bytes(raw), kind
+
+
+def test_malformed_content_length_is_left_alone():
+    from starlette.types import Message
+
+    from hermes_cli.web_server_gzip import _compressible
+
+    message: Message = {"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"application/json"), (b"content-length", b"12x")]}
+    assert _compressible(message, 4096) is False
