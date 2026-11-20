@@ -223,31 +223,45 @@ def resolve_window(profile_home: Path | str, profile: str, key: str, title: str,
                    now: float | None = None) -> tuple[str, bool]:
     """``(title, reused)`` for a DM on conversation ``key`` into ``profile``'s side windows.
 
-    Reuses the newest window stamped with ``key`` that was active within ``REUSE_MAX_IDLE_SECONDS``
-    and is not busy (mid-turn, or its window turn lock held). Otherwise a free title: ``title``,
-    or, when that conversation's live tab is busy, ``"<its title> (2)"``; a title another session
-    already holds gets the next free number, so a new conversation never lands in an old tab.
-    Raises on a store error: the caller falls back to the ``auto`` route."""
+    Reuses the newest window stamped with ``key`` that was active within ``REUSE_MAX_IDLE_SECONDS``,
+    busy or not: one conversation keeps one tab. A follow-up into a busy window (mid-turn, or its
+    window turn lock held, ``window_busy``) is queued into it through the window's live owner by the
+    delivery runner, never opened as a ``"<title> (2)"`` sibling (Tim, 19 Nov 2026). Otherwise a free
+    title: ``title``, or, when another session already holds it, the next free ``"<title> (N)"``, so a
+    new conversation never lands in an old tab. Raises on a store error: the caller falls back to the
+    ``auto`` route."""
     now = time.time() if now is None else now
     home = Path(profile_home)
     if not (home / "state.db").is_file():
         return title, False
     from persistence_assembly import open_persistence_reader
-    from tools.bot_mode_probe import _hermes_root
-    from tools.bot_relay import turn_lock_held
 
-    root = _hermes_root(home)
     with open_persistence_reader(home) as store:
-        busy_tab = ""
         for window in store.sessions.find_side_windows(key):
-            if not window.title or now - window.last_active > REUSE_MAX_IDLE_SECONDS:
-                continue
-            if session_mid_turn(store, window.id, now) or turn_lock_held(
-                    root, side_window_lock_name(profile, window.title)):
-                busy_tab = busy_tab or window.title
-                continue
-            return window.title, True
-        return _free_title(store, busy_tab or title, numbered=bool(busy_tab)), False
+            if window.title and now - window.last_active <= REUSE_MAX_IDLE_SECONDS:
+                return window.title, True
+        return _free_title(store, title, numbered=False), False
+
+
+def window_busy(profile_home: Path | str, profile: str, title: str, now: float | None = None) -> bool:
+    """The titled side window is busy right now: its live tip is mid-turn, or its window turn lock is
+    held (a delivery runner is in it). Never raises; unknown is not busy."""
+    try:
+        from persistence_assembly import open_persistence_reader
+        from tools.bot_mode_probe import _hermes_root
+        from tools.bot_relay import turn_lock_held
+
+        home = Path(profile_home)
+        if turn_lock_held(_hermes_root(home), side_window_lock_name(profile, title)):
+            return True
+        if not (home / "state.db").is_file():
+            return False
+        with open_persistence_reader(home) as store:
+            session_id = _resolve_window(store, title)
+            return bool(session_id) and session_mid_turn(store, session_id, now)
+    except Exception:
+        logger.debug("message_agent: could not read side window %r in %s", title, profile_home, exc_info=True)
+        return False
 
 
 def _free_title(store, title: str, *, numbered: bool) -> str:
@@ -384,6 +398,27 @@ def stamp_side_window(profile_home: Path | str, title: str, *, author: dict | No
     finally:
         if store is not None:
             store.close()
+
+
+def is_conversation_window(profile_home: Path | str, title: str, key: str | None) -> bool:
+    """Whether ``title`` already names this conversation's side window: the chat the transport resolves
+    carries the side-window stamp with ``key`` (any stamp when the route has no key, the ``auto``
+    route). A titled chat with no stamp, or another conversation's, is an unrelated title collision.
+    Read before the turn's own restamp; never raises."""
+    try:
+        from persistence.conversation.sessions import record_side_window_stamp
+        from persistence_assembly import open_persistence_reader
+
+        home = Path(profile_home)
+        if not (home / "state.db").is_file():
+            return False
+        with open_persistence_reader(home) as store:
+            session_id = _resolve_window(store, title)
+            stamp = record_side_window_stamp(store.sessions.get(session_id)) if session_id else None
+        return stamp is not None and (not key or stamp.get("key") in (None, key))
+    except Exception:
+        logger.debug("message_agent: could not read side window %r in %s", title, profile_home, exc_info=True)
+        return False
 
 
 def _resolve_window(store, title: str) -> str | None:
