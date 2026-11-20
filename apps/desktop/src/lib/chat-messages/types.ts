@@ -43,7 +43,7 @@ export type ChatMessage = {
   parts: ChatMessagePart[]
   /** Result body only; the system text remains the compact completion label. */
   asyncResult?: string
-  asyncResultKind?: 'process'
+  asyncResultKind?: 'brief' | 'cron' | 'notice' | 'process'
   timestamp?: number
   completedAt?: number
   pending?: boolean

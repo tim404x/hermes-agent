@@ -9,6 +9,7 @@ import {
   messageContentText,
   PROCESS_NOTIFICATION_RE
 } from '@/components/assistant-ui/thread/content'
+import { EventRow } from '@/components/assistant-ui/thread/event-row'
 import { MessageHoverTime } from '@/components/assistant-ui/thread/message-hover-time'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { BackgroundResult } from '@/components/assistant-ui/thread/system-message'
@@ -25,6 +26,7 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { StopFilled } from '@/lib/icons'
 import { LruCache } from '@/lib/lru-cache'
+import { processNotificationTitle } from '@/lib/process-title'
 import { $touchPointer, isTouchInteraction } from '@/lib/touch-interaction'
 import { cn } from '@/lib/utils'
 import { $gateway } from '@/store/gateway'
@@ -231,43 +233,41 @@ const AgentMessageNote: FC<{ text: string }> = ({ text }) => {
       .find(line => line.trim())
       ?.trim() ?? ''
 
-  // Grok-bots shape: an inter-agent delivery is a timeline EVENT, not a
-  // conversation bubble — a subtle centered notice ("Message from 🤖 X"),
-  // with the delivered text one click away instead of shouting in the
-  // transcript. The recipient's reply below it stays a normal assistant
-  // message, so the exchange still reads in order.
+  // An inter-agent delivery is a timeline EVENT, not a conversation bubble: one quiet EventRow
+  // ("Message from Neo") with the delivered text one click away. The recipient's reply below it
+  // stays a normal assistant message (or its folded "Replied to" event), so the exchange still
+  // reads in order.
+  const glyph = avatar ? (
+    <img alt="" aria-hidden className="size-3.5 shrink-0 rounded-full object-cover" src={avatar} />
+  ) : (
+    <span aria-hidden className="text-[0.75rem] leading-none">
+      🤖
+    </span>
+  )
+
   return (
-    <div
-      className="flex max-w-[min(86%,44rem)] flex-col gap-0.5 self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/60"
-      data-slot="aui_agent-message-note"
-    >
-      <span className="flex items-center justify-center gap-1.5">
-        {avatar ? (
-          <img alt="" aria-hidden className="size-4 shrink-0 rounded-full object-cover" src={avatar} />
-        ) : (
-          <span aria-hidden className="text-[0.8125rem] leading-none">
-            🤖
-          </span>
-        )}
-        {mainChat ? (
-          <span className="min-w-0 truncate" data-slot="aui_agent-message-main-chat">
+    <EventRow
+      detail={
+        shownBody
+          ? () => (
+              <div className="max-w-[36rem] rounded-lg border border-(--ui-stroke-tertiary) px-3 py-2 text-left text-[0.75rem] leading-5 text-foreground/85">
+                <UserMessageText text={shownBody} />
+              </div>
+            )
+          : undefined
+      }
+      icon={glyph}
+      label={
+        mainChat ? (
+          <span data-slot="aui_agent-message-main-chat">
             {shortSender} asked: {firstLine}
           </span>
         ) : (
-          <span className="wrap-anywhere">Message from {sender}</span>
-        )}
-      </span>
-      {shownBody && (
-        <details className="self-center">
-          <summary className="cursor-pointer select-none text-center text-muted-foreground/45 hover:text-muted-foreground/70">
-            show message
-          </summary>
-          <div className="mt-1 max-w-[36rem] rounded-lg border border-(--ui-stroke-tertiary) px-3 py-2 text-left text-[0.75rem] leading-5 text-foreground/85">
-            <UserMessageText text={shownBody} />
-          </div>
-        </details>
-      )}
-    </div>
+          `Message from ${shortSender}`
+        )
+      }
+      slot="aui_agent-message-note"
+    />
   )
 }
 
@@ -277,7 +277,7 @@ const ProcessNotificationNote: FC<{ text: string }> = ({ text }) => {
   const headline = (newline === -1 ? body : body.slice(0, newline)).trim()
   const detail = newline === -1 ? '' : body.slice(newline + 1).trim()
 
-  return <BackgroundResult process report={detail} text={headline} />
+  return <BackgroundResult process report={detail} text={processNotificationTitle(headline, detail)} />
 }
 
 function isChipOnlyTurn(hasBody: boolean, attachmentRefs: readonly string[]): boolean {

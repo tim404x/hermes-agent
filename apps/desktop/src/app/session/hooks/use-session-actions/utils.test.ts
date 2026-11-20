@@ -1573,8 +1573,9 @@ describe('appendLiveSessionProjection', () => {
 
     const inflightRow = (message: ChatMessage) => message.id === 'user-inflight-runtime-1'
 
+    // An older backend's command-quoting title reads as the job, never the command (polish 1119).
     expect(typed.filter(inflightRow).map(message => [message.role, chatMessageText(message)])).toEqual([
-      ['system', 'Background Process Finished: fixture']
+      ['system', 'Background job finished']
     ])
 
     const quoted = appendLiveSessionProjection([], {
