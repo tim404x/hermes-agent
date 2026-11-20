@@ -145,7 +145,7 @@ class PruneReclaimEstimate:
 
 @dataclass(frozen=True, slots=True)
 class SessionExportRow:
-    """One exported ``sessions`` row: the 67 columns as stored (66 upstream + the fork's ``project_pinned_at``), in table order (``model_config`` and ``origin_json`` are the stored text, flags the stored 0/1). ``system_prompt`` is resolved through the prompt store; ``tool_names`` is resolved by ``export_session`` and the stored hash in ``export_all``. ``last_active`` is set by ``export_all`` only; ``reset_from`` and ``branched_from`` are the ``_reset_from`` / ``_branched_from`` markers lifted out of ``model_config``. ``as_dict()`` is the row dict: an unset extra has no key."""
+    """One exported ``sessions`` row: the 68 columns as stored (66 upstream + the fork's ``project_pinned_at`` and ``side_window_json``), in table order (``model_config`` and ``origin_json`` are the stored text, flags the stored 0/1). ``system_prompt`` is resolved through the prompt store; ``tool_names`` is resolved by ``export_session`` and the stored hash in ``export_all``. ``last_active`` is set by ``export_all`` only; ``reset_from`` and ``branched_from`` are the ``_reset_from`` / ``_branched_from`` markers lifted out of ``model_config``. ``as_dict()`` is the row dict: an unset extra has no key."""
 
     id: SessionId
     runtime_revision: int
@@ -210,6 +210,7 @@ class SessionExportRow:
     pinned: int
     hidden: int
     project_pinned_at: Optional[float]  # fork carry "pin in project": the pin time, None when unpinned
+    side_window_json: Optional[str]  # fork carry "bot-mode side windows": the stamp text, None when no side window
     last_read_at: Optional[float]
     tool_names: Optional[str]
     transcript_revision: int

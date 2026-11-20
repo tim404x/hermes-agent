@@ -45,6 +45,7 @@ def _cells(record, **cells):
         "profile_name": record.profile_name, "transport_profile": None, "rewind_count": 0, "archived": 0,
         "auto_archived": 0, "pinned": 0, "hidden": 0,
         "project_pinned_at": None,  # fork carry "pin in project" (c5d207fc69): the pin time, None when unpinned
+        "side_window_json": None,  # fork carry "bot-mode side windows": the stamp text, None when no side window
         "last_read_at": None, "tool_names": None, "transcript_revision": 0,
         "prompt_cache_clock": None,
     }

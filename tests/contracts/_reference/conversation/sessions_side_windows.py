@@ -1,24 +1,27 @@
 """Fork carry (bot mode): the side-window stamp of the in-memory session reference, mixed into
 ``InMemorySessionRepository`` (``sessions.py``), which supplies the row storage and the record builder.
 
-The stamp is the row's ``origin`` under ``SIDE_WINDOW_KEY``, as the SQLite store keeps it in ``origin_json``
-(``persistence/sqlite/conversation/_store/side_windows.py``); semantics follow ``persistence/conversation/sessions.py``.
+The stamp is the row's own ``side_window_json`` cell, as the SQLite store keeps it
+(``persistence/sqlite/conversation/_store/side_windows.py``), never its ``origin``; a legacy stamp under
+``origin[SIDE_WINDOW_KEY]`` still reads. Semantics follow ``persistence/conversation/sessions.py``.
 """
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, Optional
 
 from persistence import SessionId
 from persistence.conversation.messages import TranscriptRead
-from persistence.conversation.sessions import (
-    SIDE_WINDOW_KEY,
-    SideWindow,
-    SideWindowMatch,
-    origin_is_side_window_only,
-    side_window_stamp,
-)
+from persistence.conversation.sessions import SideWindow, SideWindowMatch, side_window_stamp
+
+
+def _row_stamp(row: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """The row's own stamp cell, else the legacy stamp inside its origin."""
+    if row.get("side_window_json"):
+        return dict(json.loads(row["side_window_json"]))
+    return side_window_stamp(row["origin"])
 
 
 class SessionSideWindowsMixin:
@@ -32,13 +35,10 @@ class SessionSideWindowsMixin:
             row = self._table(scope).get(session_id)
             if row is None:
                 return False
-            origin = row["origin"]
-            if origin is not None and not origin_is_side_window_only(origin):
-                return False
-            kept = (side_window_stamp(origin) or {}).get("key")
+            kept = (_row_stamp(row) or {}).get("key")
             if key or kept:
                 stamp["key"] = key or kept
-            row["origin"] = {SIDE_WINDOW_KEY: stamp}
+            row["side_window_json"] = json.dumps(stamp)
         return True
 
     def _stamped(self, *, key: Optional[str], limit: int) -> list[tuple[dict[str, Any], dict[str, Any]]]:
@@ -47,7 +47,7 @@ class SessionSideWindowsMixin:
         scope = self._backend.scope
         stamped = []
         for row in self._table(scope).values():
-            stamp = side_window_stamp(row["origin"])
+            stamp = _row_stamp(row)
             if stamp is None or stamp.get("at") is None or row["archived"]:
                 continue
             if key is not None and stamp.get("key") != key:

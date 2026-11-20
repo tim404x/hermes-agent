@@ -310,7 +310,7 @@ _INHERIT_PARENT_ROUTING_SQL = (
     "UPDATE sessions\n                       SET "
     + _INHERIT_SEP.join(_inherit_col_sql(c) for c in (
         "user_id", "session_key", "chat_id", "chat_type", "thread_id", "display_name", "origin_json",
-        "transport_profile",
+        "side_window_json", "transport_profile",
     ))
     + "\n                     WHERE id = ? AND parent_session_id IS NOT NULL\n"
     "                       AND EXISTS (\n"
