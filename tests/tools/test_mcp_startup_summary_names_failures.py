@@ -6,6 +6,7 @@ retry cooldown never got a per-server WARNING at all.
 """
 
 import logging
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -60,6 +61,7 @@ def test_summary_marks_candidate_skipped_for_cooldown(caplog, _clean_registry):
 
     with mcp_tool._lock:
         mcp_tool._servers[_server_key("ok")] = SimpleNamespace(_registered_tool_names=["t1", "t2"])
+        mcp_tool._server_connect_retry_after[_server_key("cooled")] = time.monotonic() + 60
     with caplog.at_level(logging.INFO, logger="tools.mcp_tool"):
         _log_summary("  MCP:", ["ok", "cooled"])
 
