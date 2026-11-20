@@ -7,6 +7,7 @@ decided from ACTUAL starts (adversarial review, 19 Nov 2026: ghost waves, cross-
 waiters collapsing into one burst, lifecycle launches bypassing the pacer and the fan-out cap).
 """
 
+import contextvars
 import itertools
 import threading
 from types import SimpleNamespace
@@ -141,6 +142,53 @@ def test_profiles_and_provider_accounts_keep_separate_schedules(tmp_path, monkey
     stop.set()
     held.join(timeout=5)
     assert outcome == [False]
+
+
+def test_named_credential_pools_at_one_endpoint_keep_separate_schedules(monkeypatch):
+    """Two named providers at one gateway URL, each with its own credential pool (round-2 review, 19 Nov 2026):
+    account B's first child is not held 300 s behind account A's. The schedule follows the pool's name, never
+    the object, so a rebuilt pool for account A still waits behind account A."""
+    from agent.credential_pool import CredentialPool, PooledCredential
+    from tools import delegate_tool_config
+
+    url = "https://gateway.example/v1"
+    _config(f"  launch_wave_size: 1\n  launch_wave_seconds: 300\nproviders:\n  account-a:\n    api: {url}\n"
+            f"  account-b:\n    api: {url}\n")
+    schedules = waves.LaunchSchedules(clock=lambda: 0.0)
+    monkeypatch.setattr(waves, "_SCHEDULES", schedules)
+    pools: dict = {}
+    monkeypatch.setattr(delegate_tool_config, "_loaded_pool",
+                        lambda key: pools.get(key) or pools.get("custom:" + key))
+
+    def child(account: str, stop: "threading.Event | None" = None) -> _Child:
+        pool_key, key = f"custom:{account}", f"key-{account}"
+        row = PooledCredential(provider=pool_key, id=account, label=account, auth_type="api_key", priority=0,
+                               source="manual", access_token=key, base_url=url)
+        pools[pool_key] = CredentialPool(pool_key, [row])  # a new object every time: a rebuilt view of the pool
+        pool = delegate_tool_config._resolve_child_credential_pool(
+            "custom", None, url, effective_requested_provider=pool_key)
+        assert pool is pools[pool_key]  # the real resolution picked this account's own pool
+        return _Child(stop, provider="custom", requested_provider=pool_key, base_url=url, api_key=key,
+                      _credential_pool=pool)
+
+    def start(account: str) -> tuple:
+        stop, outcome = threading.Event(), []
+        built = child(account, stop)
+        thread = threading.Thread(target=contextvars.copy_context().run,
+                                  args=(lambda: outcome.append(waves.wait_for_launch_wave(built)),), daemon=True)
+        thread.start()
+        wait_until(lambda: outcome or schedules.waiting() == 1, timeout=5)
+        return stop, thread, outcome
+
+    assert waves.wait_for_launch_wave(child("account-a"))
+    for account, admitted in (("account-b", [True]), ("account-a", [])):
+        stop, thread, outcome = start(account)
+        try:
+            assert outcome == admitted, account
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+        assert not thread.is_alive()
 
 
 def test_waves_off_by_default_and_a_child_stopped_in_its_wave_wait_never_starts(monkeypatch):
