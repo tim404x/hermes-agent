@@ -681,6 +681,14 @@ export async function openBotCanonicalChat(
   owner: RosterRow | string,
   { background = false, openingStillCurrent = null, intent = 'in-place' }: OpenCanonicalChatOptions = {}
 ): Promise<{ openedId: string; registryId: string } | null> {
+  // In place only: that is the switch. A new-tab open keeps registry-first so
+  // a superseded roster row can never leave a second Bot Chat tab behind.
+  const rosterCanonical = background || intent !== 'in-place' ? null : rosterCanonicalChat(owner)
+
+  if (rosterCanonical && typeof host.openSession === 'function') {
+    return openRosterCanonicalChat(owner, rosterCanonical, { intent, openingStillCurrent })
+  }
+
   const existing = await findExistingCanonicalChat(owner)
 
   if (existing?.id && typeof host.openSession === 'function') {
@@ -718,6 +726,94 @@ export async function openBotCanonicalChat(
         openedId: String(created)
       }
     : null
+}
+
+/** The registry row the roster last reported for this bot: `canonical_session`
+ *  on `profiles.list`, resolved server-side by the same exact-title lookup. Not
+ *  a stored pointer: it is re-resolved on every roster poll and the click
+ *  re-confirms it against the registry below. */
+function rosterCanonicalChat(owner: RosterRow | string): (CanonicalChatRow & { id: string }) | null {
+  const canonical = botOwner(owner).bot?.canonical_session
+  const id = String(canonical?.id || '').trim()
+
+  return canonical && id ? { ...canonical, id } : null
+}
+
+/** Paint-first explicit open (bot-switch-speed): every click consulted the
+ *  registry BEFORE opening, so a switch to a bot whose chat this window
+ *  already held in memory still waited a full gateway round trip (plus the
+ *  "Waking up" overlay) before the cached thread could paint. The row's
+ *  `canonical_session` is the same registry row, so open it now (the session
+ *  cache paints it at once, forceResume still pulls fresh rows behind it)
+ *  while the registry lookup runs beside it. The registry stays the
+ *  authority: when it names a different row (a compression tip the roster
+ *  has not polled yet), that row is opened; when it confirms the chat is gone,
+ *  creation runs exactly as on the registry-first path. */
+async function openRosterCanonicalChat(
+  owner: RosterRow | string,
+  roster: CanonicalChatRow & { id: string },
+  { intent, openingStillCurrent }: Pick<OpenCanonicalChatOptions, 'intent' | 'openingStillCurrent'>
+): Promise<{ openedId: string; registryId: string } | null> {
+  const stillCurrent = () => !openingStillCurrent || openingStillCurrent()
+  const rosterOpenedId = String(roster.resolved_id || roster.id)
+  const registry = findExistingCanonicalChat(owner)
+  // Consumed below on every path; this only keeps an early open failure from
+  // reporting the lookup's rejection as unhandled.
+  registry.catch(() => undefined)
+
+  if (!stillCurrent()) {
+    return null
+  }
+
+  // Settles to the open's error (or null) so it can be awaited late, or never.
+  const rosterOpen = openStoredBotChat(owner, rosterOpenedId, roster, { intent }).then(
+    () => null,
+    (error: unknown) => error ?? new Error(`Could not open ${botOwner(owner).name}'s Bot Chat`)
+  )
+
+  let existing: CanonicalChatRow | null
+
+  try {
+    existing = await registry
+  } catch (error) {
+    // The lookup guards MINTING, and nothing is minted here. When the roster's
+    // own row opened, it is the server's last registry answer and stays on
+    // screen; reporting a failed open over it would also re-front the previous
+    // group chat. Without it on screen, the failure surfaces as before.
+    if (await rosterOpen) {
+      throw error
+    }
+
+    return { registryId: roster.id, openedId: rosterOpenedId }
+  }
+
+  if (!stillCurrent()) {
+    return null
+  }
+
+  if (!existing?.id) {
+    // Confirmed absence (findExistingCanonicalChat fails closed on anything
+    // less): the roster named a chat that no longer holds the title. The
+    // creation's open supersedes the roster open, so it is not awaited.
+    const created = await createCanonicalChat(owner, { openingStillCurrent })
+
+    return created ? { registryId: String(created), openedId: String(created) } : null
+  }
+
+  const openedId = String(existing.resolved_id || existing.id)
+
+  if (openedId !== rosterOpenedId) {
+    // A newer open supersedes the roster one (its wait rejects as superseded).
+    await openStoredBotChat(owner, openedId, existing, { intent })
+  } else {
+    const rosterOpenError = await rosterOpen
+
+    if (rosterOpenError) {
+      throw rosterOpenError
+    }
+  }
+
+  return { registryId: String(existing.id), openedId }
 }
 
 export async function prepareBotSource(bot: RosterRow) {
