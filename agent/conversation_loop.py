@@ -363,7 +363,13 @@ def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text
         # as assistant text the model echoes it (#81841).
         append_message(messages, {"role": "assistant", "content": visible} if visible else hidden_interrupt_placeholder_row())
     # Transcript shows the user's own words; the provider replays the scaffolded form.
-    append_message(messages, {"role": "user", "content": text, "api_content": correction})
+    _correction_row = {"role": "user", "content": text, "api_content": correction}
+    # A steer upgraded to a redirect (display.steer_cancels_model_call) carries the steer marker:
+    # keep the steer row's display kind so renderers and the alternation repair treat it as one.
+    from agent.prompt_builder import STEER_DISPLAY_KIND, STEER_MARKER_OPEN
+    if text.startswith(STEER_MARKER_OPEN):
+        _correction_row["display_kind"] = STEER_DISPLAY_KIND
+    append_message(messages, _correction_row)
 
     # Stateful scrubber for <memory-context> spans split across stream deltas (#5719).  sanitize_context()
     # alone can't survive chunk boundaries because the block regex needs both tags in one string.
