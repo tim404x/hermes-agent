@@ -128,7 +128,8 @@ class GatewayAgentCacheMixin:
                 runtime.get("base_url", ""), runtime.get("provider", ""),
                 runtime.get("requested_provider", ""), runtime.get("api_mode", ""),
                 sorted((runtime.get("capabilities") or {}).items()),
-                sorted(enabled_toolsets) if enabled_toolsets else [],
+                # [] (no toolsets) and None (every toolset) must never share a cached agent.
+                sorted(enabled_toolsets) if enabled_toolsets is not None else None,
                 # reasoning_config excluded — set per-message on the cached agent; no prompt/tool effect.
                 ephemeral_prompt or "",
                 sorted((cache_keys or {}).items()),

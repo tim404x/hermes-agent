@@ -25,6 +25,8 @@ except ImportError:  # pragma: no cover - mirrors api_server's optional import
 
 # Logger parity with the origin module (moved log records keep their name).
 logger = logging.getLogger("gateway.platforms.api_server")
+# Request-scoped effective ``X-Hermes-Toolsets`` narrowing, echoed by the SSE response headers.
+_TOOLSETS_APPLIED_REQUEST_KEY = "hermes_toolsets_applied"
 
 async def _iter_stream_items(stream_q, agent_task, response):
     """Yield agent stream items until EOS, writing SSE keepalives while idle.
@@ -961,6 +963,10 @@ class OpenAICompatRoutesMixin:
         # above still applies; it grants no internal ingress or control authority.
         if provided_session_id and body.get("hermes_notification_category") == "diagnostic":
             run_kwargs["notification_category"] = "diagnostic"
+        toolsets_narrowing = self._request_toolsets_narrowing(request)
+        if toolsets_narrowing is not None:
+            run_kwargs["toolsets_narrowing"] = toolsets_narrowing
+            request[_TOOLSETS_APPLIED_REQUEST_KEY] = toolsets_narrowing  # SSE headers, before prepare()
         if stream:
             _stream_q = ThreadSafeAsyncQueue()
             # tool_call_ids with an emitted "running": a "completed" without one (internal/
@@ -1026,7 +1032,8 @@ class OpenAICompatRoutesMixin:
         # Same #13437 identity contract as the SSE path: an explicit-header client is echoed
         # the stable id it sent; a fingerprint-derived (header-less) turn keeps reporting the
         # id the agent actually resolved, so headerless clients still learn where the turn went.
-        response_headers = {"X-Hermes-Session-Id": (provided_session_id or result.get("session_id", session_id))}
+        response_headers = {"X-Hermes-Session-Id": (provided_session_id or result.get("session_id", session_id)),
+                            **self._toolsets_applied_headers(toolsets_narrowing)}
         if gateway_session_key:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
         # Hard fail (no usable text AND a real failure) -> 502 OpenAI error envelope so SDK
@@ -1143,7 +1150,8 @@ class OpenAICompatRoutesMixin:
     ) -> web.StreamResponse:
         """Open a prepared SSE StreamResponse with CORS + session headers (the CORS middleware
         can't inject headers after ``prepare()`` flushes them, so they are resolved here)."""
-        sse_headers = self._sse_headers(request)
+        sse_headers = {**self._sse_headers(request),
+                       **self._toolsets_applied_headers(request.get(_TOOLSETS_APPLIED_REQUEST_KEY))}
         if session_id:
             sse_headers["X-Hermes-Session-Id"] = session_id
         if gateway_session_key:
