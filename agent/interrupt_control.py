@@ -129,6 +129,21 @@ def _ic_codex_method(agent, name: str):
     return method if callable(method) else None
 
 
+_MAX_STEER_CANCELS_PER_RESPONSE = 2
+
+
+def _restore_redirected_steer_parts(agent, parts) -> None:
+    """A redirect that carried steers was dropped (stop / clear) before the loop applied it: put
+    the steers back in the buffer, unsettled, so the existing drains and the hard-stop wipe treat
+    them exactly as if the timer had never fired (no loss, ``withdraw_steer`` still works)."""
+    if not parts:
+        return
+    with _ic_lock(agent, "_pending_steer_lock"):
+        for ticket, _ in parts:
+            _steer_fates(agent).pop(ticket, None)
+        _set_steer_parts(agent, list(parts) + _steer_parts(agent))
+
+
 def _steer_cancel_eligible(agent) -> bool:
     """A steer may cancel the request only while a model request is in flight, no tool is running
     and the response has not started a tool call (``_model_streaming_tool_call``, set by
@@ -137,6 +152,14 @@ def _steer_cancel_eligible(agent) -> bool:
     if _ic_codex_method(agent, "request_steer") is not None:
         return False
     if getattr(agent, "_executing_tools", False) or getattr(agent, "_model_streaming_tool_call", False):
+        return False
+    # Subagents get steers fanned out from the gateway; only the top-level turn cancels for them.
+    if int(getattr(agent, "_delegate_depth", 0) or 0) > 0:
+        return False
+    # Each cancel is a refunding redirect restart; apply_retry_restarts ends the turn after
+    # max_retries restarts without a response. Two steer cancels per response leave room for an
+    # explicit redirect; later steers wait for the normal drains.
+    if int(vars(agent).get("_steer_cancels_since_response") or 0) >= _MAX_STEER_CANCELS_PER_RESPONSE:
         return False
     active = getattr(agent, "_model_request_active", None)
     return active is not None and active.is_set()
@@ -247,6 +270,10 @@ class InterruptControlMixin:
                 _fence(), when_in_flight=False, failure_log="Compression hard-cancel fence admission failed"
             )
             self._pending_redirect = None
+            _dropped_steer_parts = vars(self).pop("_pending_redirect_steer_parts", None)
+            vars(self).pop("_pending_redirect_steer_only", None)
+        # Outside the redirect lock (lock order is steer -> redirect).
+        _restore_redirected_steer_parts(self, _dropped_steer_parts)
 
         # Codex watches a private interrupt event rather than Hermes' per-thread flag.
         _request_interrupt = _ic_codex_method(self, "request_interrupt")
@@ -304,8 +331,14 @@ class InterruptControlMixin:
             self._interrupt_requested = False
             self._interrupt_message = self._tool_interrupt_reason = None
             getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
+            _dropped_steer_parts = None
             if not preserve_redirect:
                 self._pending_redirect = None
+                _dropped_steer_parts = vars(self).pop("_pending_redirect_steer_parts", None)
+                vars(self).pop("_pending_redirect_steer_only", None)
+        # Outside the redirect lock (lock order is steer -> redirect); a hard cancel below then
+        # settles them exactly like steers that were never upgraded.
+        _restore_redirected_steer_parts(self, _dropped_steer_parts)
         self._interrupt_thread_signal_pending = False
         if self._execution_thread_id is not None:
             _set_interrupt(False, self._execution_thread_id)
@@ -384,19 +417,21 @@ class InterruptControlMixin:
             return False
         # Lock order steer -> redirect (no path takes them the other way round): the buffer is emptied
         # only when the redirect was accepted, so a drain can never see the text twice or not at all.
+        # The redirect remembers the parts, so a stop that drops it puts them back
+        # (_restore_redirected_steer_parts). Sockets are aborted after both locks are released.
         with _ic_lock(self, "_pending_steer_lock"):
             parts = _steer_parts(self)
             if not parts:
                 return False
-            from agent.prompt_builder import format_steer_marker
-
             joined = "\n".join(part_text for _, part_text in parts)
-            if not self._redirect_model_request(format_steer_marker(joined).lstrip()):
+            if not self._accept_redirect(joined, steer_parts=parts):
                 return False
             _set_steer_parts(self, [])
             for ticket, _ in parts:
                 if ticket is not None:
                     _steer_fates(self)[ticket] = True
+            self._steer_cancels_since_response = int(vars(self).get("_steer_cancels_since_response") or 0) + 1
+        self._signal_redirect()
         logger.info(
             "Steer upgraded to redirect: cancelled the in-flight model request to deliver %d message(s)",
             len(parts),
@@ -447,6 +482,16 @@ class InterruptControlMixin:
     def _redirect_model_request(self, cleaned: str) -> bool:
         """Cancel only the in-flight model request and queue ``cleaned`` as the correction the loop
         rebuilds with; False when no model request is in flight (or a hard stop is pending)."""
+        if not self._accept_redirect(cleaned):
+            return False
+        self._signal_redirect()
+        return True
+
+    def _accept_redirect(self, cleaned: str, *, steer_parts=None) -> bool:
+        """Queue ``cleaned`` as the pending correction if a model request is in flight (under the
+        redirect lock). ``steer_parts``: the steers this redirect carries (debounced steer cancel);
+        remembered so a stop that drops the redirect can put them back, and so a redirect made only
+        of steers is delivered as a steer row."""
         _model_active = getattr(self, "_model_request_active", None)
         with _ic_lock(self, "_pending_redirect_lock"):
             if _model_active is None or not _model_active.is_set():
@@ -457,11 +502,21 @@ class InterruptControlMixin:
             self._pending_redirect = (
                 f"{existing}\n\n[Additional user correction]\n{cleaned}" if existing else cleaned
             )
+            if steer_parts:
+                self._pending_redirect_steer_parts = (
+                    list(vars(self).get("_pending_redirect_steer_parts") or []) + list(steer_parts)
+                )
+            # A steer row only when every text in the redirect came from steers.
+            self._pending_redirect_steer_only = bool(steer_parts) and (
+                not existing or bool(vars(self).get("_pending_redirect_steer_only"))
+            )
             self._interrupt_requested = True
             self._interrupt_message = None
             self._turn_user_intervened = True
+        return True
 
-        # Interrupt only the model request — no fan-out to tool workers / child agents as interrupt() does.
+    def _signal_redirect(self) -> None:
+        """Interrupt only the model request: no fan-out to tool workers / child agents as interrupt() does."""
         _execution_thread_id = getattr(self, "_execution_thread_id", None)
         if _execution_thread_id is not None:
             _set_interrupt(True, _execution_thread_id)
@@ -469,7 +524,6 @@ class InterruptControlMixin:
         else:
             self._interrupt_thread_signal_pending = True
         _ic_abort_active_request(self, "redirect_abort", "Failed to abort request for redirect")
-        return True
 
     def _has_pending_redirect(self) -> bool:
         """Return whether an active-turn redirect is waiting to be applied."""
@@ -481,6 +535,9 @@ class InterruptControlMixin:
         with _ic_lock(self, "_pending_redirect_lock"):
             text = _ic_slot(self, "_pending_redirect_lock", "_pending_redirect")
             self._pending_redirect = None
+            vars(self).pop("_pending_redirect_steer_parts", None)
+            # Read once by _apply_active_turn_redirect: deliver as a steer row.
+            self._applied_redirect_steer_only = bool(vars(self).pop("_pending_redirect_steer_only", False) and text)
         return text
 
     def _drain_pending_steer(self) -> Optional[str]:
