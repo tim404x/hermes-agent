@@ -294,8 +294,18 @@ def _undeclared_error(provider: DelegationProvider, index: int, names: list[str]
             f"{listed}; if this session's delegate_task tool offers {listed}, {fix}.")
 
 
+def _inherited_effort(parent_agent: Any, config: Mapping[str, Any]) -> str:
+    """The level a child runs at when its route sets no ``reasoning_effort``, as the provider reads it
+    (``task["inherited_effort"]``): a level name, ``"none"`` when thinking is off, ``""`` for the provider default."""
+    from tools.delegate_tool_config import _child_reasoning
+    reasoning = _child_reasoning(parent_agent, dict(config), None)
+    if not isinstance(reasoning, dict):
+        return ""
+    return "none" if reasoning.get("enabled") is False else str(reasoning.get("effort") or "").strip().lower()
+
+
 def _route_one(provider: DelegationProvider, declared: dict[str, dict[str, Any]], index: int,
-               task: Mapping[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
+               task: Mapping[str, Any], config: Mapping[str, Any], inherited_effort: str = "") -> dict[str, Any]:
     undeclared = sorted(name for name, value in task.items()
                         if value is not None and name not in declared and name not in RESERVED_TASK_PARAMETERS)
     if undeclared:
@@ -305,7 +315,8 @@ def _route_one(provider: DelegationProvider, declared: dict[str, dict[str, Any]]
         error = _param_error(index, name, value, declared[name])
         if error:
             raise DelegationRouteError(error)
-    payload = {"goal": task.get("goal"), "context": task.get("context"), "index": index, **params}
+    payload = {"goal": task.get("goal"), "context": task.get("context"), "index": index,
+               "inherited_effort": inherited_effort, **params}
     try:
         return _clean_route(provider.name, provider.route_task(payload, config))
     except DelegationRouteError as exc:
@@ -329,11 +340,12 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
     except DelegationRouteError as exc:
         return [], str(exc)
     declared = _declared_parameters(provider, config)
+    inherited_effort = _inherited_effort(parent_agent, config)
     cache: dict[str, TaskRoute] = {}
     routes: list[TaskRoute] = []
     for i, task in enumerate(task_list):
         try:
-            route = _route_one(provider, declared, i, task, config)
+            route = _route_one(provider, declared, i, task, config, inherited_effort)
             _check_backend_effort(i, route, config)
             request = {name: task[name] for name in declared if task.get(name) is not None}
             routes.append(replace(_route_to_task_route(route, parent_agent, cache, config, provider.name),
