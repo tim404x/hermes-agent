@@ -19,19 +19,22 @@ keeps each answer under the store files' signature:
   second commit inside the same timestamp tick, rewriting the WAL in place at the same size, could otherwise
   hide behind the first one. A store that committed in the last 2 s is simply read again, exactly as before;
 - the signature is taken BEFORE the read, so a kept answer is never older than the signature it is kept under;
-- **every kept answer expires after** ``_MAX_AGE_S``: a WAL commit is written first and published in ``-shm``
-  only after its fsync, which moves no stat. A fsync stalled past the racy window lets a read see the WAL
-  settled but the commit not yet visible; the age cap bounds that (rare) case to seconds, not until the next
-  commit.
+- **an answer kept while the WAL held frames expires after** ``_MAX_AGE_S``: a WAL commit is written first
+  and published in ``-shm`` only after its fsync (``synchronous=FULL``), which moves no stat. A writer stalled
+  past the racy window there lets a read see the WAL settled but the commit not yet visible; the age cap bounds
+  that (rare) case to seconds, not until the next commit. With no WAL frames nothing can be pending, so those
+  answers live until the store moves.
 
 Only read-only holders (the browse handles) use it: a writer's own uncommitted or just-committed rows are its
 own business, reads inside ``transcript_read_snapshot`` or an open transaction see their own generation, and a
-holder still reading a store file that has since been replaced at its path reads that file, never the memo's.
-Only compact listings are kept (full rows carry ~50 KB of system prompt each); the Desktop's are all compact.
+holder still reading a store file that has since been replaced at its path (or whose file identity is unknown)
+reads that file, never the memo's. Only compact listings are kept (full rows carry ~50 KB of system prompt
+each); the Desktop's are all compact.
 
 Kept answers are shared, so they are immutable: frozen listing entries whose ``model_config`` / ``origin``
-mappings refuse mutation (copy them first), ints, and the lineage projection is copied out per caller.
-``HERMES_LISTING_MEMO=0`` turns every lookup into a plain read.
+mappings refuse mutation, ints, and the lineage projection is copied out per caller. Every compact listing a
+read-only handle returns has those immutable mappings, kept or not, so a consumer that mutates one fails in its
+first test rather than only in production. ``HERMES_LISTING_MEMO=0`` turns every lookup into a plain read.
 """
 
 from __future__ import annotations
@@ -89,7 +92,11 @@ def store_signature(db_path) -> Optional[tuple]:
     """The committed-content signature of the store at *db_path*, or None when it cannot vouch for one."""
     if db_path is None:
         return None
-    path = os.path.realpath(db_path)  # SQLite puts the -wal beside the symlink's target
+    return _signature(os.path.realpath(db_path))  # SQLite puts the -wal beside the symlink's target
+
+
+def _signature(path: str) -> Optional[tuple]:
+    """``store_signature`` of an already resolved store path: ``((dev, ino), db parts, wal parts)``."""
     now_ns = _now_ns()
     wal = _file_parts(f"{path}-wal", now_ns, wal=True)  # before the store file: see the module docstring
     if wal is None:
@@ -97,7 +104,8 @@ def store_signature(db_path) -> Optional[tuple]:
     db = _file_parts(path, now_ns, wal=False)
     if not db:
         return None
-    return db, wal
+    dev, _mtime, _size, ino = db[:4]  # (st_dev, *utils.file_signature): mtime, size, ino, ctime
+    return (dev, ino), db, wal
 
 
 def _memo_store(holder) -> Optional[str]:
@@ -117,30 +125,36 @@ def _memo_store(holder) -> Optional[str]:
 
 
 def _reads_this_file(holder, signature: tuple) -> bool:
-    """Whether *holder* still reads the file now at its path (a replaced store keeps old handles on the old one).
-    ``signature[0]`` starts with the store file's ``(st_dev, st_mtime_ns, st_size, st_ino, ...)``."""
+    """Whether *holder* provably reads the file now at its path: a replaced store keeps old handles on the old
+    file, and a holder whose file identity is unknown cannot tell."""
     opened = getattr(holder, "_db_file_identity", None)
-    if opened is None:
-        return True
-    dev, _mtime, _size, ino = signature[0][:4]
-    return tuple(opened) == (dev, ino)
+    return opened is not None and tuple(opened) == signature[0]
+
+
+def _fresh(kept: tuple, signature: tuple, now: float) -> bool:
+    if kept[0] != signature:
+        return False
+    # Frames in the WAL: one of them could have been published after the read (see the module docstring).
+    return signature[2] == () or now - kept[3] < _MAX_AGE_S
 
 
 def memoized(holder, kind: str, key: tuple, compute: Callable[[], T],
              keep: Optional[Callable[[T], T]] = None, weigh: Optional[Callable[[T], int]] = None) -> T:
     """``compute()``, or the answer it gave for *key* on this store while the store has not moved since.
-    ``keep`` makes an answer safe to share (it is what every caller gets); ``weigh`` counts its rows."""
+    ``keep`` makes an answer safe to share: every read-only caller gets its result, kept or not. ``weigh``
+    counts an answer's rows."""
     store = _memo_store(holder)
     if store is None:
         return compute()
-    signature = store_signature(store)  # BEFORE the read: the answer is at least this new
+    signature = _signature(store)  # BEFORE the read: the answer is at least this new
     if signature is None or not _reads_this_file(holder, signature):
-        return compute()
+        answer = compute()
+        return keep(answer) if keep is not None else answer
     slot = (store, kind, key)
     now = time.monotonic()
     with _lock:
         hit = _memo.get(slot)
-        if hit is not None and hit[0] == signature and now - hit[3] < _MAX_AGE_S:
+        if hit is not None and _fresh(hit, signature, now):
             _memo.move_to_end(slot)
             return hit[1]
     answer = compute()
@@ -181,8 +195,9 @@ def _refuse(self, *args, **kwargs):
 
 
 class SharedMapping(dict):
-    """A ``dict`` that refuses mutation: reads, ``isinstance(x, dict)`` and JSON encoding work as before;
-    ``dict(x)`` / ``copy`` / ``deepcopy`` / pickling give a plain, mutable copy."""
+    """A ``dict`` that refuses mutation: reads, ``isinstance(x, dict)`` and JSON encoding work as before.
+    ``copy.deepcopy`` and pickling give plain, mutable containers all the way down; ``dict(x)``, ``x.copy()``,
+    ``copy.copy`` and ``x | y`` are shallow: the top level is a plain dict, nested values stay shared."""
 
     __slots__ = ()
     __setitem__ = __delitem__ = __ior__ = _refuse
@@ -228,17 +243,18 @@ def _shared(value):
 
 
 def shared_entries(entries: tuple) -> tuple:
-    """Listing entries made safe to hand to every caller: the session's mappings refuse mutation."""
-    out = []
+    """Freshly read listing entries made safe to hand to every caller: their sessions' ``model_config`` and
+    ``origin`` refuse mutation. In place: nobody holds these entries yet, and copying a 76-field frozen record
+    per row cost the miss path ~40 us a row."""
     for entry in entries:
         session = getattr(entry, "session", None)
         if session is None or isinstance(session, type) or not dataclasses.is_dataclass(session):
-            out.append(entry)
             continue
-        changes = {name: _shared(getattr(session, name)) for name in ("model_config", "origin")
-                   if isinstance(getattr(session, name, None), (dict, list))}
-        out.append(dataclasses.replace(entry, session=dataclasses.replace(session, **changes)) if changes else entry)
-    return tuple(out)
+        for name in ("model_config", "origin"):
+            value = getattr(session, name, None)
+            if isinstance(value, (dict, list)) and not isinstance(value, (SharedMapping, SharedList)):
+                object.__setattr__(session, name, _shared(value))  # a frozen dataclass: set past its guard
+    return entries
 
 
 def clear() -> None:
