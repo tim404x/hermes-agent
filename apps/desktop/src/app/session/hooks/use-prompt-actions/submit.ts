@@ -364,9 +364,37 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       const heldStoredSessionId = options?.storedSessionId ?? selectedStoredSessionIdRef.current
 
       if (hasSubmitHold(heldStoredSessionId)) {
+        // The foreground as the user sent it. Every later step of this
+        // pipeline reads the LIVE refs, so a same-id verdict that lands after
+        // the user moved to another chat would bind (and upload attachments
+        // to) that chat (switch-fix2-1119). An explicit destination other
+        // than the chat on screen is a background send and keeps its target.
+        const heldRouteToken = getRouteToken()
+        const heldSelectedStoredId = selectedStoredSessionIdRef.current
+        const heldInForeground = !options?.storedSessionId || options.storedSessionId === heldSelectedStoredId
+
         const verdict = await awaitSubmitConfirmation(heldStoredSessionId)
 
         if (verdict.kind === 'unconfirmed') {
+          return false
+        }
+
+        if (
+          verdict.kind === 'confirmed' &&
+          verdict.storedSessionId === heldStoredSessionId &&
+          heldInForeground &&
+          sessionContextDrift({
+            startRouteToken: heldRouteToken,
+            nowRouteToken: getRouteToken(),
+            startSelectedStoredId: heldSelectedStoredId,
+            nowSelectedStoredId: selectedStoredSessionIdRef.current,
+            submitTargetStoredId: heldStoredSessionId
+          })
+        ) {
+          // Refused before any write: the composer keeps the words in the
+          // chat they were typed for.
+          notify({ kind: 'info', message: copy.heldSendNotSent })
+
           return false
         }
 
