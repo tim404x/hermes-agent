@@ -160,3 +160,36 @@ def test_a_silent_wake_in_any_desktop_session_never_paints_the_marker(monkeypatc
     assert _run("process_complete") == ("", "")
     assert _run("internal_notification") == ("", "")
     assert _run(None) == ("NO_REPLY", "NO_REPLY")
+
+
+def test_a_silent_completion_is_marked_so_clients_skip_the_toast_sound_and_unread_dot(monkeypatch):
+    """message.complete says ``silent: true`` when the turn chose silence where it may (a machinery wake or
+    the Bot Chat): the desktop must not toast "Message complete.", beep or light the unread dot for a turn
+    nobody will see. A real reply, a human turn's marker in a plain session, and a failed turn carry no mark."""
+    events = []
+    monkeypatch.setattr(srv, "_emit", lambda event, _sid, payload=None: events.append((event, payload)))
+    monkeypatch.setattr(srv, "_load_interim_assistant_messages", lambda: False)
+    monkeypatch.setattr(srv, "_start_usage_ticker", lambda _sid, _agent: (SimpleNamespace(set=lambda: None), SimpleNamespace(join=lambda: None)))
+    monkeypatch.setattr(srv, "_get_usage", lambda _agent: {})
+    monkeypatch.setattr(srv, "render_message", lambda _text, _cols: None)
+    monkeypatch.setattr(srv, "_clear_inflight_turn", lambda _session: None)
+
+    def _run(display_kind, reply, title="Scratch"):
+        monkeypatch.setattr(srv, "_session_live_title", lambda _s, _k: title)
+
+        def run_conversation(_message, **kwargs):
+            kwargs["stream_callback"](reply)
+            return {"final_response": reply}
+
+        agent = SimpleNamespace(_session_title_hint=title, run_conversation=run_conversation)
+        session = {"pending_title": None, "session_key": "k", "history_lock": contextlib.nullcontext(), "agent": agent}
+        st = srv._TurnRun(agent=agent, one_turn_restore=None, terminal_callback=None, receipt_committed=True)
+        srv._invoke_agent("sid", session, st, "wake", "wake", None, [], display_kind, None)
+        payload, _, _ = srv._complete_turn_payload(session, st, None, 80)
+        return payload
+
+    assert _run("process_complete", "NO_REPLY \u26a1")["silent"] is True
+    assert _run(None, "NO_REPLY", title="Bot Chat")["silent"] is True
+    assert "silent" not in _run("process_complete", "Build failed: 3 tests.")
+    assert "silent" not in _run(None, "NO_REPLY")
+    assert "silent" not in _run("process_complete", "Paris.\n\nNO_REPLY")

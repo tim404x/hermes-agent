@@ -49,8 +49,24 @@ NOTIFICATION_NO_REPLY_EXIT = "notification_no_reply"
 # nameable; never a client-chosen presentation such as ``hidden``.
 PRODUCER_CARD_KINDS = frozenset({INTERNAL_NOTIFICATION_DISPLAY_KIND, *PRODUCER_NOTICE_DISPLAY_KINDS, "plugin_card"})
 
-# Longer than any marker could plausibly be, even with stray punctuation.
+# Longer than any marker could plausibly be, even with stray punctuation. Counted in code points.
 _MARKER_LENGTH_CAP = 64
+
+# The machine tokens a model emits on purpose (never ordinary words). Only these may carry a sign-off
+# wrapping (``NO_REPLY ⚡``, ``✅ NO_REPLY``, ``NO_REPLY 1️⃣``); the natural words ``Silent`` / ``No reply`` /
+# ``静默`` keep the punctuation-only rule, so ``No reply 😕`` stays a person's answer on every platform.
+_MACHINE_SILENCE_MARKERS = frozenset({"NO_REPLY", "[SILENT]", "[静默]", "[沉默]"})
+
+# Emoji blocks taken by range, not by unicodedata category: a sign-off from a Unicode newer than the
+# runtime's tables (``🩷`` is Cn on Python 3.11) must read the same here and in the desktop twin.
+_SIGNOFF_EMOJI_RANGES = ((0x1F000, 0x1FAFF), (0x2600, 0x27BF))
+# Symbol/format/mark categories the rest of a sign-off is built from (``™``, the variation selector
+# and ZWJ inside ``✈️`` or a family emoji). Never ``Sk``: a backtick quotes a value (```NO_REPLY```
+# is content); skin tones sit in the emoji ranges above.
+_EDGE_SIGNOFF_CATEGORIES = frozenset({"So", "Cf", "Mn"})
+# A keycap emoji (``1️⃣``) is its base character, an optional variation selector and U+20E3.
+_KEYCAP_BASES = frozenset("0123456789#*")
+_KEYCAP = "\u20e3"
 
 
 def _strip_format_characters(text: str) -> str:
@@ -85,38 +101,76 @@ def _canonical_silence_candidate(text: str) -> str:
     return _strip_bracket_padding(" ".join(_strip_format_characters(text).strip().upper().split()))
 
 
-# Symbol/format/mark categories a bot's sign-off emoji is built from (``⚡``, ``✈️`` = symbol +
-# variation selector, ZWJ sequences, skin tones): ``NO_REPLY ⚡`` is still the silence verdict.
-_EDGE_SIGNOFF_CATEGORIES = frozenset({"So", "Sk", "Cf", "Mn"})
-
-
 def _is_edge_punctuation(ch: str) -> bool:
     # Square brackets stay structural so malformed ``[SILENT`` cannot become ``SILENT``.
+    return ch not in "[]" and unicodedata.category(ch).startswith("P")
+
+
+def _is_edge_signoff(ch: str) -> bool:
     if ch in "[]":
         return False
+    if any(lo <= ord(ch) <= hi for lo, hi in _SIGNOFF_EMOJI_RANGES):
+        return True
     category = unicodedata.category(ch)
     return ch.isspace() or category.startswith("P") or category in _EDGE_SIGNOFF_CATEGORIES
 
 
-def _strip_edge_silence_punctuation(text: str) -> str:
-    """Strip stray edge punctuation and sign-off emoji (``.NO_REPLY``, ``*NO_REPLY*``, ``NO_REPLY ⚡``)
-    without erasing marker structure."""
+def _strip_edges(text: str, is_noise) -> str:
     start, end = 0, len(text)
-    while start < end and _is_edge_punctuation(text[start]):
+    while start < end and is_noise(text[start]):
         start += 1
-    while end > start and _is_edge_punctuation(text[end - 1]):
+    while end > start and is_noise(text[end - 1]):
         end -= 1
     return text[start:end].strip()
 
 
-def _canonical_silence_candidates(text: Any) -> tuple[str, ...]:
-    """Canonical forms of a short marker-sized response; ``()`` when not a candidate at all."""
+def _keycap_from(text: str, i: int, end: int) -> int:
+    """Length of the keycap sequence starting at ``i`` (``1``, optional U+FE0F, U+20E3), else 0."""
+    if i < end and text[i] in _KEYCAP_BASES:
+        j = i + 1 + (i + 1 < end and text[i + 1] == "\ufe0f")
+        if j < end and text[j] == _KEYCAP:
+            return j + 1 - i
+    return 0
+
+
+def _keycap_until(text: str, start: int, end: int) -> int:
+    """Length of the keycap sequence ending at ``end``, else 0."""
+    if end > start and text[end - 1] == _KEYCAP:
+        k = end - 1 - (end - 2 >= start and text[end - 2] == "\ufe0f")
+        if k - 1 >= start and text[k - 1] in _KEYCAP_BASES:
+            return end - (k - 1)
+    return 0
+
+
+def _strip_signoff_edges(text: str) -> str:
+    """Strip a sign-off emoji wrapping, keycaps included, from both ends; a bare digit stays text."""
+    start, end = 0, len(text)
+    while start < end:
+        step = 1 if _is_edge_signoff(text[start]) else _keycap_from(text, start, end)
+        if not step:
+            break
+        start += step
+    while end > start:
+        step = 1 if _is_edge_signoff(text[end - 1]) else _keycap_until(text, start, end)
+        if not step:
+            break
+        end -= step
+    return text[start:end].strip()
+
+
+def _canonical_silence_candidates(text: Any) -> tuple[tuple[str, frozenset[str]], ...]:
+    """``(canonical form, markers it may match)`` for a short marker-sized response; ``()`` when not a
+    candidate at all. Stray edge punctuation (``.NO_REPLY``, ``*NO_REPLY*``) may wrap any marker; a
+    sign-off emoji or code span only a machine token."""
     stripped = text.strip() if isinstance(text, str) else ""
     if not 0 < len(stripped) <= _MARKER_LENGTH_CAP:
         return ()
-    depunctuated = _strip_edge_silence_punctuation(stripped)
-    forms = (stripped,) if depunctuated == stripped else (stripped, depunctuated)
-    return tuple(_canonical_silence_candidate(f) for f in forms)
+    forms = (
+        (stripped, LIVE_GATEWAY_SILENT_MARKERS),
+        (_strip_edges(stripped, _is_edge_punctuation), LIVE_GATEWAY_SILENT_MARKERS),
+        (_strip_signoff_edges(stripped), _MACHINE_SILENCE_MARKERS),
+    )
+    return tuple((_canonical_silence_candidate(form), markers) for form, markers in forms)
 
 
 def is_intentional_silence_response(response: Any) -> bool:
@@ -125,7 +179,7 @@ def is_intentional_silence_response(response: Any) -> bool:
     Prose that merely mentions ``NO_REPLY`` must be delivered normally. A blank
     response is not silence either — that is the empty-response failure path.
     """
-    return any(c in LIVE_GATEWAY_SILENT_MARKERS for c in _canonical_silence_candidates(response))
+    return any(c in markers for c, markers in _canonical_silence_candidates(response))
 
 
 def _split_trailing_line(text: str) -> tuple[str, str]:
@@ -389,6 +443,6 @@ def is_partial_silence_marker(text: Any) -> bool:
     from every marker, or exceeding the cap, resumes normal streaming.
     """
     return any(
-        c and any(marker.startswith(c) for marker in LIVE_GATEWAY_SILENT_MARKERS)
-        for c in _canonical_silence_candidates(text)
+        c and any(marker.startswith(c) for marker in markers)
+        for c, markers in _canonical_silence_candidates(text)
     )

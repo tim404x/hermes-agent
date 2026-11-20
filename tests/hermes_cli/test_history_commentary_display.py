@@ -146,7 +146,7 @@ class _FakeStore:
 
         page = PromptPage(messages=(_WireRow(row),), row_id=1, limit=120, returned=1, offset=0, total=1,
                           has_older=False, has_newer=False)
-        self.sessions = SimpleNamespace(resolve_id=lambda sid: sid)
+        self.sessions = SimpleNamespace(resolve_id=lambda sid: sid, get_title=lambda sid: None)
         self.lineage = SimpleNamespace(resolve_resume_target=lambda sid: sid)
         self.messages = SimpleNamespace(read_transcript=lambda *args, **kwargs: (_WireRow(row),),
                                         read_prompt_page=lambda *args, **kwargs: page)
