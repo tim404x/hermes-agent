@@ -1,3 +1,9 @@
+import { useStore } from '@nanostores/react'
+import { act, cleanup, render } from '@testing-library/react'
+import { useEffect, useRef, useState } from 'react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { ChatSwitchIndicator } from '@/app/chat/chat-switch-indicator'
 /**
  * Switching between two bots is a warm switch, not a reload.
  *
@@ -15,13 +21,7 @@
  * still landing new rows, no duplicate rows, and a live turn on A still
  * streaming after the round trip.
  */
-
-import { useStore } from '@nanostores/react'
-import { act, cleanup, render } from '@testing-library/react'
-import { useEffect, useRef, useState } from 'react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-
-import { ChatSwapOverlay } from '@/app/chat/chat-swap-overlay'
+import { useComposerSubmit } from '@/app/chat/composer/hooks/use-composer-submit'
 import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
 import type * as OpenSessionModule from '@/app/open-session'
 import { getLatestSessionMessages, getSession } from '@/hermes'
@@ -36,6 +36,7 @@ import {
 } from '@/store/gateway'
 import { $notifications } from '@/store/notifications'
 import { $gatewaySwapTarget, ensureGatewayAgent, ensureGatewayProfile } from '@/store/profile'
+import { $busy } from '@/store/session'
 import {
   $activeSessionId,
   $freshDraftReady,
@@ -53,9 +54,12 @@ import {
   setSessions,
   setUnlistedSessionOwnerRows
 } from '@/store/session'
+import { hasSubmitHold } from '@/store/session-open-confirmation'
 import { clearSubmitHolds } from '@/store/session-open-confirmation'
+import { isLiveTurnAwaitingEvents } from '@/store/session-states'
 import { clearAllSessionStates } from '@/store/session-states'
 
+import { usePromptActions } from './use-prompt-actions'
 import { useSubmitPrompt } from './use-prompt-actions/submit'
 import { useRouteResume } from './use-route-resume'
 import { useSessionActions } from './use-session-actions'
@@ -181,6 +185,12 @@ const trace: Trace = { calls: [], overlay: [], published: [] }
 const seenNotices: Array<{ action?: string; text: string }> = []
 
 /** prompt.submit calls the fake backend admitted. */
+const corrections: Array<{ at: number; method: string; session_id: string; text: string }> = []
+let typeAndSend: (text: string) => void
+const attachmentTargets: Array<{ id: string; options: unknown; attachments: unknown }> = []
+let realSubmit: ReturnType<typeof usePromptActions>['submitText']
+const attachRequests: Array<Record<string, unknown>> = []
+
 const sent: Array<{ at: number; session_id: string; text: string }> = []
 
 /** Methods (RPC names, or 'rest') the fake backend fails, and how many more
@@ -302,6 +312,18 @@ function backend(method: string, params: Record<string, unknown> = {}): Promise<
       }))
     }
 
+    case 'file.attach':
+      attachRequests.push({ ...params, at: Date.now() })
+
+      return later(LATENCY.rpc, () => ({ attached: true, ref_text: '@file:attached/atlas.txt' }))
+
+    case 'session.redirect':
+
+    case 'session.steer':
+      corrections.push({ at: Date.now(), method, session_id: String(params.session_id), text: String(params.text) })
+
+      return later(LATENCY.rpc, () => ({ status: 'redirected' }))
+
     case 'prompt.submit':
       return later(LATENCY.rpc, () => {
         sent.push({ at: Date.now(), session_id: String(params.session_id), text: String(params.text) })
@@ -366,7 +388,9 @@ function AppHarness({ onReady }: { onReady: (cache: ReturnType<typeof useSession
   const sessionResumeRequest = useStore($sessionResumeRequest)
   const resumeFailedSessionId = useStore($resumeFailedSessionId)
   const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
-  const busyRef = useRef(false)
+  const liveBusy = useStore($busy)
+  const busyRef = useRef(liveBusy)
+  busyRef.current = liveBusy
   const creatingSessionRef = useRef(false)
   const path = useRoutePath()
   const pathRef = useRef(path)
@@ -424,9 +448,76 @@ function AppHarness({ onReady }: { onReady: (cache: ReturnType<typeof useSession
     resumeStoredSession: actions.resumeSession,
     runtimeIdByStoredSessionIdRef: cache.runtimeIdByStoredSessionIdRef,
     selectedStoredSessionIdRef: cache.selectedStoredSessionIdRef,
-    syncAttachmentsForSubmit: async (id: string, attachments: never[]) => ({ attachments, sessionId: id }),
+    syncAttachmentsForSubmit: async (id: string, attachments: never[], options: unknown) => {
+      attachmentTargets.push({ id, attachments, options })
+
+      return { attachments, sessionId: id }
+    },
     updateSessionState: cache.updateSessionState
   } as never)
+
+  const promptActions = usePromptActions({
+    activeSessionId,
+    activeSessionIdRef: cache.activeSessionIdRef,
+    busyRef,
+    branchCurrentSession: async () => false,
+    createBackendSessionForSend: async () => {
+      throw new Error('unexpected create')
+    },
+    getRoutedStoredSessionId: () => routedIdRef.current,
+    getRuntimeIdForStoredSession: (id: string) => cache.runtimeIdByStoredSessionIdRef.current.get(id) ?? null,
+    getRouteToken: () => pathRef.current,
+    handleSkinCommand: () => '',
+    openMemoryGraph: () => undefined,
+    refreshSessions: async () => undefined,
+    requestGateway: ((method: string, params?: Record<string, unknown>) => backend(method, params)) as never,
+    resumeStoredSession: actions.resumeSession,
+    runtimeIdByStoredSessionIdRef: cache.runtimeIdByStoredSessionIdRef,
+    selectedStoredSessionIdRef: cache.selectedStoredSessionIdRef,
+    startFreshSessionDraft: () => undefined,
+    sttEnabled: false,
+    updateSessionState: cache.updateSessionState
+  })
+
+  realSubmit = promptActions.submitText
+  const draft = useRef('')
+
+  const composer = useComposerSubmit({
+    activeQueueSessionKey: selectedStoredSessionId,
+    activeQueueSessionKeyRef: { current: selectedStoredSessionId },
+    attachments: [],
+    busy: liveBusy,
+    busyInputMode: 'interrupt',
+    clearDraft: () => {
+      draft.current = ''
+    },
+    disabled: false,
+    draftScopeRef: { current: selectedStoredSessionId },
+    draftRef: draft,
+    drainNextQueued: async () => false,
+    editorRef: { current: null },
+    exitQueuedEdit: () => false,
+    focusInput: () => undefined,
+    inputDisabled: false,
+    loadIntoComposer: () => undefined,
+    onCancel: promptActions.cancelRun,
+    onSteer: promptActions.redirectPrompt,
+    onSteerHidden: promptActions.injectHiddenPrompt,
+    onSubmit: submit,
+    queueCurrentDraft: () => {
+      throw new Error('unexpected queue')
+    },
+    queueEdit: null,
+    queuedPrompts: [],
+    sessionId: activeSessionId,
+    setComposerText: () => undefined,
+    stashAt: () => undefined
+  })
+
+  typeAndSend = text => {
+    draft.current = text
+    composer.submitDraft()
+  }
 
   useRouteResume({
     activeSessionId,
@@ -516,11 +607,11 @@ const primaryText = () => JSON.stringify(PRIMARY_SESSION_VIEW.$messages.get())
 let cache!: ReturnType<typeof useSessionStateCache>
 let submit!: ReturnType<typeof useSubmitPrompt>
 let container: HTMLElement | null = null
-/** Virtual ms the rendered "Waking up" overlay was visible (opacity-100). */
+/** Virtual ms the rendered switch indicator showed chrome (its slow/stalled rungs). */
 let overlayMs = 0
 
 function SwapOverlayProbe() {
-  return <ChatSwapOverlay profile={useStore($gatewaySwapTarget)} />
+  return <ChatSwitchIndicator failure={null} syncing={null} target={useStore($gatewaySwapTarget)} />
 }
 
 let unlisten: Array<() => void> = []
@@ -582,7 +673,7 @@ async function advance(ms: number, step = 4) {
       await vi.advanceTimersByTimeAsync(slice)
     })
 
-    if (container?.querySelector('.opacity-100')) {
+    if (container?.querySelector('[data-switch-state="slow"], [data-switch-state="stalled"]')) {
       overlayMs += slice
     }
   }
@@ -1096,5 +1187,156 @@ describe('the open is judged on the target transcript (switch-fix-1119)', () => 
     const cleared = trace.overlay.find(entry => entry.at >= clickedAt && entry.value === null)
     expect(cleared!.at - clickedAt).toBeGreaterThanOrEqual(apexPainted!)
     expect(overlayMs).toBeGreaterThan(0)
+  })
+})
+
+describe('a held send only ever reaches the confirmed chat (switch-fix2-1119)', () => {
+  const runAtlasTurn = () =>
+    act(() =>
+      cache.updateSessionState(
+        bots.atlas!.runtimeId,
+        state => ({ ...state, awaitingResponse: true, busy: true, streamId: 'live-atlas' }),
+        bots.atlas!.storedId
+      )
+    )
+
+  it('holds a busy Send until the registry answers, then runs it in the confirmed Bot Chat', async () => {
+    corrections.length = 0
+    bots.atlas!.running = true
+    await mount()
+    await clickBot(bots.atlas!, 9_000)
+    runAtlasTurn()
+    await clickBot(bots.apex!, 9_000)
+    const { old, oldRoster } = displaceAtlasChat()
+
+    act(() => {
+      void openRosterBot(oldRoster)
+    })
+    await advance(40)
+    expect($activeSessionId.get()).toBe(old.runtimeId)
+    expect($busy.get()).toBe(true)
+    expect(isLiveTurnAwaitingEvents(cache.sessionStateByRuntimeIdRef.current.get(old.runtimeId))).toBe(true)
+    expect(hasSubmitHold(old.storedId)).toBe(true)
+
+    act(() => typeAndSend('CORRECTION FOR THE CURRENT BOT CHAT'))
+    await advance(300)
+    // Nothing reached the displaced runtime while the registry was answering.
+    expect(corrections).toEqual([])
+    expect(sent).toEqual([])
+
+    await advance(9_000)
+    expect($selectedStoredSessionId.get()).toBe('atlas-current')
+    expect(corrections).toEqual([])
+    // The confirmed chat is idle, so the words run there as its next turn.
+    expect(sent.map(entry => entry.session_id)).toEqual(['rt-atlas-current'])
+    expect(primaryText()).toContain('CORRECTION FOR THE CURRENT BOT CHAT')
+  })
+
+  it('redirects the live turn once the registry confirms the same chat', async () => {
+    corrections.length = 0
+    bots.atlas!.running = true
+    await mount()
+    await clickBot(bots.atlas!, 9_000)
+    runAtlasTurn()
+    await clickBot(bots.apex!, 9_000)
+
+    act(() => {
+      void openRosterBot(roster(bots.atlas!))
+    })
+    await advance(40)
+    expect($busy.get()).toBe(true)
+    expect(hasSubmitHold(bots.atlas!.storedId)).toBe(true)
+
+    act(() => typeAndSend('steer the running atlas turn'))
+    await advance(40)
+    expect(corrections).toEqual([])
+
+    await advance(3_000)
+    expect(corrections.map(entry => [entry.method, entry.session_id])).toEqual([
+      ['session.redirect', bots.atlas!.runtimeId]
+    ])
+    expect(sent).toEqual([])
+  })
+
+  it('refuses a held send the user navigated away from, before uploading its attachment', async () => {
+    attachRequests.length = 0
+    const desktop = window.hermesDesktop
+
+    window.hermesDesktop = {
+      ...desktop,
+      getStagedFileForAttach: () => undefined,
+      readFileDataUrlForAttach: async () => 'data:text/plain;base64,U0VDUkVU'
+    } as never
+
+    try {
+      await mount()
+      await clickBot(bots.atlas!, 9_000)
+      await clickBot(bots.apex!, 9_000)
+
+      act(() => {
+        void openRosterBot(roster(bots.atlas!))
+      })
+      await advance(40)
+      expect(hasSubmitHold(bots.atlas!.storedId)).toBe(true)
+      let accepted: boolean | undefined
+
+      act(() => {
+        void realSubmit('PRIVATE ATLAS FILE', {
+          attachments: [
+            {
+              id: 'private-atlas',
+              kind: 'file',
+              label: 'atlas.txt',
+              path: '/private/atlas.txt',
+              refText: '@file:/private/atlas.txt'
+            } as never
+          ],
+          composerScope: bots.atlas!.storedId
+        }).then(value => {
+          accepted = value
+        })
+      })
+      await advance(40)
+      // Ordinary tab navigation: it never advances the roster-open generation.
+      act(() => harnessRoute.navigate('/' + bots.apex!.storedId))
+      await advance(100)
+      expect($activeSessionId.get()).toBe(bots.apex!.runtimeId)
+      await advance(3_000)
+
+      expect(attachRequests).toEqual([])
+      expect(sent).toEqual([])
+      expect(accepted).toBe(false)
+      expect($selectedStoredSessionId.get()).toBe(bots.apex!.storedId)
+      expect(notices().join('\n')).toMatch(/not sent/i)
+    } finally {
+      window.hermesDesktop = desktop
+    }
+  })
+
+  it('still delivers an explicit background send into the held chat once it is confirmed', async () => {
+    await mount()
+    await clickBot(bots.atlas!, 9_000)
+    await clickBot(bots.apex!, 9_000)
+
+    act(() => {
+      void openRosterBot(roster(bots.atlas!))
+    })
+    await advance(40)
+    act(() => harnessRoute.navigate('/' + bots.apex!.storedId))
+    await advance(100)
+    expect($selectedStoredSessionId.get()).toBe(bots.apex!.storedId)
+    expect(hasSubmitHold(bots.atlas!.storedId)).toBe(true)
+    let accepted: boolean | undefined
+
+    act(() => {
+      void realSubmit('queued for atlas', { fromQueue: true, storedSessionId: bots.atlas!.storedId }).then(value => {
+        accepted = value
+      })
+    })
+    await advance(3_000)
+
+    expect(sent.map(entry => entry.session_id)).toEqual([bots.atlas!.runtimeId])
+    expect(accepted).toBe(true)
+    expect($selectedStoredSessionId.get()).toBe(bots.apex!.storedId)
   })
 })

@@ -4245,6 +4245,7 @@ export interface Translations extends NoticeTranslations {
     readOnlyTranscriptTitle: string
     readOnlyTranscriptBody: string
     readOnlyTranscriptSendBlocked: string
+    heldSendNotSent: string
     resumeStrandedTitle: string
     resumeStrandedBody: string
     poolSlotTimeoutBody: string
