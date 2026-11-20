@@ -756,9 +756,10 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
 def _invoke_agent(
     sid: str, session: dict, st: _TurnRun, prompt: Any, run_message: Any, streamer,
     images: list[str], display_kind: str | None, display_metadata: dict | None,
-    turn_author: dict | None = None, text: Any = None) -> None:
+    turn_author: dict | None = None, text: Any = None, *, person_turn: bool = False) -> None:
     """Wire the streaming callbacks and run the conversation into ``st.result``.
-    ``text`` is the turn's raw submit, matched against the row staged by prompt.submit."""
+    ``text`` is the turn's raw submit, matched against the row staged by prompt.submit.
+    ``person_turn``: the client's prompt.submit started this turn (never a synthesized wake)."""
     agent = st.agent
     st.compression_count = getattr(getattr(agent, "context_compressor", None), "compression_count", None)
     # Bot Chat mirrors gateway.stream_consumer: deltas are withheld while the reply could still
@@ -798,10 +799,11 @@ def _invoke_agent(
         _emit("message.interim", sid, {"text": text, "already_streamed": already_streamed})
     agent.interim_assistant_callback = (
         _interim_assistant_cb if _load_interim_assistant_messages() else None)
-    # A prompt the person typed (a synthesized turn carries a display kind) opens a long turn with
-    # the model's own one-line ack, sealed by the desktop and the phone as its own bubble.
+    # A prompt the person typed opens a long turn with the model's own one-line ack, sealed by the
+    # desktop and the phone as its own bubble. Positive signal only: a synthesized wake (notification,
+    # /loop or heartbeat tick, hosted room member turn) never carries ``person_turn``.
     from agent.ack_first import stage_ack_first
-    stage_ack_first(agent, prompt, person_turn=display_kind is None)
+    stage_ack_first(agent, prompt, person_turn=person_turn and display_kind is None)
     # A synthesized turn is typed at turn START so a crash persist writes a timeline event,
     # not a raw user bubble; the post-turn stamp is the fallback for an older agent.
     st.run_kwargs = run_kwargs = {
@@ -1154,7 +1156,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    turn_author: dict | None = None, report_ownership_refusal: bool = True) -> bool:
+    turn_author: dict | None = None, report_ownership_refusal: bool = True, person_turn: bool = False) -> bool:
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -1220,7 +1222,7 @@ def _run_prompt_submit(
             prompt, run_message, cols, streamer = prepared
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
-                display_metadata, turn_author, text)
+                display_metadata, turn_author, text, person_turn=person_turn)
             status_note = _absorb_turn_result(
                 sid, session, st, text, display_kind, display_metadata)
             payload, raw, status = _complete_turn_payload(session, st, status_note, cols)
