@@ -62,7 +62,15 @@ def test_repair_integrity_scan_allows_a_concurrent_writer(cjk_db, monkeypatch):
     monkeypatch.setattr(repair, "_connect_repair_durable", traced_connect)
     assert repair._db_opens_cleanly(cjk_db) is None
     assert writes == ["ok"]
-    assert _store_snapshot(cjk_db) == before
+    # The probe's own write moves the store's visible list revision (list_revision's counter): not the scan's doing.
+    assert _without_list_revision(_store_snapshot(cjk_db)) == _without_list_revision(before)
+
+
+def _without_list_revision(snapshot):
+    from persistence.sqlite.conversation._store.list_revision import REVISION_KEY
+
+    schema, meta = snapshot
+    return schema, [row for row in meta if row[0] != REVISION_KEY]
 
 
 @pytest.mark.parametrize("outer_transaction", [False, True])
