@@ -17,6 +17,11 @@ from hermes_cli.plugins import PluginManager
 
 REPO_PLUGINS = Path(__file__).resolve().parents[2] / "plugins"
 
+
+def _bundled_strategies() -> set[str]:
+    """The bundled delegation strategies (each ``plugins/delegation/<name>/`` with a plugin.yaml), default included."""
+    return {d.name for d in (REPO_PLUGINS / "delegation").iterdir() if (d / "plugin.yaml").is_file()}
+
 PROBE_PLUGIN = '''
 from agent.delegation_provider import DelegationProvider, DelegationRouteError
 
@@ -234,8 +239,10 @@ def test_a_saved_switch_refuses_the_previous_backends_parameter_and_names_the_fi
         from agent.delegation_backends import list_backends, set_global_backend
         from tools.delegate_tool import delegate_task
 
-        # Subset: other bundled strategies (effort-router) may be installed beside them.
-        assert {"default", "probe-options", "probe-profiles"} <= {b.name for b in list_backends()}
+        # "default first, then every registered backend": the bundled strategies (effort-router) sit beside the probes.
+        names = [b.name for b in list_backends()]
+        assert names[0] == "default" and len(names) == len(set(names))
+        assert set(names) == {"default", "probe-options", "probe-profiles"} | _bundled_strategies()
         before = (home / "config.yaml").read_bytes()
         with pytest.raises(ValueError, match="'nope' is not installed"):
             set_global_backend("nope")
