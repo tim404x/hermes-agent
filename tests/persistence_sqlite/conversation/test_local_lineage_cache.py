@@ -22,6 +22,9 @@ def store(backend, scope_a):
     store.sessions.create(NewSession("head", "cli"))
     _write("UPDATE sessions SET end_reason='session_reset' WHERE id='owner'", scope=scope_a)
     _write("INSERT INTO state_meta(key,value) VALUES(?,?)", (POLICY_PREFIX + "owner", RECEIPT), scope=scope_a)
+    # The reuse pinned here serves a store WITHOUT idx_state_meta_local_lineage; an indexed store seeks the few
+    # multi-segment receipts on every listing instead (test_visible_list_revision).
+    _write("DROP INDEX IF EXISTS idx_state_meta_local_lineage", scope=scope_a)
     return store
 
 

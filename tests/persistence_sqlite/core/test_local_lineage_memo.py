@@ -44,6 +44,9 @@ def db(tmp_path):
     _put(conn, 'odd-owner', json.dumps({'session_id': 7, 'lineage': ['a', 'b']}))
     _put(conn, 'odd-lineage', json.dumps({'session_id': 'odd-lineage', 'lineage': ['a', 3]}))
     _put(conn, 'array', json.dumps(['session_id', 'lineage']))
+    # This memo serves a store WITHOUT idx_state_meta_local_lineage (one a current build has not opened writable
+    # yet); an indexed store seeks the few multi-segment receipts instead (test_visible_list_revision).
+    conn.execute('DROP INDEX IF EXISTS idx_state_meta_local_lineage')
     conn.commit()
     yield database
     database.close()

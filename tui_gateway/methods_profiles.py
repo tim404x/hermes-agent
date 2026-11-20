@@ -223,6 +223,10 @@ def _canonical_session_row(persistence, profile_path):
         return None
 
 
+# profiles.list's listings rank a window of this many recently active rows first (``SessionQuery.recent_candidates``).
+_ROSTER_RECENT_WINDOW = 128
+
+
 def _latest_profile_session_rows(persistence):
     """(newest human-facing session, newest worker session); the worker row lets rosters show a
     profile as working (workers heartbeat ``last_activity_at`` every ≤60s).
@@ -238,8 +242,11 @@ def _latest_profile_session_rows(persistence):
     from persistence.conversation.sessions import SessionOrder, SessionQuery, SessionWindow
     try:
         human = worker = None
+        # Ranked over a window of recently active rows when that provably gives the same page (#151727: a
+        # busy store's full ranking was 150+ ms of every 5 s poll).
         for entry in persistence.sessions.list_sessions(
-                SessionQuery(order=SessionOrder.LAST_ACTIVE), SessionWindow(limit=20), compact_rows=True):
+                SessionQuery(order=SessionOrder.LAST_ACTIVE, recent_candidates=_ROSTER_RECENT_WINDOW),
+                SessionWindow(limit=20), compact_rows=True):
             s = entry.session
             title, last_active = s.title or "", entry.last_active or s.started_at or 0
             if _denied_source({"source": s.source}):
@@ -299,7 +306,8 @@ def _open_turn_rows(persistence, canonical) -> list:
         ids = [canonical["resolved_id"]] if canonical else []
         cutoff = time.time() - BUSY_TURN_MAX_AGE_SECONDS
         query = SessionQuery(order=SessionOrder.LAST_ACTIVE,
-                             exclude_sources=(*INTERNAL_LISTING_SOURCES, *_BACKGROUND_TURN_EXTRA_SOURCES))
+                             exclude_sources=(*INTERNAL_LISTING_SOURCES, *_BACKGROUND_TURN_EXTRA_SOURCES),
+                             recent_candidates=_ROSTER_RECENT_WINDOW)
         for entry in persistence.sessions.list_sessions(query, SessionWindow(limit=_TURN_SCAN_LIMIT),
                                                          compact_rows=True):
             if (entry.last_active or entry.session.started_at or 0) < cutoff:
