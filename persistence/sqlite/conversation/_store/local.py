@@ -9,6 +9,23 @@ from collections import OrderedDict
 POLICY_PREFIX = 'gateway.local_policy.v1:'
 
 
+# The receipts ``local_lineage_index`` selects (a lineage of more than one segment), as the indexed expression
+# ``idx_state_meta_local_lineage`` (_schema_ddl.DEFERRED_INDEX_SQL) is built on: ``<expr> > 1`` is then an index
+# seek over those few receipts instead of a JSON parse of every receipt (#152507). It must stay structurally
+# identical to the index's expression (SQLite compares parsed expressions) or the planner falls back to the scan.
+LOCAL_LINEAGE_LEN_EXPR = ("(CASE WHEN key GLOB '" + POLICY_PREFIX + "*' AND json_valid(value) "
+                          "THEN json_array_length(value, '$.lineage') END)")
+LOCAL_LINEAGE_INDEX = 'idx_state_meta_local_lineage'
+LOCAL_LINEAGE_INDEX_SQL = f'CREATE INDEX IF NOT EXISTS {LOCAL_LINEAGE_INDEX} ON state_meta({LOCAL_LINEAGE_LEN_EXPR})'
+# Owner and lineage extracted by SQLite (C, GIL released) rather than ``json.loads`` of a whole ~40 KB policy in
+# Python. Same reading as before: an owner that is not a JSON string is no owner. No ORDER BY: sorting by key in SQL
+# makes the planner walk the key index and evaluate the expression on every receipt instead of seeking this one;
+# the caller sorts the few rows by key (the order the key scan had).
+_MULTI_SEGMENT_RECEIPTS_SQL = (
+    "SELECT key, CASE WHEN json_type(value, '$.session_id') = 'text' THEN json_extract(value, '$.session_id') END,"
+    f" json_extract(value, '$.lineage') FROM state_meta WHERE {LOCAL_LINEAGE_LEN_EXPR} > 1")
+
+
 API_BINDING_PREFIX = 'gateway.api.binding.v1.'
 
 
@@ -92,11 +109,8 @@ def local_lineage_index(conn):
     reset segment to ``(owner, lineage)`` for the row that represents the conversation. A delete
     of that row removes the whole lineage (``hermes_state_mutation_guards.delete_targets``)."""
     superseded, heads = set(), {}
-    rows = conn.execute("SELECT value FROM state_meta WHERE key GLOB ? AND json_valid(value) "
-                        "AND json_array_length(value, '$.lineage') > 1", (POLICY_PREFIX + '*',)).fetchall()
-    for (raw,) in rows:
-        receipt = json.loads(raw)
-        owner, lineage = receipt.get('session_id'), receipt.get('lineage')
+    for _key, owner, raw_lineage in sorted(conn.execute(_MULTI_SEGMENT_RECEIPTS_SQL).fetchall(), key=lambda row: row[0]):
+        lineage = json.loads(raw_lineage)
         if not isinstance(owner, str) or not all(isinstance(sid, str) for sid in lineage):
             continue
         marks = ','.join('?' * len(lineage))
@@ -117,6 +131,15 @@ def _copy_lineage_index(value):
     return set(superseded), {key: (owner, list(lineage)) for key, (owner, lineage) in heads.items()}
 
 
+def _receipts_indexed(conn):
+    """Whether this store has ``idx_state_meta_local_lineage`` on exactly this expression (a writable open of a
+    current build creates it). An index of that name on any other expression is not one the planner can seek with
+    ``_MULTI_SEGMENT_RECEIPTS_SQL``: the store keeps the memoized receipt pass then."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                       (LOCAL_LINEAGE_INDEX,)).fetchone()
+    return row is not None and row[0] == LOCAL_LINEAGE_INDEX_SQL.replace('IF NOT EXISTS ', '', 1)
+
+
 def _cached_local_lineage_index(db, conn):
     # Owned by this SessionDB, not a process-global path/id cache. Bound retained connections
     # across read-pool churn and close/reopen; a closed/replaced connection cannot match a new one.
@@ -126,6 +149,15 @@ def _cached_local_lineage_index(db, conn):
         with lock:
             cache.pop(conn, None)
         return local_lineage_index(conn)
+    if _receipts_indexed(conn):
+        # The receipt pass is one seek over the few multi-segment receipts: nothing left worth keeping between
+        # listings (no Python receipt memo, no projection memo), and the answer is always this snapshot's.
+        conn.execute('BEGIN')  # the receipts and the segments' end_reason: one snapshot
+        try:
+            return local_lineage_index(conn)
+        finally:
+            if conn.in_transaction:
+                conn.execute('ROLLBACK')
     # Browse handles are opened per request, so their connection's cache below never hits twice: a
     # store that has not moved shares one projection across every read-only handle (``listing_memo``).
     from persistence.sqlite.conversation._store.listing_memo import memoized

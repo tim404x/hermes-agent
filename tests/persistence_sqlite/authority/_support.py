@@ -19,10 +19,16 @@ def copy_db(src: Path, dst: Path) -> None:
 
 
 def dump(path: Path, tables: Iterable[str] = AUTHORITY_TABLES) -> dict[str, Any]:
-    """Every row of each named table that exists, in rowid order."""
+    """Every row of each named table that exists, in rowid order. Leaves out the visible list revision
+    (``list_revision.REVISION_KEY``): a listing-cache counter that counts writes, so a write a later write undoes
+    still moved it, and it is no part of any ledger."""
+    from persistence.sqlite.conversation._store.list_revision import REVISION_KEY
+
     with sqlite3.connect(path) as conn:
         present = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         return {table: conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+                       if table != "state_meta" else
+                       conn.execute("SELECT * FROM state_meta WHERE key != ? ORDER BY rowid", (REVISION_KEY,)).fetchall()
                 for table in tables if table in present}
 
 
