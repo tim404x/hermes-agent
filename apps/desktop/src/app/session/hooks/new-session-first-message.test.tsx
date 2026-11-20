@@ -135,7 +135,7 @@ async function mount({ refuse = false } = {}) {
   }
 
   const rest = installRestBridge(request =>
-    request.path.endsWith('/messages') ? { messages: persisted, session_id: 'stored-new' } : {}
+    new URL(request.path, 'http://x').pathname.endsWith('/messages') ? { messages: persisted, session_id: 'stored-new' } : {}
   )
 
   let ready!: Ready

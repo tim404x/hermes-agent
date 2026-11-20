@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { capabilityScoped, hermesApi, type ProfileScope, sessionReadOwnerPin } from '@/api/client'
+import { setLeanTranscriptParams } from '@/api/sessions'
 import {
   cachedTimelineIndex,
   previousPromptRowId,
@@ -50,6 +51,9 @@ export async function fetchHistoryWindow(
   if (route.profile) {
     query.set('profile', route.profile)
   }
+
+  // Same lean page as the transcript reads: image refs, not inline copies.
+  setLeanTranscriptParams(query)
 
   // The Electron REST bridge cannot transfer AbortSignal over IPC. Cancellation
   // below releases the caller immediately and fences the eventual bounded read;
