@@ -42,6 +42,10 @@ class GatewaySessionAgentMixin:
     def _skip_context_files(self, platform_key) -> bool:
         """gateway.platforms.<plat>.skip_context_files: messaging platforms may opt out of
         filesystem-heavy context-file discovery (SOUL.md, AGENTS.md, .cursorrules)."""
+        from gateway.session_api_turn import api_turn_narrowed
+        if api_turn_narrowed():
+            # Phone line third-party calls: a narrowed agent never sees Tim's memory, profile or context files.
+            return True
         from gateway.session_policy import policy_for_source
         policy = policy_for_source(self._runner, self._ctx.source)
         if policy:
@@ -164,6 +168,9 @@ class GatewaySessionAgentMixin:
         from gateway.session_policy import policy_for_source
         from gateway.session_worker_construct import session_prefill
         policy = policy_for_source(runner, src)
+        from gateway.session_api_turn import api_turn_narrowed
+        # Phone line third-party calls: a narrowed agent never sees Tim's memory, profile or context files.
+        narrowed = api_turn_narrowed()
         return ctx.AIAgent(
             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
             max_iterations=max_iterations, quiet_mode=not bool(policy and policy.verbose), verbose_logging=False,
@@ -185,8 +192,8 @@ class GatewaySessionAgentMixin:
             fallback_model=None if api_runtime_locked() else self._runner._refresh_fallback_model(),
             skip_context_files=skip_context_files,
             # Keep the persona even with minimal context: soul identity is one small file.
-            load_soul_identity=not bool(policy and policy.ignore_rules),
-            skip_memory=bool(policy and policy.ignore_rules),
+            load_soul_identity=not (narrowed or bool(policy and policy.ignore_rules)),
+            skip_memory=narrowed or bool(policy and policy.ignore_rules),
             pass_session_id=bool(policy and policy.pass_session_id),
             # A local session's frozen budget (`--run-budget` / its profile's agent.run_budget_seconds);
             # None leaves the agent reading the owner's config, as before.
@@ -199,12 +206,14 @@ class GatewaySessionAgentMixin:
         ctx = self._ctx
         runner = self._runner
         skip_context_files = self._skip_context_files(platform_key)
+        from gateway.session_api_turn import api_turn_narrowed
         sig = runner._agent_config_signature(
             turn_route["model"], turn_route["runtime"], ctx.enabled_toolsets, combined_ephemeral,
             cache_keys=runner._extract_cache_busting_config(ctx.user_config),
             user_id=getattr(ctx.source, "user_id", None),
             user_id_alt=getattr(ctx.source, "user_id_alt", None),
             skip_context_files=skip_context_files,
+            skip_memory=api_turn_narrowed(),
         )
         cache_lock = getattr(runner, "_agent_cache_lock", None)
         cache = getattr(runner, "_agent_cache", None)

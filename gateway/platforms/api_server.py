@@ -326,6 +326,13 @@ def _narrow_toolsets(enabled: Any, narrowing: Any) -> list[str]:
     return sorted(name for name in set(enabled or ()) if name in allowed)
 
 
+# Phone line third-party calls: a narrowed agent never sees Tim's memory, profile or context files.
+# Any honoured X-Hermes-Toolsets narrowing (``none`` included) builds the agent with no MEMORY.md /
+# USER.md / memory provider (skip_memory), no SOUL.md (load_soul_identity off) and no AGENTS.md or
+# other context files (skip_context_files). Un-narrowed agents never get these kwargs.
+NARROWED_AGENT_ISOLATION_KWARGS = {"skip_memory": True, "skip_context_files": True, "load_soul_identity": False}
+
+
 def _request_relay_metadata(body: Any) -> dict[str, Any]:
     """Extract Relay metadata from an OpenAI request body."""
     if not isinstance(body, dict):
@@ -2294,8 +2301,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "reasoning_config": request_reasoning_config,
             "gateway_session_key": gateway_session_key,
             # The session's provider from the previous request, so its queued recall reaches this turn
-            # (#120116); checked back in by the turn's finally.
-            "memory_manager": self._memory_sessions.checkout(session_id)}
+            # (#120116); checked back in by the turn's finally. A narrowed turn leaves it parked.
+            "memory_manager": None if toolsets_narrowing is not None else self._memory_sessions.checkout(session_id)}
+        if toolsets_narrowing is not None:
+            # Phone line third-party calls: a narrowed agent never sees Tim's memory, profile or context files.
+            agent_kwargs.update(NARROWED_AGENT_ISOLATION_KWARGS)
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
         agent = AIAgent(**agent_kwargs)
