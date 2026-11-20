@@ -266,3 +266,24 @@ def test_a_lent_handle_never_opens_its_store_again():
             # The sweep closed the store under the lent handle; the retry answers False on it, as on a closed store.
             assert stores[0].search.retry_deferred_search_recovery() is False
             assert _registry.stats()["live_generations"] == 0
+
+
+def test_another_profiles_provider_parses_its_config_once_until_the_file_changes(monkeypatch):
+    """Every browse handle on another profile resolves that profile's provider: the sidebar opens one per profile per
+    refresh, so the YAML is parsed again only when the file changed (a rewrite, even within the same second)."""
+    import utils
+    import utils.files
+
+    home = profile_home("eta")
+    config = home / "config.yaml"
+    config.write_text("persistence:\n  provider: sqlite\n", encoding="utf-8")
+    parses = []
+    real = utils.files.fast_safe_load
+    for module in (utils, utils.files):
+        monkeypatch.setattr(module, "fast_safe_load", lambda stream: parses.append(1) or real(stream))
+    for _ in range(4):
+        assert persistence_assembly._provider_for_home(home) == "sqlite"
+    assert len(parses) == 1
+    config.write_text("persistence:\n  provider: bogus\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown persistence provider 'bogus'"):
+        persistence_assembly._provider_for_home(home)
