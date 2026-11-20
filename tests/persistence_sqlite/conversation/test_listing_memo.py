@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import time
+from contextlib import closing
 from types import SimpleNamespace
 
 import pytest
@@ -77,7 +78,8 @@ def _count_calls(monkeypatch, module, name):
 
 
 def _listed(handle, **window):
-    return [str(e.session.session_id) for e in handle.sessions.list_sessions(SessionQuery(), SessionWindow(**window))]
+    return [str(e.session.session_id) for e in handle.sessions.list_sessions(
+        SessionQuery(), SessionWindow(**window), compact_rows=True)]
 
 
 def _browse(scope, fn):
@@ -145,7 +147,7 @@ def test_each_window_and_query_is_its_own_answer(store, scope_a):
     assert len(one) == 1 and len(two) == 2
     assert _browse(scope_a, lambda r: _listed(r, limit=1)) == one
     hidden = _browse(scope_a, lambda r: [str(e.session.session_id) for e in r.sessions.list_sessions(
-        SessionQuery(sources=("telegram",)), SessionWindow(limit=10))])
+        SessionQuery(sources=("telegram",)), SessionWindow(limit=10), compact_rows=True)])
     assert hidden == []
 
 
@@ -161,16 +163,100 @@ def test_counts_are_kept_and_follow_commits(store, scope_a, monkeypatch):
 
 
 def test_a_kept_answer_cannot_be_mutated_by_a_caller(store, scope_a):
+    import copy
+
+    _write(scope_a, "UPDATE sessions SET model_config=?, origin_json=? WHERE id='a'",
+           (json.dumps({"k": {"nested": [1, 2]}}), json.dumps({"platform": "cli"})))
     _quiet(scope_a)
-    rows = _browse(scope_a, lambda r: [e.as_list_row() for e in r.sessions.list_sessions(
-        SessionQuery(), SessionWindow(limit=10))])
-    for row in rows:
+
+    def entries(r):
+        return r.sessions.list_sessions(SessionQuery(), SessionWindow(limit=10), compact_rows=True)
+
+    rows = _browse(scope_a, lambda r: [e.as_list_row() for e in entries(r)])
+    for row in rows:  # a caller's row dicts are its own
         row["title"] = "mutated"
         row.clear()
-    again = _browse(scope_a, lambda r: [e.as_list_row() for e in r.sessions.list_sessions(
-        SessionQuery(), SessionWindow(limit=10))])
-    assert sorted(row["id"] for row in again) == ["a", "b", "c"]
-    assert all(row.get("title") != "mutated" for row in again)
+    kept = {str(e.session.session_id): e for e in _browse(scope_a, entries)}
+    assert sorted(kept) == ["a", "b", "c"]
+    assert all(e.as_list_row().get("title") != "mutated" for e in kept.values())
+    # The shared entry's mappings read, encode and copy like dicts, and refuse mutation.
+    config, origin = kept["a"].session.model_config, kept["a"].session.origin
+    assert isinstance(config, dict) and config["k"]["nested"] == [1, 2] and origin == {"platform": "cli"}
+    assert json.loads(json.dumps(config)) == {"k": {"nested": [1, 2]}}
+    for mutate in (lambda: config.__setitem__("x", 1), lambda: config["k"].update(x=1),
+                   lambda: config["k"]["nested"].append(3), lambda: origin.pop("platform")):
+        with pytest.raises(TypeError):
+            mutate()
+    mine = copy.deepcopy(config)
+    mine["k"]["nested"].append(3)
+    assert type(mine) is dict and config["k"]["nested"] == [1, 2]
+    assert dict(config) == {"k": {"nested": [1, 2]}}
+    again = {str(e.session.session_id): e for e in _browse(scope_a, entries)}
+    assert again["a"].session.model_config == {"k": {"nested": [1, 2]}}
+
+
+def test_full_rows_are_never_kept(store, scope_a, monkeypatch):
+    reads = _count_calls(monkeypatch, sessions_module, "list_sessions_rich")
+    _quiet(scope_a)
+    for _ in range(3):
+        _browse(scope_a, lambda r: r.sessions.list_sessions(SessionQuery(), SessionWindow(limit=10)))
+    assert len(reads) == 3
+
+
+def test_a_kept_answer_expires(store, scope_a, monkeypatch):
+    """A WAL commit is published in -shm after its fsync, which moves no stat: kept answers are bounded in age."""
+    reads = _count_calls(monkeypatch, sessions_module, "list_sessions_rich")
+    _quiet(scope_a)
+    _browse(scope_a, lambda r: _listed(r, limit=10))
+    _browse(scope_a, lambda r: _listed(r, limit=10))
+    assert len(reads) == 1
+    monkeypatch.setattr(_listing_memo(), "_MAX_AGE_S", 0.0)
+    _browse(scope_a, lambda r: _listed(r, limit=10))
+    assert len(reads) == 2
+
+
+def test_a_symlinked_store_sees_commits_written_beside_its_target(backend, scope_a, scope_b):
+    from persistence_assembly import profile_scope
+
+    writer = backend.open(scope_b)
+    for sid in ("x", "y"):
+        writer.sessions.create(NewSession(sid, "cli"))
+    linked = store_for(scope_a).parent.parent / "linked"
+    linked.mkdir()
+    (linked / "state.db").symlink_to(store_for(scope_b))
+
+    def browse_link():
+        with open_persistence_reader(profile_scope(home=linked).profile_dir) as reader:
+            return sorted(_listed(reader, limit=10))
+
+    _quiet(scope_b)
+    assert browse_link() == ["x", "y"]
+    writer.sessions.create(NewSession("z", "cli"))  # its WAL frames land beside the TARGET
+    assert browse_link() == ["x", "y", "z"]
+
+
+def test_a_handle_still_on_a_replaced_store_file_never_feeds_the_memo(backend, scope_a, scope_b):
+    first = backend.open(scope_a)
+    for sid in ("a", "b"):
+        first.sessions.create(NewSession(sid, "cli"))
+    other = backend.open(scope_b)
+    other.sessions.create(NewSession("x", "cli"))
+    path = store_for(scope_a)
+    with open_persistence_reader(path) as old_handle:
+        assert sorted(_listed(old_handle, limit=10)) == ["a", "b"]  # its connection is on the old file
+        backend.close()
+        replacement = path.with_name("replacement.db")
+        with closing(sqlite3.connect(store_for(scope_b))) as src, closing(sqlite3.connect(replacement)) as dst:
+            src.backup(dst)
+        os.replace(replacement, path)
+        for sidecar in (path.with_name("state.db-wal"), path.with_name("state.db-shm")):
+            sidecar.unlink(missing_ok=True)
+        _quiet(scope_a)
+        try:
+            _listed(old_handle, limit=10)  # still the old file (or refused): either way, not kept
+        except Exception:
+            pass
+    assert _browse(scope_a, lambda r: _listed(r, limit=10)) == ["x"]
 
 
 def _write(scope, sql, params=()):
@@ -200,7 +286,7 @@ def test_the_local_lineage_projection_is_shared_until_a_lineage_write(store, sco
 
 def _holder(**overrides):
     holder = SimpleNamespace(read_only=True, db_path="/tmp/x/state.db", _conn=None,
-                             _pinned_read_conn=lambda: None)
+                             _pinned_read_conn=lambda: None, _db_file_identity=None)
     for key, value in overrides.items():
         setattr(holder, key, value)
     return holder
