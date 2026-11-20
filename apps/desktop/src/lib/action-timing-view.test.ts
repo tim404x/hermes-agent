@@ -79,6 +79,23 @@ describe('action-timing-view (switch / open_chat painted)', () => {
     expect(flushed()?.a).toEqual({ open_chat: [166] })
   })
 
+  it('leaving a streaming chat: its deltas before and at the flip do not end the open', () => {
+    viewActionStart('switch', 'local::delta')
+    viewActionBind('switch', 'local::delta', 'delta-chat')
+    now += 300
+    $messages.set([msg('old'), msg('streaming')]) // the chat being left keeps streaming
+    now += 400
+    $selectedStoredSessionId.set('delta-chat') // the open path flips the selection first
+    expect(frames).toHaveLength(0)
+    now += 300
+    $messages.set([]) // then drops the old transcript (loader)
+    expect(frames).toHaveLength(0)
+    now += 600
+    $messages.set([msg('d1')]) // the target's transcript
+    runFrames()
+    expect(flushed()?.a).toEqual({ switch: [1600] })
+  })
+
   it('switch binds late and ends when the bot chat tile is fronted with its transcript', () => {
     viewActionStart('switch', 'local::atlas')
     now += 300
@@ -111,7 +128,8 @@ describe('action-timing-view (switch / open_chat painted)', () => {
     $sessionStates.set({ rt2: createClientSessionState('forge-chat', [msg('f')]) })
     setFocused('forge-chat')
     viewActionStart('switch', 'local::forge')
-    viewActionBind('switch', 'local::forge', 'forge-chat')
+    // The real path: focusExistingBotTab fronts the (already fronted) tile and binds `painted`.
+    viewActionBind('switch', 'local::forge', 'forge-chat', { painted: true })
     runFrames()
     expect(flushed()).toBeNull()
   })
