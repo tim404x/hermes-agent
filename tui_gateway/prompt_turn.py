@@ -977,9 +977,16 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
     # The receipt verifies the stored row's body, which keeps the model's text as written;
     # only the delivered copy drops a silence marker.
     receipt = _persisted_turn_receipt(st, raw, status)
+    silent = False
     if getattr(st, "silence_ok", False) or _is_bot_mode_session(session):  # turn stubs predate the field
+        from gateway.response_filters import is_intentional_silence_agent_result
+        silent = status == "complete" and is_intentional_silence_agent_result(result, raw)
         raw = _bot_mode_delivery_text(raw, successful=status == "complete")
     payload = {"text": raw, "usage": _get_usage(agent), "status": status, **_pause_mark(session, status)}
+    if silent:
+        # The turn chose silence where it may: clients show nothing for it, so no "Message complete."
+        # toast, completion sound or unread dot either (a Desktop renderer older than this ignores it).
+        payload["silent"] = True
     if receipt:
         payload["persisted_turn"] = receipt
     if last_reasoning:

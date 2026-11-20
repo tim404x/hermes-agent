@@ -362,9 +362,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         stream_delta_cb = None
         local_viewer_route = getattr(ctx.source, "platform", None) == Platform.LOCAL
         if delta_sinks or self._approval_owner is not None:
-            def stream_delta_cb(text: Optional[str]) -> None:
-                if not ctx._run_still_current():
-                    return
+            def deliver_delta(text: Optional[str]) -> None:
                 delivered = bool(delta_sinks)
                 if text is not None:
                     delivered = self._publish_execution("message.delta", {"text": text}) or delivered
@@ -381,10 +379,39 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     # stitched as a "partial delivery" nobody received (classic -q parity).
                     raise _NoStreamConsumer()
 
+            # A local viewer paints and speaks each delta at once, ahead of the delivery seam that
+            # swallows a silence marker, and a later empty message.complete cannot take painted text
+            # back. Hold what could still become a marker, as tui_gateway's turn does; release a held
+            # line that never became one at the segment boundary or the turn end.
+            from gateway.response_filters import SilenceMarkerStreamHold
+            hold = [SilenceMarkerStreamHold()] if local_viewer_route else None
+
+            def release_held() -> None:
+                rest, hold[0] = hold[0].finish(), SilenceMarkerStreamHold()
+                if rest:
+                    deliver_delta(rest)
+
+            def stream_delta_cb(text: Optional[str]) -> None:
+                if not ctx._run_still_current():
+                    return
+                if hold is None:
+                    deliver_delta(text)
+                elif text is None:
+                    release_held()
+                    deliver_delta(None)
+                elif shown := hold[0].feed(text):
+                    deliver_delta(shown)
+
+            if hold is not None:
+                self._flush_local_silence_hold = lambda: ctx._run_still_current() and release_held()
+
         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
                 return
             unseen = False
+            if local_viewer_route and not already_streamed:
+                from gateway.response_filters import is_intentional_silence_response, strip_trailing_silence_marker
+                text = "" if is_intentional_silence_response(text) else strip_trailing_silence_marker(text)
             if local_viewer_route and not already_streamed and str(text or "").strip():
                 # LocalSessionAdapter.send publishes nothing, so unstreamed commentary handed to the
                 # consumer would be recorded as delivered while no viewer saw it. A codex app-server
@@ -1149,6 +1176,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     ctx.persist_user_display_kind, ctx.reply_expected)
                 try:
                     result = agent.run_conversation(api_message, **kwargs)
+                    # The reply's last held line that never became a marker is part of it: deliver it.
+                    if (flush := getattr(self, "_flush_local_silence_hold", None)) is not None:
+                        flush()
                 finally:
                     agent._silence_marker_needs_reply = False
             if captured is not None:
@@ -1567,10 +1597,17 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         if local_sinks is not None:
             was_delivered = getattr(agent, "_interim_text_was_delivered", None)
             previewed = bool(previewed or (callable(was_delivered) and bool(final_response) and was_delivered(final_response) is True))
+            from gateway.response_filters import is_intentional_silence_agent_result, silence_allowed
+            # A turn the delivery seam always lets end silent (a machinery wake, an unaddressed message)
+            # and that did: the viewer raises no toast, sound or unread mark for it (message.complete
+            # ``silent``, as tui_gateway/prompt_turn.py marks its own).
+            silent = silence_allowed(ctx.persist_user_display_kind, ctx.reply_expected) and \
+                is_intentional_silence_agent_result(result, final_response)
             viewer_meta = {
                 "local_viewer": True,
                 **({"billing_block": result["billing_block"]} if isinstance(result.get("billing_block"), dict) else {}),
                 **({"warning": result["warning"]} if isinstance(result.get("warning"), str) and result["warning"] else {}),
+                **({"silent": True} if silent else {}),
             }
         from gateway.response_filters import is_intentional_silence_agent_result
         # A machinery turn the model chose to leave unanswered (``notification_no_reply``) stays

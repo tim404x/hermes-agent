@@ -1,5 +1,5 @@
 {
-  "_doc": "Shared cases for gateway/response_filters.py::is_intentional_silence_response and its desktop twin apps/desktop/src/lib/silence-marker.ts::isSilenceMarkerText. Both suites load this file, so the server's delivery rule and the renderer's paint rule cannot drift apart.",
+  "_doc": "Shared cases for gateway/response_filters.py (is_intentional_silence_response; optional 'strip' = strip_trailing_silence_marker, 'autonomous' = is_autonomous_silence_response) and its desktop twin apps/desktop/src/lib/silence-marker.ts (isSilenceMarkerText, stripTrailingSilenceMarker). Both suites load this file, so the server's delivery rule and the renderer's paint rule cannot drift apart.",
   "cases": [
     { "name": "bare NO_REPLY", "input": "NO_REPLY", "silent": true },
     { "name": "bracketed SILENT", "input": "[SILENT]", "silent": true },
@@ -16,6 +16,31 @@
     { "name": "bracketed marker opening a note is prose here", "input": "[SILENT] nothing new this tick", "silent": false },
     { "name": "malformed bracket is not a marker", "input": "[SILENT", "silent": false },
     { "name": "blank is not silence", "input": "   ", "silent": false },
-    { "name": "plain answer", "input": "No problem, shipping it now.", "silent": false }
+    { "name": "plain answer", "input": "No problem, shipping it now.", "silent": false },
+    { "name": "a natural-word answer with an emoji is a reply (No reply + face)", "input": "No reply \ud83d\ude15", "silent": false, "autonomous": false },
+    { "name": "a natural-word answer with a muted-speaker emoji is a reply", "input": "Silent \ud83d\udd07", "silent": false, "autonomous": false },
+    { "name": "a leading check mark keeps a natural-word answer", "input": "\u2705 No reply", "silent": false, "autonomous": false },
+    { "name": "a leading emoji keeps a natural-word answer", "input": "\ud83d\udd07 Silent", "silent": false },
+    { "name": "a zh-Hans natural word with an emoji is a reply", "input": "\u9759\u9ed8 \u26a1", "silent": false },
+    { "name": "an answer line closing a question is not stripped", "input": "Dani?\n\nNo reply \ud83d\ude15", "silent": false, "strip": "Dani?\n\nNo reply \ud83d\ude15", "autonomous": false },
+    { "name": "cron output closing on an emoji answer line is delivered", "input": "Paris.\n\nNo reply \ud83d\ude15", "silent": false, "strip": "Paris.\n\nNo reply \ud83d\ude15", "autonomous": false },
+    { "name": "a natural word with punctuation only stays a marker", "input": "No reply.", "silent": true, "autonomous": true },
+    { "name": "a code span is a quoted value, never a marker", "input": "`NO_REPLY`", "silent": false },
+    { "name": "a literal value on the last line stays", "input": "The literal value is:\n`NO_REPLY`", "silent": false, "strip": "The literal value is:\n`NO_REPLY`", "autonomous": false },
+    { "name": "a digit keycap sign-off is emoji", "input": "NO_REPLY 1\ufe0f\u20e3", "silent": true },
+    { "name": "a hash keycap sign-off is emoji", "input": "NO_REPLY #\ufe0f\u20e3", "silent": true },
+    { "name": "a keycap without the variation selector is emoji", "input": "NO_REPLY 1\u20e3", "silent": true },
+    { "name": "a bare digit after the marker is text", "input": "NO_REPLY 1", "silent": false },
+    { "name": "the machine token after a check mark is silence", "input": "\u2705 NO_REPLY", "silent": true },
+    { "name": "a closing machine token with a sign-off is stripped", "input": "Paris.\n\nNO_REPLY \u26a1", "silent": false, "strip": "Paris.", "autonomous": true },
+    { "name": "a Unicode 15 sign-off emoji (pink heart)", "input": "NO_REPLY \ud83e\ude77", "silent": true },
+    { "name": "a Unicode 16 sign-off emoji (face with bags)", "input": "NO_REPLY \ud83e\udee9", "silent": true },
+    { "name": "the length cap counts code points, not UTF-16 units (28 astral emoji)", "input": "NO_REPLY \ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d\ud83d\udd2d", "silent": true },
+    { "name": "the length cap counts code points (7 ZWJ family emoji)", "input": "NO_REPLY \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66", "silent": true },
+    { "name": "a sign-off from a Unicode newer than the runtime (unassigned U+1FAFF) is still emoji", "input": "NO_REPLY \ud83e\udeff", "silent": true },
+    { "name": "NEL is whitespace inside a marker", "input": "NO\u0085REPLY", "silent": true },
+    { "name": "a unit separator is whitespace at the edge", "input": "NO_REPLY\u001f", "silent": true },
+    { "name": "a byte-order mark before the machine token", "input": "\ufeffNO_REPLY", "silent": true },
+    { "name": "past the length cap is never a marker", "input": "NO_REPLY \u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1\u26a1", "silent": false }
   ]
 }

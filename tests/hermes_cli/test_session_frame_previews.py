@@ -83,3 +83,31 @@ def test_roster_preview_keeps_a_reply_that_mentions_the_marker(db):
     _seed(db, "s1", {"role": "user", "content": "what did you answer?"},
           {"role": "assistant", "content": "I answered NO_REPLY on purpose."})
     assert _latest_message_preview(db, "s1") == "I answered NO_REPLY on purpose."
+
+
+def test_roster_preview_shows_a_persons_marker_like_prompt_and_its_answer(db):
+    """Silence suppression is role- and turn-aware: a person's own words never vanish from a list, and a reply
+    the live view showed (a person's question, a plain session) shows here too."""
+    _seed(db, "s1", {"role": "user", "content": "type the token"}, {"role": "assistant", "content": "NO_REPLY"})
+    assert _latest_message_preview(db, "s1") == "NO_REPLY"
+    _seed(db, "s2", {"role": "assistant", "content": "ready"}, {"role": "user", "content": "Silent"})
+    assert _latest_message_preview(db, "s2") == "Silent"
+
+
+def test_roster_preview_drops_a_closing_marker_of_a_wake_reply(db):
+    _seed(db, "s1", {"role": "user", "content": PROCESS_DONE, "display_kind": "process_complete"},
+          {"role": "assistant", "content": "Build is green.\n\nNO_REPLY"})
+    assert _latest_message_preview(db, "s1") == "Build is green."
+
+
+
+def test_a_persons_marker_like_prompt_stays_a_timeline_row(db):
+    """Timeline rows, prompt pages, first-message previews and titles show a person's words as typed; a
+    prompt reading ``NO_REPLY`` is still a prompt (silence suppression is for a bot's silent reply only)."""
+    seed_session(db, "s1", "desktop", model="m")
+    ids = seed_messages(db, "s1", {"role": "user", "content": "Keep this first prompt"},
+                        {"role": "assistant", "content": "Okay"}, {"role": "user", "content": "NO_REPLY"},
+                        {"role": "assistant", "content": "This is a literal variable value"})
+    timeline = db.messages.read_session_timeline("s1")
+    assert "NO_REPLY" in repr(timeline)
+    assert db.messages.read_prompt_page("s1", ids[2]) is not None

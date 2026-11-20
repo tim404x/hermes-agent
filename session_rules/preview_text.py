@@ -15,10 +15,11 @@ prompts. The chat view projects those away; every list surface must too, or a si
 - ``[Runtime note: …]`` / ``[System note: …]`` blocks and ``<memory-context>`` fences are removed from real text;
 - a row that is nothing but a harness frame (``[IMPORTANT: …]``, ``[System: …]``, ``[ASYNC DELEGATION …]``, a pure
   compaction summary, …) yields ``""`` so the caller can fall back to an older row.
-- a bare silence marker (``NO_REPLY``, ``[SILENT]``, the gateway's :func:`is_intentional_silence_response` rule) is
-  a bot choosing to say nothing, so it yields ``""`` too and never stands as a bot's "last message".
+- with ``silence_ok`` (an assistant reply in a turn that may end silent), a bare silence marker (``NO_REPLY``,
+  ``[SILENT]``; :func:`is_intentional_silence_response`) yields ``""`` too and never stands as a bot's "last
+  message", and one closing the reply on its own last line is dropped.
 
-The desktop keeps a byte-for-byte twin in ``apps/desktop/src/lib/preview-text.ts`` (for previews cached or served by an
+The desktop keeps a twin in ``apps/desktop/src/lib/preview-text.ts`` (for previews cached or served by an
 older backend); both are pinned by the shared cases in ``tests/fixtures/preview_text_cases.json``.
 """
 
@@ -27,7 +28,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from gateway.response_filters import is_intentional_silence_response
+from gateway.response_filters import is_intentional_silence_response, strip_trailing_silence_marker
 from session_rules.turns import (
     LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX, _MERGED_PRIOR_CONTEXT_HEADER, _SUMMARY_END_MARKER, describe_skill_invocation,
     sanitize_context,
@@ -57,8 +58,11 @@ COMPACTION_FRAME_OPENERS = (
 WHOLE_ROW_FRAME_OPENERS = HARNESS_FRAME_OPENERS + COMPACTION_FRAME_OPENERS
 
 
-def display_preview_text(raw: Any) -> str:
-    """*raw* as a list row shows it: harness frames removed, whitespace collapsed; ``""`` when nothing is left."""
+def display_preview_text(raw: Any, *, silence_ok: bool = False) -> str:
+    """*raw* as a list row shows it: harness frames removed, whitespace collapsed; ``""`` when nothing is left.
+
+    ``silence_ok``: *raw* is an assistant reply in a turn that may end silent (``session_rules.silent_turns``);
+    only then is a silence marker dropped. A person's own words, titles and timeline rows never are."""
     text = str(raw or "")
     if not text.strip():
         return ""
@@ -70,7 +74,11 @@ def display_preview_text(raw: Any) -> str:
     text = _STEER_FRAME_RE.sub(" ", text)
     text = sanitize_context(text)
     text = _INLINE_NOTE_TAIL_RE.sub(" ", _INLINE_NOTE_RE.sub(" ", text))
+    if silence_ok:
+        # Before flattening: a marker closing the reply on its own line ("Paris.\n\nNO_REPLY") is dropped
+        # as the thread drops it; flattened, it would read as prose.
+        text = strip_trailing_silence_marker(text)
     text = " ".join(text.split())
-    if text.startswith(WHOLE_ROW_FRAME_OPENERS) or is_intentional_silence_response(text):
+    if text.startswith(WHOLE_ROW_FRAME_OPENERS) or (silence_ok and is_intentional_silence_response(text)):
         return ""
     return text

@@ -77,6 +77,8 @@ def completion_payload(row, settled, response, captured):
             complete['failure_reason'] = captured_result['failure_reason']
         if isinstance(captured_result.get('last_reasoning'), str) and captured_result['last_reasoning'].strip():
             complete['reasoning'] = captured_result['last_reasoning'].strip()
+        if captured_result.get('silent') is True and complete['status'] == 'complete':
+            complete['silent'] = True
     # The committed row addresses of the turn: a viewer binds the streamed reply to
     # its stored row, so a transcript read racing this frame never paints it twice.
     # ``submission_id`` names whose turn it is: the sending viewer binds its optimistic
