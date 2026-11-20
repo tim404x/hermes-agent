@@ -7,11 +7,12 @@ rows do. Render time only: nothing here writes the database.
 
 - a background-process completion (``process_complete``) shows a job title, never its shell command
   (:func:`tools.process_registry_notifications.relabel_legacy_process_title`);
-- a cron output delivered into a Bot Chat (``[Cronjob "<name>" output ...]`` frame on a ``user`` row) carries
+- a cron output delivered into a Bot Chat (``[Cronjob "<name>" output ...]`` frame on a typed ``user`` row, or the
+  writer's exact frame on a legacy untyped one) carries
   ``display_metadata.cron_delivery = {"job_name"}`` and its output as the display text, so it is never painted as
   the user's own message;
-- an assistant row that is only an interrupt sentinel (``Operation interrupted: waiting for model response (0.3s
-  elapsed).``) keeps its row and its ``interrupted`` mark with no prose.
+- an assistant row that is only an information-free interrupt sentinel (``Operation interrupted: waiting for model
+  response (0.3s elapsed).``) keeps its row and its ``interrupted`` mark with no prose; any other text stays.
 
 :func:`mark_bot_brief` types the seed prompt a bot wrote into a side window it opened for itself (``bot_brief``).
 """
@@ -32,10 +33,21 @@ _MACHINE_USER_KINDS = frozenset({"internal_notification", "process_complete", "a
 _BRIEF_SCAN_ROWS = 40
 _CRON_FRAME_KINDS = (None, "", "internal_notification")
 
-# Interrupt text the agent closes a stopped turn with (agent/conversation_loop.py
-# INTERRUPT_WAITING_FOR_MODEL_PREFIX and the ``interrupt_text`` of the retry/recovery paths): cancellation
-# metadata, never assistant prose. One line, nothing else in the row.
-_INTERRUPT_SENTINEL_RE = re.compile(r"^Operation interrupted(?::| during )[^\n]*$")
+# The runtime's information-free interrupt sentinels, and only those (agent/conversation_loop.py
+# INTERRUPT_WAITING_FOR_MODEL_PREFIX, turn_recovery_autorecover.py, turn_api_error.py retry, turn_empty_response.py):
+# cancellation metadata, never prose. A sentinel that carries an error (``handling API error (...)``, ``during retry
+# (<hint>, ...)``) or any other ``Operation interrupted ...`` sentence is the only copy of what went wrong and stays
+# visible. Twin: apps/desktop/src/lib/chat-messages/machine-rows.ts, both pinned by
+# tests/fixtures/interrupt_sentinel_cases.json.
+_INTERRUPT_SENTINEL_RE = re.compile(
+    r"^Operation interrupted: (?:waiting for model response \([0-9.]+s elapsed\)"
+    r"|waiting for the provider to recover \(cycle \d+/\d+\)"
+    r"|retrying API call after error \(retry \d+/\d+\)"
+    r"|retrying empty response from model \(retry \d+/\d+\))\.$")
+# The exact frame cron/scheduler_delivery.py::bot_chat_message opens a Bot Chat delivery with. An UNTYPED user row is
+# read as a cron delivery only when it carries this writer wording (every legacy untyped delivery does); a person
+# pasting or quoting a frame keeps their own message. Twin: machine-rows.ts, pinned by tests/fixtures/cron_frame_cases.json.
+_LEGACY_CRON_FRAME_RE = re.compile(r'^\[Cronjob "[^"\n]*" output \u2014 scheduled job, not the user\.')
 
 
 def is_interrupt_sentinel(text: Any) -> bool:
@@ -65,7 +77,10 @@ def type_display_row(row: Mapping[str, Any]) -> dict:
             return {**row, "display_metadata": {**meta, "display_text": title}}
     if role == "user" and kind in _CRON_FRAME_KINDS:
         from cron.scheduler_delivery import parse_bot_chat_frame
-        frame = parse_bot_chat_frame(_text(row.get("content")))
+        text = _text(row.get("content"))
+        # Machine provenance first: the producer types its deliveries (internal_notification); an untyped row must
+        # carry the writer's own frame wording, else it is the person's message.
+        frame = parse_bot_chat_frame(text) if kind or _LEGACY_CRON_FRAME_RE.match(text) else None
         if frame is not None:
             job_name, output = frame
             return {**row, "display_kind": kind or "internal_notification", "display_content": output,
@@ -126,28 +141,53 @@ def self_brief_author(turn_author: Any, own_profile: Optional[str], text: Any) -
     return bot_brief_author(turn_author["id"])
 
 
+def _submitted_turn_author(store: Any, row: Mapping[str, Any]) -> Optional[dict]:
+    """The bot author the row's own admission recorded (``display_metadata.submission_id`` -> the admission's
+    ``cli_turn_v1.turn_author``), else None. Row-level provenance: who opened a tab, or stamped it, says nothing about
+    who wrote its first message."""
+    meta = row.get("display_metadata")
+    if isinstance(meta, str):
+        import json
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            return None
+    submission = meta.get("submission_id") if isinstance(meta, Mapping) else None
+    if not isinstance(submission, str) or not submission:
+        return None
+    for admission in store.admissions.match(request_id=submission, include_retired=True):
+        payload = admission.payload if isinstance(admission.payload, Mapping) else {}
+        turn = payload.get("cli_turn_v1") if isinstance(payload.get("cli_turn_v1"), Mapping) else {}
+        author = turn.get("turn_author") if isinstance(turn.get("turn_author"), Mapping) else None
+        if author and author.get("is_bot"):
+            return bot_brief_author(author.get("id"))
+    return None
+
+
 def find_bot_brief(store: Any, session_id: str) -> Optional[dict]:
-    """``{"row_id", "author"}`` of the brief a bot seeded the side window *session_id* with: the session's
-    side-window stamp names a bot (``by = "bot:<profile>"``) and the lineage's first written user row is an untyped
-    prompt, not an attributed ``Message from ...`` DM. None otherwise (also when *store* cannot answer). A read: the
-    projections type that row at render time and nothing is written back."""
+    """``{"row_id", "author"}`` of the brief a bot seeded the side window *session_id* with: the lineage's first
+    written user row is an untyped prompt (not an attributed ``Message from ...`` DM) whose own admission names a bot
+    author. The side-window stamp only scopes the lookup to tabs; it is never the authorship (``hermes sessions
+    open-tab --by <bot>`` stamps a chat a person started). None otherwise (also when *store* cannot answer). A read:
+    the projections type that row at render time and nothing is written back."""
     from persistence.conversation.messages import TranscriptRead
     from persistence.conversation.sessions import record_side_window_stamp
 
     try:
         record = store.sessions.get(session_id)
-        author = bot_brief_author((record_side_window_stamp(record) or {}).get("by")) if record else None
-        if author is None:
+        if record is None or not record_side_window_stamp(record):
             return None
         rows = store.messages.read_transcript(session_id, TranscriptRead(limit=_BRIEF_SCAN_ROWS, include_lineage=True))
         users = [row.as_wire_row() for row in rows if row.role == "user"]
+        for row in users:
+            if row.get("display_kind") in _MACHINE_USER_KINDS:
+                continue
+            if not is_bot_brief_candidate(row):
+                return None
+            author = _submitted_turn_author(store, row)
+            return {"row_id": row["id"], "author": author} if author else None
     except Exception:  # a display hint: a store that cannot answer leaves the rows as stored
         logger.debug("bot brief lookup failed for %s", session_id, exc_info=True)
-        return None
-    for row in users:
-        if row.get("display_kind") in _MACHINE_USER_KINDS:
-            continue
-        return {"row_id": row["id"], "author": author} if is_bot_brief_candidate(row) else None
     return None
 
 
