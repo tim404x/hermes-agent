@@ -410,7 +410,7 @@ class AIAgent(
         """
         from agent.prompt_cache_lifecycle import reset_prompt_cache_session, session_totals_lock
 
-        with session_totals_lock(self):  # a keep-alive in flight adds to these under the same lock
+        with session_totals_lock(self):  # a keep-alive reply or a finishing subagent batch adds under it too
             reset_prompt_cache_session(self)  # a fresh session: an old keep-alive miss no longer stops warming
             for counter in (
                 "session_total_tokens", "session_input_tokens", "session_output_tokens", "session_prompt_tokens",
@@ -425,8 +425,8 @@ class AIAgent(
             # The delegation tree's spend is session-scoped like the counters above; a background child that
             # finishes after this reset is fenced out by the epoch it was built under.
             self.delegation_tree_usage, self._delegation_tree_ids = None, set()
-        self.session_cost_status = "unknown"
-        self.session_cost_source = "none"
+            self.session_cost_status = "unknown"
+            self.session_cost_source = "none"
 
         # Session boundary: the usage anchor describes the OLD transcript; fall back to full estimation.
         self._usage_anchor = None

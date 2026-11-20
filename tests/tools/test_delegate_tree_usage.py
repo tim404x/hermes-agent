@@ -10,6 +10,8 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from hermes_constants import get_hermes_home
 from tools.delegate_tool import delegate_task
 from tools.delegate_tool_results import _rollup_tree_usage
@@ -123,3 +125,100 @@ def test_a_child_finishing_after_a_session_switch_stays_out_of_the_new_sessions_
 
 def test_a_child_run_without_a_live_parent_still_reports_its_spend():
     assert _rollup_tree_usage([_agent(1, cost=0.5, inp=40)], None)["input_tokens"] == 40
+
+
+def _bare_parent(has_warmer: bool):
+    """A real AIAgent's session state (no __init__), with or without a prompt-cache warmer."""
+    from run_agent import AIAgent
+
+    parent = AIAgent.__new__(AIAgent)
+    parent.session_id, parent._session_reset_epoch = "old", 0
+    parent.session_estimated_cost_usd = 0.0
+    parent.session_cost_source, parent.session_cost_status = "none", "unknown"
+    if has_warmer:
+        from agent.prompt_cache_lifecycle.warmer import get_prompt_cache_warmer
+        get_prompt_cache_warmer(parent)
+    return parent
+
+
+def _finalize_old_batch(parent, out: list) -> None:
+    """Finish one child built in the parent's session epoch 0: 100 input tokens, $0.50."""
+    from tools.delegate_tool_results import _finalize_child_results
+
+    child = SimpleNamespace(_delegate_parent_epoch=0, session_id="child", session_input_tokens=100,
+                            session_estimated_cost_usd=0.5)
+    entry = {"task_index": 0, "status": "completed", "summary": "done", "_child_cost_usd": 0.5}
+    out.append(_finalize_child_results([entry], [{"goal": "list"}], [(0, {"goal": "list"}, child)], parent))
+
+
+@pytest.mark.parametrize("has_warmer", [False, True])
+def test_a_reset_while_a_batch_waits_for_the_accounting_lock_fences_the_batch_out(monkeypatch, has_warmer):
+    """/new lands while an old batch's finalizer is about to take the parent's accounting lock (round-2 review,
+    19 Nov 2026). The epoch is compared under that lock, so the old $0.50 and 100 tokens stay out of the new
+    session, with or without a cache warmer; the call still reports its own spend."""
+    from agent import prompt_cache_lifecycle
+
+    parent = _bare_parent(has_warmer)
+    requested, proceed = threading.Event(), threading.Event()
+    real_lock = prompt_cache_lifecycle.session_totals_lock
+
+    def paused(agent):  # a scheduler pause at the lock acquisition only: the real lock is returned
+        if threading.current_thread().name == "old-batch":
+            requested.set()
+            assert proceed.wait(5)
+        return real_lock(agent)
+
+    monkeypatch.setattr(prompt_cache_lifecycle, "session_totals_lock", paused)
+    out: list = []
+    worker = threading.Thread(target=_finalize_old_batch, args=(parent, out), name="old-batch", daemon=True)
+    worker.start()
+    try:
+        assert requested.wait(5)
+        parent.session_id = "new"
+        parent.reset_session_state()
+    finally:
+        proceed.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive() and out and out[0]["input_tokens"] == 100
+    assert parent.session_estimated_cost_usd == 0.0 and not parent.delegation_tree_usage
+
+
+@pytest.mark.parametrize("has_warmer", [False, True])
+def test_a_reset_waits_for_a_batch_that_already_passed_its_epoch_check(monkeypatch, has_warmer):
+    """The other order: the old batch passed its epoch check and pauses before folding. The check and every
+    fold are one critical section with reset_session_state, so /new waits for the fold and then zeroes it."""
+    from tools import delegate_tool_results as results
+
+    parent = _bare_parent(has_warmer)
+    checked, proceed, reset_done = threading.Event(), threading.Event(), threading.Event()
+    real_check = results._from_older_session
+
+    def paused(children, agent):  # a scheduler pause right after the real check
+        older = real_check(children, agent)
+        if threading.current_thread().name == "old-batch":
+            checked.set()
+            assert proceed.wait(5)
+        return older
+
+    def reset() -> None:
+        parent.session_id = "new"
+        parent.reset_session_state()
+        reset_done.set()
+
+    monkeypatch.setattr(results, "_from_older_session", paused)
+    out: list = []
+    worker = threading.Thread(target=_finalize_old_batch, args=(parent, out), name="old-batch", daemon=True)
+    resetter = threading.Thread(target=reset, daemon=True)
+    worker.start()
+    try:
+        assert checked.wait(5)
+        resetter.start()
+        # Holding the lock across check and fold, the reset cannot finish until the batch has folded.
+        assert not reset_done.wait(1.0)
+    finally:
+        proceed.set()
+        worker.join(timeout=5)
+        resetter.join(timeout=5)
+    assert not worker.is_alive() and not resetter.is_alive() and reset_done.is_set() and out
+    assert parent._session_reset_epoch == 1
+    assert parent.session_estimated_cost_usd == 0.0 and not parent.delegation_tree_usage
