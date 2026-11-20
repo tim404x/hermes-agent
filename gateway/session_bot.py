@@ -180,8 +180,11 @@ def _home(authority, actor, profile):
     return home
 
 
-async def _target(authority, actor, title=BOT_CHAT_TITLE):
+async def _target(authority, actor, title=BOT_CHAT_TITLE, pinned=None):
     if title != BOT_CHAT_TITLE:
+        from tools.bot_live_delivery import door_title_kind
+        if door_title_kind(authority_persistence(authority).scope.profile_dir, title) == 'side_window':
+            return await _side_window_target(authority, actor, title, pinned)
         return await _titled_target(authority, actor, title)
     ref = lane = None
     store = authority_persistence(authority)
@@ -237,6 +240,29 @@ async def _titled_target(authority, actor, title):
     live = authority.sessions[ref.session_id]
     entry = authority.runner.session_store.lookup_by_session_key(live.route)
     if live.source.platform != Platform.LOCAL or entry is None:
+        raise AuthorityRefusal('admission_conflict')
+    return ref, live, entry
+
+
+async def _side_window_target(authority, actor, title, pinned=None):
+    """A DM side window of this profile as a delivery target: the session the transport's
+    ``chat -c <title>`` resolves (``tools.bot_live_delivery.resolve_side_window_id``: the newest
+    ``"<title> #N"`` continuation, then the compression tip), never an exact-title lookup. *pinned*,
+    the id the producer resolved the same way, must be that session, or nothing is admitted. Never
+    minted here: a side window exists before a DM is queued into it."""
+    from tools.bot_live_delivery import resolve_side_window_id
+    store = authority_persistence(authority)
+    session_id = resolve_side_window_id(store, title)
+    if session_id is None:
+        raise AuthorityRefusal('not_found')
+    if pinned is not None and pinned != session_id:
+        raise AuthorityRefusal('admission_conflict')
+    from gateway.session_local_migration import resolve_local_target
+    ref = resolve_local_target(authority, actor, session_id)
+    authority.authorize(actor, ref, 'session:submit')
+    live = authority.sessions[ref.session_id]
+    entry = authority.runner.session_store.lookup_by_session_key(live.route)
+    if live.source.platform != Platform.LOCAL or entry is None or ref.session_id != session_id:
         raise AuthorityRefusal('admission_conflict')
     return ref, live, entry
 
@@ -911,7 +937,8 @@ async def _deliver(connection, params):
             if record is not None:
                 raise AuthorityRefusal('unknown_execution')
             holder = authority_persistence(authority).sessions.get_by_title(title)
-            ref, live, entry = await _target(authority, actor, title)
+            # A side window validates the pinned id itself (``_side_window_target``).
+            ref, live, entry = await _target(authority, actor, title, params.get('session_id'))
             pinned = params.get('session_id', entry.session_id)
             if pinned != entry.session_id and not _moved_aside_by_this_door(authority, holder, pinned):
                 raise AuthorityRefusal('admission_conflict')
@@ -966,11 +993,16 @@ def _not_sent_record(authority, actor, home, key, message, author, category, tit
     the FIFO holds a ``bot:<id>`` row anyway or there is no Bot Chat to name."""
     store = authority_persistence(authority)
     admitted = store.admissions.match(request_id='bot:' + key)
-    row = store.sessions.get_by_title(title)
-    if admitted or row is None:
+    from tools.bot_live_delivery import door_title_kind, resolve_side_window_id
+    if title != BOT_CHAT_TITLE and door_title_kind(home, title) == 'side_window':
+        target_id = resolve_side_window_id(store, title)  # the transport's resolution, as admitted
+    else:
+        row = store.sessions.get_by_title(title)
+        target_id = store.lineage.tip(row.session_id) if row is not None else None
+    if admitted or target_id is None:
         raise AuthorityRefusal('unknown_execution')
     from gateway.session_automation import automation_notification_metadata
-    record = dict(delivery_id=key, profile_home=str(home), session_id=store.lineage.tip(row.session_id),
+    record = dict(delivery_id=key, profile_home=str(home), session_id=target_id,
                   principal_id=actor.subject, message=message, status='failed', refused=True, reply='',
                   error='Settled as not sent after a session-writer refusal', reason=HELD_NOT_SENT)
     record.update(automation_notification_metadata({'notification_category': category}))
