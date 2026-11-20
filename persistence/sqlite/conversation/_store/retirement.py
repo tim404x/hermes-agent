@@ -143,13 +143,24 @@ _DERIVED_LOCAL_PREFIXES = ('bot-chat:', 'a2a:')
 _DERIVED_API_SQL = ("(source='bot_room' OR (source='api_server' AND id GLOB 'api-" + '[0-9a-f]' * 16 + "'))")
 
 
-def _local_conversations(conn):
+def _local_conversations(conn, *, committed=False):
     """``(members, derived)``: member id -> every id of its local conversation (the creation id
     (policy, FIFO, generation), each receipt lineage segment and the current target), and the ids
     of every derived (Bot Chat, A2A) conversation. One prefix scan, not a lookup per swept id.
-    Malformed receipts name nothing."""
-    from persistence.sqlite.conversation._store.local import POLICY_PREFIX
+    Malformed receipts name nothing. ``committed``: *conn*'s snapshot holds no uncommitted receipt
+    write, so the memo may learn from it (``receipt_scan_memo``)."""
+    from persistence.sqlite.conversation._store.receipt_scan_memo import enabled, receipt_projections
     members, derived = {}, set()
+    if enabled():
+        # apexfix: memoized retire_prunable receipt scan (only receipts whose fingerprint moved are parsed)
+        for _key, (ids, is_derived, _target) in receipt_projections(conn, remember=committed):
+            if ids is None:
+                continue
+            members.update(dict.fromkeys(ids, ids))
+            if is_derived:
+                derived.update(ids)
+        return members, derived
+    from persistence.sqlite.conversation._store.local import POLICY_PREFIX
     for (raw,) in conn.execute('SELECT value FROM state_meta WHERE key GLOB ?', (POLICY_PREFIX + '*',)):
         try:
             receipt = json.loads(raw)
@@ -187,7 +198,9 @@ def retire_prunable(conn, session_ids, *, media_root):
     first unfenced id, so an aged-out marker would send the next turn back to the swept generation.
     A Bot Chat's mailbox receipts also outlive the horizon. A caller-named API id is not derived:
     its marker ages out, so the caller can use that id again, as for any other swept session."""
-    swept, (conversations, derived) = set(session_ids), _local_conversations(conn)
+    # Every caller selects its ids and calls this before writing anything in its transaction, so the
+    # snapshot's receipts are committed ones and the scan memo may learn from it.
+    swept, (conversations, derived) = set(session_ids), _local_conversations(conn, committed=True)
 
     def removable(sid):
         whole = conversations.get(sid, (sid,))
