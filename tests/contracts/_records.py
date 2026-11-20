@@ -87,6 +87,7 @@ SESSION_RECORD_DEFAULTS: dict[str, Any] = {
     "tool_names": None,
     "prompt_cache_clock": None,
     "project_pinned_at": None,  # fork carry "pin in project" (c5d207fc69)
+    "side_window_json": None,  # fork carry "bot-mode side windows"
 }
 
 

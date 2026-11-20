@@ -26,6 +26,7 @@ _ROW_KEYS = [
     "compression_ineffective_count", "compression_recovery_deadline", "compression_overload_streak", "profile_name", "transport_profile",
     "rewind_count", "archived", "auto_archived", "pinned", "hidden",
     "project_pinned_at",  # fork carry "pin in project" (c5d207fc69)
+    "side_window_json",  # fork carry "bot-mode side windows"
     "last_read_at", "tool_names", "transcript_revision", "prompt_cache_clock",
 ]
 _MESSAGE_KEYS = [
