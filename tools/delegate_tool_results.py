@@ -474,9 +474,19 @@ def _finalize_child_results(
         return _rollup_tree_usage(child_by_index.values(), parent_agent)
 
 def _run_child_lifecycle(task_index: int, goal: str, child=None, parent_agent=None) -> dict[str, Any]:
-    """Run one child and apply the same host lifecycle used by delegate_task."""
+    """Run one child and apply the same host lifecycle used by delegate_task: the same child-start boundary
+    (subagent fan-out cap, launch wave; a lifecycle child is detached, so only its own stop ends the wait) and the
+    same finalization."""
     from tools.delegate_tool import _run_single_child
-    result = _run_single_child(task_index, goal, child, parent_agent)
+    from tools.delegate_tool_child_run import _fabricated_entry, release_unstarted_child
+    from tools.delegate_tool_launch_waves import run_child_start
+
+    def refuse(refusal) -> dict[str, Any]:
+        release_unstarted_child(parent_agent, child)
+        return _fabricated_entry(task_index, refusal.status, refusal.reason, child)
+
+    result = run_child_start(child, parent_agent, lambda: _run_single_child(task_index, goal, child, parent_agent),
+                             refuse, honor_parent_interrupt=False)
     result.setdefault("task_index", task_index)
     task = {"goal": goal}
     _finalize_child_results([result], [{"goal": ""} for _ in range(task_index)] + [task], [(task_index, task, child)], parent_agent)
