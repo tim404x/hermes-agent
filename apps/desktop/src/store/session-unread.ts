@@ -512,26 +512,88 @@ export function forgetSessionUnread(
   }
 }
 
-/** Stored ids whose last live turn completed silent (a wake answered NO_REPLY). The rows it stored
- *  paint nothing, so the next list refresh that reports MORE rows than the watermark moves the
- *  watermark over them instead of reading them as unread. A refresh still carrying the old count
- *  (already in flight at the settle) leaves the note for the next one. */
-const silentTurnSettles = new Set<string>()
-
-export function noteSilentTurnSettled(storedSessionId: string): void {
-  silentTurnSettles.add(storedSessionId)
+/** A silent turn (a wake answered NO_REPLY) paints nothing, so the rows it committed must not read
+ *  as unread. Only THOSE rows: the acknowledgement is the turn's committed row range, (start, end],
+ *  never "whatever the next count is", because an unseen real answer can sit before or after it.
+ *  Scoped by owning profile + durable id, since another profile's same-id session is a different
+ *  session. Kept until a refresh shows the whole range: a stale or mid-commit count must not spend it. */
+interface SilentRange {
+  profile: string
+  storedSessionId: string
+  durableId: string
+  /** The count before the turn's rows: the listed count at the settle, else the watermark. */
+  start: null | number
+  rows: number
 }
 
-function takeSilentTurnSettle(row: SessionInfo): boolean {
-  for (const id of silentTurnSettles) {
-    if (sessionMatchesStoredId(row, id)) {
-      silentTurnSettles.delete(id)
+const silentRanges = new Map<string, SilentRange>()
 
-      return true
+// A silent wake stores its wake row and its NO_REPLY row; a turn that also ran tools stores more,
+// which only the completion receipt can say. Undercounting leaves a dot, never hides an answer.
+const SILENT_TURN_DEFAULT_ROWS = 2
+
+const silentRangeKey = (profile: string, durableId: string) => `${profile}\n${durableId}`
+
+/** A live turn on `storedSessionId` settled silent, having committed `committedRows` rows (from its
+ *  receipt when complete). The owner is `profileHint` (the socket-proven profile), else the live
+ *  gateway's: that is where a live edge comes from, so a same-id row in another profile is never it. */
+export function noteSilentTurnSettled(
+  storedSessionId: string,
+  profileHint?: null | string,
+  committedRows?: number
+): void {
+  const profile = unlistedProfile(profileHint)
+  const row = resolveOwnedRow(storedSessionId, profile)
+  const durableId = row ? sessionPinId(row) : storedSessionId
+  const rows = committedRows && committedRows > 0 ? committedRows : SILENT_TURN_DEFAULT_ROWS
+  const key = silentRangeKey(profile, durableId)
+  const pending = silentRanges.get(key)
+
+  if (pending) {
+    // Back-to-back silent turns before any refresh shows the first: one contiguous range.
+    pending.rows += rows
+
+    return
+  }
+
+  const listed = row && Number.isFinite(row.message_count) ? row.message_count : undefined
+  const start = listed ?? $sessionSeenCounts.get()[profile]?.[durableId] ?? null
+
+  silentRanges.set(key, { profile, storedSessionId, durableId, start, rows })
+  trimOldest(silentRanges)
+}
+
+/** Drop every pending silent range (the session-state reset). */
+export function forgetSilentTurnRanges(): void {
+  silentRanges.clear()
+}
+
+function silentRangeFor(row: SessionInfo): SilentRange | undefined {
+  if (!silentRanges.size) {
+    return undefined
+  }
+
+  const profile = profileKeyForRow(row)
+  const exact = silentRanges.get(silentRangeKey(profile, sessionPinId(row)))
+
+  if (exact) {
+    return exact
+  }
+
+  for (const range of silentRanges.values()) {
+    if (range.profile === profile && sessionMatchesStoredId(row, range.storedSessionId)) {
+      return range
     }
   }
 
-  return false
+  return undefined
+}
+
+/** Rows of `range` that `count` shows above `watermark`: the silent activity to leave out of unread. */
+function silentRowsAbove(range: SilentRange, count: number, watermark: number): number {
+  const start = range.start ?? watermark
+
+  return Math.max(0, Math.min(count, start + range.rows) - Math.max(watermark, start))
 }
 
 /** Seed/refresh watermarks from freshly loaded lists: the SELECTED session
@@ -562,8 +624,12 @@ function ingestRows(rows: readonly SessionInfo[]): void {
     const bucket = next?.[profile] ?? seen[profile]
 
     if (profile === selectedProfile && isSelected(row, selected)) {
-      // On screen: its count is tracked below, so a pending silent note has nothing left to do.
-      takeSilentTurnSettle(row)
+      // On screen: its count is tracked below, so a pending silent range has nothing left to do.
+      const range = silentRangeFor(row)
+
+      if (range) {
+        silentRanges.delete(silentRangeKey(range.profile, range.durableId))
+      }
 
       if (bucket?.[durableId] !== row.message_count) {
         write(profile, durableId, row.message_count)
@@ -580,9 +646,26 @@ function ingestRows(rows: readonly SessionInfo[]): void {
         }
       }
     } else if (!bucket || !(durableId in bucket)) {
+      // First sight seeds at the current count, which already covers any silent rows.
+      silentRanges.delete(silentRangeKey(profile, durableId))
       write(profile, durableId, row.message_count)
-    } else if (row.message_count > bucket[durableId] && silentTurnSettles.size && takeSilentTurnSettle(row)) {
-      write(profile, durableId, row.message_count)
+    } else {
+      const range = silentRangeFor(row)
+      const watermark = bucket[durableId]
+
+      if (range && range.start !== null && row.message_count < range.start) {
+        // Fewer rows than before the turn (compaction rewrote the session): the range is gone.
+        silentRanges.delete(silentRangeKey(range.profile, range.durableId))
+      } else if (range && row.message_count >= (range.start ?? watermark) + range.rows) {
+        // The whole silent range is listed: move the watermark over exactly those rows, so a real
+        // answer before or after it keeps its gap. recomputeUnread excludes a partial one meanwhile.
+        silentRanges.delete(silentRangeKey(range.profile, range.durableId))
+        const covered = silentRowsAbove(range, row.message_count, watermark)
+
+        if (covered) {
+          write(profile, durableId, watermark + covered)
+        }
+      }
     }
   }
 
@@ -659,9 +742,12 @@ function recomputeUnread(): void {
 
     const durableId = sessionPinId(row)
     const watermark = seen[profileKeyForRow(row)]?.[durableId]
+    // A silent turn's rows a refresh shows only partly are still not unread.
+    const range = silentRangeFor(row)
+    const silentRows = range && typeof watermark === 'number' ? silentRowsAbove(range, row.message_count, watermark) : 0
 
     const exceedsWatermark =
-      typeof watermark === 'number' && Number.isFinite(row.message_count) && row.message_count > watermark
+      typeof watermark === 'number' && Number.isFinite(row.message_count) && row.message_count - silentRows > watermark
 
     if (exceedsWatermark || isMarked(row, durableId)) {
       unread.push(row.id)
