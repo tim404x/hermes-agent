@@ -253,6 +253,8 @@ export type GatewayEventPayload = {
   response_transformed?: MessageCompletePayload['response_transformed']
   // message.complete — `text` is a response this turn already delivered: it adds no text.
   response_reused?: MessageCompletePayload['response_reused']
+  // message.complete — the turn chose silence where it may: nothing to show, toast, beep or mark unread.
+  silent?: MessageCompletePayload['silent']
   persisted_turn?: PersistedTurn | null
   // message.complete — history-commit note the gateway surfaced instead of dropping.
   warning?: string
