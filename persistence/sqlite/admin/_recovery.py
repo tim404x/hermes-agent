@@ -19,6 +19,7 @@ from persistence.core.admin import SessionRecoveryError, SessionRecoverySafetyEr
 
 from .._holder import StoreHolder
 from .._schema_ddl import FTS_STORAGE_VERSION, SCHEMA_VERSION
+from ..conversation._store.list_revision import drop_visible_list_triggers
 from ..conversation._store.rules import EPOCH_MAX, EPOCH_MIN
 from ..gateway._delivery_ledger import _ensure_obligations_table
 from ..gateway._routes import apply_telegram_topic_migration
@@ -360,6 +361,10 @@ def _fresh_destination(output: Path, *, topic_tables: bool = False) -> sqlite3.C
             apply_telegram_topic_migration(destination_db)
     conn = _connect(output)
     conn.execute("PRAGMA foreign_keys=OFF")
+    # No visible-list revision triggers on the copy: they would run their ancestor walk and counter upsert on every
+    # copied row. The file is a new inode (no listing memo key can tie with the source), readers of an incomplete
+    # set fall back to the stat signature, and its first writable open re-creates them.
+    drop_visible_list_triggers(conn.cursor())
     return conn
 
 
