@@ -42,6 +42,7 @@ the schema cookie, which a ``backup()`` restore or any DDL moves even when the r
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from typing import Optional
 
@@ -58,10 +59,13 @@ _ANCESTOR_HOPS = 6
 # The trigger set's version is in every trigger name: readers verify their own names, so a build whose rule differs
 # (another internal source set, another hop count) never vouches with this build's triggers, and two builds never
 # DROP/CREATE each other's triggers on every writable open. Change any trigger body: bump it
-# (test_visible_list_revision pins the SQL's digest to the version). Triggers of another version only add bumps.
+# (test_visible_list_revision pins the SQL's digest to the version). Triggers of another version only add bumps,
+# except across a rebuild of a table they name: ``drop_visible_list_triggers`` (below) drops every version first.
 TRIGGER_VERSION = 1
 TRIGGER_NAMES = tuple(f"{table}_visible_list_rev_v{TRIGGER_VERSION}_{event}"
                       for table in ("sessions", "messages", "state_meta") for event in ("insert", "delete", "update"))
+# Every version's names (LIKE pattern, ``\`` escapes the underscores).
+_ANY_VERSION_LIKE = r"%\_visible\_list\_rev\_v%"
 
 _INTERNAL_LIST = ", ".join(f"'{source}'" for source in INTERNAL_SOURCES)
 
@@ -87,13 +91,23 @@ def _internal_source(expr: str) -> str:
 
 def _chain_internal(parent_expr: str, hops: int) -> str:
     """1 when the chain above a row (its parent id is *parent_expr*) ends within *hops* parent hops and every
-    ancestor on it has an internal source; 0 otherwise (a deeper chain or a dangling parent id counts as shown)."""
-    if hops == 0:
-        return f"(CASE WHEN {parent_expr} IS NULL THEN 1 ELSE 0 END)"
-    a = f"_lra{hops}"
-    return (f"(CASE WHEN {parent_expr} IS NULL THEN 1 ELSE COALESCE((SELECT CASE WHEN {_internal_source(f'{a}.source')}"
-            f" THEN {_chain_internal(f'{a}.parent_session_id', hops - 1)} ELSE 0 END"
-            f" FROM sessions {a} WHERE {a}.id = {parent_expr}), 0) END)")
+    ancestor on it has an internal source; 0 otherwise (a deeper chain or a dangling parent id counts as shown).
+
+    FLAT on purpose: one correlated scalar subquery over a LEFT JOIN chain (one join per hop) and one flat CASE,
+    so the SQL's nesting depth does not grow with *hops*. A walk nested one subquery per hop overflowed the parser
+    stack of SQLite < 3.46 (a fixed 100-entry LALR stack; this VPS's system ``sqlite3`` CLI and ``/usr/bin/python3``
+    are 3.45.1, macOS ships older still) from 4 hops on, and SQLite parses the whole schema on first use: such a
+    store becomes unreadable to every one of those builds (scripts, skills, the recovery salvage CLI).
+    ``test_visible_list_revision`` bounds the nesting and parses the DDL on an old SQLite when one is present."""
+    joins, whens, prev = [], [f"WHEN {parent_expr} IS NULL THEN 1"], parent_expr
+    for hop in range(1, hops + 1):
+        a = f"_lra{hop}"
+        # ``id`` is the PRIMARY KEY: each LEFT JOIN matches at most one row, so the subquery yields exactly one.
+        joins.append(f" LEFT JOIN sessions {a} ON {a}.id = {prev}")
+        whens.append(f"WHEN {a}.id IS NULL OR NOT {_internal_source(f'{a}.source')} THEN 0"
+                     f" WHEN {a}.parent_session_id IS NULL THEN 1")
+        prev = f"{a}.parent_session_id"
+    return f"(SELECT CASE {' '.join(whens)} ELSE 0 END FROM (SELECT 1) _lra0{''.join(joins)})"
 
 
 def _ancestors_internal(alias: str) -> str:
@@ -179,6 +193,29 @@ def _build_trigger_sql() -> str:
 # Appended to ``_schema_ddl.DEFERRED_INDEX_SQL``: every writable open creates a missing trigger and replaces one
 # whose body changed (``_execute_ddl_skipping_settled_triggers`` skips a settled DROP/CREATE pair).
 VISIBLE_LIST_REVISION_SQL = _build_trigger_sql()
+
+
+def drop_visible_list_triggers(cursor: sqlite3.Cursor, table: Optional[str] = None) -> list[str]:
+    """Drop every visible-list revision trigger, of ANY version, whose SQL names *table* (every one when *table* is
+    None); returns the dropped names. Run it inside the transaction, BEFORE any statement that renames *table*,
+    rebuilds it or drops/renames one of its columns (``_schema._rebuild_table`` does). The messages and state_meta
+    triggers read ``sessions``: ``ALTER TABLE sessions RENAME TO sessions_legacy`` rewrites them to name
+    ``sessions_legacy``, the ``DROP TABLE`` then leaves them dangling, and every later messages/state_meta write of
+    every process (old builds included) fails with "no such table"; ``DROP COLUMN`` refuses outright. Dropping them
+    is safe: readers see an incomplete set (and a moved schema cookie), so ``visible_list_revision`` returns None and
+    listings fall back to the stat signature until the next writable open of a current build re-creates the set."""
+    rows = cursor.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name LIKE ? ESCAPE '\\'", (_ANY_VERSION_LIKE,),
+    ).fetchall()
+    # Over-matching (the word inside a string literal) only drops more: safe. Identifiers may be quoted.
+    names_table = None if table is None else re.compile(rf"(?<![\w$]){re.escape(table)}(?![\w$])", re.IGNORECASE)
+    dropped = []
+    for name, sql in rows:
+        if names_table is None or sql is None or names_table.search(sql):
+            cursor.execute('DROP TRIGGER IF EXISTS "{}"'.format(name.replace('"', '""')))
+            dropped.append(name)
+    return dropped
+
 
 _TRIGGER_MARKS = ",".join("?" * len(TRIGGER_NAMES))
 _READ_SQL = (
