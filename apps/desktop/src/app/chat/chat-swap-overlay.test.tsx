@@ -3,10 +3,10 @@
 // that GlyphSpinner was rewritten to remove. It now renders GlyphSpinner, so
 // what needs pinning is that no timer comes back, that the label still survives
 // the fade-out, and that the spinner stops animating once the swap is done.
-import { cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { ChatSwapOverlay } from './chat-swap-overlay'
+import { ChatSwapOverlay, SWAP_OVERLAY_GRACE_MS } from './chat-swap-overlay'
 
 afterEach(() => {
   cleanup()
@@ -22,9 +22,32 @@ describe('ChatSwapOverlay', () => {
     vi.useRealTimers()
   })
 
+  it('never shows for a swap that settles inside the grace period', () => {
+    // A warm bot switch paints its cached thread within a frame or two; the
+    // overlay flashing over it read as a reload on every switch.
+    const { container, rerender } = render(<ChatSwapOverlay profile="turqoise" />)
+
+    act(() => {
+      vi.advanceTimersByTime(SWAP_OVERLAY_GRACE_MS - 1)
+    })
+    rerender(<ChatSwapOverlay profile={null} />)
+    act(() => {
+      vi.advanceTimersByTime(SWAP_OVERLAY_GRACE_MS)
+    })
+
+    expect(container.querySelector('.opacity-100')).toBeNull()
+    expect(screen.queryByText(/turqoise/)).toBeNull()
+  })
+
   it('keeps the last profile name through the fade-out, with the glyph frozen', () => {
     const { container, rerender } = render(<ChatSwapOverlay profile="turqoise" />)
 
+    // A real wake outlasts the grace period and shows the overlay.
+    act(() => {
+      vi.advanceTimersByTime(SWAP_OVERLAY_GRACE_MS)
+    })
+
+    expect(container.querySelector('.opacity-100')).not.toBeNull()
     expect(container.querySelector('.glyph-spinner')?.hasAttribute('data-paused')).toBe(false)
 
     rerender(<ChatSwapOverlay profile={null} />)
