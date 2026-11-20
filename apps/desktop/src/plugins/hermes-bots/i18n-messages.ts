@@ -196,6 +196,9 @@ export type BotsMessages = {
     openUnreachableMessage: string
     openChatFailedTitle: (botName: string) => string
     openChatFailedMessage: string
+    /** Paint-first open whose Bot Chat the registry could not confirm. */
+    openUnconfirmedTitle: (botName: string) => string
+    openUnconfirmedMessage: string
     openGateways: string
     /** Stands under the bot's name in a chat it has not spoken in yet. */
     chatEmpty: string

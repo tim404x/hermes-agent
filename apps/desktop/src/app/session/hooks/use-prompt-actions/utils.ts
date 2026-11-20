@@ -818,6 +818,10 @@ export interface SubmitTextOptions {
   composerScope?: string | null
   /** This submit's fresh draft acquired a stored key. Never fired for navigation. */
   onComposerScopeAssigned?: (scope: string) => void
+  /** A held send (a session opened before its identity was confirmed) was
+   *  replayed into the chat the confirmation named instead: its draft and
+   *  outgoing journal move to that chat's composer scope. */
+  onComposerScopeMoved?: (scope: string) => void
   /** What the transcript shows for this send, when it differs from the text
    *  the agent receives. A `/skill` invocation expands into the whole skill
    *  body — model-facing scaffolding the UI must never render — so the slash
