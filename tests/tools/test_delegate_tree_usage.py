@@ -7,6 +7,7 @@ count) into the parent's ``delegation_tree_usage``, and the delegate_task result
 
 import json
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from hermes_constants import get_hermes_home
@@ -60,13 +61,64 @@ def test_a_depth_two_swarm_reports_and_rolls_up_every_level():
     assert root.session_estimated_cost_usd == 4.0
 
 
-def test_later_calls_add_to_the_session_total_and_a_continued_child_counts_only_new_spend():
-    root, child = _agent(0), _agent(1, cost=0.25, inp=100, out=5)
-    assert _delegate(root, [child], 1)["usage_total"]["input_tokens"] == 100
-    child.session_input_tokens, child.session_estimated_cost_usd = 160, 0.4  # the same child, continued
-    again = _delegate(root, [child], 1)["usage_total"]
-    assert (again["input_tokens"], again["cost_usd"], again["subagents"]) == (60, 0.15, 0)
-    assert (root.delegation_tree_usage["input_tokens"], root.delegation_tree_usage["subagents"]) == (160, 1)
+def test_later_calls_add_to_the_session_total():
+    root = _agent(0)
+    assert _delegate(root, [_agent(1, cost=0.25, inp=100, out=5)], 1)["usage_total"]["input_tokens"] == 100
+    again = _delegate(root, [_agent(1, cost=0.15, inp=60)], 1)["usage_total"]
+    assert (again["input_tokens"], again["cost_usd"], again["subagents"]) == (60, 0.15, 1)
+    assert (root.delegation_tree_usage["input_tokens"], root.delegation_tree_usage["subagents"]) == (160, 2)
+
+
+def test_a_real_continue_adds_its_new_spend_but_not_the_same_subagent_again():
+    """action: continue rebuilds the child object for the same durable subagent: it is still one subagent."""
+    from tests.tools.test_delegate_continue import _parent, _ScriptedModel
+
+    parent, scripted = _parent(), _ScriptedModel()
+
+    def model(**kwargs):
+        child = scripted(**kwargs)
+        child.session_input_tokens, child.session_output_tokens, child.session_estimated_cost_usd = 100, 5, 0.25
+        return child
+
+    try:
+        with patch("run_agent.AIAgent", side_effect=model):
+            first = json.loads(delegate_task(tasks=[{"goal": "list files"}], parent_agent=parent))
+            sid = first["results"][0]["subagent_id"]
+            second = json.loads(delegate_task(action="continue", subagent_id=sid, message="list more",
+                                              parent_agent=parent))
+        assert second["results"][0]["subagent_id"] == sid
+        assert first["usage_total"]["subagents"] == 1
+        assert (second["usage_total"]["input_tokens"], second["usage_total"]["cost_usd"],
+                second["usage_total"]["subagents"]) == (100, 0.25, 0)
+        assert (parent.delegation_tree_usage["input_tokens"], parent.delegation_tree_usage["subagents"]) == (200, 1)
+    finally:
+        parent.persistence.close()
+
+
+def test_a_new_session_starts_its_tree_total_from_zero():
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    _rollup_tree_usage([SimpleNamespace(session_input_tokens=100, session_estimated_cost_usd=0.5)], agent)
+    agent.session_id = "new-session"
+    agent.reset_session_state()
+    _rollup_tree_usage([SimpleNamespace(session_input_tokens=10, session_estimated_cost_usd=0.1)], agent)
+    usage = agent.delegation_tree_usage
+    assert (usage["input_tokens"], usage["cost_usd"], usage["subagents"]) == (10, 0.1, 1)
+
+
+def test_a_child_finishing_after_a_session_switch_stays_out_of_the_new_sessions_totals():
+    root, child = _agent(0), _agent(1, cost=0.5, inp=100)
+    root._session_reset_epoch = 1
+
+    def switch(*_a, **_k):  # /new lands while the child runs (a background unit that finishes late)
+        root._session_reset_epoch, root.delegation_tree_usage, root.session_estimated_cost_usd = 2, None, 0.0
+        return {"final_response": "done", "completed": True, "api_calls": 1, "messages": []}
+
+    child.run_conversation.side_effect = switch
+    out = _delegate(root, [child], 1)
+    assert out["usage_total"]["input_tokens"] == 100  # the call still reports its own spend
+    assert not root.delegation_tree_usage and root.session_estimated_cost_usd == 0.0
 
 
 def test_a_child_run_without_a_live_parent_still_reports_its_spend():
