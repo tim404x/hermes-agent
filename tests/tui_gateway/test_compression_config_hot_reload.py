@@ -391,3 +391,29 @@ def test_apply_live_compression_config_is_self_contained():
     _apply_live_compression_config(agent, {"compression": {"enabled": True}})
     assert agent.compression_enabled is True
     assert agent.codex_responses_native_compaction is False
+
+
+# apexfix: compression.prepare_ahead applies to a live Desktop/TUI agent on its next turn
+def test_live_prepare_ahead_installs_and_removes_prepared_compaction(monkeypatch):
+    from agent.prepared_compaction import PreparedCompaction
+
+    session, compressor = _neutral_session()
+    assert getattr(compressor, "prepared_compaction", None) is None
+    _sync_with_cfg(monkeypatch, session, {"compression": {"prepare_ahead": True}})
+    installed = compressor.prepared_compaction
+    assert isinstance(installed, PreparedCompaction)
+    # unchanged config: same object kept (no churn, a running pass is not dropped)
+    _sync_with_cfg(monkeypatch, session, {"compression": {"prepare_ahead": True}})
+    assert compressor.prepared_compaction is installed
+    # removing the key restores the shipped default (off): inline compaction again
+    _sync_with_cfg(monkeypatch, session, {"compression": {}})
+    assert compressor.prepared_compaction is None
+
+
+def test_prepare_ahead_is_a_cache_busting_key():
+    from gateway.run import GatewayRunner
+
+    assert ("compression", "prepare_ahead") in GatewayRunner._CACHE_BUSTING_CONFIG_KEYS
+    on = GatewayRunner._extract_cache_busting_config({"compression": {"prepare_ahead": True}})
+    off = GatewayRunner._extract_cache_busting_config({"compression": {"prepare_ahead": False}})
+    assert on != off
