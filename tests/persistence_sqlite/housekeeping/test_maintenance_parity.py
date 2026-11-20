@@ -94,3 +94,27 @@ def test_session_projection_digest_matches_legacy_probe(seeded):
     maintenance.session_projection_digest(busy_timeout_s=0.01)
     with store.holder()._read_ctx() as conn:
         assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == budget
+
+
+@pytest.mark.parametrize("path", ["in_store", "legacy_walk"])
+@pytest.mark.parametrize("change", [
+    ("UPDATE sessions SET title = 'Alpha Repart' WHERE id = 'old-a'", True),       # same length, quiet row
+    ("UPDATE sessions SET title = '' WHERE id = 'old-c'", True),                   # NULL -> ''
+    ("UPDATE sessions SET archived = 0 WHERE id = 'old-b'", True),
+    ("UPDATE sessions SET handoff_state = 'running' WHERE id = 'old-a'", True),
+    ("DELETE FROM sessions WHERE id = 'recent-g'", True),
+    ("UPDATE sessions SET last_activity_at = 1 WHERE id = 'old-a'", False),       # the heartbeat's column
+])
+def test_the_projection_digest_sees_every_listed_change_on_both_paths(seeded, monkeypatch, path, change):
+    """The watcher's digest is built inside SQLite where the library has concat_ws (3.44+), else by the per-row walk:
+    either way any change to a listed column of ANY row (quiet ones included) moves it, and the heartbeat does not."""
+    import persistence.sqlite.housekeeping.maintenance as sqlite_maintenance
+
+    if path == "legacy_walk":
+        monkeypatch.setattr(sqlite_maintenance, "_CONCAT_WS_SQLITE", (99, 0, 0))
+    store = seeded(_seed_selection)
+    before = store.maintenance.session_projection_digest(busy_timeout_s=1.0)
+    assert before is not None and before == store.maintenance.session_projection_digest(busy_timeout_s=1.0)
+    sql, moves = change
+    store.holder()._write_sql(sql)
+    assert (store.maintenance.session_projection_digest(busy_timeout_s=1.0) != before) is moves
