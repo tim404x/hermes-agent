@@ -3,14 +3,17 @@
 Same route as ``default`` (the ``delegation`` section), plus a per-task ``effort``. The parent picks it per
 task. Two rules keep a cheap level away from work that matters:
 
-- **Floor.** Work whose goal or context touches money, legal, sends, code changes, destructive operations or
-  research synthesis, or names any write/action verb (en/pt/fr/es), never runs below ``high``, hyphenated
-  compounds included (``wire-transfer``, ``re-send``): an explicit
-  low/medium pick is raised, and so is a default that is empty, disabled or below high. The route then
-  carries ``high`` explicitly, so the child can never inherit a low parent level.
+- **Floor.** Work whose goal or context touches money, legal, sends, access grants or permission changes, code
+  changes, destructive operations or research synthesis, or names any write/action verb (en/pt/fr/es), never
+  runs below ``high``, hyphenated compounds included (``wire-transfer``, ``re-send``); so does a goal that hands
+  something to someone (``Get the deck to Armin``, ``Show Jackson the dashboard``). The floor only ever raises:
+  an explicit low/medium pick becomes ``high``, a default below high becomes ``high`` and an empty default
+  keeps the level the child would inherit when that is already high or above (``task["inherited_effort"]``),
+  else carries ``high`` explicitly, so the child can never inherit a low parent level.
 - **Auto.** When the parent omits ``effort``, the level drops to ``medium`` only for a positively identified
-  mechanical goal: one read-only verb first (fetch, list, read, look up, grep ...), one operation, no second
-  clause, plain English. Compound, ambiguous or other-language goals keep ``delegation.reasoning_effort``.
+  mechanical goal: one read-only verb first (fetch, list, read, look up, grep ...; never the light verbs
+  ``get`` / ``show``, which also mean "deliver" or "make happen"), one operation, no second clause, plain
+  English. Compound, ambiguous or other-language goals keep ``delegation.reasoning_effort``.
 
 ``xhigh`` is never chosen automatically. The schema, guidance and rules are the same at every depth, so an
 orchestrator child tiers its own sub-subtasks the same way. Each child's route label says what was picked and
@@ -80,6 +83,10 @@ _FLOOR = (
         r"telegram", r"imessage", r"sms", r"outreach", r"submit\w*", r"upload\w*", r"outbox", r"cc", r"bcc",
         r"envi(?:e|em|ar|a|am|ou|o)", r"reenvi\w*", r"encaminh\w*", r"mensage\w*", r"mensaj\w*", r"public\w*",
         r"compartilh\w*", r"convid\w*", r"envoy\w*", r"envoi\w*", r"repond\w*", r"partag\w*", r"compart\w*")),
+    ("access", _words(
+        r"acces\w*", r"acess\w*", r"admin\w*", r"permis\w*", r"privil\w*", r"(?:on|off)board(?:s|ed)?",
+        r"offboarding", r"(?:de)?provision\w*", r"seats?", r"sudoers?", r"(?:allow|white|block|black)list\w*",
+        r"(?:un)?ban(?:s|ned|ning)?")),
     ("code", _words(
         r"code", r"codebase", r"coding", r"commit\w*", r"push\w*", r"merg\w*", r"rebas\w*", r"prs?", r"pull requests?",
         r"patch\w*", r"refactor\w*", r"implement\w*", r"fix\w*", r"bugs?", r"debug\w*", r"deploy\w*", r"migrat\w*",
@@ -92,7 +99,7 @@ _FLOOR = (
         r"eras\w*", r"destroy\w*", r"kill\w*", r"reset\w*", r"revok\w*", r"cancel\w*", r"unsubscrib\w*",
         r"overwrit\w*", r"prun\w*", r"clean ?up", r"nuk(?:e|es|ed|ing)", r"shred\w*", r"rotat\w*",
         r"apag\w*", r"exclu\w*", r"supprim\w*", r"effac\w*", r"detrui\w*", r"borr\w*", r"elimin\w*", r"suprim\w*",
-        r"destru\w*", r"annul\w*")),
+        r"destru\w*", r"annul\w*", r"rid", r"deactivat\w*", r"suspend\w*")),
     ("research", _words(
         r"research\w*", r"synthes\w*", r"analy[sz]\w*", r"analis\w*", r"strateg\w*", r"estrateg\w*", r"recommend\w*",
         r"recomend\w*", r"recommand\w*", r"compar\w*", r"evaluat\w*", r"evalu\w*", r"avalia\w*", r"assess\w*",
@@ -112,16 +119,26 @@ _FLOOR = (
         r"compr(?:a|ar|e|ou)", r"agend\w*", r"reserv\w*", r"ecri\w*", r"ecriv\w*", r"mett\w*", r"remplac\w*",
         r"cre(?:e|er|ez)", r"ajout\w*", r"renomm\w*", r"deplac\w*", r"lanc\w*", r"approuv\w*", r"achet\w*",
         r"planifi\w*", r"escrib\w*", r"modific\w*", r"cambi\w*", r"actualiz\w*", r"reemplaz\w*", r"cre(?:a|ar)",
-        r"agreg\w*", r"anad\w*", r"renombr\w*", r"muev\w*", r"ejecut\w*", r"aprob\w*")),
+        r"agreg\w*", r"anad\w*", r"renombr\w*", r"muev\w*", r"ejecut\w*", r"aprob\w*", r"back up",
+        r"reboot\w*", r"start(?:s|ed|ing)?")),
 )
 _LETTER_HYPHENS_ONLY = frozenset({"write"})
 _DASHES = re.compile(r"[\u2010-\u2015\u2212]")  # hyphen, en/em dash, minus ... all read as "-"
 _LETTER_HYPHEN = re.compile(r"(?<=[^\W\d_])-(?=[^\W\d_])")
 
+# A light verb handing something to someone is a send: ``Get the deck to Armin`` / ``to the team``, ``Show Jackson
+# the dashboard``, ``Get the contributors their Scout codes``. Read on the raw goal, since a name is what marks the
+# recipient; ``me`` / ``us`` (the parent asking for a result) is not one.
+_HANDOFF = re.compile(
+    r"^\s*(?:(?i:please)\s+)?(?i:get|show|give|hand|bring|take|pass|deliver|provide)\s+"
+    r"(?:.*\b(?i:to)\s+(?:[A-Z]|(?i:(?:the\s+)?(?:team|clients?|buyers?|customers?|users?|contributors?|partners?"
+    r"|investors?|board|group|channel)|everyone|everybody|all)\b)"
+    r"|(?!(?i:me|us|it)\b)(?:[A-Z][\w'.-]*|(?i:him|her|them|everyone|everybody)|(?i:the|our|all|my|your)\s+\w+)\s+"
+    r"(?i:the|their|his|her|its|our|your|my|a|an|this|that|these|those|every|some)\b)")
 # Auto level: the goal STARTS with one read-only verb ...
 _MECHANICAL = re.compile(
-    r"^\s*(?:fetch|get|list|read|look ?up|lookup|find|search|grep|count|extract|show|print|display|query|locate"
-    r"|view)\b", re.IGNORECASE)
+    r"^\s*(?:fetch|list|read|look ?up|lookup|find|search|grep|count|extract|print|display|query|locate|view)\b",
+    re.IGNORECASE)
 # ... holds no second clause, sequencing word or judgment once URLs and paths are blanked ...
 _COMPOUND = re.compile(r"[,;&+|]|->|=>|\.\s+\S|\n|:\s|" + _words(
     r"and", r"then", r"also", r"after\w*", r"before", r"if", r"unless", r"when\w*", r"while", r"but", r"so", r"plus",
@@ -144,12 +161,13 @@ def _fold(text: str) -> str:
 
 
 def floor_reason(goal: str, context: str = "") -> Optional[str]:
-    """The category (money, legal, send, code, destructive, research, write) that keeps a task at high or above,
-    or None."""
+    """The category (money, legal, send, access, code, destructive, research, write) that keeps a task at high or
+    above, or None."""
     text = _DASHES.sub("-", _fold(f"{goal}\n{context}"))
     split = {False: text.replace("-", " "), True: _LETTER_HYPHEN.sub(" ", text)}
     return next((category for category, pattern in _FLOOR
-                 if pattern.search(split[category in _LETTER_HYPHENS_ONLY])), None)
+                 if pattern.search(split[category in _LETTER_HYPHENS_ONLY])),
+                "send" if _HANDOFF.match(goal) else None)
 
 
 def is_mechanical(goal: str) -> bool:
@@ -168,8 +186,11 @@ def _level(value: Any) -> str:
     return value.strip().lower() if isinstance(value, str) else ""
 
 
-def choose_effort(goal: str, context: str, asked: Optional[str], default: Any) -> tuple[Optional[str], str]:
-    """``(effort, why)`` for one task: the parent's pick, else the auto level or the default, under the floor."""
+def choose_effort(goal: str, context: str, asked: Optional[str], default: Any,
+                  inherited: Any = "") -> tuple[Optional[str], str]:
+    """``(effort, why)`` for one task: the parent's pick, else the auto level or the default, under the floor.
+    ``inherited`` is the level the child gets when the route sets none (``""`` = unknown or the provider default);
+    the floor only ever raises it."""
     reason, configured = floor_reason(goal, context), _level(default)
     if asked in LEVELS:
         if reason and asked not in _AT_OR_ABOVE_FLOOR:
@@ -178,6 +199,8 @@ def choose_effort(goal: str, context: str, asked: Optional[str], default: Any) -
     if reason:
         if configured in _AT_OR_ABOVE_FLOOR:
             return configured, "default"
+        if not configured and _level(inherited) in _AT_OR_ABOVE_FLOOR:
+            return None, f"floor met: {_level(inherited)}, {reason}"
         return FLOOR, f"floor: default {configured or 'inherited'}, {reason}"
     if configured not in _AT_OR_BELOW_AUTO and is_mechanical(goal):
         return _AUTO, "auto: mechanical"
@@ -215,7 +238,7 @@ class EffortRouterProvider(DelegationProvider):
     def route_task(self, task: Mapping[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
         route = {k: v for k, v in config.items() if k != "service_tier"}
         effort, why = choose_effort(str(task.get("goal") or ""), str(task.get("context") or ""),
-                                    task.get("effort"), config.get("reasoning_effort"))
+                                    task.get("effort"), config.get("reasoning_effort"), task.get("inherited_effort"))
         if effort:
             route["reasoning_effort"] = effort
         route["label"] = f"effort {effort or 'inherited'}" + (f" ({why})" if why else "")

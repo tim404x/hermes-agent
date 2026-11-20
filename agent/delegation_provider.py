@@ -43,7 +43,7 @@ from agent.provider_base import ProviderBase
 #: refused at schema-build time: plugins add parameters, they never redefine core ones, and the
 #: raw route fields (``provider``/``model``/``base_url``/``api_key``) never become model-facing.
 RESERVED_TASK_PARAMETERS = frozenset({
-    "goal", "context", "index", "output_schema", "images", "group", "role", "toolsets",
+    "goal", "context", "index", "inherited_effort", "output_schema", "images", "group", "role", "toolsets",
     "acp_command", "acp_args", "provider", "model", "base_url", "api_key", "api_mode",
 })
 
@@ -111,7 +111,10 @@ class DelegationProvider(ProviderBase):
     def route_task(self, task: Mapping[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
         """Return the route for one task (vocabulary in the module docstring).
 
-        ``task`` carries ``goal``, ``context``, ``index`` and the values the model supplied for
-        this provider's :meth:`task_parameters` (absent when omitted). Raise
+        ``task`` carries ``goal``, ``context``, ``index``, ``inherited_effort`` and the values the
+        model supplied for this provider's :meth:`task_parameters` (absent when omitted).
+        ``inherited_effort`` is the reasoning level the child runs at when the route sets no
+        ``reasoning_effort`` (``delegation.reasoning_effort``, else the parent's level): a level
+        name, ``"none"`` when thinking is off, ``""`` when it is the provider's default. Raise
         :class:`DelegationRouteError` to refuse the task.
         """
