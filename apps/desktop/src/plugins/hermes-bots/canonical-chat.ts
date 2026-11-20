@@ -12,7 +12,14 @@ import * as sdk from '@hermes/plugin-sdk'
 import { host } from '@hermes/plugin-sdk'
 import type { SessionListRow } from '@hermes/plugin-sdk'
 
-import { $botMeta, botMetaKey, botOwner, persistBotMetaSnapshot } from './data'
+import {
+  $botMeta,
+  botMetaKey,
+  botOwner,
+  persistBotMetaSnapshot,
+  ROSTER_POLL_INTERVAL_MS,
+  rosterSnapshotAgeMs
+} from './data'
 import { botsText } from './i18n'
 import { backendTargetProfile, botConnectionRoute, botRosterMeta, botWorkspaceOwnerKey, requestForBot } from './routing'
 import type { RpcErrorLike } from './routing'
@@ -42,6 +49,11 @@ const canonicalCreations = new Map<string, CanonicalCreation>()
 /** Upper bound for per-profile session.list scans (hide sweep, canonical-chat
  *  adoption, stored-session lookups). */
 export const PROFILE_SESSION_LIST_LIMIT = 200
+
+/** Paint-first is allowed while the roster is at most one poll cycle old: the
+ *  poll interval plus the time a slow poll takes to land (profiles.list p95
+ *  was 3.5 s from the Mac under load, bot-switch-speed-1119 measurements). */
+const ROSTER_PAINT_FIRST_MAX_AGE_MS = ROSTER_POLL_INTERVAL_MS + 4_000
 
 /** The one canonical title. (profile, CANONICAL_CHAT_TITLE) IS the bot's
  *  forever-chat identity — see the header above. Exported for the roster
@@ -118,6 +130,10 @@ interface OpenStoredBotChatOptions {
    *  always replaced the first; ⌘-click / "Open in new tab" on a bot row
    *  pass `tab` so two Bot Chats can stay open side by side. */
   intent?: BotChatOpenIntent
+  /** Default true (an explicit switch never trusts a cached transcript). A
+   *  paint-first open re-waiting on the SAME session with the registry's
+   *  hydration policy passes false: its resume is already in flight. */
+  forceResume?: boolean
 }
 
 export type BotChatOpenIntent = 'in-place' | 'tab'
@@ -126,7 +142,7 @@ async function openStoredBotChat(
   owner: RosterRow | string,
   storedId: string,
   summary: CanonicalChatRow,
-  { background = false, intent = 'in-place' }: OpenStoredBotChatOptions = {}
+  { background = false, forceResume = true, intent = 'in-place' }: OpenStoredBotChatOptions = {}
 ): Promise<string> {
   if (!storedId || typeof host.openSession !== 'function') {
     throw new Error('This Hermes Desktop version cannot open stored sessions')
@@ -182,7 +198,7 @@ async function openStoredBotChat(
     intent,
     awaitHydration: !background,
     expectHistory,
-    forceResume: true,
+    forceResume,
     hydrationTimeoutMs,
     keepAllProfilesScope: true,
     ...(background ? { refreshInPlace: true } : {}),
@@ -308,6 +324,35 @@ export function notifyBotOpenFailure(error: unknown, bot: RosterRow, step: BotOp
     message: b.openChatFailedMessage,
     ...(detail ? { detail } : {}),
     action
+  })
+}
+
+/** A paint-first open the registry could not confirm (switch-fix-1119): the
+ *  last known thread stays on screen, but sending waits for a confirmation,
+ *  so say so and offer the retry. Info, not error: nothing failed that the
+ *  user did, and the chat they are reading is real. One toast per bot, raised
+ *  again when a send is refused. Late import: roster-actions imports this
+ *  module. */
+function notifyBotOpenUnconfirmed(owner: RosterRow | string) {
+  const { bot, key, name } = botOwner(owner)
+  const b = botsText().bot
+  const retryLabel = typeof sdk.translateNow === 'function' ? sdk.translateNow('common.retry') : 'Retry'
+
+  host.notify?.({
+    id: `hermes-bots:unconfirmed:${key}`,
+    kind: 'info',
+    title: b.openUnconfirmedTitle(name),
+    message: b.openUnconfirmedMessage,
+    ...(bot
+      ? {
+          action: {
+            label: retryLabel || 'Retry',
+            onClick: () => {
+              void import('./roster-actions').then(({ openRosterBot }) => openRosterBot(bot))
+            }
+          }
+        }
+      : {})
   })
 }
 
@@ -683,7 +728,13 @@ export async function openBotCanonicalChat(
 ): Promise<{ openedId: string; registryId: string } | null> {
   // In place only: that is the switch. A new-tab open keeps registry-first so
   // a superseded roster row can never leave a second Bot Chat tab behind.
-  const rosterCanonical = background || intent !== 'in-place' ? null : rosterCanonicalChat(owner)
+  // A roster that has not polled for a full cycle is registry-first too: the
+  // poll pauses while the window is hidden, so right after un-hiding the row
+  // can name a Bot Chat that was replaced hours ago.
+  const rosterAge = rosterSnapshotAgeMs()
+  const rosterFresh = rosterAge !== null && rosterAge <= ROSTER_PAINT_FIRST_MAX_AGE_MS
+
+  const rosterCanonical = background || intent !== 'in-place' || !rosterFresh ? null : rosterCanonicalChat(owner)
 
   if (rosterCanonical && typeof host.openSession === 'function') {
     return openRosterCanonicalChat(owner, rosterCanonical, { intent, openingStillCurrent })
@@ -697,6 +748,13 @@ export async function openBotCanonicalChat(
     }
 
     const openedId = existing.resolved_id || existing.id
+
+    // The registry has spoken for this id: a hold an earlier, unconfirmed
+    // paint-first open left on it (sends refused) is superseded.
+    if (!background) {
+      host.holdSubmitsUntilConfirmed?.(String(openedId), Promise.resolve(String(openedId)))
+    }
+
     await openStoredBotChat(owner, openedId, existing, { background, intent })
 
     // Both identities matter downstream: the durable registry row names the
@@ -739,6 +797,27 @@ function rosterCanonicalChat(owner: RosterRow | string): (CanonicalChatRow & { i
   return canonical && id ? { ...canonical, id } : null
 }
 
+interface Deferred<T> {
+  promise: Promise<T>
+  reject: (error: unknown) => void
+  resolve: (value: T) => void
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void
+  let reject!: (error: unknown) => void
+
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+
+  // A verdict nobody is waiting on must not surface as an unhandled rejection.
+  promise.catch(() => undefined)
+
+  return { promise, reject, resolve }
+}
+
 /** Paint-first explicit open (bot-switch-speed): every click consulted the
  *  registry BEFORE opening, so a switch to a bot whose chat this window
  *  already held in memory still waited a full gateway round trip (plus the
@@ -747,8 +826,15 @@ function rosterCanonicalChat(owner: RosterRow | string): (CanonicalChatRow & { i
  *  cache paints it at once, forceResume still pulls fresh rows behind it)
  *  while the registry lookup runs beside it. The registry stays the
  *  authority: when it names a different row (a compression tip the roster
- *  has not polled yet), that row is opened; when it confirms the chat is gone,
- *  creation runs exactly as on the registry-first path. */
+ *  has not polled yet, a Bot Chat another window replaced), that row is
+ *  opened; when it confirms the chat is gone, creation runs exactly as on the
+ *  registry-first path.
+ *
+ *  The paint is display until the registry confirms it (switch-fix-1119): a
+ *  stale roster row is a LIVE old chat, and a send typed into it before the
+ *  answer would land there while the view moves on. So sends into the painted
+ *  id are held (host.holdSubmitsUntilConfirmed) and released to the confirmed
+ *  chat, or refused with the draft kept when it cannot be confirmed. */
 async function openRosterCanonicalChat(
   owner: RosterRow | string,
   roster: CanonicalChatRow & { id: string },
@@ -765,6 +851,40 @@ async function openRosterCanonicalChat(
     return null
   }
 
+  // Held BEFORE the open selects the session, so no send slips in between.
+  const confirmation = deferred<null | string>()
+
+  host.holdSubmitsUntilConfirmed?.(rosterOpenedId, confirmation.promise, {
+    onUnconfirmed: () => notifyBotOpenUnconfirmed(owner)
+  })
+
+  try {
+    const opened = await confirmRosterCanonicalChat(owner, roster, rosterOpenedId, registry, confirmation, {
+      intent,
+      openingStillCurrent
+    })
+
+    // Every confirming path settled it already; anything left is superseded.
+    confirmation.resolve(null)
+
+    return opened
+  } catch (error) {
+    confirmation.reject(error)
+
+    throw error
+  }
+}
+
+async function confirmRosterCanonicalChat(
+  owner: RosterRow | string,
+  roster: CanonicalChatRow,
+  rosterOpenedId: string,
+  registry: Promise<CanonicalChatRow | null>,
+  confirmation: Deferred<null | string>,
+  { intent, openingStillCurrent }: Pick<OpenCanonicalChatOptions, 'intent' | 'openingStillCurrent'>
+): Promise<{ openedId: string; registryId: string } | null> {
+  const stillCurrent = () => !openingStillCurrent || openingStillCurrent()
+
   // Settles to the open's error (or null) so it can be awaited late, or never.
   const rosterOpen = openStoredBotChat(owner, rosterOpenedId, roster, { intent }).then(
     () => null,
@@ -776,15 +896,28 @@ async function openRosterCanonicalChat(
   try {
     existing = await registry
   } catch (error) {
-    // The lookup guards MINTING, and nothing is minted here. When the roster's
-    // own row opened, it is the server's last registry answer and stays on
-    // screen; reporting a failed open over it would also re-front the previous
-    // group chat. Without it on screen, the failure surfaces as before.
+    // The lookup guards MINTING, and nothing is minted here. Without the
+    // roster's chat on screen, the failure surfaces as before.
     if (await rosterOpen) {
       throw error
     }
 
-    return { registryId: roster.id, openedId: rosterOpenedId }
+    // The chat itself opened: one quiet retry, so a single blip stays
+    // silent. A second failure is a backend that cannot answer: the thread
+    // stays on screen (reporting a failed open over it would also re-front
+    // the previous group chat), but it is NOT confirmed. Sends stay refused
+    // with their drafts kept, and the user is told why, with a retry.
+    try {
+      existing = await findExistingCanonicalChat(owner)
+    } catch (retryError) {
+      confirmation.reject(retryError)
+
+      if (stillCurrent()) {
+        notifyBotOpenUnconfirmed(owner)
+      }
+
+      return { registryId: String(roster.id), openedId: rosterOpenedId }
+    }
   }
 
   if (!stillCurrent()) {
@@ -797,14 +930,32 @@ async function openRosterCanonicalChat(
     // creation's open supersedes the roster open, so it is not awaited.
     const created = await createCanonicalChat(owner, { openingStillCurrent })
 
+    confirmation.resolve(created ? String(created) : null)
+
     return created ? { registryId: String(created), openedId: String(created) } : null
   }
 
   const openedId = String(existing.resolved_id || existing.id)
 
   if (openedId !== rosterOpenedId) {
-    // A newer open supersedes the roster one (its wait rejects as superseded).
+    // A newer open supersedes the roster one (its wait rejects as
+    // superseded). Held sends follow once it is on screen.
     await openStoredBotChat(owner, openedId, existing, { intent })
+    confirmation.resolve(stillCurrent() ? openedId : null)
+
+    return { registryId: String(existing.id), openedId }
+  }
+
+  // Same chat: identity is confirmed now, so held sends go at registry speed.
+  confirmation.resolve(openedId)
+
+  // The open waits with the roster's hydration policy; the registry's row
+  // counts are newer. A chat the roster still thinks has history but the
+  // registry reports empty (a full rewind) can never paint any, so that wait
+  // would strand a healthy chat for the whole budget. Re-wait on the same
+  // session with the registry's policy; the newer wait supersedes the old.
+  if (resolveExpectHistory(existing) !== resolveExpectHistory(roster)) {
+    await openStoredBotChat(owner, openedId, existing, { forceResume: false, intent })
   } else {
     const rosterOpenError = await rosterOpen
 
