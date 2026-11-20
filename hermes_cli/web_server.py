@@ -1455,6 +1455,10 @@ def _start_server_runtime(
     restore_user_proxy_env()  # a backend an update replayed keeps the user's proxy env, not the update's
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
+    # This process faces the Desktop's ~1 Hz /api/status poll: answer it from the last body
+    # (stale-while-revalidate, hermes_cli/web_routers/status_snapshot.py), never queued behind the GIL.
+    from hermes_cli.web_routers.status_snapshot import STATUS_SNAPSHOT
+    STATUS_SNAPSHOT.arm()
 
     # Dashboard-mode starts don't route through main.py's `serve` path, which
     # applies the same RLIMIT_NOFILE floor (policy in resource_limits, #81547).
