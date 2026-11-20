@@ -10,7 +10,8 @@ bot's canonical "Bot Chat" session on a Bot-Mode-managed install (same gate as
 re-checks that gate so a forged call returns a structured error. Transports:
 local → ``hermes -p <name> chat --in ~ -c "Bot Chat" --create-if-missing -Q
 --query-file <tmp>``; peer → ``hermes peer dm <peer>[/<name>] < <tmp>``; both via
-``terminal_tool(background=True, notify_on_complete=True)``.
+``terminal_tool(background=True, notify_on_complete=True)``. ``new_tab`` runs a brief as the
+caller's own task tab, a side window under itself (``_open_self_tab``).
 """
 
 from __future__ import annotations
@@ -60,6 +61,16 @@ _PEER_TARGET_RE = re.compile(r"^([a-z0-9][a-z0-9_-]{0,63})/([a-zA-Z0-9][a-zA-Z0-
 _LOCAL_TARGET_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 # Fan-out bound: one combined runner holds one sub-runner per target.
 FAN_OUT_MAX = 8
+# message_agent(new_tab=true): a task tab a bot opens from inside one of its own task tabs nests one deeper (the turn
+# author's runtime ``tab_depth``), and none opens past this depth.
+SELF_TAB_MAX_DEPTH = 3
+# How long the new_tab ack waits for a NEW tab's stamp (the runner starts, the gateway mints the row) to name its id.
+SELF_TAB_WAIT_SECONDS = 15.0
+_SELF_ALIASES = frozenset({"me", "self", "myself"})
+_SELF_MESSAGE_ERROR = (
+    "You can't message yourself. To work something in a NEW tab of your own, call message_agent again with "
+    "new_tab=true, target='me', topic='<tab title>' and message='<the brief>': the tab opens under you in the app "
+    "and runs the brief in the background. Never ask the user to open a chat or paste a brief for you.")
 
 
 def _default_home() -> str:
@@ -75,8 +86,8 @@ def message_agent_tool_schema() -> dict:
             "name": MESSAGE_AGENT_TOOL_NAME,
             "description": (
                 "Send a message to ANOTHER agent (teammate) on this install, a registered peer gateway, or "
-                "another connected machine. FIRE-AND-FORGET: it validates the target against the live roster, "
-                "delivers to that agent with your attribution prefixed, and returns a dispatch "
+                "another connected machine, or open a NEW task tab of your own (new_tab). FIRE-AND-FORGET: it "
+                "validates the target against the live roster, delivers to that agent with your attribution prefixed, and returns a dispatch "
                 "ack at once (status queued + delivery_id: a hand-off, not a receipt). It never returns the "
                 "reply: finish your turn; the completion notification wakes you with the outcome (its "
                 "`outcome` line says who answered or why not) — unless the ack says reply_delivery=\"poll\": "
@@ -87,7 +98,11 @@ def message_agent_tool_schema() -> dict:
                 "The message usually opens in a side window (a tab under that teammate) titled `topic`; "
                 "reuse the same topic to keep one conversation in one tab. "
                 "Set route='main' only when the user explicitly told you, in this turn, to put it in the "
-                "teammate's MAIN chat (e.g. 'handoff to Neo in main chat')."
+                "teammate's MAIN chat (e.g. 'handoff to Neo in main chat'). "
+                "To work something in a NEW tab of YOUR OWN, call it with target='me', new_tab=true, "
+                "topic=<tab title>, message=<the brief>: the tab opens under you in the app and runs the brief "
+                "in the background; the same topic again continues that tab. Never ask the user to open a chat "
+                "or paste a brief for you."
             ),
             "parameters": {
                 "type": "object",
@@ -136,6 +151,15 @@ def message_agent_tool_schema() -> dict:
                             "of a side window. Use it ONLY when the user explicitly asked, in this turn, for "
                             "the teammate's main chat; otherwise omit it. Without that ask the message is "
                             "still delivered, on the normal route, and the ack says why."
+                        ),
+                    },
+                    "new_tab": {
+                        "type": "boolean",
+                        "description": (
+                            "true: open a task tab under YOURSELF (target 'me' or your own name) and run "
+                            "`message` there as your own brief, in the background; `topic` is the tab title "
+                            "and the same topic continues that tab. Not for teammates: a message to them "
+                            "already opens in a tab under them."
                         ),
                     },
                 },
@@ -325,11 +349,17 @@ def _wants_reply(value: Any) -> bool:
     return str(value).strip().lower() not in ("false", "0", "no")
 
 
+def _flag(value: Any) -> bool:
+    """An opt-in boolean as models send it (``new_tab``): true, or its string spelling."""
+    return str(value).strip().lower() in ("true", "1", "yes")
+
+
 def message_agent_tool(target: str = "", message: str = "", task_id: Optional[str] = None, agent: Any = None,
                        expects_reply: Any = True, cancel: str = "", constraints: str = "", expecting: str = "",
-                       topic: str = "", route: str = "") -> str:
-    """Deliver ``message`` to ``target`` (several comma-separated targets fan out), or withdraw
-    the caller's own request ``cancel``. Returns a JSON ack/error.
+                       topic: str = "", route: str = "", new_tab: Any = False) -> str:
+    """Deliver ``message`` to ``target`` (several comma-separated targets fan out), withdraw
+    the caller's own request ``cancel``, or (``new_tab``) run ``message`` as the caller's own brief
+    in a task tab under itself (``_open_self_tab``). Returns a JSON ack/error.
     ``agent`` is the calling AIAgent — used for the Bot Chat gate and sender identity.
     A local teammate gets it in a side window titled ``topic`` or in its Bot Chat, per
     ``bot_mode.dm_route`` (``_deliver_local``); ``route="main"`` sends this one message to the
@@ -377,6 +407,11 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
     want_route = str(route or "").strip().lower()
     if want_route not in ("", ROUTE_OVERRIDE_MAIN):
         return _err(f"route must be '{ROUTE_OVERRIDE_MAIN}' or omitted, not {route!r}. Nothing was sent.")
+    if _flag(new_tab):
+        if want_route:
+            return _err("route='main' does not apply to new_tab: a task tab is never your main chat. "
+                        "Nothing was opened.")
+        return _open_self_tab(sender, str(target or ""), body, reply=_wants_reply(expects_reply))
     route_override, route_note = _main_route_override(want_route, agent)
     if route_override == ROUTE_OVERRIDE_MAIN and len(body) + len(MAIN_CHAT_MARKER) + 1 > MESSAGE_MAX_CHARS:
         # The main-chat marker rides inside the receiver's attribution headroom: keep the total bound.
@@ -459,6 +494,8 @@ def _dispatch(raw_target: str, content: str, sender: Sender, *, wake: Any) -> st
             return relayed
     # Local teammate — folder id, or a friendly name / Desktop @-slug ('Scribe', 'Dr. Foo').
     resolved = _resolve_local_name(raw_target, roster, root)
+    if resolved is None and raw_target.strip().lower() in _SELF_ALIASES:
+        return _err(_SELF_MESSAGE_ERROR)
     is_local_shape = bool(_LOCAL_TARGET_RE.match(raw_target))
     if resolved is None and not is_local_shape and "@" not in raw_target:
         return sender.roster_err(f"Invalid target: {raw_target!r}.")
@@ -470,7 +507,7 @@ def _dispatch(raw_target: str, content: str, sender: Sender, *, wake: Any) -> st
         if relayed is not None:
             return relayed
         if resolved == me:
-            return _err("You can't message yourself. Pick a teammate from the roster.")
+            return _err(_SELF_MESSAGE_ERROR)
         return sender.roster_err(f"No teammate named '{raw_target}' on this install, on a connected "
                                  "machine, or on a registered peer. Pick a name from the roster "
                                  "(roles are listed in your system prompt).")
@@ -698,6 +735,83 @@ def _launch_side_window(profile: str, profile_home: Path, content: str, window: 
         detail += " The reply arrives as a notification. Do NOT resend."
     ack.update(routed="side_window", window=window, detail=detail)
     return json.dumps(ack)
+
+
+def _open_self_tab(sender: Sender, raw_target: str, body: str, *, reply: bool) -> str:
+    """``message_agent(new_tab=true)``: run ``body`` as the caller's OWN brief in a task tab under itself, through the
+    same side-window runner a teammate's DM takes (``_launch_side_window``), in the caller's own profile. The author is
+    ``bot:<self>`` and no signature is prefixed, so the tab's first row is typed as the bot's brief
+    (``agent.display_row_typing.self_brief_author``), never as the user's words. One title is one tab: the
+    conversation key is the title, so the same title (within ``REUSE_MAX_IDLE_SECONDS``) continues that tab, queued
+    behind its running turn when busy. The ack waits up to ``SELF_TAB_WAIT_SECONDS`` for a new tab's stamp to name its
+    session id; ``tab_pending`` says it was not stamped yet (the tab still opens when its turn starts)."""
+    from tools import bot_mode_dm_side_window as side
+    from tools.bot_mode_probe import _handle
+
+    roster = list(sender.roster_homes)
+    handle = _handle(sender.me, roster)
+    if not _names_self(raw_target, sender):
+        other = raw_target.strip().lstrip("@")
+        return _err(f"new_tab opens a task tab under YOU, so target must be 'me' or your own name (@{handle}). To "
+                    f"reach @{other}, drop new_tab: a message to a teammate already opens in a tab under them. "
+                    "Nothing was sent.")
+    depth = _self_tab_depth(sender.agent, sender.me)
+    if depth > SELF_TAB_MAX_DEPTH:
+        return _err(f"This turn already runs in a task tab {depth - 1} deep, and task tabs nest at most "
+                    f"{SELF_TAB_MAX_DEPTH} deep, so no new tab was opened. Do the work here. Do not retry.")
+    home = Path(sender.roster_homes.get(sender.me) or sender.home)
+    author = {"id": f"bot:{sender.me}", "name": handle, "is_bot": True, "tab_depth": depth}
+    title = side.side_window_title(sender.topic, sender.display, sender.message)
+    key = side.side_window_key(author["id"], sender.me, sender.topic or title, "")
+    try:
+        window, reused = side.resolve_window(home, sender.me, key, title)
+    except Exception as exc:
+        logger.warning("message_agent: could not resolve the new_tab window %r", title, exc_info=True)
+        return _err(f"Could not open the task tab: {exc}. Nothing was started.")
+    lead = (f"Your task tab '{window}' already exists, so the brief continues there (queued behind its turn if one "
+            "is running)." if reused else
+            f"Opened a new task tab '{window}' under you (it shows as a tab in the app) and started your brief there "
+            "in the background.")
+    ack = json.loads(_launch_side_window(sender.me, home, body, window, key=key, lead=lead, author=author,
+                                         roster=roster, task_id=sender.task_id, agent=sender.agent,
+                                         wake="notify" if reply else "none"))
+    if ack.get("error"):
+        return json.dumps(ack)
+    session_id = _await_self_tab(home, key, window)
+    ack.update(ok=True, tab=True, title=window, session_id=session_id, reused=reused, routed="new_tab")
+    if session_id is None:
+        ack["tab_pending"] = True
+    return json.dumps(ack)
+
+
+def _names_self(raw_target: str, sender: Sender) -> bool:
+    """Whether a new_tab ``target`` names the caller: empty, 'me'/'self'/'myself' (unless a teammate is called that),
+    or a name that resolves to the caller's own profile."""
+    name = raw_target.strip().lstrip("@")
+    resolved = _resolve_local_name(name, list(sender.roster_homes), sender.root) if name else None
+    return resolved == sender.me or (resolved is None and (not name or name.lower() in _SELF_ALIASES))
+
+
+def _self_tab_depth(agent: Any, me: str) -> int:
+    """The depth a task tab opened now nests at: one past the tab this turn runs in when the bot itself authored the
+    turn (``bot:<me>``, its runtime ``tab_depth``, 1 when absent), else 1."""
+    author = getattr(agent, "_turn_author", None) or {}
+    if not (author.get("is_bot") and author.get("id") == f"bot:{me}"):
+        return 1
+    parent = author.get("tab_depth")
+    return (parent if isinstance(parent, int) and not isinstance(parent, bool) and parent > 0 else 1) + 1
+
+
+def _await_self_tab(home: Path, key: str, title: str) -> Optional[str]:
+    """The session id of the task tab stamped for ``key`` under ``title``, polled until ``SELF_TAB_WAIT_SECONDS``."""
+    from tools.bot_mode_dm_side_window import tab_session
+
+    deadline = time.monotonic() + SELF_TAB_WAIT_SECONDS
+    while True:
+        session_id = tab_session(home, key, title)
+        if session_id or time.monotonic() >= deadline:
+            return session_id
+        time.sleep(0.25)
 
 
 def _dm_dir() -> Path:
@@ -928,23 +1042,56 @@ def _retry_side_window(argv: list[str], dm_file: str, *, env: Optional[dict[str,
 
     retry = retitled(argv)
     with _delivery_lock(retry, stdin_file=False, side_window=True):
-        _stamp_side_window(retry, profile_home, author, window_key)
-        rc = _run_local_turn(retry, dm_file, env=env, retried=True, profile_home=profile_home, author=author,
-                             window_key=window_key)
-        _stamp_side_window(retry, profile_home, author, window_key)  # a new '(2)' row exists only now
-        return rc
+        return _run_stamped_window_turn(retry, dm_file, env=env, profile_home=profile_home, author=author,
+                                        window_key=window_key, retried=True)
+
+
+def _run_stamped_window_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]],
+                             profile_home: Path | None, author: Optional[dict], window_key: Optional[str],
+                             own_window: bool = False, retried: bool = False) -> int:
+    """One side-window turn (inside the window's turn lock) with its tab stamped: an EXISTING window before the turn,
+    so the tab shows at once; a NEW one as soon as the gateway mints its row with the turn's first message in it
+    (``stamp_when_minted``), so a long turn shows its tab while it runs; and every window again after the turn. The
+    runner never writes a new window's row itself: the gateway (the single writer) mints it through the transport's
+    --create-if-missing, and a row written here was not gateway-owned, so every turn into it failed with
+    permission_denied (Tim, 4 Nov 2026)."""
+    stop, watcher = threading.Event(), None
+    if _stamp_side_window(argv, profile_home, author, window_key) is None:
+        watcher = _start_stamp_watcher(argv, profile_home, author, window_key, stop)
+    try:
+        return _run_local_turn(argv, dm_file, env=env, retried=retried, profile_home=profile_home, author=author,
+                               window_key=window_key, own_window=own_window)
+    finally:
+        stop.set()
+        if watcher is not None:
+            watcher.join(timeout=30)
+        _stamp_side_window(argv, profile_home, author, window_key)
+
+
+def _start_stamp_watcher(argv: list[str], profile_home: Path | None, author: Optional[dict],
+                         window_key: Optional[str], stop: threading.Event) -> Optional[threading.Thread]:
+    """Start ``stamp_when_minted`` for the transport's window on a daemon thread until ``stop``."""
+    from agent.memory_provider import spawn_context_thread
+    from tools.bot_mode_dm_side_window import stamp_when_minted, window_title
+
+    home = profile_home or _local_delivery_home(argv)
+    if home is None:
+        return None
+    watcher = spawn_context_thread(stamp_when_minted, name="side-window-stamp", args=(home, window_title(argv)),
+                                   kwargs=dict(author=author, key=window_key, stop=stop))
+    watcher.start()
+    return watcher
 
 
 def _stamp_side_window(argv: list[str], profile_home: Path | None, author: Optional[dict],
-                       window_key: Optional[str] = None) -> None:
-    """Stamp the window a side-window turn is about to run (inside its turn lock, before the
-    transport starts) so the desktop opens it as a tab; every DM turn restamps. ``window_key``
-    (its conversation, ``side_window_key``) lets that conversation's next DM find the tab."""
+                       window_key: Optional[str] = None) -> Optional[str]:
+    """Stamp the window a side-window turn runs in so the desktop opens it as a tab; every DM turn
+    restamps. ``window_key`` (its conversation, ``side_window_key``) lets that conversation's next DM
+    find the tab. Returns the stamped id, None when no row holds the title yet."""
     from tools.bot_mode_dm_side_window import stamp_side_window, window_title
 
     home = profile_home or _local_delivery_home(argv)
-    if home is not None:
-        stamp_side_window(home, window_title(argv), author=author, key=window_key)
+    return stamp_side_window(home, window_title(argv), author=author, key=window_key) if home is not None else None
 
 
 def _is_own_window(argv: list[str], profile_home: Path | None, window_key: Optional[str]) -> bool:
@@ -1245,15 +1392,8 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
                                       window_key=window_key)
         with _delivery_lock(argv, stdin_file=stdin_file, side_window=side_window):
             if side_window:
-                # Stamp an EXISTING window before the turn (the tab shows early). A new window's row is
-                # minted by the gateway (the single writer) through the transport's --create-if-missing
-                # and stamped right after the turn: a row written here directly is not gateway-owned,
-                # and every turn into it failed with permission_denied (Tim, 4 Nov 2026).
-                _stamp_side_window(argv, profile_home, author, window_key)
-                rc = _run_local_turn(argv, dm_file, env=env, profile_home=profile_home, author=author,
-                                     window_key=window_key, own_window=own_window)
-                _stamp_side_window(argv, profile_home, author, window_key)
-                return rc
+                return _run_stamped_window_turn(argv, dm_file, env=env, profile_home=profile_home, author=author,
+                                                window_key=window_key, own_window=own_window)
             # Keep the file open until the transport exits; cleanup occurs
             # after subprocess.run returns, not merely after stdin reaches EOF.
             with open(dm_file, "r", encoding="utf-8-sig") as stream:
