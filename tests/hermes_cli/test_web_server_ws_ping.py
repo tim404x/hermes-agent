@@ -399,3 +399,32 @@ def test_gateway_listener_compresses_only_for_remote_peers(host, auth_required, 
     config, _server = build_listener_server(lambda scope, receive, send: None, host, 0,
                                             auth_required=auth_required)
     assert config.ws_per_message_deflate is deflate
+
+
+def test_start_server_keeps_idle_http_sockets_for_remote_desktop_pauses(monkeypatch):
+    """uvicorn closes an idle keep-alive socket after 5 s, so a remote Desktop's next REST call after
+    any short pause paid a fresh tailnet handshake (174 ms vs 77 ms warm). The dashboard keeps it 75 s."""
+    captured = _stub_uvicorn(monkeypatch)
+
+    web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+
+    assert captured["timeout_keep_alive"] == 75
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (None, 75), ("", 75), ("abc", 75), (0, 75), (-3, 75), (float("nan"), 75),
+    (5, 5), ("30", 30), (90.7, 90), (10_000, 600),
+])
+def test_keep_alive_setting_is_bounded_and_fails_open(raw, expected):
+    from hermes_cli.web_server_lifecycle import _dashboard_keep_alive_s
+
+    cfg = {} if raw is None else {"http_keep_alive_s": raw}
+    assert _dashboard_keep_alive_s(cfg) == expected
+
+
+def test_gateway_listener_keeps_idle_http_sockets():
+    from hermes_cli.web_server_lifecycle import build_listener_server
+
+    config, _server = build_listener_server(lambda scope, receive, send: None, "127.0.0.1", 0,
+                                            auth_required=False)
+    assert config.timeout_keep_alive == 75
