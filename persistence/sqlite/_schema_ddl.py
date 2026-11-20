@@ -6,6 +6,8 @@ import sqlite3
 from typing import Sequence
 
 from persistence.sqlite._state.keys import CRON_PRINCIPAL_ID
+from persistence.sqlite.conversation._store.list_revision import VISIBLE_LIST_REVISION_SQL
+from persistence.sqlite.conversation._store.local import LOCAL_LINEAGE_INDEX_SQL
 
 # Pre-split logger identity so log filtering/capture is unchanged.
 logger = logging.getLogger("hermes_state")
@@ -608,7 +610,13 @@ CREATE INDEX IF NOT EXISTS idx_sessions_local_created_started
 CREATE INDEX IF NOT EXISTS idx_sessions_pinned
     ON sessions(started_at DESC)
     WHERE pinned = 1;
-"""
+""" + f"""-- Every session listing asks local_lineage_index for the receipts whose lineage has more than one segment.
+-- Without this the query JSON-parses every local-policy receipt (each carries its session's whole policy):
+-- 116 MB / 222 ms per listing on the default store, 374 MB / 623 ms on a cron-heavy one (#152507/#152508).
+-- The expression must stay structurally identical to local.LOCAL_LINEAGE_LEN_EXPR, or the planner silently
+-- falls back to the scan (a test pins the plan).
+{LOCAL_LINEAGE_INDEX_SQL};
+""" + VISIBLE_LIST_REVISION_SQL
 
 
 # ── Deferred FTS rebuild bookkeeping (schema v23) ──

@@ -121,6 +121,10 @@ def _memo_store(holder) -> Optional[str]:
     conn = getattr(holder, "_conn", None)
     if conn is not None and getattr(conn, "in_transaction", False):
         return None
+    from persistence.sqlite._state.health import STORAGE_OK, storage_state
+
+    if storage_state(path) != STORAGE_OK:
+        return None  # latched corrupt: every listing reads (and fails) as every other read of it does
     return os.path.realpath(path)
 
 
@@ -131,6 +135,32 @@ def _reads_this_file(holder, signature: tuple) -> bool:
     return opened is not None and tuple(opened) == signature[0]
 
 
+def _visible_signature(holder, store: str) -> Optional[tuple]:
+    """``((dev, ino), ("rev", revision, schema cookie), ())`` from the store's visible list revision
+    (``list_revision``), or None when the store cannot vouch for one (no triggers yet, a read error): the caller
+    then uses the files' stat signature. Exact for a listing that cannot show internal rows, and it holds through
+    the internal-row writes that move the store's files every second on a busy store (and its checkpoints, which
+    move the store file itself every few seconds there: no file stat can stay in this key).
+
+    Every write that goes through SQLite runs the triggers, whoever writes; a rename over the path moves (dev, ino)
+    (``_reads_this_file``) and a ``backup()`` restore or any DDL moves the schema cookie. A rewrite that bypasses
+    SQLite in place (a damaged page) is caught by the corruption latch the next real read trips (``_memo_store``).
+    No age cap: the counter is read in its own read transaction BEFORE the listing's read, so a commit published
+    late (the stat signature's ``_MAX_AGE_S`` case) is either in neither read or moves the counter for every read
+    after the first that sees it."""
+    from persistence.sqlite.conversation._store.list_revision import visible_list_revision
+
+    try:
+        st = os.stat(store)
+        with holder._read_ctx() as conn:
+            revision = visible_list_revision(conn)
+    except Exception:  # health: allow BLE001 -- any failed read means "no revision": the stat signature decides
+        return None
+    if revision is None:
+        return None
+    return (st.st_dev, st.st_ino), ("rev", *revision), ()
+
+
 def _fresh(kept: tuple, signature: tuple, now: float) -> bool:
     if kept[0] != signature:
         return False
@@ -138,25 +168,52 @@ def _fresh(kept: tuple, signature: tuple, now: float) -> bool:
     return signature[2] == () or now - kept[3] < _MAX_AGE_S
 
 
+# (store, "rev" | "stat", "hit" | "miss") -> count: what a bench or a debugging session reads (``stats()``).
+_counts: dict[tuple, int] = {}
+
+
+def _count(store: str, family: str, outcome: str) -> None:
+    key = (store, family, outcome)
+    if key in _counts or len(_counts) < 4 * _MAX_ENTRIES:
+        _counts[key] = _counts.get(key, 0) + 1
+
+
+def stats() -> dict[tuple, int]:
+    """Hits and misses per store and signature kind since the process started (or ``clear()``)."""
+    with _lock:
+        return dict(_counts)
+
+
+def _family(signature: tuple) -> str:
+    return "rev" if signature[1][:1] == ("rev",) else "stat"
+
+
 def memoized(holder, kind: str, key: tuple, compute: Callable[[], T],
-             keep: Optional[Callable[[T], T]] = None, weigh: Optional[Callable[[T], int]] = None) -> T:
+             keep: Optional[Callable[[T], T]] = None, weigh: Optional[Callable[[T], int]] = None, *,
+             visible_only: bool = False) -> T:
     """``compute()``, or the answer it gave for *key* on this store while the store has not moved since.
     ``keep`` makes an answer safe to share: every read-only caller gets its result, kept or not. ``weigh``
-    counts an answer's rows."""
+    counts an answer's rows. ``visible_only``: the answer can neither include nor depend on an internal row
+    (``list_revision``), so the store's visible list revision keys it when the store has one; the files' stat
+    signature otherwise."""
     store = _memo_store(holder)
     if store is None:
         return compute()
-    signature = _signature(store)  # BEFORE the read: the answer is at least this new
+    # BEFORE the read: the answer is at least this new.
+    signature = (_visible_signature(holder, store) if visible_only else None) or _signature(store)
     if signature is None or not _reads_this_file(holder, signature):
         answer = compute()
         return keep(answer) if keep is not None else answer
     slot = (store, kind, key)
+    family = _family(signature)
     now = time.monotonic()
     with _lock:
         hit = _memo.get(slot)
         if hit is not None and _fresh(hit, signature, now):
             _memo.move_to_end(slot)
+            _count(store, family, "hit")
             return hit[1]
+        _count(store, family, "miss")
     answer = compute()
     if keep is not None:
         answer = keep(answer)
@@ -164,8 +221,10 @@ def memoized(holder, kind: str, key: tuple, compute: Callable[[], T],
     if weight > _MAX_ROWS:
         return answer
     with _lock:
-        # A moved store obsoletes every answer kept under its older signatures.
-        for k in [k for k, kept in _memo.items() if k[0] == store and kept[0] != signature] + [slot]:
+        # A moved store obsoletes every answer kept under its older signatures of the same kind: a revision-keyed
+        # answer and a stat-keyed one are kept side by side (a quiet revision outlives every stat move).
+        for k in [k for k, kept in _memo.items()
+                  if k[0] == store and kept[0] != signature and _family(kept[0]) == family] + [slot]:
             dropped = _memo.pop(k, None)
             if dropped is not None:
                 _weight[0] -= dropped[2]
@@ -262,3 +321,4 @@ def clear() -> None:
     with _lock:
         _memo.clear()
         _weight[0] = 0
+        _counts.clear()
