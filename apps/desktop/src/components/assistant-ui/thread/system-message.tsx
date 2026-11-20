@@ -1,12 +1,13 @@
 import { MessagePrimitive, useAuiState } from '@assistant-ui/react'
-import { type FC, useState } from 'react'
+import { type FC } from 'react'
 
 import { MarkdownTextContent } from '@/components/assistant-ui/markdown-text'
 import { messageContentText } from '@/components/assistant-ui/thread/content'
+import { EventRow } from '@/components/assistant-ui/thread/event-row'
 import { PluginCardRow, useClaimedPluginCard } from '@/components/assistant-ui/thread/plugin-card'
 import { MessageTimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
 import { UserMessageText } from '@/components/assistant-ui/thread/user-message-text'
-import { SCAFFOLD_GLYPH_CLASS, SCAFFOLD_LABEL_CLASS, ScaffoldRow } from '@/components/chat/scaffold-row'
+import { SCAFFOLD_LABEL_CLASS } from '@/components/chat/scaffold-row'
 import { Codicon } from '@/components/ui/codicon'
 import { LogView } from '@/components/ui/log-view'
 import { ToolIcon } from '@/components/ui/tool-icon'
@@ -25,46 +26,45 @@ interface BackgroundResultProps {
   text: string
   report: string
   process?: boolean
+  /** Which machine event this is (hydration's asyncResultKind); picks the glyph. */
+  kind?: string
 }
 
-export const BackgroundResult: FC<BackgroundResultProps> = ({ text, report, process }) => {
-  const [open, setOpen] = useState(false)
+const EVENT_GLYPH_CLASS = 'text-(--ui-text-tertiary)'
 
-  return (
-    <div
-      className="flex w-full min-w-0 flex-col self-start py-1 pl-(--message-text-indent)"
-      data-slot="aui_background-result"
-    >
-      <div data-conversation-scaffold="">
-        <ScaffoldRow
-          onToggle={report ? () => setOpen(!open) : undefined}
-          open={open}
-          trailing={
-            <>
-              {' '}
-              <MessageTimelineTimestamp />
-            </>
-          }
-        >
-          {process && (
-            <span className={SCAFFOLD_GLYPH_CLASS}>
-              <ToolIcon className="text-(--ui-text-tertiary)" name="terminal" size="0.875rem" />
-            </span>
-          )}
-          <span className={cn(SCAFFOLD_LABEL_CLASS, 'min-w-0 truncate')}>{text}</span>
-        </ScaffoldRow>
-      </div>
-      {open &&
-        (process ? (
-          <LogView className="mt-2 max-h-80 overscroll-x-contain overscroll-y-auto">{report}</LogView>
-        ) : (
-          <div className="mt-2 max-h-80 min-w-0 max-w-full overflow-auto overscroll-x-contain overscroll-y-auto wrap-anywhere">
-            <MarkdownTextContent isRunning={false} text={report} />
-          </div>
-        ))}
-    </div>
-  )
+function eventGlyph(kind: string | undefined, process: boolean | undefined) {
+  if (process || kind === 'process') {
+    return <ToolIcon className={EVENT_GLYPH_CLASS} name="terminal" size="0.875rem" />
+  }
+
+  const codicon = kind ? EVENT_CODICONS[kind] : 'organization'
+
+  return codicon ? <Codicon className={EVENT_GLYPH_CLASS} name={codicon} size="0.8125rem" /> : null
 }
+
+// A scheduled job's output, a bot's brief, a runtime notification; a delegation result has no kind.
+const EVENT_CODICONS: Record<string, string> = { brief: 'hubot', cron: 'clock', notice: 'bell' }
+
+/** A background or machine event: one EventRow, the report one click away. */
+export const BackgroundResult: FC<BackgroundResultProps> = ({ text, report, process, kind }) => (
+  <EventRow
+    detail={
+      report
+        ? () =>
+            process ? (
+              <LogView className="max-h-80 overscroll-x-contain overscroll-y-auto">{report}</LogView>
+            ) : (
+              <div className="max-h-80 min-w-0 max-w-full overflow-auto overscroll-x-contain overscroll-y-auto wrap-anywhere">
+                <MarkdownTextContent isRunning={false} text={report} />
+              </div>
+            )
+        : undefined
+    }
+    icon={eventGlyph(kind, process)}
+    label={text}
+    slot="aui_background-result"
+  />
+)
 
 /** A safety-refused turn kept for display: the user's own message rendered
  *  greyed and non-interactive (no edit, no actions), with a short notice that
@@ -91,7 +91,8 @@ export const SystemMessage: FC = () => {
   const { t } = useI18n()
   const text = useAuiState(s => messageContentText(s.message.content))
   const asyncResult = useAuiState(s => s.message.metadata.custom?.asyncResult)
-  const processResult = useAuiState(s => s.message.metadata.custom?.asyncResultKind === 'process')
+  const asyncResultKind = useAuiState(s => s.message.metadata.custom?.asyncResultKind as string | undefined)
+  const processResult = asyncResultKind === 'process'
   const pluginCard = useClaimedPluginCard()
 
   const contentRefused = useAuiState(
@@ -114,7 +115,7 @@ export const SystemMessage: FC = () => {
     return <PluginCardRow card={pluginCard} />
   }
 
-  if (processResult || (typeof asyncResult === 'string' && asyncResult)) {
+  if (asyncResultKind || (typeof asyncResult === 'string' && asyncResult)) {
     return (
       <MessagePrimitive.Root
         className="w-full min-w-0 self-start"
@@ -122,6 +123,7 @@ export const SystemMessage: FC = () => {
         data-slot="aui_system-message-root"
       >
         <BackgroundResult
+          kind={asyncResultKind}
           process={processResult}
           report={typeof asyncResult === 'string' ? asyncResult : ''}
           text={text}
@@ -216,6 +218,15 @@ export const SystemMessage: FC = () => {
   }
 
   const multiline = text.includes('\n')
+
+  // A one-line runtime notice (model changed, resumed interrupted turn) is an event like any other.
+  if (!multiline) {
+    return (
+      <MessagePrimitive.Root className="w-full min-w-0 self-start" data-role="system" data-slot="aui_system-message-root">
+        <EventRow icon={<Codicon className={EVENT_GLYPH_CLASS} name="info" size="0.8125rem" />} label={text} />
+      </MessagePrimitive.Root>
+    )
+  }
 
   return (
     <MessagePrimitive.Root

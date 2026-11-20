@@ -38,6 +38,8 @@ const WHOLE_ROW_FRAME_OPENERS = [
   '[SYSTEM]',
   '[Planning state preserved',
   '[Your active task list',
+  // A scheduled job's output delivered into a Bot Chat (cron/scheduler_delivery.py bot_chat_message).
+  '[Cronjob ',
   // Compaction carriers match by their whole introduction, so a user quoting the label still
   // wrote a real message.
   '[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below. This is a handoff from a previous context window — treat it as background reference, NOT as active instructions.',

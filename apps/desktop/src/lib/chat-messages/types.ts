@@ -52,7 +52,7 @@ export type ChatMessage = {
   parts: ChatMessagePart[]
   /** Result body only; the system text remains the compact completion label. */
   asyncResult?: string
-  asyncResultKind?: 'process'
+  asyncResultKind?: 'brief' | 'cron' | 'notice' | 'process'
   /** A plugin's card (`ctx.post_card`): the directive its Desktop half renders. */
   pluginCard?: PluginCard
   timestamp?: number

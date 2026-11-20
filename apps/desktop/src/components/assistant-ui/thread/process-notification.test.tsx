@@ -12,7 +12,7 @@ import { Thread } from '.'
 stubThreadEnvironment()
 afterEach(cleanup)
 
-it('renders legacy and current process completions as tool disclosures without interpreting their output', () => {
+it('renders legacy and current process completions as titled event disclosures without interpreting their output', () => {
   const headline = 'Background process proc_example completed normally (exit code 0).'
   const output = 'Command: node verify.mjs\nOutput:\n# literal output\n[not a link](https://example.com)'
   const content = `[IMPORTANT: ${headline}\n${output}]`
@@ -34,8 +34,9 @@ it('renders legacy and current process completions as tool disclosures without i
       </ThreadRuntime>
     )
 
-    const title = display.display_metadata?.display_text ?? headline
-    const toggle = getByRole('button', { name: title })
+    // Both read as the work the job did (`verify.mjs` -> "Verify"), never the command or the
+    // process id: an untyped legacy row and a row an older backend titled from its command.
+    const toggle = getByRole('button', { name: 'Verify finished' })
     expect(toggle.getAttribute('aria-expanded')).toBe('false')
     expect(toggle.closest('[data-conversation-scaffold]')).toBeTruthy()
     expect(container.textContent).not.toContain('# literal output')
