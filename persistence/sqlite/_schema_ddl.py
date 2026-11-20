@@ -603,6 +603,11 @@ CREATE INDEX IF NOT EXISTS idx_sessions_effective_activity
 CREATE INDEX IF NOT EXISTS idx_sessions_local_created_started
     ON sessions(created_source, started_at DESC)
     WHERE source = 'local';
+-- Every Desktop listing back-fills the pinned rows its page missed (include_pinned). Without this the
+-- back-fill walks the whole table in started_at order to find a handful of pins (16-19 ms on 8k rows).
+CREATE INDEX IF NOT EXISTS idx_sessions_pinned
+    ON sessions(started_at DESC)
+    WHERE pinned = 1;
 """
 
 
