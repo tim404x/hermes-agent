@@ -25,7 +25,7 @@ _TOOL_SINKS = {'tool_start_callback', 'tool_complete_callback'}
 _SETTING_KEYS = ('ephemeral_system_prompt', 'requested_model', 'requested_provider',
                  'model_options', 'route', 'session_model', 'confirmed_runtime_lock',
                  'requested_runtime', 'route_source', 'room_dispatch', 'room_execution_policy',
-                 'session_history_delivery')
+                 'session_history_delivery', 'toolsets_narrowing')
 _OWNER_SCOPE_RE = re.compile(r'[0-9a-f]{64}')
 
 
@@ -83,6 +83,17 @@ def api_session_vars():
     if current is None:
         return {}
     return {'session_history_delivery': current['settings'].get('session_history_delivery') or ''}
+
+
+def api_turn_toolsets(enabled_toolsets):
+    """The executing API admission's toolsets: *enabled_toolsets* narrowed by its authenticated
+    ``X-Hermes-Toolsets`` (``toolsets_narrowing``), unchanged otherwise. Only ever intersects."""
+    current = api_execution.get()
+    narrowing = current['settings'].get('toolsets_narrowing') if current else None
+    if narrowing is None:
+        return enabled_toolsets
+    from gateway.platforms.api_server import _narrow_toolsets
+    return _narrow_toolsets(enabled_toolsets, narrowing)
 
 
 def check_api_settings(adapter, settings):
@@ -157,6 +168,8 @@ def admit_api_steps(adapter, **kwargs):
     sid = authority.logical_owner(sid)
     authority._require_admission_open()
     settings = {key: kwargs.get(key) for key in _SETTING_KEYS}
+    if settings['toolsets_narrowing'] is None:
+        del settings['toolsets_narrowing']  # an un-narrowed turn's payload (retry identity) is unchanged
     # Route credentials remain in the server's configuration, never admission JSON.
     route = settings.get('route')
     if route and route.get('api_key'):
