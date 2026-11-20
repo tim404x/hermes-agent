@@ -35,7 +35,7 @@ from ._store import stored_reads
 from ._store.compression import _compression_tip_on, reopen_if_explicitly_closed
 from ._store.core import is_kanban_owned_session, retag_kanban_worker_sessions
 from ._store.gateway import list_gateway_sessions
-from ._store.listing_memo import frozen_key, memoized
+from ._store.listing_memo import frozen_key, memoized, shared_entries
 from ._store.local import POLICY_PREFIX
 from ._store.local_migration import LEGACY_PREFIX
 from ._store.model_config import session_ids_with_model_config_key, update_conversation_model_config_value
@@ -906,8 +906,11 @@ class SQLiteSessionRepository:
                 )
             return tuple(_list_entry(holder, row, compact=compact_rows) for row in rows)
 
+        if not compact_rows:
+            return read()  # full rows carry the system prompt (~50 KB each): never kept
         # A browse handle on a store that has not moved answers from the listing memo (``listing_memo``).
-        return memoized(holder, "list_sessions", (_query_key(query), window.limit, window.offset, compact_rows), read)
+        return memoized(holder, "list_sessions", (_query_key(query), window.limit, window.offset), read,
+                        keep=shared_entries, weigh=len)
 
     def search_sessions(
         self,
