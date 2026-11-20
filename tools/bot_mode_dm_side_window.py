@@ -26,7 +26,8 @@ BUSY_TURN_MAX_AGE_SECONDS = 15 * 60
 TITLE_MAX_CHARS = 60
 # The second try when the titled window is open live on another surface (SESSION_NOT_OWNED).
 RETRY_SUFFIX = " (2)"
-_FALLBACK_WORDS = 6
+# A title built from the message (no topic) stays short: about one tab's width.
+_FALLBACK_MAX_CHARS = 48
 # A side window idle this long is a finished conversation: the next DM on its key opens a new tab.
 REUSE_MAX_IDLE_SECONDS = 6 * 60 * 60
 # Numbered tabs tried before giving up on a free title ("<title> (2)" ... "<title> (N)").
@@ -36,7 +37,23 @@ _NUMBERED_RE = re.compile(r" \((\d{1,2})\)$")
 ROUTE_SIDE_WINDOW, ROUTE_AUTO, ROUTE_MAIN = "side_window", "auto", "main"
 DEFAULT_DM_ROUTE = ROUTE_SIDE_WINDOW
 _ROUTES = (ROUTE_SIDE_WINDOW, ROUTE_AUTO, ROUTE_MAIN)
-_QUOTES_RE = re.compile(r"[\"'`\u2018\u2019\u201c\u201d]")
+_LEGACY_QUOTES_RE = re.compile(r"[\"'`\u2018\u2019\u201c\u201d]")
+# Title cleaning: double quotes and backticks go everywhere; a single quote only where it wraps a word,
+# so "Emmanuel's" and "Tim\u2019s" keep their apostrophe.
+_DOUBLE_QUOTES_RE = re.compile(r"[\"`\u201c\u201d]")
+_WRAPPING_SINGLE_QUOTE_RE = re.compile(r"(?<!\w)['\u2018\u2019]|['\u2018\u2019](?!\w)")
+_MD_LINK_RE = re.compile(r"\[([^\[\]\n]+)\]\([^)\s]*\)")
+_BRACKET_TAG_RE = re.compile(r"\[[^\[\]\n]{0,80}\]")
+_MENTION_RE = re.compile(r"^\s*@[\w.-]+[,:]?\s+")
+_GREETING_RE = re.compile(r"^\s*(?:hey|hi|hello|hiya|yo|ok|okay)\b(?:\s+@?[\w.-]+){0,2}?\s*[,:!.\u2014-]\s*",
+                          re.IGNORECASE)
+_INTRO_RE = re.compile(r"^\s*@?[\w.-]+\s+here\b\s*[:,.!\u2014-]?\s*", re.IGNORECASE)
+# The first clause ends at sentence punctuation, a colon or semicolon (before a space or the end), a
+# line break, or a spaced dash.
+_CLAUSE_SPLIT_RE = re.compile(r"[.!?;:](?=\s|$)|\n|\s[-\u2013\u2014]\s")
+_TITLE_STOP_WORDS = frozenset({"the", "a", "an", "to", "your", "my", "our", "of", "for", "and", "or", "with",
+                               "on", "in", "at", "by", "from", "is", "are"})
+_TRAIL_PUNCT = " ,;:.!?-\u2013\u2014"
 
 # A one-message ``route: "main"`` override is honoured only when the human's own words in the
 # sender's CURRENT turn ask for the main chat: "handoff to Neo in main chat", "drop it in his Bot
@@ -197,7 +214,7 @@ def _configured_route(path: Path) -> str:
 def side_window_key(sender_id: str, target: str, topic: str, origin_session: str) -> str:
     """The conversation a side window belongs to: the sender, the target, and the normalized topic,
     or (without a topic) the sender's originating session, so one back-and-forth stays in one tab."""
-    norm = _clean(topic).casefold()
+    norm = _key_norm(topic)
     tail = f"topic:{norm}" if norm else f"session:{origin_session or '-'}"
     return f"{sender_id}>{target}|{tail}"
 
@@ -247,14 +264,13 @@ def _free_title(store, title: str, *, numbered: bool) -> str:
 
 
 def side_window_title(topic: str, sender: str, message: str) -> str:
-    """The window title: the sender's ``topic``, else ``"<sender>: <first words>"``. One line,
-    no quotes, at most ``TITLE_MAX_CHARS``, never an option-looking or the canonical Bot Chat."""
-    # "Neo | Chief of Staff" -> "Neo": a bot title is "Name | Role"; the role only bloats a tab title.
-    short = re.split(r"\s+[|\u00b7\u2022\u2014\u2013]\s+", str(sender or "").strip())[0] or str(sender or "")
-    # Drop a leading self-introduction ("Neo here:") so the title starts with the subject.
-    body = re.sub(rf"^\s*{re.escape(short)}\s+here\s*[:,.\u2014-]?\s*", "", str(message or ""), flags=re.IGNORECASE)
-    words = " ".join(body.split()[:_FALLBACK_WORDS])
-    title = _clean(topic) or _clean(f"{short}: {words}")
+    """The window title. A ``topic`` is used as typed: one line, wrapping quotes and backticks dropped,
+    apostrophes kept, cut on a word boundary with a single ``…`` past ``TITLE_MAX_CHARS``. Without one,
+    the message's first clause, past any bracket tag (``[no reply needed]``), greeting or self-intro
+    (``Hey Kepler,``, ``Neo here:``), cut on a word boundary at ``_FALLBACK_MAX_CHARS``, never ending
+    on a stop word, sentence case. No sender prefix: the tab already sits under that bot. Never
+    option-looking, never the canonical Bot Chat."""
+    title = _cut(_clean(topic), TITLE_MAX_CHARS) or _fallback_title(sender, message)
     from tools.bot_mode_probe import BOT_CHAT_TITLE
 
     if title.casefold() == BOT_CHAT_TITLE.casefold():
@@ -262,9 +278,57 @@ def side_window_title(topic: str, sender: str, message: str) -> str:
     return title
 
 
+def _fallback_title(sender: str, message: str) -> str:
+    """The first clause of ``message`` as a short title (see ``side_window_title``)."""
+    text = _MD_LINK_RE.sub(r"\1", str(message or ""))
+    text = _BRACKET_TAG_RE.sub(" ", text).strip()
+    for _ in range(3):  # "Hey Kepler, Neo here: ..." peels in two passes
+        peeled = _INTRO_RE.sub("", _GREETING_RE.sub("", _MENTION_RE.sub("", text, count=1), count=1), count=1)
+        if peeled == text:
+            break
+        text = peeled.strip()
+    parts = _CLAUSE_SPLIT_RE.split(text, maxsplit=1)
+    clause = _clean(parts[0])
+    rest = _CLAUSE_SPLIT_RE.split(text[len(parts[0]):].lstrip(":").strip(), maxsplit=1)[0] if len(parts) > 1 else ""
+    if len(clause.split()) < 3 and text[len(parts[0]):].startswith(":") and _clean(rest):
+        clause = f"{clause}: {_clean(rest)}"  # "Update: the heatmap is live" reads better whole
+    title = _cut(clause, _FALLBACK_MAX_CHARS, strip_stop_words=True)
+    if not title:
+        short = re.split(r"\s+[|\u00b7\u2022\u2014\u2013]\s+", str(sender or "").strip())[0] or str(sender or "")
+        return _clean(f"Message from {short}") if short.strip() else "Message"
+    return title[:1].upper() + title[1:]
+
+
+def _cut(text: str, limit: int, *, strip_stop_words: bool = False) -> str:
+    """``text`` cut on a word boundary to at most ``limit`` characters with one ``…`` appended when
+    anything was dropped. A cut text, or any text with ``strip_stop_words``, also loses trailing stop
+    words ("the", "your", ...)."""
+    words, cut = text.split(), False
+    if len(text) > limit:
+        cut = True
+        head = text[:limit - 1]
+        boundary = head.rfind(" ")
+        if text[limit - 1:limit] == " ":
+            boundary = len(head)
+        words = (head[:boundary] if boundary > 0 else head).split()
+    # A cut title never ends on a stop word ("... for the…"); an uncut topic stays as typed.
+    while (strip_stop_words or cut) and len(words) > 1 and words[-1].strip(_TRAIL_PUNCT).casefold() in _TITLE_STOP_WORDS:
+        words, cut = words[:-1], True
+    out = " ".join(words).rstrip(_TRAIL_PUNCT) if cut else " ".join(words)
+    return f"{out}\u2026" if cut and out else out
+
+
 def _clean(text: str) -> str:
-    text = " ".join(_QUOTES_RE.sub("", str(text or "")).split()).lstrip("-").strip()
-    return text[:TITLE_MAX_CHARS].rstrip()
+    text = _DOUBLE_QUOTES_RE.sub("", str(text or ""))
+    text = _WRAPPING_SINGLE_QUOTE_RE.sub("", text)
+    return " ".join(text.split()).lstrip("-").strip()
+
+
+def _key_norm(topic: str) -> str:
+    """The topic part of a conversation key. Frozen to the original normalization (every quote mark
+    dropped, first ``TITLE_MAX_CHARS``) so keys stamped before the title rules changed still match."""
+    text = " ".join(_LEGACY_QUOTES_RE.sub("", str(topic or "")).split()).lstrip("-").strip()
+    return text[:TITLE_MAX_CHARS].rstrip().casefold()
 
 
 def window_title(argv: Sequence[str]) -> str:

@@ -240,9 +240,9 @@ def test_without_a_topic_one_sender_session_keeps_one_tab(tmp_path, spawned, mon
     same_session = _send(home, "also the Q4 forecast")
     other_session = _send(home, "also the Q4 forecast", session_id="sess-2")
 
-    assert first["window"] == "hermes: please review the Q3 volume numbers"
+    assert first["window"] == "Please review the Q3 volume numbers today"
     assert same_session["window"] == first["window"]
-    assert other_session["window"] == "hermes: also the Q4 forecast"
+    assert other_session["window"] == "Also the Q4 forecast"
 
 
 def test_a_different_topic_opens_a_new_tab(tmp_path, spawned, monkeypatch):
