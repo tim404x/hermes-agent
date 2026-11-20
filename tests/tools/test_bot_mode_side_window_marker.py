@@ -10,6 +10,7 @@ never carry it.
 
 import json
 import subprocess
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -248,3 +249,148 @@ def test_a_bot_chat_turn_is_never_stamped(tmp_path, target, monkeypatch):
 
     assert seen == [[]]
     assert _windows(target) == []
+
+
+# ── a window the desktop holds live gets the DM inside it, never a "(2)" sibling (P5) ─────────
+
+
+KEY = "bot:neo>researcher|topic:micro1"
+
+
+def _idle_window(profile_home: Path, sid: str, title: str) -> None:
+    """A window whose last turn finished (its DM answered), so it is not busy."""
+    _window(profile_home, sid, title)
+    with _db(profile_home) as store:
+        _append(store, sid, "assistant", "answered")
+
+
+def _ready_authority(monkeypatch):
+    """The target profile's gateway is up (its owner holds the window live in the app); its
+    ``bot_relay.deliver`` door is the fake authority the Bot Chat tests use."""
+    from types import SimpleNamespace
+
+    from hermes_cli import gateway_runtime
+    from tools import bot_live_delivery as live
+    from tests.tools.test_bot_mode_dm import _FakeAuthority
+
+    monkeypatch.setattr(gateway_runtime, "discover_gateway_endpoint", lambda home, timeout=5: SimpleNamespace(
+        state="ready", endpoint=SimpleNamespace(instance_id="authority-1")))
+    authority = _FakeAuthority()
+    monkeypatch.setattr(live, "authority_delivery", authority)
+    return authority
+
+
+def _transport(monkeypatch, *responses):
+    """subprocess.run stand-in recording each transport's window title."""
+    titles, queue = [], list(responses)
+
+    def fake_run(argv, **kwargs):
+        titles.append(argv[argv.index("-c") + 1])
+        return queue.pop(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return titles
+
+
+_NOT_OWNED = subprocess.CompletedProcess([], 1, stdout="", stderr="hermes-refusal-reason: SESSION_NOT_OWNED\n")
+
+
+def test_a_window_the_desktop_holds_live_is_admitted_through_its_owner(tmp_path, target, monkeypatch):
+    """Regression (P5, 19 Nov 2026): watching a task tab spawned "Sales | Deal heatmap (2)" then "(3)"."""
+    monkeypatch.setattr(bot_mode_dm, "_default_home", lambda: str(target.parent.parent))
+    _idle_window(target, "w1", "micro1")
+    assert side.stamp_side_window(target, "micro1", author=AUTHOR, key=KEY) == "w1"
+    authority = _ready_authority(monkeypatch)
+    waited = []
+    monkeypatch.setattr(bot_mode_dm, "_wait_live_dm", lambda home, delivery_id, dm_file=None:
+                        waited.append((home, delivery_id)) or 0)
+    titles = _transport(monkeypatch, _NOT_OWNED)
+    dm_file = _dm(tmp_path)
+
+    code = bot_mode_dm._run_delivery(_side_argv("micro1"), dm_file, stdin_file=False, profile_home=target,
+                                     author=AUTHOR, side_window=True, window_key=KEY)
+
+    assert code == 0
+    assert titles == ["micro1"]  # the refused transport only: no "(2)" turn ever ran
+    [(home, params)] = authority.calls
+    assert home == target.resolve()
+    assert (params["title"], params["session_id"], params["message"]) == ("micro1", "w1", "hi")
+    assert params["author"] == AUTHOR
+    assert waited == [(str(target.resolve()), params["id"])]
+    assert [w["title"] for w in _windows(target)] == ["micro1"]
+
+
+def test_another_conversations_window_with_the_title_still_retries_numbered(tmp_path, target, monkeypatch):
+    """A real title collision (the titled chat belongs to another conversation) keeps the "(2)" retry."""
+    monkeypatch.setattr(bot_mode_dm, "_default_home", lambda: str(target.parent.parent))
+    _idle_window(target, "w1", "micro1")
+    side.stamp_side_window(target, "micro1", author=AUTHOR, key="bot:atlas>researcher|topic:micro1")
+    authority = _ready_authority(monkeypatch)
+    titles = _transport(monkeypatch, _NOT_OWNED, subprocess.CompletedProcess([], 0, stdout="R", stderr=""))
+
+    code = bot_mode_dm._run_delivery(_side_argv("micro1"), _dm(tmp_path), stdin_file=False, profile_home=target,
+                                     author=AUTHOR, side_window=True, window_key=KEY)
+
+    assert code == 0
+    assert titles == ["micro1", "micro1 (2)"]
+    assert authority.calls == []
+
+
+def test_an_owner_that_cannot_admit_falls_back_to_the_numbered_retry(tmp_path, target, monkeypatch):
+    """No live owner reachable, nothing admitted: the DM still lands (in the old "(2)" window)."""
+    from tools import bot_live_delivery as live
+
+    monkeypatch.setattr(bot_mode_dm, "_default_home", lambda: str(target.parent.parent))
+    _idle_window(target, "w1", "micro1")
+    side.stamp_side_window(target, "micro1", author=AUTHOR, key=KEY)
+
+    def unavailable(home, title=None):
+        raise ValueError("profile authority is not ready")
+
+    monkeypatch.setattr(live, "find_canonical_live_owner", unavailable)
+    titles = _transport(monkeypatch, _NOT_OWNED, subprocess.CompletedProcess([], 0, stdout="R", stderr=""))
+    dm_file = _dm(tmp_path)
+
+    code = bot_mode_dm._run_delivery(_side_argv("micro1"), dm_file, stdin_file=False, profile_home=target,
+                                     author=AUTHOR, side_window=True, window_key=KEY)
+
+    assert code == 0
+    assert titles == ["micro1", "micro1 (2)"]
+    assert not Path(bot_mode_dm._live_intent_file(dm_file)).exists()
+
+
+def test_the_door_admits_into_a_stamped_side_window_only(target):
+    """The owner's ``bot_relay.deliver`` door accepts a side window message_agent stamped, and still
+    no other titled chat of the profile."""
+    from tools import bot_live_delivery as live
+
+    _window(target, "w1", "micro1")
+    _window(target, "p1", "Tim's private chat")
+    assert not live.door_accepts_title(target, "micro1")
+    side.stamp_side_window(target, "micro1", author=AUTHOR, key=KEY)
+    assert live.door_accepts_title(target, "micro1")
+    assert not live.door_accepts_title(target, "Tim's private chat")
+    assert not live.door_accepts_title(target, "no such chat")
+
+
+def test_a_busy_window_of_the_same_conversation_queues_the_dm_through_its_owner(tmp_path, target, monkeypatch):
+    """Regression (P5): Kepler's "(2)" tab opened 9 s after the first DM because the first turn was still
+    running. A follow-up into the conversation's own busy window is admitted into it (the owner queues it
+    behind the running turn); no transport runs and no sibling opens."""
+    monkeypatch.setattr(bot_mode_dm, "_default_home", lambda: str(target.parent.parent))
+    _window(target, "w1", "micro1")
+    side.stamp_side_window(target, "micro1", author=AUTHOR, key=KEY)
+    with _db(target) as store:
+        _append(store, "w1", "user", "the first DM, still being answered", timestamp=time.time())
+    authority = _ready_authority(monkeypatch)
+    monkeypatch.setattr(bot_mode_dm, "_wait_live_dm", lambda home, delivery_id, dm_file=None: 0)
+    titles = _transport(monkeypatch)
+
+    code = bot_mode_dm._run_delivery(_side_argv("micro1"), _dm(tmp_path), stdin_file=False, profile_home=target,
+                                     author=AUTHOR, side_window=True, window_key=KEY)
+
+    assert code == 0
+    assert titles == []
+    [(_, params)] = authority.calls
+    assert (params["title"], params["session_id"]) == ("micro1", "w1")
+    assert [w["title"] for w in _windows(target)] == ["micro1"]
