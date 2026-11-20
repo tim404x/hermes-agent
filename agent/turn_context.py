@@ -1207,6 +1207,20 @@ def _persist_turn_start(
     )
 
 
+def _self_seeded_brief(turn_author, text, display_metadata):
+    """``(display_kind, display_metadata)`` for this turn's user row: ``bot_brief`` with its author when a bot
+    seeded a tab in its own profile, so no surface paints the brief as the human's own message."""
+    from agent.display_row_typing import BOT_BRIEF_DISPLAY_KIND, self_brief_author
+    from hermes_constants import get_hermes_home, profile_name_for_home
+
+    if not (turn_author or {}).get("is_bot"):
+        return None, display_metadata
+    author = self_brief_author(turn_author, profile_name_for_home(get_hermes_home()), text)
+    if author is None:
+        return None, display_metadata
+    return BOT_BRIEF_DISPLAY_KIND, {**(display_metadata or {}), "author": author}
+
+
 def build_turn_context(
     agent, user_message: Any, system_message: Optional[str],
     conversation_history: Optional[list[dict[str, Any]]], task_id: Optional[str], stream_callback,
@@ -1232,6 +1246,10 @@ def build_turn_context(
     # Reset first: a cached gateway agent must never carry the previous turn's bot author into a human turn.
     turn_author = parse_turn_author(turn_author)
     agent._turn_author = turn_author
+    if not persist_user_display_kind:
+        persist_user_display_kind, persist_user_display_metadata = _self_seeded_brief(
+            turn_author, persist_user_message if persist_user_message is not None else user_message,
+            persist_user_display_metadata)
 
     # Recover a rotated session before binding log/turn ids or copying client history so
     # everything in this turn belongs to the canonical child.

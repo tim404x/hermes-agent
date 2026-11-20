@@ -372,10 +372,12 @@ def read_page(store, target, order, after, limit, *, profile_home, inline_images
     plus the tool results that stay with their call. A window whose rows all project to nothing (hidden
     scaffolding) is read past, so an empty page is the end. *whole*: ``_whole_lineage``, decided here
     when None."""
+    from agent.display_row_typing import find_bot_brief
     from gateway.session_controls import display_projection
     latest = order == 'latest'
     count = limit + _TOOL_RUN
     lineage = lineage or store.lineage.resume_lineage_ids(target)
+    brief = find_bot_brief(store, target)
     through = 0
     while True:
         rows, keys, beyond, edge, segments, earlier = _window(store, target, latest, after, count, lineage, whole)
@@ -388,7 +390,8 @@ def read_page(store, target, order, after, limit, *, profile_home, inline_images
             entries = _entries(rows, handoffs, items[:taken])
             shown = [row for kind, row in entries if kind == ROW_KIND_MESSAGE]
             return project_entries(entries, lambda marked: display_projection(
-                _call_context(store, shown, segments) + marked, profile_home, image_urls=inline_images))
+                _call_context(store, shown, segments) + marked, profile_home, image_urls=inline_images,
+                bot_brief=brief))
         projected, taken = _fit(project, roles, latest, _take(roles, latest, limit))
         through = max([through, *(rows[index]['_row_id'] for index, _ in items[:taken]
                                   if isinstance(rows[index].get('_row_id'), int))])
