@@ -5,7 +5,7 @@ import { isSessionRemovalPending } from '@/store/session-removal'
 
 import type { ClientSessionState } from '../../../types'
 
-import { cachedSessionRow } from './utils'
+import { cachedSessionRow, parkedHiddenSessionRow } from './utils'
 
 /** Navigation revokes the view, not a read owned by an unchanged session. */
 export function captureDisplayHydration({
@@ -40,7 +40,8 @@ export function captureDisplayHydration({
   return {
     owns() {
       const state = runtimeId ? states.get(runtimeId) : undefined
-      const row = cachedSessionRow(storedSessionId)
+      // A hidden Bot Chat is never listed; its parked row is its cache.
+      const row = cachedSessionRow(storedSessionId) ?? parkedHiddenSessionRow(storedSessionId)
 
       return (
         flights.get(key) === token &&
