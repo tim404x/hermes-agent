@@ -97,6 +97,7 @@ __all__ = [
     "normalize_activity_provenance",
     "origin_is_side_window_only",
     "parse_model_config",
+    "record_side_window_stamp",
     "sanitize_title",
     "session_yolo_enabled",
     "side_window_stamp",
@@ -166,7 +167,7 @@ SESSION_ROW_COLUMNS: tuple[str, ...] = (
     "compression_failure_cooldown_until", "compression_failure_error", "compression_fallback_streak",
     "compression_ineffective_count", "compression_recovery_deadline", "compression_overload_streak", "profile_name",
     "transport_profile", "rewind_count", "archived", "auto_archived", "pinned", "hidden", "project_pinned_at",
-    "last_read_at", "tool_names", "transcript_revision", "prompt_cache_clock",
+    "side_window_json", "last_read_at", "tool_names", "transcript_revision", "prompt_cache_clock",
 )
 
 #: The columns a ``compact_rows`` listing does not read.
@@ -175,10 +176,10 @@ COMPACT_EXCLUDED_COLUMNS: frozenset[str] = frozenset({"system_prompt", "system_p
 #: The ``model_config`` key of the YOLO flag.
 YOLO_KEY = "yolo_mode"
 
-#: Fork carry (bot mode): the ``origin_json`` key of the stamp ``message_agent`` puts on a teammate's side window
-#: (``tools/bot_mode_dm_side_window.py``), ``{"side_window": {"at": <epoch>, "by": <author id>, "key": <conversation
-#: key>}}``. A CLI side window has no other origin, and a compression continuation inherits its parent's origin, so
-#: the stamp follows the live tip without a schema change.
+#: Fork carry (bot mode): the key of the stamp ``message_agent`` puts on a teammate's side window
+#: (``tools/bot_mode_dm_side_window.py``). The stamp ``{"at": <epoch>, "by": <author id>, "key": <conversation key>}``
+#: lives in its own ``sessions.side_window_json`` cell, which a compression continuation inherits; a legacy stamp sits
+#: in ``origin_json`` as ``{"side_window": {...}}`` and is still read (:func:`record_side_window_stamp`).
 SIDE_WINDOW_KEY = "side_window"
 
 #: The ``model_config`` key holding a chat's first-run onboarding run (``session_rules.onboarding_flow``'s record).
@@ -279,6 +280,19 @@ def side_window_stamp(origin: Any) -> Optional[dict[str, Any]]:
         return None
     stamp = value.get(SIDE_WINDOW_KEY) if isinstance(value, Mapping) else None
     return dict(stamp) if isinstance(stamp, Mapping) else None
+
+
+def record_side_window_stamp(record: Any) -> Optional[dict[str, Any]]:
+    """Fork carry (bot mode): the side-window stamp of a :class:`SessionRecord`: its own ``side_window_json`` cell, else a legacy stamp inside ``origin_json`` (rows stamped before the stamp moved out of the origin, and rows stamped by hand); ``None`` when it carries neither."""
+    if record is None:
+        return None
+    try:
+        own = json.loads(record.side_window_json) if getattr(record, "side_window_json", None) else None
+    except (TypeError, ValueError):
+        own = None
+    if isinstance(own, Mapping):
+        return dict(own)
+    return side_window_stamp(getattr(record, "origin_json", None) or getattr(record, "origin", None))
 
 
 def origin_is_side_window_only(origin: Any) -> bool:
@@ -507,6 +521,9 @@ class SessionRecord:
     #: Fork carry "pin in project": the pin time (epoch seconds), ``None`` when unpinned. Orders the chat to the top of
     #: its project (newest pin first); orthogonal to ``pinned``, the keep flag that moves a chat out to Pinned.
     project_pinned_at: Optional[float] = None
+    #: Fork carry (bot mode): the stored side-window stamp text (``{"at", "by", "key"}``), ``None`` when the row is no
+    #: side window; read it through :func:`record_side_window_stamp`, which also honours a legacy ``origin_json`` stamp.
+    side_window_json: Optional[str] = None
 
     def as_session_row(self) -> dict[str, JsonValue]:
         return {**self._row_cells(), **self._marker_cells()}

@@ -191,9 +191,10 @@ def _attended_side_chat(agent: Any) -> bool:
 
 
 def _is_side_window(agent: Any) -> bool:
-    """True when this session carries the ``side_window`` origin stamp. Unknown = True (fail closed)."""
+    """True when this session carries the side-window stamp (its own cell or a legacy origin stamp). Unknown = True
+    (fail closed)."""
     try:
-        from persistence.conversation.sessions import side_window_stamp
+        from persistence.conversation.sessions import record_side_window_stamp
 
         persistence, sid = getattr(agent, "persistence", None), getattr(agent, "session_id", None)
         if persistence is None or not sid:
@@ -201,7 +202,7 @@ def _is_side_window(agent: Any) -> bool:
         record = persistence.sessions.get(sid)
         if record is None:
             return True
-        return side_window_stamp(record.origin) is not None
+        return record_side_window_stamp(record) is not None
     except Exception:  # pragma: no cover — must never break a turn
         logger.debug("_is_side_window failed", exc_info=True)
         return True

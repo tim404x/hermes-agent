@@ -113,6 +113,8 @@ def blank_session_row(session_id: str, *, lineage_kind: Any, model_config: Optio
         "pinned": False,
         "hidden": False,
         "project_pinned_at": None,
+        # Fork carry (bot mode): the side-window stamp, its own cell (never the origin); a continuation inherits it.
+        "side_window_json": None,
         # Epoch watermark: None is never tracked (read), 0.0 is explicitly unread.
         "last_read_at": None,
         "expiry_finalized": False,
@@ -296,6 +298,7 @@ class InMemorySessionRepository(SessionTitlesConfigMixin, SessionDeleteMixin, Se
             pinned=bool(row["pinned"]),
             hidden=bool(row["hidden"]),
             project_pinned_at=row.get("project_pinned_at"),
+            side_window_json=row.get("side_window_json"),
             last_read_at=row.get("last_read_at"),
             tool_pin=stored_tool_pin(row["tool_pin"]) if resolve_tool_pin else None,
             transcript_revision=row.get("transcript_revision", 0),
@@ -471,7 +474,7 @@ class InMemorySessionRepository(SessionTitlesConfigMixin, SessionDeleteMixin, Se
         config = row["model_config"]
         if parent["session_id"] in (config.get("_delegate_from"), config.get("_branched_from")):
             return
-        for field in (*_ROUTING_FIELDS, "display_name", "origin", "transport_profile"):
+        for field in (*_ROUTING_FIELDS, "display_name", "origin", "side_window_json", "transport_profile"):
             if row[field] is None:
                 row[field] = dict(parent[field]) if field == "origin" and parent[field] is not None else parent[field]
 

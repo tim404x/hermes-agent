@@ -132,11 +132,11 @@ def find_bot_brief(store: Any, session_id: str) -> Optional[dict]:
     prompt, not an attributed ``Message from ...`` DM. None otherwise (also when *store* cannot answer). A read: the
     projections type that row at render time and nothing is written back."""
     from persistence.conversation.messages import TranscriptRead
-    from persistence.conversation.sessions import side_window_stamp
+    from persistence.conversation.sessions import record_side_window_stamp
 
     try:
         record = store.sessions.get(session_id)
-        author = bot_brief_author((side_window_stamp(record.origin) or {}).get("by")) if record else None
+        author = bot_brief_author((record_side_window_stamp(record) or {}).get("by")) if record else None
         if author is None:
             return None
         rows = store.messages.read_transcript(session_id, TranscriptRead(limit=_BRIEF_SCAN_ROWS, include_lineage=True))
