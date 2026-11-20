@@ -214,6 +214,12 @@ from hermes_cli.dashboard_auth.body_limit import AuthBodyLimitMiddleware
 # Register first (innermost): auth gates run before this, JSON parsing after it.
 app.add_middleware(AuthBodyLimitMiddleware)
 
+from hermes_cli.web_routers.status_snapshot import StatusWriteInvalidation
+
+# Inside every auth gate (a refused write never reaches it): a settings/gateway/profile write retires the
+# /api/status snapshot, so the Desktop's next poll reads the state that write produced.
+app.add_middleware(StatusWriteInvalidation)
+
 
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router
