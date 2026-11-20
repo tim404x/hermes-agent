@@ -8,6 +8,7 @@
 
 import { atom, host, queryClient, useQuery, useValue } from '@hermes/plugin-sdk'
 
+import { noteRosterLoaded } from './action-timing'
 import { botsText } from './i18n'
 import { displayName } from './labels'
 import {
@@ -975,7 +976,7 @@ export function useRoster() {
 
   return useQuery({
     queryKey: [...ROSTER_KEY, activeConnectionId],
-    queryFn: () => fetchRosterSnapshot(activeConnectionId),
+    queryFn: () => fetchRosterSnapshot(activeConnectionId).then(noteRosterLoaded),
     refetchInterval: ROSTER_POLL_INTERVAL_MS,
     staleTime: ROSTER_POLL_INTERVAL_MS,
     retry: ROSTER_QUERY_RETRY,
@@ -995,7 +996,7 @@ export async function primeRoster(): Promise<void> {
   try {
     await queryClient.fetchQuery({
       queryKey: [...ROSTER_KEY, connectionId],
-      queryFn: () => fetchRosterSnapshot(connectionId),
+      queryFn: () => fetchRosterSnapshot(connectionId).then(noteRosterLoaded),
       staleTime: 5000
     })
   } catch {
