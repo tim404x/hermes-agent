@@ -607,11 +607,15 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             agent.clarify_context_callback = None
             agent.thinking_progress = False
         # A person's message (not a self-injected notification, not an API client) whose interim text
-        # this chat delivers opens a long turn with the model's own one-line ack. getattr: minimal
-        # test contexts omit the turn's message fields.
+        # this chat delivers as its own message opens a long turn with the model's own one-line ack. Not
+        # where the stream IS the message (Slack native streaming): a streamed ack there is only a segment
+        # break, so the answer would extend the ack's message. getattr: minimal test contexts omit the
+        # turn's message fields.
+        consumer = (getattr(ctx, "stream_consumer_holder", None) or [None])[0]
+        absorbs = getattr(consumer, "stream_absorbs_commentary", None)
         stage_ack_first(agent, getattr(ctx, "message", None), person_turn=(
             not getattr(ctx, "persist_user_display_kind", None) and getattr(ctx, "reply_expected", None) is not False
-            and ctx.source.platform != Platform.API_SERVER))
+            and ctx.source.platform != Platform.API_SERVER and not (callable(absorbs) and absorbs() is True)))
         ctx.agent_holder[0] = agent  # interrupt support
         if self._approval_owner is not None:
             authority, owner_id, generation = self._approval_owner

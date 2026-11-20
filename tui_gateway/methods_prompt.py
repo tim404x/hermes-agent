@@ -691,7 +691,8 @@ def _run_after_agent_ready(
     hosted_images=None,
 ):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
-    accepted in-flight message), then run."""
+    accepted in-flight message), then run. The prompt the person typed is the one this thread runs
+    without a hosted-room proof or a relayed bot author (``person_turn``: ack-first)."""
     # The wait delivers the prompt when the still-running build completes, honors a cancel promptly, notices
     # the user once past the slow threshold, and only errors when the build itself fails or the bounded cap
     # expires. See #63078.
@@ -719,7 +720,8 @@ def _run_after_agent_ready(
             return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
-        image_paths=hosted_images, terminal_callback=hosted_terminal_callback, turn_author=turn_author)
+        image_paths=hosted_images, terminal_callback=hosted_terminal_callback, turn_author=turn_author,
+        person_turn=hosted_terminal_callback is None and turn_author is None)
 
 
 _TRUNCATION_PARAMS = (
