@@ -1808,6 +1808,10 @@ export {
   useI18n,
   usePluginI18n
 } from '@/i18n'
+/** User-felt action timing (desktop.log `[perf-actions]`): Bot Mode marks the
+ *  roster load and the bot switch. Never throws, never renders. */
+export { markOnce as markActionOnce } from '@/lib/action-timing'
+export { viewActionAbandon, viewActionBind, viewActionStart } from '@/lib/action-timing-view'
 /** THE way to run a decorative rAF animation (avatars, shimmer, sprites):
  *  fps budget + hidden/minimized/unfocused pause + idle dormancy + teardown.
  *  Plugins must route animation clocks through this instead of raw rAF loops
