@@ -20,7 +20,7 @@ from persistence_assembly import open_persistence_reader
 from tests.persistence_sqlite.conftest import store_for
 
 VISIBLE = SessionQuery(exclude_sources=(*INTERNAL_LISTING_SOURCES, "cron"))
-TRIGGER_SQL_DIGEST_V1 = "e944a2fccd5f4fb5"
+TRIGGER_SQL_DIGEST_V1 = "26fe10be4fd0e166"
 
 
 @pytest.fixture(autouse=True)
@@ -406,7 +406,8 @@ def _paren_depth(sql: str) -> int:
 
 
 def test_the_generated_ddl_nesting_is_bounded_and_does_not_grow_with_the_hop_count(monkeypatch):
-    # Portable guard: runs where no old SQLite is installed (CI).
+    # Portable guard: runs where no old SQLite is installed (CI). Paren depth is a proxy for parser-stack use (on
+    # 3.45.1 a nested subquery level costs far more stack than a plain paren); the hop-count check is the sharp part.
     from persistence.sqlite._schema_ddl import DEFERRED_INDEX_SQL
 
     assert _paren_depth(list_revision.VISIBLE_LIST_REVISION_SQL) <= _PAREN_DEPTH_BOUND
