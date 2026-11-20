@@ -1834,6 +1834,8 @@ def delete_session(
         ):
             return False
         from persistence.sqlite.conversation._store.retirement import retire_sessions
+        from persistence.sqlite.conversation._store.receipt_scan_memo import warm
+        warm(conn)  # apexfix: memoized retire_prunable receipt scan (nothing written in this txn yet)
         retire_sessions(conn, scope, media_root=media_root)
         delegate_ids = _delete_delegate_children(conn, scope, media_root=media_root)
         for sid in scope:  # orphan remaining children (branches) so FK is satisfied
@@ -1969,6 +1971,8 @@ def delete_sessions(
                 return 0
             expanded = expand(existing)
         from persistence.sqlite.conversation._store.retirement import retire_sessions
+        from persistence.sqlite.conversation._store.receipt_scan_memo import warm
+        warm(conn)  # apexfix: memoized retire_prunable receipt scan (nothing written in this txn yet)
         retire_sessions(conn, expanded, media_root=media_root)
         delegate_ids = _delete_delegate_children(conn, expanded, media_root=media_root)
         for chunk in _id_chunks(expanded):
