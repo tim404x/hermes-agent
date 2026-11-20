@@ -751,3 +751,19 @@ def test_a_number_that_never_became_a_keycap_is_released():
     delta_cb('1')
     delta_cb(' more thing: the build is red.')
     assert [p['text'] for _k, p in published] == ['NO_REPLY 1 more thing: the build is red.']
+
+
+def test_a_finite_turns_held_answer_never_raises_at_the_turn_end():
+    """A `chat -q` / `-z` viewer prints only the terminal reply: an answer "No." on a wake turn is neither
+    held nor re-delivered from the turn-end flush, where nothing would catch the no-viewer signal."""
+    from gateway.session_finite import finite_turn_scope
+    published = []
+    turn = _turn(Platform.LOCAL, published, display_kind=WAKE)
+    with finite_turn_scope(True):
+        delta_cb = _delta_cb(turn)
+        for chunk in ('No', '.'):
+            try:
+                delta_cb(chunk)
+            except Exception:
+                pass  # in-stream, the agent's own guard swallows the no-viewer signal
+        turn._flush_local_silence_hold()
