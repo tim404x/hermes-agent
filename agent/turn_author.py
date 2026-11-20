@@ -74,10 +74,12 @@ def parse_turn_author(raw: Any) -> Optional[dict[str, Any]]:
         }
         if author["id"] is None and author["name"] is None:
             return None
-        # Runtime-written chain fields of a bot-to-bot delivery (agent/bot_chain.py); never model input.
-        hops = raw.get("hops")
-        if isinstance(hops, int) and not isinstance(hops, bool) and 0 < hops <= _MAX_CHAIN_HOPS:
-            author["hops"] = hops
+        # Runtime-written chain fields, never model input: a bot-to-bot delivery's hop (agent/bot_chain.py) and the
+        # nesting depth of a task tab a bot opened for itself (message_agent new_tab, tools/bot_mode_dm.py).
+        for chain_field in ("hops", "tab_depth"):
+            value = raw.get(chain_field)
+            if isinstance(value, int) and not isinstance(value, bool) and 0 < value <= _MAX_CHAIN_HOPS:
+                author[chain_field] = value
         origin = _clean_text(raw.get("origin"))
         if origin and author["id"] and author["id"].startswith("bot:") and "/" not in author["id"]:
             author["id"] = _clean_text(bot_author_id(author["id"][len("bot:"):], origin))
