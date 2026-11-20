@@ -294,10 +294,12 @@ def _remember_tool_call_args(tool_calls: list, tool_call_args: dict) -> None:
             tool_call_args[tc_id] = (fn["name"], args)
 
 
-def _history_to_messages(history: list[dict], *, profile_home=None, image_urls: bool = True) -> list[dict]:
+def _history_to_messages(history: list[dict], *, profile_home=None, image_urls: bool = True,
+                         bot_brief: dict | None = None) -> list[dict]:
     """``image_urls=False`` is the ``inline_images=false`` projection (#116511): image parts render ``[image]``
-    so a remote client's history read stays kilobytes instead of re-transmitting every stored attachment."""
-    from agent.display_row_typing import type_display_row
+    so a remote client's history read stays kilobytes instead of re-transmitting every stored attachment.
+    ``bot_brief`` (``agent.display_row_typing.find_bot_brief``) types a bot's self-seeded task brief."""
+    from agent.display_row_typing import mark_bot_brief, type_display_row
     from agent.history_commentary import project_history_commentary
     from session_rules.turns import withheld_prompt_text
 
@@ -319,7 +321,7 @@ def _history_to_messages(history: list[dict], *, profile_home=None, image_urls: 
         if m.get("display_kind") == "hidden":
             continue
         # Machine rows typed for display (job titles, cron deliveries, interrupt sentinels), as the REST page does.
-        m = type_display_row(m)
+        m = mark_bot_brief(type_display_row(m), bot_brief, m.get("_row_id"))
         content_text = _user_image_display_text(m.get("content")) if role == "user" else None
         if content_text is None:
             content_text = _coerce_message_text(m.get("content"), image_urls=image_urls)
