@@ -17,6 +17,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from agent.ack_first import consume_ack_first_note
 from agent.conversation_compression import recover_rotated_compression_session
 from agent.iteration_budget import IterationBudget
 from agent.memory_context import build_memory_context_block, sanitize_context
@@ -982,13 +983,13 @@ def _merge_gateway_notes(
 ) -> str:
     """Must-deliver per-turn notes ride the user-message injection channel (one-shot) so the
     ephemeral system prompt stays byte-stable: the gateway's staged notes, plugin go-live notices no
-    tool result carried, then the surface-switch correction. Multimodal (list) content can't take the
-    string sidecar — append a durable text part instead."""
+    tool result carried, then the surface-switch correction, last the ack-first ask. Multimodal (list)
+    content can't take the string sidecar — append a durable text part instead."""
     forward_lsp_verdicts(agent)  # late LSP verdicts on last turn's edits ride the plugin-notice queue
     _turn_notes = "\n\n".join(
         part for part in (consume_gateway_turn_context_notes(agent), pop_plugin_notices(agent),
                           consume_surface_switch_note(agent),
-                          consume_skills_index_note(agent)) if part
+                          consume_skills_index_note(agent), consume_ack_first_note(agent)) if part
     )
     if not _turn_notes:
         return plugin_user_context
