@@ -15,10 +15,11 @@ from gateway.config import Platform
 from gateway.run_turn_runner import TurnRunner
 
 
-def _turn(platform, published, *, live=None):
+def _turn(platform, published, *, live=None, display_kind=None):
     turn = object.__new__(TurnRunner)
     turn._ctx = SimpleNamespace(
         source=SimpleNamespace(platform=platform, chat_id='chat'),
+        persist_user_display_kind=display_kind, reply_expected=None,
         mute_notification_reply=False, scheduled_heartbeat=False,
         streaming_tts_consumer_holder=[None], stream_consumer_holder=[None],
         interim_assistant_messages_enabled=False, user_config={},
@@ -671,9 +672,12 @@ def test_subagent_roster_survives_a_parent_rebuild():
 # take back text a viewer already painted. So the viewer stream is held exactly as tui_gateway's turn
 # holds it (gateway.response_filters.SilenceMarkerStreamHold): nothing that could still become a marker
 # is published, a held line that never became one is released at the segment boundary or turn end.
+WAKE = 'process_complete'
+
+
 def test_a_silent_turn_never_publishes_its_marker_to_the_local_viewer():
     published = []
-    delta_cb = _delta_cb(_turn(Platform.LOCAL, published))
+    delta_cb = _delta_cb(_turn(Platform.LOCAL, published, display_kind=WAKE))
     delta_cb('NO_')
     delta_cb('REPLY \u26a1')
     delta_cb(None)
@@ -682,7 +686,7 @@ def test_a_silent_turn_never_publishes_its_marker_to_the_local_viewer():
 
 def test_a_held_start_that_never_became_a_marker_is_released():
     published = []
-    delta_cb = _delta_cb(_turn(Platform.LOCAL, published))
+    delta_cb = _delta_cb(_turn(Platform.LOCAL, published, display_kind=WAKE))
     delta_cb('NO')
     delta_cb(' problem, done.')
     assert published == [('message.delta', {'text': 'NO problem, done.'})]
@@ -690,7 +694,7 @@ def test_a_held_start_that_never_became_a_marker_is_released():
 
 def test_a_closing_marker_line_is_dropped_and_a_held_word_released_at_the_turn_end():
     published = []
-    turn = _turn(Platform.LOCAL, published)
+    turn = _turn(Platform.LOCAL, published, display_kind=WAKE)
     delta_cb = _delta_cb(turn)
     delta_cb('Build is green.\n\nNO_')
     delta_cb('REPLY')
@@ -705,3 +709,45 @@ def test_a_messaging_route_stream_is_not_held():
     delta_cb = _delta_cb(_turn(Platform.TELEGRAM, published))
     delta_cb('NO_')
     assert published == [('message.delta', {'text': 'NO_'})]
+
+
+# A person's question answered with a marker-looking word ("Reply with exactly the word Silent.") is an
+# answer: the delivery seam rejects a marker on that turn, so the live view must not hold or drop it.
+def test_a_persons_answer_that_reads_like_a_marker_reaches_the_viewer_whole():
+    published = []
+    turn = _turn(Platform.LOCAL, published)
+    turn._ctx._status_adapter = None
+    _consumer, delta_cb, interim_cb, _want = turn._setup_stream_consumer('cli')
+    interim_cb('Silent', already_streamed=False)
+    delta_cb('NO_')
+    delta_cb('REPLY')
+    delta_cb(None)
+    assert published == [('message.interim', {'text': 'Silent', 'already_streamed': False}),
+                         ('message.delta', {'text': 'NO_'}), ('message.delta', {'text': 'REPLY'}),
+                         ('message.delta', {'text': None})]
+
+
+def test_a_silent_wakes_marker_interim_is_never_published():
+    published = []
+    turn = _turn(Platform.LOCAL, published, display_kind=WAKE)
+    turn._ctx._status_adapter = None
+    _consumer, _delta, interim_cb, _want = turn._setup_stream_consumer('cli')
+    interim_cb('NO_REPLY', already_streamed=False)
+    assert published == []
+
+
+def test_a_keycap_sign_off_split_across_chunks_never_publishes_the_marker():
+    published = []
+    delta_cb = _delta_cb(_turn(Platform.LOCAL, published, display_kind=WAKE))
+    for chunk in ('NO_REPLY ', '1', '\ufe0f', '\u20e3', None):
+        delta_cb(chunk)
+    assert published == [('message.delta', {'text': None})]
+
+
+def test_a_number_that_never_became_a_keycap_is_released():
+    published = []
+    delta_cb = _delta_cb(_turn(Platform.LOCAL, published, display_kind=WAKE))
+    delta_cb('NO_REPLY ')
+    delta_cb('1')
+    delta_cb(' more thing: the build is red.')
+    assert [p['text'] for _k, p in published] == ['NO_REPLY 1 more thing: the build is red.']
