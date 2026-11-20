@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sqlite3
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -30,6 +31,9 @@ from ..conversation._store.write_guards import _guarded_ids, _write_guards_rejec
 from ..gateway._routes import _sql_session_last_active
 from ._portability import SessionPortability
 from ._retirement import prune_retired_tombstones
+
+# concat_ws() is SQLite 3.44+; an older library keeps the per-row Python digest.
+_CONCAT_WS_SQLITE = (3, 44, 0)
 
 __all__ = ["SQLiteSessionMaintenance"]
 
@@ -472,6 +476,17 @@ class SQLiteSessionMaintenance(SessionPortability):
             fields = tuple(field for field in SESSION_PROJECTION_FIELDS if field in available)
             if not fields:
                 return None
+            if sqlite3.sqlite_version_info >= _CONCAT_WS_SQLITE:
+                # Every row's projected cells joined inside SQLite (the GIL is released while it works), then
+                # hashed by hashlib (which releases it too for a large buffer). The change watcher runs this on
+                # every commit to every served store; the Python walk below held the GIL for ~75-140 ms per
+                # store and stalled every request meanwhile. NULL renders as char(0), apart from ''. Rows come
+                # in table order: the digest is only ever compared with this store's previous one.
+                cells = ", ".join(f"coalesce({field}, char(0))" for field in fields)
+                rendered = conn.execute(
+                    f"SELECT CAST(group_concat(concat_ws(char(31), {cells}), char(30)) AS BLOB) FROM sessions",
+                ).fetchone()[0]
+                return fields, hashlib.blake2b(rendered or b"", digest_size=16).digest()
             order = " ORDER BY id" if "id" in available else ""
             rows = conn.execute(f"SELECT {', '.join(fields)} FROM sessions{order}")
             digest = hashlib.blake2b(digest_size=16)
