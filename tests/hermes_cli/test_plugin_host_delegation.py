@@ -87,7 +87,12 @@ def test_hosted_delegation_provider_extends_schema_and_routes_from_the_host(tmp_
         out = invoke_plugin_command(plugins_mod.get_plugin_command_handler("deleg-switch"), "default",
                                     session_key="chat-a")
         pid, listed = out.split(" ", 1)
-        assert int(pid) != os.getpid() and {"default", "hosted-map"} <= set(listed.split(","))  # + other bundled
+        # "default first, then every registered backend": the bundled strategies (effort-router) sit beside it.
+        names = listed.split(",")
+        assert int(pid) != os.getpid() and names[0] == "default" and len(names) == len(set(names))
+        bundled = {d.name for d in (Path(__file__).resolve().parents[2] / "plugins" / "delegation").iterdir()
+                   if (d / "plugin.yaml").is_file()}
+        assert set(names) == {"default", "hosted-map"} | bundled
         assert yaml.safe_load((home / "config.yaml").read_text())["delegation"]["backend"] == "default"
         assert delegation_backends._rebuild_requests == {"chat-a"}
         delegation_backends._rebuild_requests.clear()
