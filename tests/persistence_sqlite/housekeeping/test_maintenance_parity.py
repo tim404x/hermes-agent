@@ -81,13 +81,18 @@ def test_session_projection_digest_matches_legacy_probe(seeded):
     maintenance = store.maintenance
     digest = maintenance.session_projection_digest()
     assert digest is not None and digest[0] == SESSION_PROJECTION_FIELDS
-    assert digest == _session_db_content_sig(store.store_path)
+    # The watcher signs the store with session_change_digests (listed rows apart from worker rows and counters).
+    watched = _session_db_content_sig(store.store_path)
+    assert watched == maintenance.session_change_digests(busy_timeout_s=1.0)
     # The activity columns the heartbeat restamps are not part of it; a projected column is.
     store.holder()._write_sql("UPDATE sessions SET last_activity_at = ? WHERE id = 'old-a'", (NOW,))
     assert maintenance.session_projection_digest(busy_timeout_s=1.0) == digest
+    assert maintenance.session_change_digests(busy_timeout_s=1.0) == watched
     store.holder()._write_sql("UPDATE sessions SET title = 'renamed' WHERE id = 'old-a'")
     changed = maintenance.session_projection_digest()
-    assert changed != digest and changed == _session_db_content_sig(store.store_path)
+    assert changed != digest
+    moved = _session_db_content_sig(store.store_path)
+    assert moved.listed != watched.listed and moved == maintenance.session_change_digests(busy_timeout_s=1.0)
     # The read connection's own busy budget is restored after the probe.
     with store.holder()._read_ctx() as conn:
         budget = conn.execute("PRAGMA busy_timeout").fetchone()[0]
@@ -119,3 +124,45 @@ def test_the_projection_digest_sees_every_listed_change_on_both_paths(seeded, mo
     sql, moves = change
     store.holder()._write_sql(sql)
     assert (store.maintenance.session_projection_digest(busy_timeout_s=1.0) != before) is moves
+
+
+@pytest.mark.parametrize("path", ["in_store", "legacy_walk"])
+@pytest.mark.parametrize("change, moves", [
+    ("UPDATE sessions SET title = 'Alpha Repart' WHERE id = 'old-a'", {"listed"}),          # same length, quiet row
+    ("UPDATE sessions SET title = '' WHERE id = 'old-c'", {"listed"}),                      # NULL -> ''
+    ("UPDATE sessions SET message_count = message_count + 1 WHERE id = 'cwd-h'", {"counts"}),
+    ("UPDATE sessions SET message_count = 0 WHERE id = 'cwd-h'", {"listed", "counts"}),     # crosses zero
+    ("UPDATE sessions SET tool_call_count = 7 WHERE id = 'open-e'", {"running_counts"}),     # open-e runs here
+    ("UPDATE sessions SET source = 'oneshot' WHERE id = 'old-a'", {"listed", "counts", "internal"}),
+    ("UPDATE sessions SET last_activity_at = 1 WHERE id = 'old-a'", set()),                 # the heartbeat's column
+    ("UPDATE sessions SET started_at = started_at + 0.000001 WHERE id = 'old-a'", {"listed"}),  # 1 us, 17th digit
+    ("UPDATE sessions SET message_count = 5 WHERE id = 'sub-chat'", {"counts"}),             # a chat's delegate run
+    ("UPDATE sessions SET title = 'x' WHERE id = 'sub-chat-nested'", {"counts"}),
+    ("UPDATE sessions SET message_count = 5 WHERE id = 'sub-worker'", {"internal"}),         # a worker's delegate run
+    ("UPDATE sessions SET title = 'x' WHERE id = 'sub-worker-nested'", {"internal"}),
+    ("UPDATE sessions SET parent_session_id = 'old-a' WHERE id = 'sub-worker'", {"counts", "internal"}),  # re-rooted
+])
+def test_session_change_digests_split_the_same_way_on_both_paths(seeded, monkeypatch, path, change, moves):
+    """In-store (concat_ws, 3.44+) and per-row Python walk: the same partitions move for the same change."""
+    import persistence.sqlite.housekeeping.maintenance as sqlite_maintenance
+
+    if path == "legacy_walk":
+        monkeypatch.setattr(sqlite_maintenance, "_CONCAT_WS_SQLITE", (99, 0, 0))
+    def seed(db):
+        _seed_selection(db)
+        _session(db, "sub-chat", source="subagent", parent_session_id="old-a",
+                 model_config='{"_delegate_from": "old-a"}')
+        _session(db, "sub-chat-nested", source="subagent", parent_session_id="sub-chat")
+        _session(db, "sub-worker", source="subagent", parent_session_id="orphan-f")
+        _session(db, "sub-worker-nested", source="cli", parent_session_id="sub-worker",
+                 model_config='{"_delegate_from": "sub-worker"}')
+
+    store = seeded(seed)
+    store.holder()._write_sql("UPDATE sessions SET source = 'oneshot' WHERE id = 'orphan-f'")
+    read = lambda: store.maintenance.session_change_digests(running_ids=["open-e"], busy_timeout_s=1.0)
+    before = read()
+    assert before == read()
+    store.holder()._write_sql(change)
+    after = read()
+    assert {part for part in ("listed", "counts", "running_counts", "internal")
+            if getattr(after, part) != getattr(before, part)} == moves

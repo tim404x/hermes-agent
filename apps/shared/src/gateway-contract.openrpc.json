@@ -52425,6 +52425,18 @@
       ]
     },
     {
+      "name": "jobs.changed",
+      "summary": "A row only workers write moved (one-shot runs, kanban/tool workers and the delegate runs they start); no session window lists or watches it. Floored at 15 s.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/ChangeSignalPayload"
+          }
+        }
+      ]
+    },
+    {
       "name": "message.complete",
       "summary": "The turn ended: final text, usage and outcome.",
       "params": [
@@ -52840,6 +52852,18 @@
           "name": "payload",
           "schema": {
             "$ref": "#/components/schemas/SessionUsagePayload"
+          }
+        }
+      ]
+    },
+    {
+      "name": "sessions.activity",
+      "summary": "Only the message/tool counters of a turn running in this backend moved (its stream already carries them); nothing to refetch.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/ChangeSignalPayload"
           }
         }
       ]

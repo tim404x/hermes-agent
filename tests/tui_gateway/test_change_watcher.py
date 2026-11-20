@@ -140,6 +140,193 @@ def test_session_row_changes_broadcast_sessions_changed(watcher_home, sql):
     assert ("sessions.changed", {}) in events
 
 
+def _seed_mixed_store(db_path):
+    """A desktop chat, a Telegram chat, a one-shot worker run, the worker's delegate run and the chat's delegate run,
+    as the live stores hold them."""
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, parent_session_id TEXT, model_config TEXT, "
+        "title TEXT, message_count INTEGER, tool_call_count INTEGER, last_activity_at REAL);"
+        "INSERT INTO sessions VALUES ('chat', 'desktop', NULL, NULL, 'Chat', 2, 0, 1);"
+        "INSERT INTO sessions VALUES ('tg', 'telegram', NULL, NULL, 'Telegram', 4, 0, 1);"
+        "INSERT INTO sessions VALUES ('job', 'oneshot', NULL, NULL, 'Job', 1, 0, 1);"
+        "INSERT INTO sessions VALUES ('sub', 'subagent', 'chat', '{\"_delegate_from\": \"chat\"}', 'Sub', 1, 0, 1);"
+        "INSERT INTO sessions VALUES ('jobsub', 'subagent', 'job', '{\"_delegate_from\": \"job\"}', 'J', 1, 0, 1);"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _names(events):
+    return [name for name, _payload in events]
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE sessions SET message_count = message_count + 1, tool_call_count = 3 WHERE id = 'job'",
+    "UPDATE sessions SET title = 'renamed' WHERE id = 'job'",
+    "INSERT INTO sessions VALUES ('job2', 'oneshot', NULL, NULL, NULL, 0, 0, 2)",
+    "UPDATE sessions SET message_count = 9 WHERE id = 'jobsub'",
+    "INSERT INTO sessions VALUES ('sub2', 'subagent', 'job', NULL, NULL, 1, 0, 2)",
+    "INSERT INTO sessions VALUES ('sub3', 'subagent', 'jobsub', NULL, NULL, 1, 0, 2)",
+])
+def test_worker_rows_never_refresh_a_session_list(watcher_home, sql):
+    """One-shot runs and the delegate runs they start were ~80% of the row moves behind a sessions.changed every
+    ~2.5 s; no window lists or watches them, so they sign jobs.changed (floored at 15 s) instead."""
+    home, events = watcher_home
+    _seed_mixed_store(home / "state.db")
+    server._broadcast_watched_changes(now=0.0)
+
+    time.sleep(0.02)
+    _write(home / "state.db", sql)
+    server._broadcast_watched_changes(now=20.0)
+
+    assert "sessions.changed" not in _names(events) and "sessions.activity" not in _names(events)
+    assert ("jobs.changed", {}) in events
+
+
+def test_a_watch_pass_reads_each_store_once(watcher_home, monkeypatch):
+    """sessions.changed, sessions.activity and jobs.changed sign the same per-store read: a pass reads a store once,
+    also while its mtime is racy (a commit in the last 2 s is re-read every pass)."""
+    home, events = watcher_home
+    _seed_mixed_store(home / "state.db")
+    reads = []
+    real = server._session_rows_sig
+    monkeypatch.setattr(server, "_session_rows_sig", lambda *a, **k: reads.append(1) or real(*a, **k))
+    server._broadcast_watched_changes(now=0.0)
+    assert len(reads) == 1
+    reads.clear()
+    _write(home / "state.db", "UPDATE sessions SET title = 'x' WHERE id = 'job'")
+    server._broadcast_watched_changes(now=20.0)
+    assert len(reads) == 1 and ("jobs.changed", {}) in events
+
+
+def test_jobs_changed_is_floored_at_15_s_but_keeps_its_trailing_edge(watcher_home):
+    home, events = watcher_home
+    db = home / "state.db"
+    _seed_mixed_store(db)
+    server._broadcast_watched_changes(now=0.0)
+    for step, now in enumerate((20.0, 25.0, 30.0, 36.0), start=1):
+        time.sleep(0.02)
+        _write(db, "UPDATE sessions SET message_count = ? WHERE id = 'job'", 10 + step)
+        server._broadcast_watched_changes(now=now)
+    # 20 fires; 25 and 30 are inside the floor; 36 is past it and carries the trailing change.
+    assert _names(events).count("jobs.changed") == 2
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE sessions SET message_count = 9 WHERE id = 'sub'",
+    "INSERT INTO sessions VALUES ('sub2', 'subagent', 'chat', NULL, NULL, 1, 0, 2)",
+])
+def test_a_chats_hidden_delegate_run_still_refreshes_on_the_counters_floor(watcher_home, sql):
+    """No list shows a chat's delegate run, but a window can watch its transcript: it signs sessions.changed at the
+    10 s counters floor, never jobs.changed."""
+    home, events = watcher_home
+    _seed_mixed_store(home / "state.db")
+    server._broadcast_watched_changes(now=0.0)
+
+    time.sleep(0.02)
+    _write(home / "state.db", sql)
+    server._broadcast_watched_changes(now=5.0)
+    assert _names(events) == ["sessions.changed"]
+    time.sleep(0.02)
+    _write(home / "state.db", "UPDATE sessions SET message_count = 11 WHERE id = 'sub'")
+    server._broadcast_watched_changes(now=8.0)
+    assert _names(events) == ["sessions.changed"]     # inside the 10 s counters floor: held
+    server._broadcast_watched_changes(now=15.0)
+    assert _names(events) == ["sessions.changed"] * 2
+
+
+def test_a_subagent_run_is_listed_again_when_the_profile_shows_subagents(watcher_home):
+    home, events = watcher_home
+    (home / "config.yaml").write_text("display: {}\nsessions:\n  show_subagents: true\n")
+    _seed_mixed_store(home / "state.db")
+    server._broadcast_watched_changes(now=0.0)
+
+    time.sleep(0.02)
+    _write(home / "state.db", "UPDATE sessions SET title = 'renamed' WHERE id = 'sub'")
+    server._broadcast_watched_changes(now=20.0)
+
+    assert ("sessions.changed", {}) in events and "jobs.changed" not in _names(events)
+
+
+def test_counter_moves_of_a_turn_running_here_ride_the_light_event(watcher_home, monkeypatch):
+    """The desktop chat's turn runs in this process: every append already streams to the windows attached to it.
+    Its counter moves sign sessions.activity at 2 s; sessions.changed carries them only once per 30 s (for the
+    windows not attached), and the turn's start and end edges at the 10 s counters floor."""
+    home, events = watcher_home
+    db = home / "state.db"
+    _seed_mixed_store(db)
+    live = {}
+    monkeypatch.setattr(server, "_sessions", live)
+    server._broadcast_watched_changes(now=0.0)
+
+    live["rt-chat"] = {"session_key": "chat", "running": True}  # turn starts
+    server._broadcast_watched_changes(now=10.0)
+    assert "sessions.changed" in _names(events)
+    events.clear()
+
+    for step, now in enumerate((20.0, 30.0), start=1):
+        time.sleep(0.02)
+        _write(db, "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = 'chat'", 2 + step, step)
+        server._broadcast_watched_changes(now=now)
+    assert _names(events) == ["sessions.activity"] * 2
+    time.sleep(0.02)
+    _write(db, "UPDATE sessions SET message_count = 9 WHERE id = 'chat'")
+    server._broadcast_watched_changes(now=40.0)       # 30 s since the last sessions.changed: the slow refresh
+    assert _names(events).count("sessions.activity") == 3 and _names(events).count("sessions.changed") == 1
+
+    events.clear()
+    live["rt-chat"]["running"] = False  # turn ends
+    server._broadcast_watched_changes(now=50.0)
+    assert "sessions.changed" in _names(events)
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE sessions SET message_count = 5 WHERE id = 'tg'",
+    "UPDATE sessions SET message_count = 3 WHERE id = 'chat'",
+])
+def test_a_counter_move_from_another_writer_still_refreshes_the_lists(watcher_home, sql):
+    """A Telegram turn (the messaging gateway), or a delivery into an idle tab, never streams to this process's
+    windows: sessions.changed is how they learn about it (open transcript, bot tile, unread dot, message count)."""
+    home, events = watcher_home
+    _seed_mixed_store(home / "state.db")
+    server._broadcast_watched_changes(now=0.0)
+
+    time.sleep(0.02)
+    _write(home / "state.db", sql)
+    server._broadcast_watched_changes(now=10.0)
+
+    assert ("sessions.changed", {}) in events
+
+
+def test_counter_only_moves_are_coalesced_to_the_desktops_list_cadence(watcher_home):
+    """Another process appending to a listed row (a Telegram turn) still refreshes the lists, at most once per
+    10 s with the trailing move kept; a structural move (a rename) still goes out within the 2 s floor."""
+    home, events = watcher_home
+    db = home / "state.db"
+    _seed_mixed_store(db)
+    server._broadcast_watched_changes(now=0.0)
+
+    def counter(now, n):
+        time.sleep(0.02)
+        _write(db, "UPDATE sessions SET message_count = ? WHERE id = 'tg'", n)
+        server._broadcast_watched_changes(now=now)
+
+    counter(20.0, 5)                                  # fires: nothing went out in the last 10 s
+    counter(22.5, 6)
+    counter(25.0, 7)                                  # inside 10 s: held
+    assert _names(events).count("sessions.changed") == 1
+    time.sleep(0.02)
+    _write(db, "UPDATE sessions SET title = 'Renamed' WHERE id = 'chat'")
+    server._broadcast_watched_changes(now=26.0)       # structural: the 2 s floor (6 s since the last one)
+    assert _names(events).count("sessions.changed") == 2
+    counter(27.0, 8)
+    server._broadcast_watched_changes(now=35.0)       # counters only, 9 s after the rename: held
+    assert _names(events).count("sessions.changed") == 2
+    server._broadcast_watched_changes(now=36.5)       # the trailing counter move goes out once the window opens
+    assert _names(events).count("sessions.changed") == 3
+
+
 def test_unreadable_store_keeps_last_digest(watcher_home):
     """A locked/unreadable moment after a good read must not flip to the mtime signature:
     digest -> mtime -> digest would broadcast twice for nothing."""
