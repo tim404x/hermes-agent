@@ -99,6 +99,7 @@ import {
 import { orderTilesByTree } from './session-tile-order'
 import {
   ackStoredSessionId,
+  forgetSilentTurnRanges,
   isMessagingCompletion,
   markSessionUnreadFinished,
   noteSilentTurnSettled
@@ -755,8 +756,11 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
 
     // A turn that chose silence showed nothing: no green dot now, and the rows it stored do not
     // count as unread when the list next reports them.
-    if (silentSettles.delete(runtimeId)) {
-      noteSilentTurnSettled(storedId)
+    if (silentSettles.has(runtimeId)) {
+      const committedRows = silentSettles.get(runtimeId)
+
+      silentSettles.delete(runtimeId)
+      noteSilentTurnSettled(storedId, runtimeOwnerProfile(runtimeId), committedRows)
 
       return
     }
@@ -781,11 +785,23 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
 }
 
 /** Runtime ids whose live turn just completed silent (`message.complete` with `silent: true`), consumed
- *  by that turn's busy->idle edge. Set before the completion publishes the idle state. */
-const silentSettles = new Set<string>()
+ *  by that turn's busy->idle edge, each with the row count its receipt proved committed (undefined when
+ *  it proved none). Set before the completion publishes the idle state. */
+const silentSettles = new Map<string, number | undefined>()
 
-export function noteSilentCompletion(runtimeId: string): void {
-  silentSettles.add(runtimeId)
+export function noteSilentCompletion(runtimeId: string, committedRows?: number): void {
+  silentSettles.set(runtimeId, committedRows)
+}
+
+/** The socket-proven owner profile of a runtime, when its events named one. */
+function runtimeOwnerProfile(runtimeId: string): string | undefined {
+  const owner = runtimeSessionOwner(runtimeId)
+
+  return typeof owner === 'string'
+    ? owner
+    : typeof owner?.profile === 'string' && owner.profile.trim()
+      ? owner.profile
+      : undefined
 }
 
 /** Mark a completed turn unread unless the user is already looking at it. */
@@ -794,14 +810,7 @@ function lightUnreadCompletion(storedId: string, runtimeId?: string) {
   // with no row, the socket-proven owner profile keeps a background profile's
   // finish out of the ACTIVE profile's bucket (#91710). The same owner decides
   // whether the completion is a messaging conversation's.
-  const owner = runtimeId ? runtimeSessionOwner(runtimeId) : undefined
-
-  const profileHint =
-    typeof owner === 'string'
-      ? owner
-      : typeof owner?.profile === 'string' && owner.profile.trim()
-        ? owner.profile
-        : undefined
+  const profileHint = runtimeId ? runtimeOwnerProfile(runtimeId) : undefined
 
   // FOCUSED, not selected: a session finishing in the tile the user is
   // watching is already seen, and a tile is never the primary selection.
@@ -975,6 +984,8 @@ export function clearAllSessionStates() {
 
   sessionEventSilenceTimers.clear()
   silentTurnChecks.clear()
+  silentSettles.clear()
+  forgetSilentTurnRanges()
   settledExpiry.clear()
   unconfirmedReconnectSettles.clear()
   clearAllProviderWaits()
