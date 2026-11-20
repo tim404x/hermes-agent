@@ -20,7 +20,7 @@ import { providerWaitText, setSessionProviderWait } from '@/store/provider-wait'
 import { setCurrentUsage, setTurnStartedAt } from '@/store/session'
 import { refreshSupportedSessionControlAfterTurn } from '@/store/session-control'
 import { $focusedStoredSessionId } from '@/store/session-focus'
-import { $sessionStates } from '@/store/session-states'
+import { $sessionStates, noteSilentCompletion } from '@/store/session-states'
 import { lightDesktopMessagingCompletion } from '@/store/session-unread'
 import { pruneFinishedSessionSubagents } from '@/store/subagents'
 import { clearActiveSessionTodos } from '@/store/todos'
@@ -430,8 +430,17 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
 
     flushQueuedDeltas(sessionId)
 
-    // Keyed by session so only one window beeps when several are open.
-    playCompletionSound(sessionId)
+    // A turn that chose silence (a background wake answered NO_REPLY) shows nothing, so nothing
+    // announces it: no beep here, no toast in completeAssistantMessage, no unread dot on its settle.
+    const silent = payload?.silent === true
+
+    if (silent) {
+      noteSilentCompletion(sessionId)
+    } else {
+      // Keyed by session so only one window beeps when several are open.
+      playCompletionSound(sessionId)
+    }
+
     lightOwnMessagingTurn(sessionId, event.admission_id, event.profile)
 
     const finalText = coerceGatewayText(payload?.text) || coerceGatewayText(payload?.rendered)
@@ -452,7 +461,8 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
       Boolean(payload?.response_transformed),
       typeof payload?.status === 'string' ? payload.status : undefined,
       payload?.response_reused === true,
-      typeof payload?.failure_reason === 'string' ? payload.failure_reason : undefined
+      typeof payload?.failure_reason === 'string' ? payload.failure_reason : undefined,
+      silent
     )
 
     // The continuation a pause waited for has ended: sends held for it go now. Interrupted to be continued
@@ -495,7 +505,7 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
       // Light up the pet's mail icon if the user wasn't looking when the turn
       // finished — a glanceable "new message" hint on the popped-out overlay.
       // Cleared when they open the app via the mail icon or refocus the window.
-      if (typeof document !== 'undefined' && !document.hasFocus()) {
+      if (!silent && typeof document !== 'undefined' && !document.hasFocus()) {
         markPetUnread()
       }
     }

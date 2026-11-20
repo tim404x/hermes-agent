@@ -11,7 +11,7 @@ import { isSilenceMarkerText, stripTrailingSilenceMarker } from './silence-marke
 const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), '../../../../tests/fixtures/silence_marker_cases.json')
 
 const { cases } = JSON.parse(readFileSync(FIXTURE, 'utf8')) as {
-  cases: { input: string; name: string; silent: boolean }[]
+  cases: { input: string; name: string; silent: boolean; strip?: string }[]
 }
 
 describe('isSilenceMarkerText', () => {
@@ -21,6 +21,10 @@ describe('isSilenceMarkerText', () => {
 
   it.each(cases.map(c => [c.name, c] as const))('%s', (_name, c) => {
     expect(isSilenceMarkerText(c.input)).toBe(c.silent)
+
+    if (c.strip !== undefined) {
+      expect(stripTrailingSilenceMarker(c.input)).toBe(c.strip)
+    }
   })
 
   it('reads non-strings as not silent', () => {
