@@ -193,6 +193,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- Fork carry "pin in project" (c5d207fc69): the pin time, NULL = unpinned. Declared LAST, where ADD COLUMN
     -- put it on every upgraded store, so the salvage lane's layout inference stays unambiguous.
     project_pinned_at REAL,
+    -- Fork carry "bot-mode side windows": the message_agent side-window stamp, JSON {"at", "by", "key"}, NULL =
+    -- not a side window. Its own cell (not origin_json) so a gateway-created chat can carry it too. Declared last.
+    side_window_json TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );
