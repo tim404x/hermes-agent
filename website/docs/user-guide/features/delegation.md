@@ -311,6 +311,10 @@ Note that the pin is global: with the default strategy `delegate_task` has no pe
 
 Both come from the official `advanced-delegation` plugin, which also adds `hermes delegation config` (create, edit and delete model routes, pick profiles) and the `/delegation` slash command. While `model_map` or `profile_routes` is active, `delegation.model` / `delegation.provider` are inactive: the routes decide.
 
+**Effort tiering (`effort-router`, bundled):** `delegation.backend: effort-router` keeps the default route and adds a per-task `effort` (`low`, `medium`, `high`, `xhigh`). The model picks `low`/`medium` for clearly easy mechanical work (lookups, fetch-and-extract, formatting, file moves, a single API read) and `xhigh` only for genuinely hard work. When a task omits it, a cheap heuristic runs a short goal that starts with a mechanical verb (fetch, list, read, rename, look up ...) at `medium` and everything else at `delegation.reasoning_effort`; work whose goal or context touches money, legal, sends, code changes or research synthesis never runs below `high`, whoever chose the level, and `xhigh` is never chosen automatically. The same parameter, guidance and heuristic apply when an orchestrator child delegates. Each result's `route.label` says what was picked and why (`effort medium (auto: mechanical)`), and the call's `effort_mix` counts the levels.
+
+**Spend of the whole tree:** every `delegate_task` result carries `usage_total`: tokens (input, output, cache read/write, reasoning), cost and subagent count of its children and everything they delegated to in turn. The parent agent keeps the running sum for the session in `delegation_tree_usage`, so a depth-2 swarm reports its real spend rather than the top level's own.
+
 Each strategy's settings live under `delegation.backends.<backend name>`:
 
 ```yaml
