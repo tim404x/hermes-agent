@@ -28,8 +28,14 @@ Safety (the firer may run in a restart-safe external worker whose environment is
   (default 30) even when the peek says unchanged, so a wrong "unchanged" can delay a real run by at most
   that long, never drop it;
 - divergence latch: after every admission the firer compares the owner's verdict (did the stored hash move?)
-  with its own peek. If the owner saw a change the peek did not, the gate is switched off for that job
-  (``monitor_gate_state.json``) and a WARNING is logged; every later tick of that job admits as before.
+  with its own peek. The FIRST time the owner sees a change the peek did not, the job goes on probation for
+  ``PROBATION_S``: every tick admits (the owner decides, nothing is delayed) while the firer keeps peeking and
+  comparing. A SECOND divergence within ``DIVERGENCE_WINDOW_S`` switches the gate off for that job for good
+  (``monitor_gate_state.json``, WARNING logged); every later tick of that job admits as before. One divergence
+  alone is usually a flapping source (one transient output between the peek and the owner's run seconds later;
+  seen on a live Slack/Gmail monitor), which must not cost the job its gate. A peek that is really blind keeps
+  diverging on the next real change, and during probation that change is admitted, not delayed.
+  # apexfix: divergence latch needs a second miss (probation after the first)
 
 Every decision appends one JSON line to ``<cron store>/monitor_gate.jsonl`` (rotated at 5 MB, 2 kept)
 and logs one INFO line. Kill switch: ``HERMES_CRON_MONITOR_PREADMIT=0`` restores the old path exactly.
@@ -58,6 +64,9 @@ _ledger_lock = threading.Lock()
 MAX_SKIP_ENV = "HERMES_CRON_MONITOR_PREADMIT_MAX_SKIP_MIN"
 DEFAULT_MAX_SKIP_MIN = 30.0
 STATE_NAME = "monitor_gate_state.json"
+DIVERGENCE_LATCH_COUNT = 2  # divergences within DIVERGENCE_WINDOW_S that switch a job's gate off for good
+DIVERGENCE_WINDOW_S = 24 * 3600.0
+PROBATION_S = 6 * 3600.0  # after one divergence: admit every tick (owner decides) and keep comparing
 
 
 def enabled() -> bool:
@@ -179,13 +188,30 @@ class Admission:
             raw = fresh.get("monitor_state")
             owner_hash = raw.get("last_output_hash") if isinstance(raw, dict) else None
             owner_changed = owner_hash != self.stored_hash
-            fields = {"last_admit_at": time.time()}
+            now = time.time()
+            fields = {"last_admit_at": now}
             if self.peek_unchanged and owner_changed:
-                # The owner saw a change the firer's peek did not: never trust the peek for this job again.
-                logger.warning("Job '%s': monitor pre-admission peek said unchanged but the owner saw a change; "
-                               "pre-admission gate disabled for this job", self.job_id)
-                record_decision(self.job_id, "admit", reason="divergence_latched", output_hash=owner_hash)
-                fields["disabled"] = "divergence"
+                # The owner saw a change the firer's peek did not. Once can be a flapping source; twice within
+                # the window means the peek cannot be trusted for this job: switch its gate off for good.
+                entry = _load_state().get(self.job_id)
+                prior = entry.get("divergences") if isinstance(entry, dict) else None
+                recent = [t for t in (prior if isinstance(prior, list) else [])
+                          if isinstance(t, (int, float)) and now - t < DIVERGENCE_WINDOW_S]
+                recent.append(now)
+                fields["divergences"] = recent[-(DIVERGENCE_LATCH_COUNT * 2):]
+                if len(recent) >= DIVERGENCE_LATCH_COUNT:
+                    logger.warning("Job '%s': monitor pre-admission peek said unchanged but the owner saw a change "
+                                   "(%d times in 24 h); pre-admission gate disabled for this job",
+                                   self.job_id, len(recent))
+                    record_decision(self.job_id, "admit", reason="divergence_latched", output_hash=owner_hash)
+                    fields["disabled"] = "divergence"
+                else:
+                    logger.warning("Job '%s': monitor pre-admission peek said unchanged but the owner saw a change "
+                                   "(1st in 24 h, a flapping source?); every tick admits for the next %d min "
+                                   "(probation), a second miss disables the gate for this job",
+                                   self.job_id, int(PROBATION_S // 60))
+                    record_decision(self.job_id, "admit", reason="divergence_observed", output_hash=owner_hash)
+                    fields["probation_until"] = now + PROBATION_S
             _update_state(self.job_id, **fields)
         except Exception:
             logger.debug("monitor pre-admission follow-up failed", exc_info=True)
@@ -253,6 +279,12 @@ def preadmit_monitor_decision(job: dict, *, extra_prompt: Optional[str] = None,
         record_decision(job_id, "admit", reason="first_run" if peek.first_run else "changed",
                         output_hash=peek.output_hash, elapsed_ms=elapsed)
         return None, Admission(job_id, stored, False)
+    probation_until = state.get("probation_until")
+    if isinstance(probation_until, (int, float)) and time.time() < probation_until:
+        # After a first divergence: the owner decides every tick (nothing delayed) and the comparison keeps
+        # running, so a peek that is really blind is caught on the next real change.
+        record_decision(job_id, "admit", reason="probation", output_hash=peek.output_hash, elapsed_ms=elapsed)
+        return None, Admission(job_id, stored, True)
     last_admit = state.get("last_admit_at")
     if not isinstance(last_admit, (int, float)) or time.time() - last_admit >= _max_skip_seconds():
         # Bounded trust: the owner re-checks this job at least every MAX_SKIP minutes.
