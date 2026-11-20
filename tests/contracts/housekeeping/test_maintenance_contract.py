@@ -461,6 +461,71 @@ def test_session_projection_digest_tracks_the_listed_columns_only(backend, scope
     assert store_a.maintenance.session_projection_digest()[1] != first
 
 
+def test_session_change_digests_split_listed_counters_running_and_internal_rows(backend, scope_a):
+    store_a = backend.open(scope_a)
+    chat = _live(backend, scope_a, "cd-chat")
+    store_a.messages.append(chat, NewMessage(role="user", content="hello", timestamp=_BASE))
+    worker = SessionId("cd-worker")
+    store_a.sessions.create(NewSession(session_id=worker, source="oneshot"))
+    child = SessionId("cd-delegate")  # a chat's delegate run: watched
+    store_a.sessions.create(NewSession(session_id=child, source="subagent", parent_session_id=chat,
+                                       model_config={"_delegate_from": str(chat)}))
+    worker_child = SessionId("cd-worker-delegate")  # a worker's delegate run, and its own delegate: internal
+    store_a.sessions.create(NewSession(session_id=worker_child, source="subagent", parent_session_id=worker,
+                                       model_config={"_delegate_from": str(worker)}))
+    nested = SessionId("cd-worker-nested")
+    store_a.sessions.create(NewSession(session_id=nested, source="subagent", parent_session_id=worker_child,
+                                       model_config={"_delegate_from": str(worker_child)}))
+    empty = _live(backend, scope_a, "cd-empty")
+    digests = store_a.maintenance.session_change_digests
+    first = digests()
+    # CONTRACT: the digests name the projected columns the store has and are 16 bytes each.
+    assert first.fields == SESSION_PROJECTION_FIELDS
+    assert {len(d) for d in (first.listed, first.counts, first.running_counts, first.internal)} == {16}
+    # CONTRACT: an activity heartbeat moves nothing.
+    store_a.sessions.touch_activity(chat, time.time(), description="busy", provenance="agent")
+    assert digests() == first
+    # CONTRACT: a counter-only change to a listed row moves ``counts`` only (``listed`` keeps zero / non-zero).
+    store_a.messages.append(chat, NewMessage(role="assistant", content="hi", timestamp=_BASE + 1))
+    counted = digests()
+    assert counted.counts != first.counts
+    assert (counted.listed, counted.running_counts, counted.internal) == (first.listed, first.running_counts, first.internal)
+    # CONTRACT: the same move on a row named in running_ids moves ``running_counts`` instead.
+    running = digests(running_ids=[str(chat)])
+    store_a.messages.append(chat, NewMessage(role="user", content="more", timestamp=_BASE + 2))
+    after = digests(running_ids=[str(chat)])
+    assert after.running_counts != running.running_counts
+    assert (after.listed, after.counts, after.internal) == (running.listed, running.counts, running.internal)
+    # CONTRACT: message_count crossing zero is a listed change.
+    before_first = digests()
+    store_a.messages.append(empty, NewMessage(role="user", content="first", timestamp=_BASE + 3))
+    assert digests().listed != before_first.listed
+    # CONTRACT: any projected change to an internal row (a one-shot worker, the delegate chain it started) moves
+    # ``internal`` only.
+    for sid in (worker, worker_child, nested):
+        before = digests()
+        store_a.sessions.set_title(sid, f"renamed {sid}")
+        moved = digests()
+        assert moved.internal != before.internal
+        assert (moved.listed, moved.counts, moved.running_counts) == (before.listed, before.counts, before.running_counts)
+    # CONTRACT: a hidden delegate run of a chat is watched: its changes move ``counts`` only.
+    before = digests()
+    store_a.sessions.set_title(child, "renamed watched")
+    moved = digests()
+    assert moved.counts != before.counts
+    assert (moved.listed, moved.running_counts, moved.internal) == (before.listed, before.running_counts, before.internal)
+    # CONTRACT: include_subagents lists every delegate run with a non-internal source: its change is a listed one.
+    for sid in (child, nested):
+        before = digests(include_subagents=True)
+        store_a.sessions.set_title(sid, f"renamed again {sid}")
+        moved = digests(include_subagents=True)
+        assert moved.listed != before.listed and moved.internal == before.internal
+    # CONTRACT: a structural change to a listed row moves ``listed``.
+    before = digests()
+    store_a.sessions.set_title(chat, "renamed chat")
+    assert digests().listed != before.listed
+
+
 def test_retained_tree_is_live_reads_sessions_inside_the_tree(backend, scope_a, tmp_path):
     store_a = backend.open(scope_a)
     tree = tmp_path / "wt"
