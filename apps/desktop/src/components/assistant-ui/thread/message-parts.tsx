@@ -149,13 +149,31 @@ const failedCallNeedsUser = (part: TimelineToolCallProps): boolean => {
   return toolCallFailed(part) || (typeof exitCode === 'number' && exitCode !== 0)
 }
 
+// A call parked on the user's approval (tools/terminal_tool.py, tools/bot_mode_dm.py return
+// `status: "pending_approval"`): the user has to act, so its row always renders.
+const callAwaitsApproval = (part: TimelineToolCallProps): boolean =>
+  parseMaybeObject(part.result).status === 'pending_approval'
+
+const callNeedsUser = (part: TimelineToolCallProps): boolean => failedCallNeedsUser(part) || callAwaitsApproval(part)
+
 const ChainToolFallback: FC<TimelineToolCallProps> = props => {
   const showToolActivity = useStore($showToolActivity)
 
-  // todo parts are hoisted to a dedicated panel above the message content; tool plumbing (finding,
-  // describing or polling the agent's own tools) is never the user's business.
-  if (isTodoToolName(props.toolName) || isPlumbingToolCall(props.toolName, props.args)) {
+  // todo parts are hoisted to a dedicated panel above the message content.
+  if (isTodoToolName(props.toolName)) {
     return null
+  }
+
+  // Successful tool plumbing (finding, describing or polling the agent's own tools) is never the
+  // user's business. A failed call (an error, a nonzero exit) or one awaiting approval is real
+  // content: a poll that reports the job died may be the only record of the failure, so its row
+  // renders open, a nonzero exit painted as the error it is.
+  if (isPlumbingToolCall(props.toolName, props.args)) {
+    if (!callNeedsUser(props)) {
+      return null
+    }
+
+    return <ToolFallback {...props} defaultOpen isError={props.isError || failedCallNeedsUser(props)} />
   }
 
   // An inter-agent delivery run through the terminal tool renders as the
@@ -191,7 +209,7 @@ const ChainToolFallback: FC<TimelineToolCallProps> = props => {
   // The tool feed (reads, searches, commands, connector calls) follows
   // display.tool_progress, never show_reasoning. Cards, approvals, and failed
   // calls the user must act on remain regardless.
-  if (!showToolActivity && !failedCallNeedsUser(props) && !isCardTool(props.toolName)) {
+  if (!showToolActivity && !callNeedsUser(props) && !isCardTool(props.toolName)) {
     return null
   }
 
