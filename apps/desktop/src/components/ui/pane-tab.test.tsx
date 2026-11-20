@@ -157,3 +157,33 @@ describe('PaneTab under a context-menu trigger', () => {
     expect(tab?.hasAttribute(HERMES_CONTEXT_MENU_TRIGGER_ATTR)).toBe(true)
   })
 })
+
+// Desktop polish batch 2 (P9): a tab title reads as typed and a cut one still says which chat it is.
+describe('PaneTabLabel title', () => {
+  const title = "Neo: Tim added on the task: your main-chat update should be about Emmanuel's deal heatmap"
+
+  it('carries the full title as its hover tooltip', () => {
+    render(
+      <PaneTab onClose={vi.fn()}>
+        <PaneTabLabel>{title}</PaneTabLabel>
+      </PaneTab>
+    )
+
+    expect(screen.getByText(title).closest('[title]')?.getAttribute('title')).toBe(title)
+  })
+
+  it('is never shouted in caps and ends in an ellipsis when cut, closeable or not', () => {
+    for (const onClose of [undefined, vi.fn()]) {
+      const { unmount } = render(
+        <PaneTab onClose={onClose}>
+          <PaneTabLabel>{title}</PaneTabLabel>
+        </PaneTab>
+      )
+
+      const text = screen.getByText(title)
+      expect(text.className).not.toMatch(/\buppercase\b|text-clip/)
+      expect(text.className).toMatch(/\btruncate\b/)
+      unmount()
+    }
+  })
+})
