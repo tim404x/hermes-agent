@@ -1108,9 +1108,10 @@ class SessionRepository(Protocol):
         ...
 
     def mark_side_window(
-        self, session_id: SessionId, *, by: Optional[str] = None, at: Optional[float] = None, key: Optional[str] = None
+        self, session_id: SessionId, *, by: Optional[str] = None, at: Optional[float] = None, key: Optional[str] = None,
+        dm: bool = False,
     ) -> bool:
-        """Fork carry (bot mode): stamp the row as a ``message_agent`` side window that just received a DM, writing ``origin`` as ``{SIDE_WINDOW_KEY: {"at", "by", "key"}}`` (``at`` defaults to now, ``by`` to ``""``). ``key`` names the conversation; a stamp without one keeps the key already there. False with nothing written when the row is missing or its origin is anything but empty or an earlier side-window stamp (:func:`origin_is_side_window_only`): a gateway routing peer or an import record is never overwritten."""
+        """Fork carry (bot mode): stamp the row as a ``message_agent`` side window that just received a DM, writing ``{"at", "by", "key", "dm"}`` (``at`` defaults to now, ``by`` to ``""``; ``key`` and ``dm: true`` only when set) into its own ``side_window_json`` cell. ``key`` names the conversation and ``dm`` marks a direct-message window; a stamp without them keeps the ones already there (own cell or legacy origin stamp). The stamp is mirrored into ``origin`` as ``{SIDE_WINDOW_KEY: stamp}`` only when that origin is empty or already an earlier side-window stamp (:func:`origin_is_side_window_only`): a gateway routing peer or an import record is never overwritten. On a store without the cell (the previous schema) only that origin stamp is written. False with nothing written when the row is missing, when it or its compression-lineage root is the canonical Bot Chat (:data:`CANONICAL_BOT_CHAT_TITLE`), or when there is no cell and the origin may not carry the stamp."""
         ...
 
     def unarchive_recoverable(self, session_id: SessionId) -> bool:
