@@ -83,6 +83,24 @@ _COMPRESSION_INT_KEYS = (
 )
 
 
+def _apply_live_prepare_ahead(cc: Any, compression: dict) -> None:
+    """apexfix: prepare_ahead applies live. ``compression.prepare_ahead`` is installed on the compressor at agent
+    construction only (agent_init), so a Desktop/TUI session kept compacting inline after the key was turned on until
+    its agent was rebuilt. Turning it on installs the prepared-compaction state on the live compressor; turning it off
+    (or removing the key: default off) discards any candidate and running pass and restores inline compaction."""
+    from agent.context_compressor import ContextCompressor
+    if not isinstance(cc, ContextCompressor):
+        return
+    want = is_truthy_value(compression.get("prepare_ahead"), default=False)
+    current = getattr(cc, "prepared_compaction", None)
+    if want and current is None:
+        from agent.prepared_compaction import PreparedCompaction
+        cc.prepared_compaction = PreparedCompaction()
+    elif not want and current is not None:
+        current.discard("prepare_ahead turned off")
+        cc.prepared_compaction = None
+
+
 def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     """Update a live session's compressor in place from config.yaml. Every adopted key has UNSET semantics:
     a removed key restores the normalized default (or model-derived value) through the construction
@@ -115,6 +133,7 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     cc = getattr(agent, "context_compressor", None)
     if cc is None:
         return
+    _apply_live_prepare_ahead(cc, compression)
     # tail_mode: unknown/absent values land on the ctor default ("lean"), matching agent_init.
     default_tail = str(_compressor_ctor_default("tail_mode", "lean"))
     mode = str(compression.get("tail_mode", default_tail) or default_tail).strip().lower()
