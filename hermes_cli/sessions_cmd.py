@@ -966,11 +966,24 @@ def _cmd_pin(args, pinning, *, persistence=None):
 
 def _cmd_open_tab(args, *, persistence=None):
     """Stamp one session as a side window (``mark_side_window``) so the Desktop shows it as a task tab."""
+    from persistence.conversation.sessions import CANONICAL_BOT_CHAT_TITLE
+
+    def _bot_chat(title) -> bool:
+        return " ".join(str(title or "").split()).casefold() == CANONICAL_BOT_CHAT_TITLE.casefold()
+
     resolved = persistence.sessions.resolve_id(args.session_id)
     if not resolved:
         return _not_found(args.session_id)
+    # The canonical Bot Chat is the bot's own surface, never a Desktop task tab.
+    if _bot_chat(persistence.sessions.get_title(resolved)) or (args.title and _bot_chat(args.title)):
+        print(f"Error: '{CANONICAL_BOT_CHAT_TITLE}' cannot be opened as a Desktop tab.")
+        return 1
     if args.title:
-        persistence.sessions.set_title(resolved, args.title)
+        try:
+            persistence.sessions.set_title(resolved, args.title)
+        except ValueError as e:  # TitleConflict (a title another session holds) is a ValueError
+            print(f"Error: {e}")
+            return 1
     by = str(args.by or "").strip()
     if not persistence.sessions.mark_side_window(resolved, by=f"bot:{by}" if by else ""):
         return _not_found(args.session_id)

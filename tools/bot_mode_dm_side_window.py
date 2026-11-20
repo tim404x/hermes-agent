@@ -389,7 +389,7 @@ def stamp_side_window(profile_home: Path | str, title: str, *, author: dict | No
                 logger.warning("message_agent: could not drop pre-minted window %s", session_id, exc_info=True)
             return None
         if session_id and store.sessions.mark_side_window(
-                session_id, by=str((author or {}).get("id") or ""), key=key):
+                session_id, by=str((author or {}).get("id") or ""), key=key, dm=True):
             return session_id
         return None
     except Exception:

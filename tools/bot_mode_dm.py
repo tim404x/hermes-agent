@@ -809,7 +809,8 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
                          else "already has a live owner" in stderr_text)
     if proc.returncode != 0 and refused_not_owned:
         if not retried and own_window:
-            rc = _admit_into_held_window(argv, dm_file, profile_home=profile_home, author=author)
+            rc = _admit_into_held_window(argv, dm_file, profile_home=profile_home, author=author,
+                                         window_key=window_key)
             if rc is not None:
                 return rc
         if not retried:
@@ -843,7 +844,7 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
 
 
 def _admit_into_held_window(argv: list[str], dm_file: str, *, profile_home: Path | None,
-                            author: Optional[dict]) -> Optional[int]:
+                            author: Optional[dict], window_key: Optional[str] = None) -> Optional[int]:
     """The DM's own side window is open live in the app: admit it INTO that window through the
     window's live owner (the profile authority's ``bot_relay.deliver`` door, queued behind or steered
     into its running turn, exactly like a Bot Chat delivery) and wait for the reply. None when nothing
@@ -877,7 +878,46 @@ def _admit_into_held_window(argv: list[str], dm_file: str, *, profile_home: Path
         return 1
     if record is None:
         return None
+    # Admitted: refresh the window's stamp like every other DM turn, so a closed tab reopens and
+    # badges (the desktop ignores an unchanged ``at``).
+    _restamp_admitted_window(_pinned_owner(dm_file) or record, home, window_title(argv), author, window_key)
     return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file)
+
+
+def _pinned_owner(dm_file: str) -> Optional[dict]:
+    """The owner pin of a DM's live intent (the session the door validated and admitted into), or None."""
+    try:
+        owner = json.loads(Path(_live_intent_file(dm_file)).read_text(encoding="utf-8-sig")).get("owner")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return owner if isinstance(owner, dict) and owner.get("session_id") else None
+
+
+def _restamp_admitted_window(record: dict, home: Path, title: str, author: Optional[dict],
+                             window_key: Optional[str]) -> None:
+    """Stamp the exact session a busy-window DM was admitted into (the intent's pinned owner id, which
+    the door admits into or refuses, else the title's transport resolution), keeping the stamp's author ``by`` and conversation ``key`` rules of
+    ``stamp_side_window``. Never raises: a missing tab must never cost the DM."""
+    store = None
+    try:
+        from persistence_assembly import open_persistence, profile_scope, store_exists
+        from tools.bot_mode_dm_side_window import stamp_side_window
+
+        session_id = record.get("session_id") if isinstance(record, dict) else None
+        if not session_id:
+            stamp_side_window(home, title, author=author, key=window_key)
+            return
+        scope = profile_scope(home=Path(record.get("profile_home") or home))
+        if not store_exists(scope):
+            return
+        store = open_persistence(scope, eager=True)
+        store.sessions.mark_side_window(session_id, by=str((author or {}).get("id") or ""), key=window_key,
+                                        dm=True)
+    except Exception:
+        logger.warning("message_agent: could not restamp admitted side window %r", title, exc_info=True)
+    finally:
+        if store is not None:
+            store.close()
 
 
 def _retry_side_window(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]],
@@ -990,7 +1030,7 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
     """Pin intent before admission; retries may inspect, never change transport. ``title`` names a
     side window the owner holds live (``_admit_into_held_window``) instead of the Bot Chat."""
     from tools.bot_live_delivery import (PreDialError, deliver_to_live_owner, find_canonical_live_owner,
-                                         read_delivery_result)
+                                         find_side_window_live_owner, read_delivery_result)
     from utils import fsync_directory
 
     intent: dict[str, Any]
@@ -1001,8 +1041,10 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
     else:
         assert profile_home is not None
         try:
+            # A side window pins the session the transport's ``chat -c <title>`` resolves (its
+            # newest ``#N`` continuation), never an exact-title lookup of an older same-title tab.
             owner = find_canonical_live_owner(profile_home) if title is None else \
-                find_canonical_live_owner(profile_home, title)
+                find_side_window_live_owner(profile_home, title)
         except Exception as exc:
             # Discovery runs before the intent exists and never admits: definite, not ambiguous.
             raise LiveTargetUnavailableError(f"canonical Bot Chat target is unavailable ({exc})") from exc
@@ -1194,7 +1236,8 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
         if own_window and _window_busy(argv, profile_home):
             # A follow-up while the window's turn is still running: queue it INTO the window through
             # its live owner, before taking the window's lock (never wait behind the running turn).
-            rc = _admit_into_held_window(argv, dm_file, profile_home=profile_home, author=author)
+            rc = _admit_into_held_window(argv, dm_file, profile_home=profile_home, author=author,
+                                         window_key=window_key)
             if rc is not None:
                 return rc
             # Nothing admitted (no reachable owner): the DM still lands, in a numbered sibling.
