@@ -1,5 +1,5 @@
 {
- "_doc": "Real stored rows from Thu 19 Nov 2026 (REST page /api/sessions/<id>/messages as the desktop loads it), trimmed (tool output <= 400 chars, reasoning <= 200). Sources: /home/hermes/.hermes/work/desktop-polish-audit-1119/data/. Pins the desktop polish batch 1 contract: nothing machine-made paints as the user's bubble or leaks commands, paths, job ids, frames or plumbing.",
+ "_doc": "Real stored rows from Thu 19 Nov 2026 (REST page /api/sessions/<id>/messages as the desktop loads it), trimmed (tool output <= 400 chars, reasoning <= 200). Sources: /home/hermes/.hermes/work/desktop-polish-audit-1119/data/. Pins the desktop polish batch 1 contract: nothing machine-made paints as the user's bubble or leaks commands, paths, job ids, frames or plumbing. default_voice_line: Tim speaking on a phone voice line (session phone-test-1119-a, Thu 19 Nov 2026); the gateway stored his words typed internal_notification, and they must stay his own bubble (tool rows between the prompt and the reply trimmed).",
  "kepler_main": [
   {
    "id": 47506,
@@ -1737,6 +1737,33 @@
    "active": 1,
    "compacted": 0,
    "message_uid": "555ce4934d2c4b63a9c1b4ca7c579caa"
+  }
+ ],
+ "default_voice_line": [
+  {
+   "id": 507763,
+   "session_id": "phone-test-1119-a",
+   "role": "user",
+   "content": "Hey, what's on my calendar tomorrow morning?",
+   "timestamp": 1795131061.716799,
+   "display_kind": "internal_notification",
+   "display_metadata": {
+    "gateway_input_owner": "a1a13133-6a62-5158-8a15-7c456020a956",
+    "submission_id": "6a078fd60c9d443eba70be2034660ba7"
+   },
+   "message_uid": "e9b36c9cb7f24c6eab7f0f2aff1339ad"
+  },
+  {
+   "id": 507772,
+   "session_id": "phone-test-1119-a",
+   "role": "assistant",
+   "content": "You've got a sales sync at six, then a half-hour sync with Dani at seven. After that it's back to back: Hub Labs with Asim at nine, Google on Gemini evals and DeepMind at nine thirty, and Clay at ten.",
+   "timestamp": 1795131074.532509,
+   "display_metadata": {
+    "reasoning_tokens": 27
+   },
+   "message_uid": "b3dcfa0d54d0471891bd220b5e68db25",
+   "finish_reason": "stop"
   }
  ]
 }

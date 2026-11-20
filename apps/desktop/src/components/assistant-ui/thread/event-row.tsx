@@ -38,21 +38,42 @@ export const EventRow: FC<EventRowProps> = ({ defaultOpen = false, detail, icon,
       data-slot={slot ?? 'aui_event-row'}
     >
       <div data-conversation-scaffold="">
-        <ScaffoldRow
-          onToggle={hasDetail ? () => setOpen(!open) : undefined}
-          open={open}
-          trailing={
-            timestamp ? (
-              <>
-                {' '}
-                <MessageTimelineTimestamp />
-              </>
-            ) : undefined
-          }
-        >
-          {icon && <span className={SCAFFOLD_GLYPH_CLASS}>{icon}</span>}
-          <span className={cn(SCAFFOLD_LABEL_CLASS, 'min-w-0 truncate')}>{label}</span>
-        </ScaffoldRow>
+        {hasDetail ? (
+          <ScaffoldRow
+            onToggle={() => setOpen(!open)}
+            open={open}
+            trailing={
+              timestamp ? (
+                <>
+                  {' '}
+                  <MessageTimelineTimestamp />
+                </>
+              ) : undefined
+            }
+          >
+            {icon && <span className={SCAFFOLD_GLYPH_CLASS}>{icon}</span>}
+            <span className={cn(SCAFFOLD_LABEL_CLASS, 'min-w-0 truncate')}>{label}</span>
+          </ScaffoldRow>
+        ) : (
+          // Nothing to open: a plain line, not a disabled disclosure button, so the label wraps in
+          // full (its whole text is always readable) and any link in it stays clickable.
+          <div className="flex w-full max-w-full min-w-0 items-start gap-1.5 text-(--ui-text-tertiary)">
+            {icon && (
+              <span className="flex h-(--conversation-line-height) shrink-0 items-center">
+                <span className={SCAFFOLD_GLYPH_CLASS}>{icon}</span>
+              </span>
+            )}
+            <span className={cn(SCAFFOLD_LABEL_CLASS, 'min-w-0 whitespace-pre-wrap break-words')}>
+              {label}
+              {timestamp && (
+                <>
+                  {' '}
+                  <MessageTimelineTimestamp />
+                </>
+              )}
+            </span>
+          </div>
+        )}
       </div>
       {open && hasDetail && (
         <div className="mt-2 min-w-0 max-w-full" data-slot="aui_event-row-detail">

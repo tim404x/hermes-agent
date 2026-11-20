@@ -148,4 +148,15 @@ describe('polish 1119: real rows read like a conversation', { timeout: 60_000 },
     expect(text).toContain('Asim short finished')
     expect(text).not.toContain('Background Process Finished')
   })
+
+  it("Tim's voice line, stored typed internal_notification, is his own bubble, never a notification", () => {
+    $showToolActivity.set(false)
+    const { container } = renderThread(rows('default_voice_line'))
+    const text = container.textContent ?? ''
+
+    expectNoLeaks(text)
+    expect(bubbleTexts(container)).toEqual(["Hey, what's on my calendar tomorrow morning?"])
+    expect(text).not.toContain('Notification')
+    expect(text).toContain('sales sync at six')
+  })
 })
