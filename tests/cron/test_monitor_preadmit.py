@@ -176,7 +176,7 @@ def test_revalidation_admits_at_least_every_max_skip_window(hermes_env, monkeypa
 
 
 def test_divergence_latches_the_gate_off_for_that_job(hermes_env, monkeypatch, admissions):
-    """If the owner sees a change the firer's peek did not, the job always admits from then on."""
+    """A first miss puts the job on probation (every tick admits); a second miss within 24 h latches it off."""
     import time as _time
 
     import cron.monitor as mon
@@ -188,20 +188,58 @@ def test_divergence_latches_the_gate_off_for_that_job(hermes_env, monkeypatch, a
     job = _baseline(hermes_env, monkeypatch, observed)
     _counting_script(hermes_env, "echo 'state B'")  # the real source changed...
     real_peek = mon.peek_monitor
-    stored = get_job(job["id"])["monitor_state"]["last_output_hash"]
-    # ...but the firer's environment keeps reporting the old output (the reviewer's env-mismatch case).
-    monkeypatch.setattr(mon, "peek_monitor", lambda j: mon.MonitorPeek(ok=True, unchanged=True, output_hash=stored))
+    # ...but the firer's environment keeps reporting the OLD stored output (the reviewer's env-mismatch case).
+    monkeypatch.setattr(mon, "peek_monitor", lambda j: mon.MonitorPeek(
+        ok=True, unchanged=True, output_hash=j["monitor_state"]["last_output_hash"]))
     before = len(admissions)
     run_job(_scheduled(get_job(job["id"])))
     assert len(admissions) == before  # skipped (within the window): the bounded-delay case
     _update_state(job["id"], last_admit_at=_time.time() - 31 * 60)
     run_job(_scheduled(get_job(job["id"])))  # revalidation: the owner runs the agent on the change
     assert len(admissions) == before + 1 and observed["agent_runs"] == 2
+    st = _load_state()[job["id"]]
+    assert "disabled" not in st and st["probation_until"] > _time.time() and len(st["divergences"]) == 1
+    assert _ledger(hermes_env)[-1]["reason"] == "divergence_observed"
+    # probation: the next tick admits even though the peek says unchanged (nothing is delayed)...
+    _counting_script(hermes_env, "echo 'state C'")  # ...and the next real change arrives
+    run_job(_scheduled(get_job(job["id"])))
+    assert len(admissions) == before + 2 and observed["agent_runs"] == 3  # ran at once, not 30 min later
+    assert [r["reason"] for r in _ledger(hermes_env)[-2:]] == ["probation", "divergence_latched"]
     assert _load_state()[job["id"]]["disabled"] == "divergence"
     run_job(_scheduled(get_job(job["id"])))
-    assert len(admissions) == before + 2  # latched: admits every tick, like the old path
+    assert len(admissions) == before + 3  # latched: admits every tick, like the old path
     assert _ledger(hermes_env)[-1]["reason"] == "disabled:divergence"
     monkeypatch.setattr(mon, "peek_monitor", real_peek)
+
+
+def test_one_flap_does_not_cost_the_job_its_gate(hermes_env, monkeypatch, admissions):
+    """A single transient owner output (flapping source) = probation, then the gate skips again; an old miss
+    (older than 24 h) does not count toward the latch."""
+    import time as _time
+
+    from cron.jobs import get_job
+    from cron.monitor_preadmit import Admission, _load_state, _update_state
+    from cron.scheduler import run_job
+
+    observed: dict = {}
+    job = _baseline(hermes_env, monkeypatch, observed)
+    jid = job["id"]
+    stored = get_job(jid)["monitor_state"]["last_output_hash"]
+    # a miss 25 h ago is outside the window
+    _update_state(jid, divergences=[_time.time() - 25 * 3600])
+    # the owner persisted a different (transient) hash after a revalidation the peek called unchanged
+    Admission(jid, "0" * 64, True).after()
+    st = _load_state()[jid]
+    assert "disabled" not in st and len(st["divergences"]) == 1 and st["probation_until"] > _time.time()
+    assert stored != "0" * 64
+    before = len(admissions)
+    run_job(_scheduled(get_job(jid)))
+    assert len(admissions) == before + 1 and _ledger(hermes_env)[-1]["reason"] == "probation"
+    # probation over, the source is stable: unchanged ticks skip again
+    _update_state(jid, probation_until=_time.time() - 1, last_admit_at=_time.time())
+    run_job(_scheduled(get_job(jid)))
+    assert len(admissions) == before + 1 and _ledger(hermes_env)[-1]["decision"] == "skip"
+    assert "disabled" not in _load_state()[jid]
 
 
 def test_first_run_is_admitted(hermes_env, monkeypatch, admissions):
