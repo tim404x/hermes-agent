@@ -532,7 +532,7 @@ describe('Hermes REST helpers', () => {
     await getSessionMessages('session-1', 'xiaoxuxu')
 
     expect(api).toHaveBeenCalledWith({
-      path: '/api/sessions/session-1/messages?profile=xiaoxuxu',
+      path: '/api/sessions/session-1/messages?profile=xiaoxuxu&image_refs=true&replay_fields=false',
       profile: 'xiaoxuxu'
     })
   })
@@ -551,7 +551,7 @@ describe('Hermes REST helpers', () => {
     })
     expect(api).toHaveBeenNthCalledWith(2, {
       connectionId: 'source-a',
-      path: '/api/sessions/session-1/messages?profile=backend-default',
+      path: '/api/sessions/session-1/messages?profile=backend-default&image_refs=true&replay_fields=false',
       profile: 'backend-default'
     })
   })
@@ -584,7 +584,7 @@ describe('Hermes REST helpers', () => {
     await getLatestSessionMessages('session-1', 'xiaoxuxu')
 
     expect(api).toHaveBeenCalledWith({
-      path: `/api/sessions/session-1/messages?profile=xiaoxuxu&limit=${LATEST_SESSION_MESSAGES_LIMIT}&order=latest&include_compacted=true`,
+      path: `/api/sessions/session-1/messages?profile=xiaoxuxu&limit=${LATEST_SESSION_MESSAGES_LIMIT}&order=latest&include_compacted=true&image_refs=true&replay_fields=false`,
       profile: 'xiaoxuxu'
     })
   })
@@ -609,7 +609,7 @@ describe('Hermes REST helpers', () => {
     await getOlderSessionMessages('session-1', 'xiaoxuxu', 240)
 
     expect(api).toHaveBeenCalledWith({
-      path: `/api/sessions/session-1/messages?profile=xiaoxuxu&limit=${LATEST_SESSION_MESSAGES_LIMIT}&offset=240&order=latest&include_compacted=true`,
+      path: `/api/sessions/session-1/messages?profile=xiaoxuxu&limit=${LATEST_SESSION_MESSAGES_LIMIT}&offset=240&order=latest&include_compacted=true&image_refs=true&replay_fields=false`,
       profile: 'xiaoxuxu'
     })
   })
@@ -631,11 +631,11 @@ describe('Hermes REST helpers', () => {
 
     expect(result.messages).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }])
     expect(api).toHaveBeenNthCalledWith(1, {
-      path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=500&offset=0&order=oldest&include_compacted=true',
+      path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=500&offset=0&order=oldest&include_compacted=true&image_refs=true&replay_fields=false',
       profile: 'xiaoxuxu'
     })
     expect(api).toHaveBeenNthCalledWith(2, {
-      path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=500&offset=2&order=oldest&include_compacted=true',
+      path: '/api/sessions/session-1/messages?profile=xiaoxuxu&limit=500&offset=2&order=oldest&include_compacted=true&image_refs=true&replay_fields=false',
       profile: 'xiaoxuxu'
     })
   })
