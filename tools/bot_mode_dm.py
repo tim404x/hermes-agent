@@ -785,12 +785,18 @@ def _delivery_lock(argv: list[str], *, stdin_file: bool, side_window: bool = Fal
 
 def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None,
                     retried: bool = False, profile_home: Path | None = None,
-                    author: Optional[dict] = None, window_key: Optional[str] = None) -> int:
+                    author: Optional[dict] = None, window_key: Optional[str] = None,
+                    own_window: bool = False) -> int:
     """One side-window turn via ``--query-file`` through the gateway-routed ``hermes chat``
     one-shot; re-emits the transport's streams and returns its exit code. Never the Bot Chat:
     that is admitted only through the profile authority (``_admit_live_dm``). No transient
     re-run here: the resumed-user-row adoption a re-run relied on retired with the cutover.
-    ``window_key`` (the window's conversation) rides along to the ``(2)`` retry's stamp."""
+    ``window_key`` (the window's conversation) rides along to the ``(2)`` retry's stamp.
+
+    A transport refused because the window is open live in the app (``SESSION_NOT_OWNED``) never
+    ran. When the title is this conversation's own window (``own_window``), the DM is admitted INTO
+    it through its live owner (``_admit_into_held_window``); the ``"<title> (2)"`` retry is left for
+    a real collision with an unrelated chat, or an owner that admitted nothing."""
     proc = subprocess.run([*argv, "--query-file", dm_file], check=False, stdin=subprocess.DEVNULL,
                           capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
     stderr_text = proc.stderr or ""
@@ -802,6 +808,10 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
     refused_not_owned = (reason == "SESSION_NOT_OWNED" if reason is not None
                          else "already has a live owner" in stderr_text)
     if proc.returncode != 0 and refused_not_owned:
+        if not retried and own_window:
+            rc = _admit_into_held_window(argv, dm_file, profile_home=profile_home, author=author)
+            if rc is not None:
+                return rc
         if not retried:
             return _retry_side_window(argv, dm_file, env=env, profile_home=profile_home, author=author,
                                       window_key=window_key)
@@ -832,6 +842,44 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
     return proc.returncode
 
 
+def _admit_into_held_window(argv: list[str], dm_file: str, *, profile_home: Path | None,
+                            author: Optional[dict]) -> Optional[int]:
+    """The DM's own side window is open live in the app: admit it INTO that window through the
+    window's live owner (the profile authority's ``bot_relay.deliver`` door, queued behind or steered
+    into its running turn, exactly like a Bot Chat delivery) and wait for the reply. None when nothing
+    was admitted (no reachable owner, an owner whose door predates side-window admission, or another
+    writer holding the window, settled as never sent): the caller then takes the numbered retry, so
+    the DM still lands."""
+    from hermes_cli.gateway_client import GatewayRPCError
+    from tools.bot_mode_dm_side_window import window_title
+
+    home = profile_home or _local_delivery_home(argv)
+    if home is None:
+        return None
+    try:
+        record = _admit_live_dm(home, dm_file, author, title=window_title(argv))
+    except LiveTargetHeldError:
+        # Another writer holds the window and the owner settled this id as never sent: a definite
+        # no-send, so the numbered retry (another transport) cannot double-deliver.
+        _unlink_dm_file(_live_intent_file(dm_file))
+        return None
+    except LiveTargetUnavailableError:
+        return None  # refused before anything was admitted; its intent is gone
+    except GatewayRPCError as exc:
+        if str(exc) != "invalid_params":
+            print(_live_outcome_unknown(dm_file, exc))
+            return 1
+        # The door refused the title while validating the request, before any admission.
+        _unlink_dm_file(_live_intent_file(dm_file))
+        return None
+    except Exception as exc:
+        print(_live_outcome_unknown(dm_file, exc))
+        return 1
+    if record is None:
+        return None
+    return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file)
+
+
 def _retry_side_window(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]],
                        profile_home: Path | None = None, author: Optional[dict] = None,
                        window_key: Optional[str] = None) -> int:
@@ -857,6 +905,23 @@ def _stamp_side_window(argv: list[str], profile_home: Path | None, author: Optio
     home = profile_home or _local_delivery_home(argv)
     if home is not None:
         stamp_side_window(home, window_title(argv), author=author, key=window_key)
+
+
+def _is_own_window(argv: list[str], profile_home: Path | None, window_key: Optional[str]) -> bool:
+    """Whether the transport's title is already this conversation's side window
+    (``is_conversation_window``)."""
+    from tools.bot_mode_dm_side_window import is_conversation_window, window_title
+
+    home = profile_home or _local_delivery_home(argv)
+    return home is not None and is_conversation_window(home, window_title(argv), window_key)
+
+
+def _window_busy(argv: list[str], profile_home: Path | None) -> bool:
+    """Whether the transport's side window is busy right now (``window_busy``)."""
+    from tools.bot_mode_dm_side_window import window_busy, window_title
+
+    home = profile_home or _local_delivery_home(argv)
+    return home is not None and window_busy(home, argv[argv.index("-p") + 1], window_title(argv))
 
 
 def _live_intent_file(dm_file: str | os.PathLike) -> str:
@@ -920,8 +985,10 @@ def _held_disposition(record: dict | None) -> bool:
     return bool(record) and record.get("refused") is True and record.get("reason") == HELD_NOT_SENT
 
 
-def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dict] = None) -> dict | None:
-    """Pin intent before admission; retries may inspect, never change transport."""
+def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dict] = None, *,
+                   title: Optional[str] = None) -> dict | None:
+    """Pin intent before admission; retries may inspect, never change transport. ``title`` names a
+    side window the owner holds live (``_admit_into_held_window``) instead of the Bot Chat."""
     from tools.bot_live_delivery import (PreDialError, deliver_to_live_owner, find_canonical_live_owner,
                                          read_delivery_result)
     from utils import fsync_directory
@@ -934,7 +1001,8 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
     else:
         assert profile_home is not None
         try:
-            owner = find_canonical_live_owner(profile_home)
+            owner = find_canonical_live_owner(profile_home) if title is None else \
+                find_canonical_live_owner(profile_home, title)
         except Exception as exc:
             # Discovery runs before the intent exists and never admits: definite, not ambiguous.
             raise LiveTargetUnavailableError(f"canonical Bot Chat target is unavailable ({exc})") from exc
@@ -1121,6 +1189,17 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
         from tools.bot_relay import delivery_env
 
         env = delivery_env(author, profile_home if not stdin_file else None)
+        # Whether the title is already this conversation's window, read before the turn's restamp.
+        own_window = side_window and _is_own_window(argv, profile_home, window_key)
+        if own_window and _window_busy(argv, profile_home):
+            # A follow-up while the window's turn is still running: queue it INTO the window through
+            # its live owner, before taking the window's lock (never wait behind the running turn).
+            rc = _admit_into_held_window(argv, dm_file, profile_home=profile_home, author=author)
+            if rc is not None:
+                return rc
+            # Nothing admitted (no reachable owner): the DM still lands, in a numbered sibling.
+            return _retry_side_window(argv, dm_file, env=env, profile_home=profile_home, author=author,
+                                      window_key=window_key)
         with _delivery_lock(argv, stdin_file=stdin_file, side_window=side_window):
             if side_window:
                 # Stamp an EXISTING window before the turn (the tab shows early). A new window's row is
@@ -1129,7 +1208,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
                 # and every turn into it failed with permission_denied (Tim, 4 Nov 2026).
                 _stamp_side_window(argv, profile_home, author, window_key)
                 rc = _run_local_turn(argv, dm_file, env=env, profile_home=profile_home, author=author,
-                                     window_key=window_key)
+                                     window_key=window_key, own_window=own_window)
                 _stamp_side_window(argv, profile_home, author, window_key)
                 return rc
             # Keep the file open until the transport exits; cleanup occurs
