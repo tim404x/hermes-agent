@@ -19,6 +19,7 @@ from contextlib import suppress
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from agent.ack_first import stage_ack_first
 from agent.i18n import t
 from agent.interrupt_compat import _accepts_keyword
 from agent.replay_cleanup import canonicalize_replay_history
@@ -605,6 +606,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             agent.interim_assistant_callback = None
             agent.clarify_context_callback = None
             agent.thinking_progress = False
+        # A person's message (not a self-injected notification, not an API client) whose interim text
+        # this chat delivers opens a long turn with the model's own one-line ack. getattr: minimal
+        # test contexts omit the turn's message fields.
+        stage_ack_first(agent, getattr(ctx, "message", None), person_turn=(
+            not getattr(ctx, "persist_user_display_kind", None) and getattr(ctx, "reply_expected", None) is not False
+            and ctx.source.platform != Platform.API_SERVER))
         ctx.agent_holder[0] = agent  # interrupt support
         if self._approval_owner is not None:
             authority, owner_id, generation = self._approval_owner
