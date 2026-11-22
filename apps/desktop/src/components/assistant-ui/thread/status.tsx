@@ -326,14 +326,24 @@ export const CenteredThreadSpinner: FC = () => {
  *  placeholder has no message yet and falls back to the todo / verb. */
 export const ResponseLoadingIndicator: FC<{ reasoningLabel?: string }> = ({ reasoningLabel = '' }) => {
   const { t } = useI18n()
-  const { compacting, drafting, providerWait, sessionId, turnStartedAt } = useThreadSessionStatus()
-  const elapsed = useElapsedSeconds(true, undefined, turnStartedAt)
+  const { busy, compacting, drafting, providerWait, sessionId, turnStartedAt } = useThreadSessionStatus()
+  // The placeholder slot mounts off the tail bubble's own `running` status.
+  // A bubble stranded pending after its turn ended (terminal events lost)
+  // must not keep a live row, so it also needs a turn this session still
+  // owns: busy, or an armed turn clock (seeded at submit, so a fresh chat's
+  // first frame still shows). Same gate TurnActivityIndicator's `working` uses.
+  const sessionWorking = busy || turnStartedAt !== undefined
+  const elapsed = useElapsedSeconds(sessionWorking, undefined, turnStartedAt)
   const hint = useStatusHint(compacting, drafting, providerWait)
   const line = useSpinnerLine(sessionId, turnStartedAt, reasoningLabel)
   // Renderer-synthesized load bar: covers loads the backend's wait loop
   // can't narrate (gateway still initializing, or an auxiliary call — not
   // the main request — triggered the autoload). A real wait frame wins.
-  const localLoad = useLocalModelLoad(!hint)
+  const localLoad = useLocalModelLoad(sessionWorking && !hint)
+
+  if (!sessionWorking) {
+    return null
+  }
 
   return (
     <StatusRow data-slot="aui_response-loading" label={hint || t.assistant.thread.loadingResponse}>
