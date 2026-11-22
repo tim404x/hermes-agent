@@ -18,7 +18,6 @@ import {
   type ChatMessage,
   preserveLocalAssistantErrors,
   preserveLocalSystemNotices,
-  sealOpenToolParts,
   toChatMessages
 } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
@@ -70,6 +69,7 @@ import {
 import type { ClientSessionState } from '../../types'
 import type { GatewayRequester } from '../types'
 
+import { settleOrphanedTurn, stateClaimsLiveTurn, withinUnconfirmedSubmitGrace } from './settle-orphaned-turn'
 import { useLiveWorkRoster } from './use-live-work-roster'
 
 interface ActiveTranscriptSession {
@@ -852,7 +852,32 @@ export function rehydrateLiveSessionStatuses(
     // information. The stream path refuses to clear busy in exactly this window
     // (`awaitingResponse && !sawAssistantPayload`); without the same refusal
     // here a poll lands between submit and first token and darkens the row.
-    const busy = working || Boolean(existing?.awaitingResponse && !existing.sawAssistantPayload)
+    //
+    // That refusal is BOUNDED. The backend flags a session running when it
+    // accepts the prompt, so an idle report about a submit older than the
+    // grace window (or one the backend already confirmed, or that already
+    // streamed) means the turn ended without its terminal events reaching
+    // this window. Holding busy there was unbounded: the tail kept a live
+    // "Ns · tokens · verb…" row for hours, and busy also gated every
+    // transcript refresh, so turns other processes (Telegram) finished never
+    // appeared. 'starting' is an accepted turn still building its agent.
+    const startingUp = session.status === 'starting'
+
+    if (
+      !working &&
+      !startingUp &&
+      existing &&
+      stateClaimsLiveTurn(existing) &&
+      !withinUnconfirmedSubmitGrace(existing, nowMs)
+    ) {
+      publishSessionState(runtimeSessionId, { ...settleOrphanedTurn(existing, nowMs), storedSessionId })
+      setSessionStalled(storedSessionId, false)
+
+      continue
+    }
+
+    const holdsSubmit = Boolean(existing?.awaitingResponse && !existing.sawAssistantPayload)
+    const busy = working || holdsSubmit
 
     // Avoid re-arming the watchdog on every poll. Publish only when the
     // authoritative live snapshot differs from the renderer mirror; normal
@@ -919,21 +944,13 @@ export function rehydrateLiveSessionStatuses(
         continue
       }
 
-      if (existing?.busy || existing?.needsInput || existing?.awaitingResponse) {
-        publishSessionState(runtimeSessionId, {
-          ...existing,
-          awaitingResponse: false,
-          busy: false,
-          needsInput: false,
-          streamId: null,
-          turnStartedAt: null,
-          turnLive: false,
-          // The turn ended without its completion events reaching us — a lost
-          // `tool.complete` would otherwise leave a spinning tool row in an
-          // idle session. Seal open tool parts the same way the settle path
-          // does, so the transcript matches the state.
-          messages: sealOpenToolParts(existing.messages)
-        })
+      // The turn ended without its completion events reaching us — a lost
+      // `tool.complete` would otherwise leave a spinning tool row, and a lost
+      // message.complete a pending bubble whose tail row never stops, in an
+      // idle session. Settle flags, clock, tool rows and pending bubbles the
+      // same way the completion path does, so the transcript matches.
+      if (existing && stateClaimsLiveTurn(existing)) {
+        publishSessionState(runtimeSessionId, settleOrphanedTurn(existing, nowMs))
       }
     }
   }
@@ -1144,10 +1161,13 @@ export function useBackgroundSync({
       const state = $sessionStates.get()[activeSessionId]
 
       if (stopHoldTimer === null && state && stopAwaitsItsReceipt(state, activeSessionId)) {
-        stopHoldTimer = setTimeout(() => {
-          stopHoldTimer = null
-          observe()
-        }, recentInterruptRemainingMs(activeSessionId) + 1)
+        stopHoldTimer = setTimeout(
+          () => {
+            stopHoldTimer = null
+            observe()
+          },
+          recentInterruptRemainingMs(activeSessionId) + 1
+        )
       }
     }
 
