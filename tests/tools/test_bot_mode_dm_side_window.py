@@ -441,3 +441,109 @@ def test_fallback_title_skips_self_intro():
     assert side.side_window_title("", "Neo | Chief of Staff", "Neo here: template batches and --gap are LIVE now") \
         == "Template batches and --gap are LIVE now"
     assert side.side_window_title("", "Atlas", "check the micro1 call") == "Check the micro1 call"
+
+
+# Hand-run follow-ups (skill recipes write ``hermes [-p <bot>] chat ...``) used to crash the runner on
+# ``argv.index("-p")`` and delete the message: every follow-up into an existing tab was lost (21 Nov 2026).
+
+def _no_profile_argv(title="micro1"):
+    return ["hermes", "chat", "--in", "~", "-c", title, "--create-if-missing", "-Q"]
+
+
+def _runner_args(dm_file, profile_home, argv, key="bot:default>default|topic:x"):
+    return ["--run-delivery", "query-file", str(dm_file), "--profile-home", str(profile_home),
+            "--side-window", "--side-window-key", key, *argv]
+
+
+@pytest.mark.parametrize("which", ["default", "researcher"])
+def test_runner_follow_up_without_profile_flag_is_delivered(tmp_path, monkeypatch, capsys, which):
+    home, target = _target(tmp_path)
+    profile_home = home if which == "default" else target
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(bot_mode_dm, "_is_own_window", lambda *a, **k: True)
+    seen = []
+    monkeypatch.setattr(side, "window_busy", lambda h, profile, title: seen.append((profile, title)) or False)
+    calls = _fake_run(monkeypatch, subprocess.CompletedProcess([], 0, stdout="REPLY", stderr=""))
+    dm_file = tmp_path / "dm.txt"
+    dm_file.write_text("follow-up", encoding="utf-8")
+
+    assert bot_mode_dm._delivery_main(_runner_args(dm_file, profile_home, _no_profile_argv())) == 0
+
+    assert seen == [(which, "micro1")]
+    assert calls == [["hermes", "-p", which, *_no_profile_argv()[1:], "--query-file", str(dm_file)]]
+    assert capsys.readouterr().out == "REPLY"
+
+
+def test_runner_pre_send_failure_is_loud_and_keeps_the_message(tmp_path, monkeypatch, capsys):
+    home, target = _target(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(bot_mode_dm, "_is_own_window", lambda *a, **k: True)
+
+    def boom(*a, **k):
+        raise ValueError("list.index(x): x not in list")
+
+    monkeypatch.setattr(bot_mode_dm, "_window_busy", boom)
+    calls = _fake_run(monkeypatch)
+    dm_file = tmp_path / "dm.txt"
+    dm_file.write_text("follow-up", encoding="utf-8")
+
+    assert bot_mode_dm._delivery_main(_runner_args(dm_file, target, _side_argv())) == 1
+
+    out = capsys.readouterr()
+    payload = json.loads(out.out)
+    assert payload["delivered"] is False and payload["status"] == "not_sent"
+    assert payload["reason"] == "not_started" and "NOT started" in payload["error"]
+    assert "ValueError" in payload["error"] and payload["payload_file"] == str(dm_file)
+    assert "NOT started" in out.err
+    assert dm_file.read_text(encoding="utf-8") == "follow-up"
+    assert calls == []
+
+
+def test_runner_refuses_profile_that_contradicts_profile_home(tmp_path, monkeypatch, capsys):
+    home, target = _target(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    calls = _fake_run(monkeypatch)
+    dm_file = tmp_path / "dm.txt"
+    dm_file.write_text("hi", encoding="utf-8")
+    argv = ["hermes", "-p", "default", *_no_profile_argv()[1:]]
+
+    assert bot_mode_dm._delivery_main(_runner_args(dm_file, target, argv)) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["delivered"] is False and "researcher" in payload["error"]
+    assert dm_file.exists() and calls == []
+
+
+def test_runner_missing_message_file_is_loud(tmp_path, monkeypatch, capsys):
+    home, target = _target(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    calls = _fake_run(monkeypatch)
+
+    assert bot_mode_dm._delivery_main(_runner_args(tmp_path / "gone.txt", target, _side_argv())) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["delivered"] is False and "does not exist" in payload["error"]
+    assert calls == []
+
+
+@pytest.mark.parametrize("args", [["--run-delivery", "bogus"], ["--run-delivery", "query-file", "/x"]])
+def test_runner_malformed_argv_says_so(args, capsys):
+    assert bot_mode_dm._delivery_main(args) == 2
+    out = capsys.readouterr()
+    assert json.loads(out.out)["delivered"] is False and "NOT started" in out.err
+
+
+def test_normalize_transport_argv_shapes(tmp_path, monkeypatch):
+    home, target = _target(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    norm = bot_mode_dm._normalize_transport_argv
+    tail = ["chat", "-c", "t", "-Q"]
+    assert norm(["hermes", *tail], None) == ["hermes", "-p", "default", *tail]
+    assert norm(["/x/hermes", "chat", "-p", "researcher", "-c", "t", "-Q"], None) == \
+        ["/x/hermes", "-p", "researcher", *tail]
+    assert norm(["hermes", "--profile=researcher", *tail], target) == ["hermes", "-p", "researcher", *tail]
+    assert norm(["ssh", "host", "hermes", "chat"], target) == ["ssh", "host", "hermes", "chat"]
+    with pytest.raises(bot_mode_dm.TransportArgvError):
+        norm(["hermes", "-p", "a", "-p", "b", *tail], None)
+    with pytest.raises(bot_mode_dm.TransportArgvError):
+        norm(["hermes", "-p"], None)
