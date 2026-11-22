@@ -12,7 +12,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { $onboardingPhase } from '@/store/onboarding-phase'
 import { $onboardingSession } from '@/store/onboarding-session'
 import { $reasoningCollapsedByDefault, setShowReasoningFromConfig } from '@/store/reasoning-disclosure'
-import { $activeSessionId } from '@/store/session'
+import { $activeSessionId, $busy } from '@/store/session'
 
 import { stubThreadEnvironment, stubThreadViewportSize, ThreadRuntime } from '../test-utils'
 
@@ -441,6 +441,7 @@ describe('assistant-ui streaming renderer', () => {
     $activeSessionId.set(null)
     $onboardingSession.set(null)
     $onboardingPhase.set('idle')
+    $busy.set(false)
   })
 
   it.each([true, false])('honors reasoning visibility %j for grouped and standalone parts', async enabled => {
@@ -479,6 +480,8 @@ describe('assistant-ui streaming renderer', () => {
   })
 
   it('renders assistant text incrementally before completion', async () => {
+    // A live turn: the loading row needs the session to own one.
+    $busy.set(true)
     let controls: StreamingControls | undefined
 
     const registerControls = (next: StreamingControls) => {
