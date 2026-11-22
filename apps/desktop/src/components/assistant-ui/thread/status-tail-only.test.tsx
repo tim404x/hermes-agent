@@ -7,6 +7,8 @@ import { type ThreadMessage } from '@assistant-ui/react'
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
+import { $busy } from '@/store/session'
+
 import { stubThreadEnvironment, ThreadRuntime, userMessage } from '../test-utils'
 
 import { Thread } from '.'
@@ -16,6 +18,7 @@ stubThreadEnvironment()
 
 afterEach(() => {
   cleanup()
+  $busy.set(false)
 })
 
 const assistantMetadata = {
@@ -45,9 +48,23 @@ const Harness = ({ messages }: { messages: ThreadMessage[] }) => (
 
 describe('thinking indicator is tail-only', () => {
   it('shows the loading indicator on a running placeholder at the tail', async () => {
+    $busy.set(true)
     const { container } = render(<Harness messages={[userMessage('u1', 'question'), assistant('a1', '', true)]} />)
 
     await waitFor(() => expect(container.querySelector('[data-slot="aui_response-loading"]')).toBeTruthy())
+  })
+
+  // Phantom spinner (21 Nov 2026): a pending placeholder stranded at the tail
+  // after its turn ended (terminal events lost) kept a live
+  // "55s · 1.2k tokens · Untangling…" row with the session idle.
+  it('shows no loading row for a stranded tail placeholder when no turn is live', async () => {
+    const { container } = render(
+      <Harness messages={[userMessage('u1', 'are all of them in s3 now?'), assistant('a1', '', true)]} />
+    )
+
+    await screen.findByText('are all of them in s3 now?')
+
+    expect(container.querySelector('[data-slot="aui_response-loading"]')).toBeNull()
   })
 
   it('never shows an indicator on a stale running message mid-transcript', async () => {
