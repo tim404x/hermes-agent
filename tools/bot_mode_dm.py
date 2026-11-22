@@ -29,6 +29,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional
@@ -1108,7 +1109,11 @@ def _window_busy(argv: list[str], profile_home: Path | None) -> bool:
     from tools.bot_mode_dm_side_window import window_busy, window_title
 
     home = profile_home or _local_delivery_home(argv)
-    return home is not None and window_busy(home, argv[argv.index("-p") + 1], window_title(argv))
+    if home is None:
+        return False
+    from tools.bot_mode_probe import _profile_name
+
+    return window_busy(home, _argv_profile(argv) or _profile_name(Path(home)), window_title(argv))
 
 
 def _live_intent_file(dm_file: str | os.PathLike) -> str:
@@ -1318,6 +1323,94 @@ def _local_delivery_home(argv: list[str]) -> Path | None:
     return dict(_roster(_hermes_root(Path(_default_home())))).get(argv[2])
 
 
+_PROFILE_FLAGS = ("-p", "--profile")
+
+
+class DeliveryNotStartedError(RuntimeError):
+    """The runner failed before any transport or live admission ran: nothing was sent, and the
+    message file is kept so the sender can resend it (never deleted on a pre-send failure)."""
+
+
+class TransportArgvError(DeliveryNotStartedError):
+    """The transport argv handed to the runner cannot target a profile unambiguously."""
+
+
+def _is_hermes_cli(argv: list[str]) -> bool:
+    cli = (argv[0] if argv else "").rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+    return cli in ("hermes", "hermes.exe")
+
+
+def _normalize_transport_argv(argv: list[str], profile_home: Path | None) -> list[str]:
+    """The ``hermes`` transport argv with its profile as ``argv[1:3] == ["-p", <name>]``.
+
+    Every runner step keys off that shape (the turn lock, the local home, ``window_busy``), and the
+    tool always builds it so. Hand-run deliveries (skill recipes write ``hermes [-p <bot>] chat ...``)
+    often omit ``-p`` for the default profile or put it later: without it the side-window follow-up
+    path crashed on ``argv.index("-p")`` and the message was never delivered (Tim, 21 Nov 2026). A
+    missing profile is taken from ``--profile-home`` (else the runner's own home); a ``-p`` that
+    contradicts ``--profile-home`` is refused loudly instead of guessed."""
+    if not _is_hermes_cli(argv):
+        return list(argv)
+    from tools.bot_mode_probe import _profile_name
+
+    rest: list[str]
+    rest, named = [argv[0]], []
+    i = 1
+    while i < len(argv):
+        part = argv[i]
+        if part in _PROFILE_FLAGS:
+            if i + 1 >= len(argv) or not argv[i + 1] or argv[i + 1].startswith("-"):
+                raise TransportArgvError(f"transport argv has {part} without a profile name")
+            named.append(argv[i + 1])
+            i += 2
+            continue
+        if part.startswith("--profile="):
+            named.append(part.split("=", 1)[1])
+            i += 1
+            continue
+        rest.append(part)
+        i += 1
+    if len(set(named)) > 1:
+        raise TransportArgvError(f"transport argv names several profiles: {', '.join(named)}")
+    home_name = _home_profile_name(Path(profile_home)) if profile_home is not None else None
+    name = named[0] if named else (home_name or _profile_name(Path(_default_home())))
+    if not name:
+        raise TransportArgvError("transport argv names an empty profile")
+    if home_name is not None and name != home_name:
+        raise TransportArgvError(f"--profile-home {profile_home} is profile '{home_name}' but the transport "
+                                 f"targets -p '{name}'")
+    return [rest[0], "-p", name, *rest[1:]]
+
+
+def _home_profile_name(profile_home: Path) -> str:
+    """The roster name of a profile home (matched on the resolved path, so a symlinked profile dir or
+    the runner's resolved ``--profile-home`` still maps), else its directory-shape name."""
+    from tools.bot_mode_probe import _hermes_root, _profile_name, _roster
+
+    with contextlib.suppress(OSError, RuntimeError):
+        want = profile_home.resolve()
+        for name, path in _roster(_hermes_root(Path(_default_home()))):
+            if Path(path).resolve() == want:
+                return name
+    return _profile_name(profile_home)
+
+
+def _argv_profile(argv: list[str]) -> Optional[str]:
+    """The ``-p <name>`` of a normalized transport argv, None when it has none."""
+    return argv[2] if len(argv) >= 3 and argv[1] in _PROFILE_FLAGS else None
+
+
+def _not_started_payload(dm_file: str, exc: BaseException) -> str:
+    kept = os.path.exists(dm_file)
+    return json.dumps({
+        "status": "not_sent", "delivered": False, "reason": "not_started",
+        "error": (f"Delivery NOT started: {exc}. Nothing was sent. "
+                  + (f"The message is kept at {dm_file}; fix the cause and resend it." if kept
+                     else "Resend the message after fixing the cause.")),
+        **({"payload_file": dm_file} if kept else {}),
+    })
+
+
 def _live_outcome_unknown(dm_file: str, cause: object) -> str:
     """The runner's stdout when a live admission may have happened but its outcome is unknown."""
     return json.dumps({"status": "ambiguous", "delivery_id": _dm_delivery_id(dm_file),
@@ -1374,13 +1467,21 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
     if not stdin_file and not side_window:
         print(json.dumps({"reason": "runtime_unavailable", "error": "No canonical Bot Chat authority; payload retained."}))
         return 1
+    keep_payload = False
     try:
-        from tools.bot_relay import delivery_env
+        try:
+            from tools.bot_relay import delivery_env
 
-        env = delivery_env(author, profile_home if not stdin_file else None)
-        # Whether the title is already this conversation's window, read before the turn's restamp.
-        own_window = side_window and _is_own_window(argv, profile_home, window_key)
-        if own_window and _window_busy(argv, profile_home):
+            env = delivery_env(author, profile_home if not stdin_file else None)
+            # Whether the title is already this conversation's window, read before the turn's restamp.
+            own_window = side_window and _is_own_window(argv, profile_home, window_key)
+            busy = own_window and _window_busy(argv, profile_home)
+        except Exception as exc:
+            # Nothing ran yet: a definite no-send. Keep the message so it can be resent; deleting it
+            # here turned a runner bug into a silently lost follow-up (Tim, 21 Nov 2026).
+            keep_payload = True
+            raise DeliveryNotStartedError(f"{type(exc).__name__}: {exc}") from exc
+        if busy:
             # A follow-up while the window's turn is still running: queue it INTO the window through
             # its live owner, before taking the window's lock (never wait behind the running turn).
             rc = _admit_into_held_window(argv, dm_file, profile_home=profile_home, author=author,
@@ -1400,7 +1501,8 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
                 # Passing the file descriptor as stdin bypasses the BOM-aware decoder.
                 return subprocess.run(argv, input=stream.read().encode("utf-8"), check=False, env=env).returncode
     finally:
-        _unlink_dm_file(dm_file)
+        if not keep_payload:
+            _unlink_dm_file(dm_file)
 
 
 def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
@@ -1651,6 +1753,8 @@ def _delivery_main(args: list[str]) -> int:
         return run_fan_out(args[1]) if len(args) == 2 else 2
     parsed = _runner_argv(args)
     if parsed is None:
+        _usage_error("malformed runner argv; expected --run-delivery [--author <json>] <stdin|query-file> "
+                     "<dm_file> [--profile-home <path>] [--side-window [--side-window-key <key>]] <transport argv...>")
         return 2
     author_json, mode, dm_file, argv = parsed
     author = None
@@ -1659,6 +1763,7 @@ def _delivery_main(args: list[str]) -> int:
 
         author = parse_turn_author(author_json)
         if author is None:
+            _usage_error(f"--author is not a valid turn author: {author_json!r}")
             return 2
     try:
         profile_home = None
@@ -1670,16 +1775,39 @@ def _delivery_main(args: list[str]) -> int:
         window_key = None
         if side_window and len(argv) >= 2 and argv[0] == "--side-window-key":
             window_key, argv = argv[1], argv[2:]
+        if not argv:
+            _usage_error("no transport argv after the runner flags")
+            return 2
+        if mode == "query-file":
+            if not os.path.isfile(dm_file):
+                raise DeliveryNotStartedError(f"message file {dm_file} does not exist")
+            argv = _normalize_transport_argv(argv, profile_home)
+            if side_window and "-c" not in argv[:-1]:
+                raise TransportArgvError("a --side-window delivery needs '-c <window title>' in the transport argv")
         return _run_delivery(argv, dm_file, stdin_file=mode == "stdin", profile_home=profile_home,
                              author=author, side_window=side_window, window_key=window_key)
+    except DeliveryNotStartedError as exc:
+        print(_not_started_payload(dm_file, exc))
+        print(f"bot_mode_dm: delivery NOT started: {exc}", file=sys.stderr)
+        return 1
     except Exception as exc:
         # Every refusal ships a typed reason on stdout so the completion notification carries it
         # back to the sender (#93091), with the same vocabulary-guarded classification the relay
         # lane applies.
         from tools.bot_failure_reasons import delivery_failure_reason
 
-        print(json.dumps({"error": str(exc), "reason": delivery_failure_reason(exc)}))
+        print(json.dumps({"error": f"Delivery failed ({type(exc).__name__}: {exc}); the message was NOT confirmed "
+                                   "delivered.", "reason": delivery_failure_reason(exc), "delivered": False}))
+        logger.error("bot_mode_dm runner failed", exc_info=True)
+        traceback.print_exc(file=sys.stderr)
         return 1
+
+
+def _usage_error(message: str) -> None:
+    """A malformed runner call: say so on both streams (it used to exit 2 with no output at all)."""
+    print(json.dumps({"status": "not_sent", "delivered": False, "reason": "usage", "error": f"Delivery NOT started: "
+                      f"{message}. Nothing was sent."}))
+    print(f"bot_mode_dm: delivery NOT started: {message}", file=sys.stderr)
 
 
 # agent-context helpers (mirror system_prompt.py's resolution)
