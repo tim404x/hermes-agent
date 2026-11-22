@@ -96,3 +96,45 @@ describe('internal notifications are retyped only on a machine signature', () =>
     expect(typeMachineRow(userRow(text, kind)).display_kind).toBe(RUNTIME_NOTICE_KIND)
   })
 })
+
+describe('API-only turn notes stored inside the person\'s row (older gateways)', () => {
+  const recovery =
+    "[System note: A new message has arrived. The conversation history contains pending tool outputs from an interrupted turn. IGNORE those pending results. Address the user's NEW message below FIRST. Do NOT re-execute old tool calls from the history.]"
+
+  const surface =
+    '[System: This conversation is now being answered on a different interface: telegram \u2014 any earlier interface guidance in this conversation is superseded \u2014 follow the interface section in the system prompt above for formatting, file delivery and any interface-specific capability.]'
+
+  const hints = '[Image attached at: /home/hermes/.hermes/cache/img/shot.jpg]\n[screenshot]'
+
+  it('shows the question and the image, not the notes (the 21 Nov telegram row)', () => {
+    const stored = `${recovery}\n\nwhy the sessions arent the same?\n\n${hints}\n${surface}`
+    const [row] = toChatMessages([userRow(stored)])
+
+    expect(row.role).toBe('user')
+    expect(chatMessageText(row)).toContain('why the sessions arent the same?')
+    expect(chatMessageText(row)).not.toContain('[System')
+    expect(JSON.stringify(row)).toContain('shot.jpg')
+  })
+
+  it('splits the leading note from the text of a row typed internal_notification', () => {
+    const typed = typeMachineRow(userRow(`${recovery}\n\nare all of them in s3 now?`, 'internal_notification'))
+
+    expect(typed.display_kind).toBe('internal_notification')
+    expect(typed.content).toBe('are all of them in s3 now?')
+  })
+
+  it('strips a model-switch note and keeps rows without notes untouched', () => {
+    const note = '[Note: model was just switched from a to b via x. Adjust your self-identification accordingly.]'
+
+    expect(typeMachineRow(userRow(`${note}\n\nnext question`)).content).toBe('next question')
+
+    const plain = userRow('I pasted [System: This conversation is now being answered on a different interface: x] here')
+
+    expect(typeMachineRow(userRow('just a question'))).toEqual(userRow('just a question'))
+    expect(typeMachineRow(plain)).toBe(plain)
+  })
+
+  it('leaves a row that is only a note alone', () => {
+    expect(typeMachineRow(userRow(recovery)).content).toBe(recovery)
+  })
+})
