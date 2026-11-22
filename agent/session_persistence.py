@@ -81,6 +81,12 @@ def durable_user_row_content(agent, msg: dict, content: Any, api_content: Any) -
     if _override_replaces_content(msg, content, override):
         if api_content is None and isinstance(content, str) and content != override:
             api_content = content
+        elif api_content is None and isinstance(content, list) and isinstance(override, list):
+            # A content-part turn: the live parts may carry API-only text (a recovery note in the
+            # caption, appended per-turn notes). Their text projection is what replay must rebuild.
+            sent = _durable_content(content)
+            if sent != _durable_content(override):
+                api_content = sent
         content = _content_with_turn_override(msg, content, override)
     return content, api_content
 
