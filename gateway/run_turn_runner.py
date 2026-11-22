@@ -226,11 +226,24 @@ def _observed_turn_persist_message(run_message, override, live_text):
     persisted and re-wrapped every turn). A clean override still swaps the live text's leading copy."""
     if not isinstance(run_message, list):
         return override if override is not None else live_text
+    return _list_turn_persist_message(run_message, override, live_text)
+
+
+def _list_turn_persist_message(run_message: list, override, live_text):
+    """The durable row of a content-part (native image) turn, as a list: a str override cannot replace
+    list content (``agent.session_persistence._override_replaces_content``), so without this the
+    model-facing parts were stored as the person's message — the interrupted-turn note the caption was
+    built from, and the per-turn notes the agent appends as trailing text parts (surface switch, plugin
+    notices). The clean override swaps the live text's leading copy in the first text part; the image
+    hints and image parts survive. Always a NEW list: the agent appends its notes to the live one."""
     first = run_message[0] if run_message else None
-    if (isinstance(override, str) and isinstance(first, dict) and first.get("type") == "text"
-            and isinstance(live_text, str) and str(first.get("text", "")).startswith(live_text)):
-        return [{**first, "text": override + first["text"][len(live_text):]}, *run_message[1:]]
-    return run_message
+    if isinstance(override, str) and isinstance(first, dict) and first.get("type") == "text" and isinstance(live_text, str):
+        text = str(first.get("text", ""))
+        # ``build_native_content_parts`` strips the caption it builds the first part from.
+        for live, clean in ((live_text, override), (live_text.strip(), override.strip())):
+            if live and text.startswith(live):
+                return [{**first, "text": clean + text[len(live):]}, *run_message[1:]]
+    return list(run_message)
 
 
 def _is_bot_chat_agent(agent) -> bool:
@@ -1066,6 +1079,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             clean_text = persist_override if persist_override is not None else ctx.message
             persist_override = clean_text
             ctx.message = api_text
+        # The person's words as the stored row must hold them. Every note this method adds (model
+        # switch, interrupted-turn recovery, skills reload) is API-only: the model reads it, the
+        # transcript never does, or a UI paints the note as the person's own message.
+        admitted = persist_override if persist_override is not None else ctx.message
         self._prepend_pending_note("_pending_model_notes")
         # Auto-continue: history ending with a tool result means the previous turn was cut off
         # (restart, crash, SIGTERM). Session-level resume_pending (drain-timeout shutdown) uses
@@ -1090,8 +1107,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             ctx.message, persist_override = _prepare_resume_pending_message(
                 resume_reason, ctx.message, interactive=self._resume_note_interactive(),
             )
+            if isinstance(admitted, str) and admitted.strip():
+                persist_override = admitted  # real text: never the model-switch note folded into it
         elif agent_history and agent_history[-1].get("role") == "tool" and interruption_is_fresh:
-            persist_override = ctx.message
+            persist_override = admitted
             ctx.message = (
                 "[System note: A new message has arrived. The conversation "
                 "history contains pending tool outputs from an interrupted turn. "
@@ -1102,6 +1121,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         self._prepend_pending_note("_pending_skills_reload_notes")
         if api_text is not None:
             persist_override = clean_text  # recovery wording is API-only too, never the stored row
+        elif persist_override is None and ctx.message != admitted:
+            persist_override = admitted  # a model-switch / skills-reload note alone is API-only too
         # Safety net: a startup auto-resume event carries empty text; if the resume_pending branch
         # did not fire (freshness signals disagreed, marker cleared) we must NOT hand the model a blank
         # user turn. Restricted to resume_pending sessions so caption-less image turns are untouched.
@@ -1163,6 +1184,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             if observed_group_context:
                 # The observed wrapper is API-only: persist the PRE-wrap turn (#137627).
                 kwargs["persist_user_message"] = _observed_turn_persist_message(
+                    run_message, persist_user_message_override, ctx.message)
+            elif isinstance(run_message, list):
+                kwargs["persist_user_message"] = _list_turn_persist_message(
                     run_message, persist_user_message_override, ctx.message)
             elif persist_user_message_override is not None:
                 kwargs["persist_user_message"] = persist_user_message_override
