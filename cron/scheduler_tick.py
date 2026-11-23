@@ -134,6 +134,9 @@ def _tick_admitted(
         if headless:
             from cron.scheduler_gateway_gate import refuse_agent_jobs_without_gateway
             due_jobs = refuse_agent_jobs_without_gateway(due_jobs)
+        # Cron update-fence hold: an agent job's worker cannot attach while `hermes update` owns the install.
+        from cron.scheduler_gateway_gate import hold_agent_jobs_while_update_fenced
+        due_jobs = hold_agent_jobs_while_update_fenced(due_jobs)
 
         if not due_jobs:
             # Idle tick: skip config load + pool setup, but still reap crashed jobs' MCP orphans.
