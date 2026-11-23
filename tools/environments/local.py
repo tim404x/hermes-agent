@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -892,15 +893,54 @@ def _make_run_env(env: dict) -> dict:
     # terminal backend), and it wins over the login snapshot's seat DISPLAY; a user who wants their own
     # seat uses an inline ``DISPLAY=:0 cmd`` prefix, which bash applies after this env. Empty (or module
     # missing) → the seat env passes through untouched.
+    # On a headless host (no seat display of its own: a server, the VPS) only the display routes a terminal
+    # child; there is no human screen a GUI app could leak onto. The screen's private session bus then rides
+    # along only where this user has no live systemd user bus: `systemctl --user`, `systemd-run --user` and
+    # `busctl --user` talk to the session bus, and the screen's dbus-run-session bus cannot activate
+    # org.freedesktop.systemd1, so all of them failed ("Process org.freedesktop.systemd1 exited with status 1")
+    # whenever the screen was up. Its XDG_CONFIG_HOME / XDG_CACHE_HOME / XDG_DATA_HOME stay with the screen's own
+    # processes (launcher, browser drivers through desktop_env()): in a terminal they hid every CLI's config
+    # (gh "not logged into any GitHub hosts", op, rclone) and moved CLI caches onto the screen's dirs. A host
+    # with a seat keeps the full routing: there the screen's bus and app dirs keep single-instance GUI apps off
+    # the human's session.
     try:
         from tools.bot_desktop.runtime import host_published_env
         published = host_published_env()
     except Exception:
         published = {}
     if published:
-        run_env.update(published)
+        own = run_env.get("WAYLAND_DISPLAY") or run_env.get("DISPLAY")
+        if own and own != published.get("DISPLAY"):
+            routed = dict(published)
+        else:
+            routed = {k: v for k, v in published.items() if k in _TERMINAL_SCREEN_KEYS}
+            if published.get("DBUS_SESSION_BUS_ADDRESS"):
+                routed.update(_systemd_user_bus(run_env) or
+                              {"DBUS_SESSION_BUS_ADDRESS": published["DBUS_SESSION_BUS_ADDRESS"]})
+        run_env.update(routed)
         run_env.pop("WAYLAND_DISPLAY", None)  # X11 desktop; a leaked Wayland socket flips GTK/Chromium backends
     return run_env
+
+
+# What a running Bot Desktop routes into a terminal child on a headless host: the display alone (_make_run_env).
+_TERMINAL_SCREEN_KEYS = ("DISPLAY", "XAUTHORITY")
+
+
+def _systemd_user_bus(env: dict) -> dict:
+    """XDG_RUNTIME_DIR + DBUS_SESSION_BUS_ADDRESS of this user's systemd user bus when it accepts a connection,
+    else {} (no user manager, or a stale socket left behind)."""
+    from tools.process_registry import systemd_user_bus_env  # imports this module at its top
+    derived = systemd_user_bus_env({k: v for k, v in env.items() if k != "DBUS_SESSION_BUS_ADDRESS"})
+    address = derived.get("DBUS_SESSION_BUS_ADDRESS", "")
+    if not address.startswith("unix:path="):
+        return {}
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.5)
+            probe.connect(address[len("unix:path="):])
+    except OSError:
+        return {}
+    return {k: derived[k] for k in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS") if derived.get(k)}
 
 
 # --- Hermes venv / repo-root detection (module-level, computed once) ---
