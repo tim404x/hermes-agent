@@ -15,6 +15,7 @@ budget, and a slot lost to a restart window is a missed fire, not a job failure.
 """
 import logging
 import os
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -80,4 +81,47 @@ def refuse_agent_jobs_without_gateway(due_jobs: list) -> list:
     logger.warning(
         "Cron tick for %s skipped %d agent job(s) (%s): %s",
         home, len(ids), ", ".join(ids), hint)
+    return [job for job in due_jobs if job.get("no_agent")]
+
+
+UPDATE_HOLD_HINT = (
+    "a Hermes update owns the install, so agent jobs wait; they fire once it finishes."
+)
+
+
+def hold_agent_jobs_while_update_fenced(due_jobs: list) -> list:
+    """Return the due jobs a tick may dispatch while ``hermes update`` holds its fence: agent jobs
+    are held (skipped, not failed), ``no_agent`` script jobs still fire.
+
+    Cron update-fence hold: while ``hermes update`` waits for idle (up to
+    ``agent.restart_after_turn_timeout``), the gateway keeps serving and its ticker keeps
+    dispatching, but every agent job's worker reaches ``connect_gateway`` -> ``ensure_gateway_runtime``,
+    which answers a fenced install with ``draining (update_paused)`` (the ``wait-update`` contract),
+    and the run was booked FAILED with its slot consumed: a 34-minute morning update failed every
+    agent cron due in it, a daily job lost its day. Held here instead, the slot stays due and fires
+    once the fence lifts (inside its grace window; a frequent job past it fast-forwards like any
+    missed run), and ``dispatch_hold`` keeps a one-shot's grace. Covers the headless tick too: its
+    readiness probe sees the serving gateway as ``ready``.
+    """
+    from hermes_cli.gateway_runtime import _update_fenced
+    from hermes_constants import get_default_hermes_root, get_hermes_home, get_process_hermes_home
+
+    agent_jobs = [job for job in due_jobs if not job.get("no_agent")]
+    if not agent_jobs or os.environ.get("HERMES_TUI_GATEWAY_URL", "").strip():
+        return due_jobs  # explicit remote gateway: connect_gateway never consults the local fence
+    home = get_hermes_home().resolve()
+    # The same homes ensure_gateway_runtime judges (the install-root marker also covers profiles).
+    if not _update_fenced({home, get_process_hermes_home(), get_default_hermes_root()}):
+        return due_jobs
+    from cron import dispatch_hold
+    from cron.jobs import _current_cron_store
+
+    ids = [str(job["id"]) for job in agent_jobs]
+    _note_fire_refused(ids, f"Held: {UPDATE_HOLD_HINT}")
+    held = dispatch_hold.read(_current_cron_store().cron_dir)
+    dispatch_hold.note_held()
+    # One warning per update window, not one per minute while it lasts.
+    continuing = held is not None and time.time() - held["last"] <= 2 * dispatch_hold.TICK_SLACK_SECONDS
+    (logger.debug if continuing else logger.warning)(
+        "Cron tick for %s held %d agent job(s) (%s): %s", home, len(ids), ", ".join(ids), UPDATE_HOLD_HINT)
     return [job for job in due_jobs if job.get("no_agent")]
