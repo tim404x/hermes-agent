@@ -26,6 +26,24 @@ def _pause_identity(paused):
             'plan': _plan_fingerprint(paused)}
 
 
+def _claim_identity(claim):
+    """The parts of a fire claim that identify its fire (owner, acquisition order, extra-fire
+    slot), not its lease."""
+    if not isinstance(claim, dict) or not claim.get('by'):
+        return None
+    from cron.extra_fire import _CLAIM_KEY
+    return {key: claim[key] for key in ('by', 'seq', _CLAIM_KEY) if claim.get(key)}
+
+
+def _recovered_claim(record, job):
+    """The claim the recovered fire held: its journal's stamp, else (a journal written before the
+    stamp) the job snapshot the owner froze at admission or the refusal recorded. None when unknown:
+    the current job's claim (a ``missing`` admission) may be a newer fire's."""
+    if 'fire_claim' in record:
+        return record['fire_claim']
+    return _claim_identity(job.get('fire_claim')) if job is not None else None
+
+
 def replayable_completions(job_id, completions):
     """The recorded completion ids whose admission journal still exists: only journal recovery
     can replay a completion into ``mark_job_run``, so an id without one is a dead tombstone."""
@@ -141,7 +159,10 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
               'extra_prompt': extra_prompt}
     root = get_hermes_home() / 'cron' / 'admissions'
     journal = journal_path(params['job_id'], params['request_id'])
-    record = {'params': params, 'receipt': None}
+    # The fire claim this fire holds (its recovery must tell it from a newer fire's) and the slot it
+    # fired for (a retry rung is not a fresh occurrence): the owner's frozen job carries neither.
+    record = {'params': params, 'receipt': None, 'fire_claim': _claim_identity(job.get('fire_claim')),
+              'scheduled_instant': job.get('_scheduled_instant')}
     if journal.exists():
         record = json.loads(journal.read_text(encoding='utf-8-sig'))
         if record['params'] != params:
@@ -266,8 +287,10 @@ def reconcile_pending(*, allow_connect=True):
                 # interrupt, a crashed tail): the receipt is not a result to save or deliver again.
                 journal.unlink(missing_ok=True)
                 continue
+            frozen = None  # the job as admitted, never the current record
             if 'refusal' in record:
                 state = {'status': 'terminal', 'result': record['refusal'], 'job': record['job']}
+                frozen = record['job']
             else:
                 owner = owner_for_home(get_hermes_home())
                 if owner is None and not allow_connect:
@@ -281,6 +304,7 @@ def reconcile_pending(*, allow_connect=True):
                     state = asyncio.run_coroutine_threadsafe(observe(), owner[1]).result(timeout=20)
                 else:
                     state = asyncio.run(observe())
+                frozen = state.get('job')
             if state['status'] == 'missing':
                 # The owner holds no admission for this fire: a definite non-admission, booked as
                 # the same failed run the in-submit refusal books. Only ``unknown`` pauses.
@@ -306,6 +330,8 @@ def reconcile_pending(*, allow_connect=True):
             from cron.quota_hold import age_hold_flag
             age_hold_flag(job)  # a receipt read late holds only what is left of the window
             job['execution_id'] = params['request_id']
+            if record.get('scheduled_instant'):
+                job['_scheduled_instant'] = record['scheduled_instant']
             # The same result verdicts as the ordinary tail: an agent-declared [CRON_FAILURE] and a
             # blank answer are failures, whichever process books them.
             success, error, declared = _apply_agent_failure_marker(job, success, error, answer)
@@ -317,7 +343,8 @@ def reconcile_pending(*, allow_connect=True):
                                  verbose=False, execution_token=None)
             fail_empty_response(delivery, answer)
             if finish_completed_run(delivery, None, params['request_id'], recovered=True,
-                                    lift_pause=record.get('pause_recorded')):
+                                    lift_pause=record.get('pause_recorded'),
+                                    recovered_claim=_recovered_claim(record, frozen)):
                 _lift_pause(params['job_id'], record.get('pause_recorded'))
         except Exception:
             logging.getLogger(__name__).warning('Cron receipt recovery deferred: %s', journal, exc_info=True)

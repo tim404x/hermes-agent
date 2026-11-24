@@ -51,13 +51,14 @@ def _classify_delivery_outcome(
 
 
 def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, recovered=False,
-                         lift_pause=None) -> bool:
+                         lift_pause=None, recovered_claim=None) -> bool:
     """mark_job_run (owner-fenced) + execution ledger row for a run that reached delivery.
 
     ``d`` is the scheduler's ``_RunDelivery``. Store and ledger writers are read off the
     ``cron.scheduler`` facade, which is where tests and the receipt-recovery path patch them.
     ``lift_pause``: receipt recovery's record of the pause this fire's unknown outcome caused;
-    the mark lifts it in the same write, before the retry ladder and quota hold plan."""
+    the mark lifts it in the same write, before the retry ladder and quota hold plan.
+    ``recovered_claim``: the fire claim the recovered fire held, so a newer fire's claim survives."""
     from cron import scheduler
     job = d.job
     if not d.should_deliver and job.get("last_delivery_queued"):
@@ -73,6 +74,8 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
         mark_kwargs['execution_id'] = execution_id
     if isinstance(lift_pause, dict):
         mark_kwargs['lift_pause'] = lift_pause
+    if recovered and isinstance(recovered_claim, dict):
+        mark_kwargs['recovered_claim'] = recovered_claim
     if not d.success and job.pop("_model_unreachable", False):
         # Never-reached-the-model failure: schedule the Cowork-style bounded re-run
         # (cron/unreachable_retry.py) inside the same fenced store write.
