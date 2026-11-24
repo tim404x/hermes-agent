@@ -171,3 +171,64 @@ def test_an_owner_refusal_is_an_answer_not_a_drop(tmp_path, monkeypatch):
         with pytest.raises(scheduler_authority.CronExecutionUnknown):
             scheduler_authority.run_canonical_job(dict(job), execution_id=fire)
     assert len(seen) == 1
+
+
+def test_a_refused_redial_is_transport_too(tmp_path, monkeypatch):
+    """A restarting owner refuses the ticket socket (raw ``ConnectionRefusedError``) on the redial:
+    still the outage, not an outcome."""
+    seen = _gateway(monkeypatch, [
+        {'submit': [dict(RECEIPT)], 'status': [GatewayClientError(DISCONNECTED)]},
+        ConnectionRefusedError(111, 'Connection refused'),
+        {'status': [_terminal()]},
+    ])
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job, fire = _fire(tmp_path)
+        assert scheduler_authority.run_canonical_job(dict(job), execution_id=fire) == tuple(RESULT)
+    assert [_methods(calls) for calls in seen] == [['submit', 'status'], [], ['status']]
+
+
+def test_a_submit_the_owner_refused_stays_refused_across_a_drop(tmp_path, monkeypatch):
+    """The owner answered the submit with an error, then the verifying ``recover`` lost its socket:
+    ``missing`` on the redial is definite (nothing of that submit is in flight), the refusal books."""
+    seen = _gateway(monkeypatch, [
+        {'submit': [GatewayRPCError('cron job refused')], 'recover': [GatewayClientError(DISCONNECTED)]},
+        {'recover': [{'status': 'missing', 'result': None}]},
+    ])
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job, fire = _fire(tmp_path)
+        success, _, _, error = scheduler_authority.run_canonical_job(dict(job), execution_id=fire)
+        journal = json.loads(scheduler_authority.journal_path(job['id'], fire).read_text())
+    assert success is False and 'cron job refused' in error
+    assert journal['refusal'][3] == error
+    assert [_methods(calls) for calls in seen] == [['submit', 'recover'], ['recover']]
+
+
+def test_a_cancel_answer_does_not_restart_the_budget(tmp_path, monkeypatch):
+    """A cancelled fire whose ``status`` keeps dropping while ``cancel`` keeps answering still
+    gives up once the budget runs out, instead of redialing forever."""
+    import threading
+    cancel = threading.Event()
+    cancel.set()
+    seen = _gateway(monkeypatch, [{'submit': [dict(RECEIPT)], 'cancel': [{}], 'status': [TimeoutError()]}]
+                    + [{'cancel': [{}], 'status': [TimeoutError()]} for _ in range(200)])
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job, fire = _fire(tmp_path)
+        with pytest.raises(scheduler_authority.CronExecutionUnknown, match='reconcile'):
+            scheduler_authority.run_canonical_job(dict(job), execution_id=fire, cancel_event=cancel)
+    assert 2 < len(seen) < 50
+
+
+def test_a_redial_does_not_restamp_unchanged_owner_progress(tmp_path, monkeypatch):
+    """The ledger row is touched once per owner progress stamp; a wedged run that keeps reporting
+    the same stamp across reconnects must age into the stale-claim sweep."""
+    touched = []
+    monkeypatch.setattr(executions, 'touch_execution_progress', touched.append)
+    stamped = dict(_started(), progress_at='2026-11-24T20:40:00+00:00')
+    seen = _gateway(monkeypatch, [
+        {'submit': [dict(RECEIPT)], 'status': [dict(stamped), GatewayClientError(DISCONNECTED)]},
+        {'status': [dict(stamped), _terminal()]},
+    ])
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job, fire = _fire(tmp_path)
+        assert scheduler_authority.run_canonical_job(dict(job), execution_id=fire) == tuple(RESULT)
+    assert len(seen) == 2 and touched == [fire]

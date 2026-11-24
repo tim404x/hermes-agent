@@ -229,8 +229,22 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
         # write (file and directory) waits in a worker, and still completes before the next step.
         await asyncio.to_thread(write_journal)
 
+    async def refuse(exc):
+        """The owner answered the submit with an error and holds no admission: the booked failure."""
+        error = f'{error_type_name(exc)}: {exc}'
+        result = [False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error]
+        record['refusal'] = result
+        record['job'] = dict(job)
+        await save()
+        return tuple(result)
+
+    # A submit the owner answered with an error, and the last owner progress stamp mirrored into
+    # our ledger row: both outlive a dropped connection (a redial must neither forget the refusal
+    # nor re-stamp a wedged run's unchanged progress as fresh).
+    answered = progress = None
+
     async def submit(call):
-        nonlocal attempted
+        nonlocal attempted, answered
         attempted = True
         await save()
         try:
@@ -240,14 +254,10 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
             # A returned owner exception is definite; a transport disconnect is not. Even an
             # owner error after commit must retain the admitted identity, so verify its absence.
             if owner is not None or isinstance(exc, GatewayRPCError):
+                answered = exc  # the owner finished handling this submit: none of it is in flight
                 state = await call('recover', params)
                 if state['status'] == 'missing':
-                    error = f'{error_type_name(exc)}: {exc}'
-                    result = [False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error]
-                    record['refusal'] = result
-                    record['job'] = dict(job)
-                    await save()
-                    return tuple(result)
+                    return await refuse(exc)
                 if state['status'] not in {'queued', 'started', 'terminal'}:
                     raise
                 # Admitted before the answer was lost: observe it through the recovered receipt.
@@ -256,9 +266,12 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
 
     async def readmit(call):
         """A reconnect's receipt for a fire whose submit answer went down with the socket: read
-        back by ``recover``, never submitted again. ``missing`` cannot prove the lost submit is not
-        still in flight on the owner, so it fails closed and leaves the journal to receipt recovery."""
+        back by ``recover``, never submitted again. ``missing`` cannot prove a lost submit is not
+        still in flight on the owner, so it fails closed and leaves the journal to receipt recovery;
+        only a submit the owner already answered with an error (``answered``) books that refusal."""
         state = await call('recover', params)
+        if state['status'] == 'missing' and answered is not None:
+            return await refuse(answered)
         if state['status'] not in {'queued', 'started', 'terminal'}:
             raise CronExecutionUnknown(f'cron admission {state["status"]} after the gateway connection dropped')
         return {'session_id': state['session_id'], 'admission_id': state['admission_id']}
@@ -266,6 +279,7 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
     async def observe(call, *, resumed=False):
         """Admit the fire (``resumed``: on a fresh connection after a drop, from the saved receipt
         or ``recover``) and poll its receipt to the outcome."""
+        nonlocal progress
         receipt = record['receipt'] if resumed else None
         if receipt is None:
             receipt = await (readmit if resumed else submit)(call)
@@ -273,7 +287,7 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                 return receipt  # the owner refused the submit: the booked failure
             record['receipt'] = receipt
             await save()
-        delay, progress = .1, None
+        delay = .1
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 await call('cancel', receipt)
@@ -317,12 +331,15 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                             raise  # the owner answered: definite, never a reason to redial
                         except (GatewayClientError, OSError, TimeoutError) as exc:
                             raise _ConnectionLost(str(exc) or error_type_name(exc)) from exc
-                        lost_at, backoff = None, RECONNECT_FIRST_DELAY_S
+                        if op != 'cancel':  # only an observation proves the owner is back
+                            lost_at, backoff = None, RECONNECT_FIRST_DELAY_S
                         return answer
                     return await observe(call, resumed=resumed)
-            except (_ConnectionLost, GatewayClientError) as exc:
-                # A dial refused on the first connection is no attempt at all (nothing journaled);
-                # a GatewayClientError out of an open connection is the firer's own work failing.
+            except Exception as exc:
+                # A dial refused before anything was journaled is no attempt at all. A failed redial
+                # (refused ticket, upgrade cut by a restarting owner) is transport like a lost socket;
+                # out of an open connection anything else is final: an owner answer, the firer's own
+                # journal write, or ``CronExecutionUnknown``.
                 if not attempted or (dialed and not isinstance(exc, _ConnectionLost)):
                     raise
                 now = time.monotonic()
