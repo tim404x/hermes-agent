@@ -631,6 +631,54 @@ def test_follows_profile_parses_each_frozen_blob_once_per_policy(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_busy_resume_does_not_wait_for_a_sqlite_writer_to_refuse_its_policy_refresh(home):
+    import asyncio
+    import sqlite3
+    from contextlib import closing
+    from gateway.session_controls import AuthorityConnection
+    from persistence_assembly import store_location
+
+    _profile(home, 'old-model', 1, 'old-key')
+    store, runner, authority, owner = _owner(home)
+    runner._peek_session_state = lambda key: None
+    viewer = AuthorityConnection(authority, object(), {'user_id': 'human'})
+    db = authority.persistence
+    try:
+        ref, _ = _frozen_bot_chat(authority, owner.actor, home)
+        sid = ref.session_id
+        _profile(home, 'new-model', 2, 'new-key')
+        row, _ = db.admissions.admit(epoch=authority.epoch, principal_id=owner.actor.subject,
+                                     session_id=sid, request_id='busy-head', payload={'text': 'work'})
+        head = db.admissions.claim(epoch=authority.epoch, session_id=sid)
+        request = {'id': 1, 'method': 'session.resume', 'params': {'session_id': sid}}
+        # A different writer owns the profile. WAL reads still work, so the viewer should get the
+        # running turn's *existing* policy and receipt, not queue a refresh write that must fail.
+        path = store_location(db.scope)
+        assert path is not None
+        with closing(sqlite3.connect(path)) as writer:
+            writer.execute('BEGIN IMMEDIATE')
+            resume = asyncio.create_task(viewer.dispatch(request))
+            try:
+                done, _ = await asyncio.wait({resume}, timeout=5)
+                assert done, 'read-only busy resume queued behind the profile writer'
+                reply = resume.result()['result']
+                assert reply['running'] and [r['input_id'] for r in reply['pending']] == ['busy-head']
+                assert not _follows(runner, authority.sessions[sid])
+            finally:
+                writer.rollback()
+                await resume
+        db.admissions.settle(epoch=authority.epoch, admission_id=row.admission_id,
+                             generation=head.generation, outcome='completed')
+        # The same attachment can still adopt the previously frozen policy once idle.
+        assert 'result' in await viewer.dispatch({**request, 'params': {'session_id': sid}})
+        assert _follows(runner, authority.sessions[sid])
+    finally:
+        await viewer.close()
+        await owner.close()
+        store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
 async def test_an_mcp_reload_keeps_a_busy_first_opens_adoption_pending(home, monkeypatch):
     """``reload.mcp`` refreshes only the MCP section (it never runs ``follow_bot_chat``): it must not
     forget an adoption a busy first open left pending, or the warm reopen returns early on the old route."""
