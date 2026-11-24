@@ -137,14 +137,16 @@ def test_reconnects_with_a_fresh_ticket_after_the_owner_drops_it(owner, tmp_path
 
 def test_in_flight_call_on_a_dropped_connection_fails_and_is_not_resent(owner, tmp_path):
     from websockets.exceptions import ConnectionClosed
-    from agent.runtime_session_store import WorkerRPC
+    from agent.runtime_session_store import WorkerLinkLost, WorkerRPC
     rpc = WorkerRPC(tmp_path)
     assert rpc('worker.persist') == {'n': 1}
     owner.drop = 'before_reply'
     started = time.monotonic()
-    # The write may have landed: the caller sees the transport error (outcome unknown), never a silent retry.
-    with pytest.raises(ConnectionClosed):
+    # The write may have landed: the caller sees the lost link (outcome unknown), never a silent retry.
+    # Only the outbox journal, which owns a replayable sequence, may send it again.
+    with pytest.raises(WorkerLinkLost) as lost:
         rpc('worker.persist')
+    assert isinstance(lost.value.__cause__, ConnectionClosed)
     assert time.monotonic() - started < 5
     assert owner.requests == ['worker.persist', 'worker.persist']
     assert rpc('worker.persist') == {'n': 3}
@@ -193,14 +195,15 @@ def test_owner_close_between_the_idle_check_and_the_send_redials_and_sends_once(
 
 def test_a_redial_whose_send_also_fails_is_not_retried_again(owner, tmp_path, monkeypatch):
     from websockets.exceptions import ConnectionClosed
-    from agent.runtime_session_store import WorkerRPC
+    from agent.runtime_session_store import WorkerLinkLost, WorkerRPC
     owner.sabotage = 0
     _owner_closes_before_the_frame_is_written(owner, monkeypatch)
     rpc = WorkerRPC(tmp_path)
     assert rpc('worker.persist') == {'n': 1}
     owner.sabotage = 2
-    with pytest.raises(ConnectionClosed):
+    with pytest.raises(WorkerLinkLost) as lost:
         rpc('worker.persist')
+    assert isinstance(lost.value.__cause__, ConnectionClosed)
     assert owner.requests == ['worker.persist']
     assert (owner.connections, owner.tickets) == (2, 2)
     assert rpc.link is None
