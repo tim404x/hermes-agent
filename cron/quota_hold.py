@@ -90,6 +90,28 @@ def _window_end(hold_seconds: float) -> datetime:
     return _seconds_after(_hermes_now(), float(hold_seconds) + HOLD_SLACK_SECONDS)
 
 
+# Run-side flag beside ``_quota_hold_seconds`` on a canonical cron result: when the owner saw the
+# failure. The window is relative to that instant, not to when a firer or receipt recovery reads it.
+HOLD_FROM_KEY = "_quota_hold_from"
+
+
+def age_hold_flag(job: dict[str, Any]) -> None:
+    """Shrink a result's ``_quota_hold_seconds`` by the time since the owner saw the failure (a
+    receipt recovered hours later must not restart the window), dropping it once the window has
+    closed; the marker itself never stays on the job."""
+    from cron.jobs import _elapsed_seconds, _parse_aware
+
+    seen = _parse_aware(job.pop(HOLD_FROM_KEY, None))
+    hold = job.get("_quota_hold_seconds")
+    if seen is None or not hold:
+        return
+    left = float(hold) - max(0.0, _elapsed_seconds(_hermes_now(), seen))
+    if left > 0:
+        job["_quota_hold_seconds"] = left
+    else:
+        job.pop("_quota_hold_seconds", None)
+
+
 def _recovery_worthwhile(
     job: dict[str, Any], natural_next: datetime, window_end: datetime,
 ) -> bool:

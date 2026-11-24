@@ -377,6 +377,12 @@ async def execute(authority, ref, row, policy):
         # run_job stamps run-side verdicts on ITS job copy (quota hold, unreachable model); the
         # firing scheduler's bookkeeping reads them off its own dict, so they ride the result.
         flags = {key: job[key] for key in RUN_JOB_FLAGS if key in job}
+        if flags.get('_quota_hold_seconds'):
+            # The window is relative to the failure: a firer or recovery that reads this receipt
+            # later holds only what is left of it (cron.quota_hold.age_hold_flag).
+            from cron.quota_hold import HOLD_FROM_KEY
+            from hermes_time import now as _hermes_now
+            flags[HOLD_FROM_KEY] = _hermes_now().isoformat()
         authority.pending_results[row['admission_id']] = {
             'result': {'final_response': result[2], 'cron_result': list(result), 'cron_job_flags': flags,
                        'failed': not result[0], 'completed': result[0]}, 'usage': {}}
