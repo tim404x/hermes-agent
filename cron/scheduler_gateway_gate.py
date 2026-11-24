@@ -89,9 +89,28 @@ UPDATE_HOLD_HINT = (
 )
 
 
-def hold_agent_jobs_while_update_fenced(due_jobs: list) -> list:
+def update_fence_holds_agent_jobs() -> bool:
+    """Whether this tick must hold its agent jobs because ``hermes update`` owns the install.
+
+    Read ONCE per tick, before the due scan (``cron.jobs.agent_dispatch_held``): the scan acts on
+    a due slot as if it fires now (a recurring job past its grace is fast-forwarded to its next
+    slot and its catch-up counted; a one-shot is claimed or retired), so a hold applied after
+    the scan lost the catch-up run. The scan and the hold must also agree on one reading.
+    """
+    from hermes_cli.gateway_runtime import _update_fenced
+    from hermes_constants import get_default_hermes_root, get_hermes_home, get_process_hermes_home
+
+    if os.environ.get("HERMES_TUI_GATEWAY_URL", "").strip():
+        return False  # explicit remote gateway: connect_gateway never consults the local fence
+    home = get_hermes_home().resolve()
+    # The same homes ensure_gateway_runtime judges (the install-root marker also covers profiles).
+    return bool(_update_fenced({home, get_process_hermes_home(), get_default_hermes_root()}))
+
+
+def hold_agent_jobs_while_update_fenced(due_jobs: list, fenced: bool | None = None) -> list:
     """Return the due jobs a tick may dispatch while ``hermes update`` holds its fence: agent jobs
-    are held (skipped, not failed), ``no_agent`` script jobs still fire.
+    are held (skipped, not failed), ``no_agent`` script jobs still fire. *fenced* is the tick's
+    own reading from before its due scan (``update_fence_holds_agent_jobs``); None reads it now.
 
     Cron update-fence hold: while ``hermes update`` waits for idle (up to
     ``agent.restart_after_turn_timeout``), the gateway keeps serving and its ticker keeps
@@ -103,16 +122,16 @@ def hold_agent_jobs_while_update_fenced(due_jobs: list) -> list:
     missed run), and ``dispatch_hold`` keeps a one-shot's grace. Covers the headless tick too: its
     readiness probe sees the serving gateway as ``ready``.
     """
-    from hermes_cli.gateway_runtime import _update_fenced
-    from hermes_constants import get_default_hermes_root, get_hermes_home, get_process_hermes_home
+    from hermes_constants import get_hermes_home
 
     agent_jobs = [job for job in due_jobs if not job.get("no_agent")]
-    if not agent_jobs or os.environ.get("HERMES_TUI_GATEWAY_URL", "").strip():
-        return due_jobs  # explicit remote gateway: connect_gateway never consults the local fence
-    home = get_hermes_home().resolve()
-    # The same homes ensure_gateway_runtime judges (the install-root marker also covers profiles).
-    if not _update_fenced({home, get_process_hermes_home(), get_default_hermes_root()}):
+    if not agent_jobs:
         return due_jobs
+    if fenced is None:
+        fenced = update_fence_holds_agent_jobs()
+    if not fenced:
+        return due_jobs
+    home = get_hermes_home().resolve()
     from cron import dispatch_hold
     from cron.jobs import _current_cron_store
 
