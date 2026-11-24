@@ -284,8 +284,9 @@ class SessionAuthority:
         store does not hold (another served profile's, under multiplex) keeps its own id."""
         if not session_id:
             return session_id
-        lineage = authority_persistence(self).lineage.lineage(session_id)
-        return lineage[0] if lineage else session_id
+        # The root only: this runs several times per notification on the owner loop, where the full
+        # lineage walk stalled it for seconds on a long-lived chat (24 Nov 2026).
+        return authority_persistence(self).lineage.lineage_root(session_id)
 
     def physical_target(self, ref):
         return authority_persistence(self).lineage.tip(ref.session_id) or ref.session_id

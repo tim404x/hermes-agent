@@ -57,7 +57,10 @@ def completion_admission(runner, event):
     if entry is None:
         return None
     identity = producer_identity(runner, event)
-    rows = authority_persistence(authority).admissions.list(session_id=_route_owner(authority, entry), pending_only=False)
+    # Only the rows that carry the identity string: this runs on the owner loop for every completion and
+    # watch notice, and a long-lived chat's full history decode stalled it for seconds (24 Nov 2026).
+    rows = authority_persistence(authority).admissions.mentioning(session_id=_route_owner(authority, entry),
+                                                                  value=identity)
     for row in rows:
         descriptor = row.payload.get('local_automation_v1') or row.payload.get('native_text_v1', {}).get('automation', {})
         if identity in descriptor.get('identities', [descriptor.get('identity')]):
@@ -438,17 +441,21 @@ def committed_route_envelope(authority, entry, *, human_only=False, user_id=None
     borrows), or ``None`` while no matching message was admitted there. ``human_only`` skips an
     automation wake's own envelope, so a reused route cannot launder a sender through it;
     ``user_id`` keeps a shared route's wake on the producer's own authenticated sender."""
-    # Admissions belong to the logical root; ``entry.session_id`` is only the transcript tip.
-    prior = authority_persistence(authority).admissions.list(session_id=authority.logical_owner(entry.session_id),
-                                                             pending_only=False)
-    for row in reversed(prior):
+    def borrowable(row):
         envelope = row.payload.get('native_text_v1')
         if not envelope or (human_only and 'automation' in envelope):
-            continue
-        if user_id is not None and str((envelope.get('source') or {}).get('user_id') or '') != str(user_id):
-            continue
-        return envelope if 'provenance' in envelope else None
-    return None
+            return False
+        return user_id is None or str((envelope.get('source') or {}).get('user_id') or '') == str(user_id)
+
+    # Admissions belong to the logical root; ``entry.session_id`` is only the transcript tip. Newest first, stopping
+    # at the first borrowable row: this runs on the owner loop, and decoding a long-lived chat's whole history there
+    # stalled it for seconds (24 Nov 2026).
+    row = authority_persistence(authority).admissions.latest_admission(
+        session_id=authority.logical_owner(entry.session_id), payload_marker='native_text_v1', match=borrowable)
+    if row is None:
+        return None
+    envelope = row.payload['native_text_v1']
+    return envelope if 'provenance' in envelope else None
 
 
 _MAX_RESET_ANCESTORS = 64

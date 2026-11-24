@@ -41,6 +41,7 @@ __all__ = [
     "TranscriptRewrite",
     "TurnBoundary",
     "UnheldMedia",
+    "payload_holds_string",
     "raise_gate",
     "steer_replayed",
 ]
@@ -144,6 +145,24 @@ class GateRefusal:
 #: gate's point inside the write, on every attempt, so a drain that began while the write waited still refuses it. The
 #: callable reads owner memory only: it never touches the store or its connection.
 AdmissionGate = GateRefusal | Callable[[], GateRefusal | None] | None
+
+
+def payload_holds_string(value: Any, text: str) -> bool:
+    """Whether decoded JSON ``value`` holds the string ``text`` as an object key or a string value, at any depth
+    (the predicate of :meth:`AdmissionRepository.mentioning`)."""
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            if item == text:
+                return True
+        elif isinstance(item, dict):
+            if text in item:
+                return True
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return False
 
 
 def raise_gate(gate: AdmissionGate) -> None:
@@ -347,8 +366,13 @@ class AdmissionRepository(Protocol):
         """The live row, else its terminal tombstone, else ``None``."""
         ...
 
-    def latest_admission(self, *, session_id: str, payload_marker: str) -> AdmissionRecord | None:
-        """The session's newest row by ``seq``, of any status, whose decoded payload holds the top-level key ``payload_marker``; ``None`` when no row does."""
+    def latest_admission(self, *, session_id: str, payload_marker: str,
+                         match: Callable[[AdmissionRecord], bool] | None = None) -> AdmissionRecord | None:
+        """The session's newest row by ``seq``, of any status, whose decoded payload holds the top-level key ``payload_marker`` (and, when given, for which ``match(record)`` is true); ``None`` when no row does. The read stops at that row: older history is never decoded."""
+        ...
+
+    def mentioning(self, *, session_id: str, value: str) -> list[AdmissionRecord]:
+        """The session's rows in ``seq`` order, of any status, whose decoded payload holds the string ``value`` as an object key or a string value at any depth (:func:`payload_holds_string`). A store may find them without decoding the rest of the session's history."""
         ...
 
     def settled_result(self, *, admission_id: str, epoch: int | None = None, generation: int | None = None) -> AdmissionResult | None:
