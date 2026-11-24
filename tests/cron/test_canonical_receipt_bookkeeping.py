@@ -114,7 +114,7 @@ def test_direct_retry_reuses_generated_fire_identity(monkeypatch, initial):
     for _ in range(2):
         with pytest.raises(scheduler_authority.CronExecutionUnknown):
             scheduler_authority.run_canonical_job(job)
-    assert requests[0] == requests[1]
+    assert len(requests) >= 2 and len(set(requests)) == 1  # every call, redials included, one identity
 
 
 @pytest.mark.parametrize('answer', ['  \n', '[CRON_FAILURE]\nchild task failed'], ids=['blank', 'declared'])
