@@ -86,6 +86,8 @@ def settle(job: dict[str, Any], now: str) -> None:
     already, and keeping it due would make every tick during the run log a lost-claim fire)."""
     from cron.jobs import compute_next_run
 
+    if job.get("state") == "completed":  # retired while it ran (an older fire's recovery)
+        return
     if queued(job) or _future_slot(job.get("next_run_at"), datetime.fromisoformat(now)):
         return
     if job.get("schedule", {}).get("kind") == "once":
