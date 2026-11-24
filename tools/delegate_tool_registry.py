@@ -18,6 +18,10 @@ _active_subagents_lock = threading.Lock()
 # subagent_id -> mutable record tracking the live child agent.  Stays only
 # for the lifetime of the run; _run_single_child is the owner.
 _active_subagents: dict[str, dict[str, Any]] = {}
+# A high-level warning counts resident children (including parents waiting on a nested join),
+# not requested batch size or scheduling slots. A recovered episode rearms at half the threshold.
+_PROCESS_PRESSURE_WARN_AT = 12
+_pressure_warned = False
 # subagent_id -> {goal, delegation_id, owner_agent_session_id, resume?} retained AFTER the child finishes (bounded FIFO;
 # ``resume`` is what action='continue' rebuilds a delegate_task child from, see ``_resume_spec``).
 # Child-started background processes routinely outlive the child (its npm ci with notify_on_complete=true finishes
@@ -53,16 +57,27 @@ def _register_subagent(record: dict[str, Any]) -> None:
     if not sid:
         return
     record.setdefault("accepting_steer", True)
+    global _pressure_warned
     with _active_subagents_lock:
         _active_subagents[sid] = record
+        count = len(_active_subagents)
+        warn = count >= _PROCESS_PRESSURE_WARN_AT and not _pressure_warned
+        if warn:
+            _pressure_warned = True
+    if warn:
+        logger.warning("%d live in-process subagents share this process; a restart ends them. "
+                       "Use durable Kanban workers for long-running work.", count)
 
 def _unregister_subagent(subagent_id: str, *, agent: Any = None, stopping: bool = False) -> Optional[dict[str, Any]]:
     """Retain attribution and trusted owners; cleanup callers hold readiness at stopping until resources close."""
+    global _pressure_warned
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
         if record is None or not (agent is None or record.get("agent") is agent):
             return
         _active_subagents.pop(subagent_id, None)
+        if len(_active_subagents) <= _PROCESS_PRESSURE_WARN_AT // 2:
+            _pressure_warned = False
         sid = record.get("subagent_id")
         if not sid:
             return
