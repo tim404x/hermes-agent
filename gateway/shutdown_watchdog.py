@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import faulthandler
+import inspect
 import itertools
 import json
 import logging
@@ -438,8 +439,23 @@ def _format_loop_thread_section(loop_thread_id: int) -> str:
     100 threads, newest first: the loop thread, started before every worker, is the one it drops."""
     try:
         frame = sys._current_frames().get(loop_thread_id)
-        stack = (_format_frame_stack(frame) if frame is not None
-                 else "(monitored loop thread stack unavailable: thread may have exited)\n")
+        if frame is None:
+            stack = "(monitored loop thread stack unavailable: thread may have exited)\n"
+        else:
+            # A frozen loop cannot answer a task-inspection callback. Its live Python frames
+            # distinguish the executing coroutine from any number of merely suspended tasks.
+            note = "monitored loop: no executing Python coroutine (callback, selector or native code)\n"
+            active = frame
+            while active is not None:
+                code = active.f_code
+                if code.co_flags & (inspect.CO_COROUTINE | inspect.CO_ITERABLE_COROUTINE | inspect.CO_ASYNC_GENERATOR):
+                    note = (f"monitored loop: executing coroutine {code.co_qualname} "
+                            f"({code.co_filename}:{active.f_lineno})\n")
+                    break
+                if code is asyncio.Handle._run.__code__:
+                    break  # Do not attribute an inner loop's callback to an outer loop's task.
+                active = active.f_back
+            stack = note + _format_frame_stack(frame)
     except Exception as exc:  # health: allow BLE001 -- a hard-exit diagnostic path must never raise
         stack = f"(monitored loop thread stack unavailable: {type(exc).__name__})\n"
     return "--- monitored gateway loop thread stack ---\n" + stack

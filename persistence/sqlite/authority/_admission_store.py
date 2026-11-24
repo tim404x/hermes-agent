@@ -119,19 +119,22 @@ def find_session_admission(holder, *, principal_id: str, session_id: str, reques
                                  'AND request_id=?', (principal_id, session_id, request_id)).fetchone())
 
 
+# Disjoint ranges of the existing (target, status, seq) index, merged in one snapshot.
+# An IN filter sorts full payload rows; adding a competing (target, seq) index instead
+# can make a pending-only probe scan terminal history. No schema build on existing stores.
+_ADMISSION_ARMS = tuple(
+    f"SELECT * FROM session_admissions WHERE target_session_id=:target AND status='{status}'"
+    for status in ('queued', 'started', 'unknown', 'terminal'))  # the table's status CHECK
+_PENDING_ADMISSIONS_SQL = ' UNION ALL '.join(_ADMISSION_ARMS[:-1]) + ' ORDER BY seq'
+_ALL_ADMISSIONS = ' UNION ALL '.join(_ADMISSION_ARMS)
+_ALL_ADMISSIONS_SQL = _ALL_ADMISSIONS + ' ORDER BY seq'
+_LATEST_ADMISSION_SQL = _ALL_ADMISSIONS_SQL + ' DESC'
+
+
 def list_session_admissions(holder, *, session_id: str, pending_only: bool = True) -> list[dict]:
     with holder._read_ctx() as conn:
-        # Pending is an explicit index-range IN, not ``!='terminal'``: a negated status cannot
-        # bound the (target, status, seq) index, so every probe scanned the session's history.
-        sql = ("SELECT * FROM session_admissions WHERE target_session_id=? "
-               + ("AND status IN ('queued','started','unknown') " if pending_only else "") + "ORDER BY seq")
-        return [_row(row) for row in conn.execute(sql, (session_id,))]
-
-
-_ADMISSION_STATUSES = ('queued', 'started', 'unknown', 'terminal')  # the table's status CHECK
-_LATEST_ADMISSION_SQL = ' UNION ALL '.join(
-    f"SELECT * FROM session_admissions WHERE target_session_id=:target AND status='{status}'"
-    for status in _ADMISSION_STATUSES) + ' ORDER BY seq DESC'
+        sql = _PENDING_ADMISSIONS_SQL if pending_only else _ALL_ADMISSIONS_SQL
+        return [_row(row) for row in conn.execute(sql, {'target': session_id})]
 
 
 def latest_session_admission(holder, *, session_id: str, payload_marker: str, match=None) -> dict | None:
@@ -171,10 +174,11 @@ def session_admissions_mentioning(holder, *, session_id: str, value: str) -> lis
         except UnicodeEncodeError:  # a lone surrogate: no stored payload holds this spelling
             continue
         tokens.add(token)
-    where = ' OR '.join('instr(payload_json, ?) > 0' for _ in tokens)
+    params = {f'token{i}': token for i, token in enumerate(sorted(tokens))}
+    where = ' OR '.join(f'instr(payload_json, :{key}) > 0' for key in params)
     with holder._read_ctx() as conn:
-        rows = conn.execute(f'SELECT * FROM session_admissions WHERE target_session_id=? AND ({where}) ORDER BY seq',
-                            (session_id, *sorted(tokens))).fetchall()
+        rows = conn.execute(f'SELECT * FROM ({_ALL_ADMISSIONS}) WHERE {where} ORDER BY seq',
+                            {'target': session_id, **params}).fetchall()
     return [row for row in map(_row, rows) if payload_holds_string(row['payload'], value)]
 
 
