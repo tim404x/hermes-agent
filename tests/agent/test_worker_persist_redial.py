@@ -34,7 +34,7 @@ def owner(monkeypatch, tmp_path):
     import agent.runtime_session_store as store_module
 
     state = SimpleNamespace(connections=0, sends=[], committed={}, applied=[], plan=[], up=True,
-                            release=threading.Event())
+                            release=threading.Event(), discovery=None)
 
     def handler(ws):
         state.connections += 1
@@ -48,6 +48,8 @@ def owner(monkeypatch, tmp_path):
                 ws.send(json.dumps({'jsonrpc': '2.0', 'id': request['id'],
                                     'error': {'code': 4001, 'message': 'stale_epoch'}}))
                 continue
+            if action == 'drop':
+                break  # the link drops before the owner ever runs it
             if action == 'busy':
                 ws.send(json.dumps({'jsonrpc': '2.0', 'id': request['id'],
                                     'error': {'code': 5001, 'message': 'storage_unavailable'}}))
@@ -74,11 +76,13 @@ def owner(monkeypatch, tmp_path):
         endpoint = SimpleNamespace(api_origin=f'http://127.0.0.1:{server.socket.getsockname()[1]}',
                                    control_home=None)
         monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint', lambda home, timeout: SimpleNamespace(
-            state='ready' if state.up else 'stopped', endpoint=endpoint if state.up else None))
+            state=(state.discovery or ('ready', None))[0] if state.up or state.discovery else 'absent',
+            reason_code=(state.discovery or ('ready', None))[1], endpoint=endpoint if state.up else None))
         monkeypatch.setattr(discovery, 'query_identify', lambda home, timeout: {'pid': -1})
         monkeypatch.setattr(gateway_client, '_session_ticket', ticket)
         monkeypatch.setattr(store_module, 'RECONNECT_BUDGET_S', 5.0, raising=False)
         monkeypatch.setattr(store_module, 'RECEIPT_WAIT_S', 0.5, raising=False)
+        monkeypatch.setattr(store_module, 'REFUSAL_CONFIRM_DELAY_S', 0.2, raising=False)
         try:
             yield state
         finally:
@@ -136,18 +140,41 @@ def test_an_owner_whose_store_is_busy_gets_the_same_entry_again(owner, tmp_path)
         store.close()
 
 
-def test_an_owner_restart_window_is_waited_out(owner, tmp_path):
+def test_an_owner_stalled_past_its_control_timeout_is_waited_out(owner, tmp_path):
+    """Its loop stalled: discovery times out on the control socket, then answers again (same owner)."""
     store = _store(tmp_path)
     try:
         assert store.try_acquire_session_turn_lease('s', 'holder') == 'turn.acquire#1'
-        owner.up = False
+        owner.up, owner.discovery = False, ('inaccessible', 'control_timeout')
         owner.plan = ['drop_after_commit']
-        threading.Timer(1.0, lambda: setattr(owner, 'up', True)).start()
+
+        def recover():
+            owner.up, owner.discovery = True, None
+        threading.Timer(1.0, recover).start()
         assert store.refresh_session_turn_lease('s', 'holder') == 'turn.renew#2'
         assert owner.applied == [(1, 'turn.acquire'), (2, 'turn.renew')]
         assert store.failure is None
     finally:
         store.close()
+
+
+@pytest.mark.parametrize('discovery', [None, ('starting', None), ('incompatible', 'runtime_protocol'),
+                                       ('inaccessible', 'profile_mismatch')])
+def test_an_owner_that_is_gone_fails_at_once_and_keeps_the_entry_for_adoption(owner, tmp_path, discovery):
+    """A killed or restarting owner never answers this worker's epoch again: only its successor's
+    adoption replays the journal, so the store fails at once (no retries holding the store lock
+    adoption needs), the entry kept, as before."""
+    from agent.runtime_session_store import WorkerLinkLost, WorkerPersistenceError
+    store = _store(tmp_path)
+    assert store.try_acquire_session_turn_lease('s', 'holder') == 'turn.acquire#1'
+    owner.up, owner.discovery = False, discovery
+    owner.plan = ['drop']
+    started = time.monotonic()
+    with pytest.raises(WorkerPersistenceError, match='owner_unavailable') as failed:
+        store.refresh_session_turn_lease('s', 'holder')
+    assert not isinstance(failed.value, WorkerLinkLost)
+    assert time.monotonic() - started < 2.0  # one receipt wait at most, no reconnect budget
+    assert [entry['sequence'] for entry in json.loads(store.path.read_text())['pending']] == [2]
 
 
 def test_an_owner_gone_past_the_budget_still_fails_closed_with_the_entry_journaled(owner, tmp_path, monkeypatch):
@@ -163,16 +190,19 @@ def test_an_owner_gone_past_the_budget_still_fails_closed_with_the_entry_journal
         return real(home, timeout)
     monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint', counting)
     store = _store(tmp_path)
-    owner.up = False
+    assert store.try_acquire_session_turn_lease('s', 'holder') == 'turn.acquire#1'
+    dials.clear()
+    owner.up, owner.discovery = False, ('inaccessible', 'control_timeout')
+    owner.plan = ['drop']
     started = time.monotonic()
-    with pytest.raises(WorkerLinkLost, match='owner_unavailable'):
-        store.try_acquire_session_turn_lease('s', 'holder')
+    with pytest.raises(WorkerLinkLost, match='owner_unresponsive'):
+        store.refresh_session_turn_lease('s', 'holder')
     assert 0.9 <= time.monotonic() - started < 5
     assert len(dials) > 2  # it did retry, with backoff, until the budget ran out
-    assert store.failure == 'owner_unavailable'
+    assert store.failure == 'owner_unresponsive'
     disk = json.loads(store.path.read_text())
-    assert [entry['sequence'] for entry in disk['pending']] == [1]  # kept for adoption / replay
-    with pytest.raises(WorkerPersistenceError, match='owner_unavailable'):
+    assert [entry['sequence'] for entry in disk['pending']] == [2]  # kept for adoption / replay
+    with pytest.raises(WorkerPersistenceError, match='owner_unresponsive'):
         store.close()
 
 
@@ -199,3 +229,43 @@ def test_a_redial_is_never_an_rpc_level_resend(owner, tmp_path):
         rpc('worker.persist', sequence=1, operation='turn.acquire', payload={})
     assert owner.sends == [1]
     wait_until(lambda: rpc.link is None)
+
+
+def test_a_resend_refused_after_a_lost_link_is_confirmed_once(owner, tmp_path):
+    """The resend can race the original still running in the owner (seen with compression.publish
+    resolving its claim target mid-commit): one confirmation, then the answer stands."""
+    store = _store(tmp_path)
+    try:
+        owner.plan = ['drop', 'refuse']
+        assert store.try_acquire_session_turn_lease('s', 'holder') == 'turn.acquire#1'
+        assert owner.sends == [1, 1, 1]
+        assert owner.applied == [(1, 'turn.acquire')]
+        assert store.failure is None
+    finally:
+        store.close()
+
+
+def test_a_refusal_that_holds_on_confirmation_is_final(owner, tmp_path):
+    from agent.runtime_session_store import WorkerOwnerRefusal
+    store = _store(tmp_path)
+    owner.plan = ['drop', 'refuse', 'refuse']
+    with pytest.raises(WorkerOwnerRefusal, match='stale_epoch'):
+        store.try_acquire_session_turn_lease('s', 'holder')
+    assert owner.sends == [1, 1, 1]
+    assert owner.applied == []
+    assert store.failure == 'stale_epoch'
+
+
+def test_a_lease_grant_is_never_retried_past_half_its_ttl(owner, tmp_path):
+    """A grant answered later than half its ttl (or a replayed receipt that old) could already be
+    expired and reclaimed by a successor: the retries stop at ttl / 2 even with budget left."""
+    from agent.runtime_session_store import WorkerLinkLost
+    store = _store(tmp_path)
+    assert store.try_acquire_session_turn_lease('s', 'holder') == 'turn.acquire#1'
+    owner.up, owner.discovery = False, ('inaccessible', 'control_timeout')
+    owner.plan = ['drop']
+    started = time.monotonic()
+    with pytest.raises(WorkerLinkLost, match='owner_unresponsive'):
+        store.refresh_session_turn_lease('s', 'holder', ttl_seconds=1.0)
+    assert 0.4 <= time.monotonic() - started < 2.5  # RECONNECT_BUDGET_S is 5 s here
+    assert [entry['sequence'] for entry in json.loads(store.path.read_text())['pending']] == [2]
