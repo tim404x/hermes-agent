@@ -64,7 +64,9 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
     mark_kwargs: dict = {"delivery_error": d.delivery_error}
     from cron.scheduler_authority import journal_path
     journal = journal_path(job['id'], execution_id)
-    if not job.get('no_agent'):
+    if recovered or not job.get('no_agent'):
+        # Recovery always names the fire: the job may have become script-only since it was admitted,
+        # and without the id its provisional mark (cron/jobs_provisional.py) would count it twice.
         mark_kwargs['execution_id'] = execution_id
     if not d.success and job.pop("_model_unreachable", False):
         # Never-reached-the-model failure: schedule the Cowork-style bounded re-run

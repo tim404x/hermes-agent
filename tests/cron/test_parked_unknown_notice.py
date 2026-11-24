@@ -166,3 +166,110 @@ def test_without_the_built_in_ticker_the_waiter_notifies_at_once(tmp_path, monke
         journal = _unknown_fire(monkeypatch, job, fire)
         _waiter_sees_unknown(monkeypatch, job, fire)
         assert len(sent) == 1 and not journal.with_suffix('.notice').exists()
+
+
+def _waiter_marks_unknown(monkeypatch, job, fire):
+    """The real waiter mark (store write included) of a fire its worker gave up on as unknown."""
+    from cron.scheduler_worker_failure import record_unknown_worker_outcome
+
+    @contextmanager
+    def owns(job_id, expected_owner):
+        yield True
+    monkeypatch.setattr(scheduler, 'fire_claim_fence', owns)
+    claimed = dict(jobs.get_job(job['id']), fire_claim={'by': 'gateway'})
+    jobs.update_job(job['id'], {'fire_claim': claimed['fire_claim']})
+    assert record_unknown_worker_outcome(dict(claimed, execution_id=fire))
+
+
+def _repeat_limited_unknown_fire(tmp_path, monkeypatch):
+    _notices(monkeypatch)
+    job = jobs.create_job(prompt='brief', schedule='every 1h', deliver='local', repeat=2)
+    fire = executions.create_execution(job['id'], source='test')['id']
+    journal = _unknown_fire(monkeypatch, job, fire)
+    _waiter_marks_unknown(monkeypatch, job, fire)
+    marked = jobs.get_job(job['id'])
+    assert marked['repeat']['completed'] == 1 and marked['failure_streak'] == 1  # provisional
+    return job, fire, journal
+
+
+def test_a_recovered_completion_replaces_the_waiters_provisional_mark(tmp_path, monkeypatch):
+    """GPT 6.2 review of t_518dcffd: a job limited to 2 runs became ``completed`` after its FIRST
+    fire, and the run that succeeded still left a failure streak."""
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job, fire, journal = _repeat_limited_unknown_fire(tmp_path, monkeypatch)
+        _peer(monkeypatch, lambda method: {'status': 'terminal', 'job': jobs.get_job(job['id']),
+                                           'result': [True, 'document', 'answer', None]})
+        scheduler_authority.reconcile_pending()
+        assert executions.get_execution(fire)['status'] == 'completed' and not journal.exists()
+        after = jobs.get_job(job['id'])
+        assert after['repeat']['completed'] == 1  # counted once, not twice
+        assert after['state'] != 'completed' and after['enabled'] is True  # one run left, pause lifted
+        assert after['last_status'] == 'ok' and after['failure_streak'] == 0
+        assert after.get('last_failure') is None and after['last_error'] is None
+        assert 'provisional_runs' not in after
+        scheduler_authority.reconcile_pending()  # a replay never counts it again
+        assert jobs.get_job(job['id'])['repeat']['completed'] == 1
+
+
+def test_a_recovered_failure_counts_one_failure_not_two(tmp_path, monkeypatch):
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job, _fire, _journal = _repeat_limited_unknown_fire(tmp_path, monkeypatch)
+        _peer(monkeypatch, lambda method: {'status': 'terminal', 'job': jobs.get_job(job['id']),
+                                           'result': [False, 'document', '', 'model said no']})
+        scheduler_authority.reconcile_pending()
+        after = jobs.get_job(job['id'])
+        assert after['repeat']['completed'] == 1 and after['failure_streak'] == 1
+        assert after['last_status'] == 'error' and 'model said no' in after['last_error']
+        assert 'model said no' in after['last_failure']['detail']
+
+
+def test_an_unknown_recovery_keeps_the_provisional_mark_as_the_only_count(tmp_path, monkeypatch):
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job, fire, _journal = _repeat_limited_unknown_fire(tmp_path, monkeypatch)
+        _peer(monkeypatch, lambda method: {'status': 'unknown', 'result': None})
+        scheduler_authority.reconcile_pending()
+        after = jobs.get_job(job['id'])
+        assert after['repeat']['completed'] == 1 and after['last_status'] == 'error'
+        assert fire in after['provisional_runs']  # still replaceable while the journal exists
+
+
+def test_a_newer_run_keeps_its_outcome_when_an_older_fire_is_recovered(tmp_path, monkeypatch):
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job, _fire, _journal = _repeat_limited_unknown_fire(tmp_path, monkeypatch)
+        newer = executions.create_execution(job['id'], source='test')['id']
+        jobs.update_job(job['id'], {'fire_claim': {'by': 'next-fire'}})
+        assert jobs.mark_job_run(job['id'], False, 'newer broke', execution_id=newer,
+                                 expected_fire_owner='next-fire')
+        jobs.update_job(job['id'], {'fire_claim': {'by': 'third-fire'}})  # a fire in flight now
+        _peer(monkeypatch, lambda method: {'status': 'terminal', 'job': jobs.get_job(job['id']),
+                                           'result': [True, 'document', 'answer', None]})
+        scheduler_authority.reconcile_pending()
+        after = jobs.get_job(job['id'])
+        assert after['repeat']['completed'] == 2  # the two fires, each once
+        assert after['last_error'] == 'newer broke'
+        assert after['fire_claim'] == {'by': 'third-fire'}
+        assert after['canonical_completions'][-1] == newer  # the newer run's delivery still settles
+
+
+def test_a_fire_whose_job_became_script_only_is_still_counted_once(tmp_path, monkeypatch):
+    """Recovery of a ``missing`` admission books the current record; a job edited to script-only
+    since its fire must still name the execution, or its provisional mark counts it twice."""
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job, _fire, _journal = _repeat_limited_unknown_fire(tmp_path, monkeypatch)
+        jobs.update_job(job['id'], {'script': 'w.sh', 'no_agent': True})
+        _peer(monkeypatch, lambda method: {'status': 'missing'})
+        scheduler_authority.reconcile_pending()
+        after = jobs.get_job(job['id'])
+        assert after['repeat']['completed'] == 1 and after['state'] != 'completed'
+        assert after['failure_streak'] == 1 and 'admission missing' in after['last_error']
+
+
+def test_a_fire_without_an_admission_journal_keeps_no_provisional_entry(tmp_path, monkeypatch):
+    _notices(monkeypatch)
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job = jobs.create_job(prompt='brief', schedule='every 1h', deliver='local', repeat=2)
+        fire = executions.create_execution(job['id'], source='test')['id']
+        _unknown_fire(monkeypatch, job, fire).unlink()  # never admitted: nothing will replace it
+        _waiter_marks_unknown(monkeypatch, job, fire)
+        after = jobs.get_job(job['id'])
+        assert after['repeat']['completed'] == 1 and 'provisional_runs' not in after
