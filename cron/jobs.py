@@ -3290,6 +3290,21 @@ def _restore_unclaimed_slot(job: dict[str, Any], scan: _DueScan) -> Optional[str
     return slot
 
 
+# The tick read the update fence before this scan and holds every agent job (``no_agent`` scripts
+# still fire): see ``cron.scheduler_gateway_gate.update_fence_holds_agent_jobs``.
+_agent_dispatch_held: ContextVar[bool] = ContextVar("cron_agent_dispatch_held", default=False)
+
+
+@contextlib.contextmanager
+def agent_dispatch_held(held: bool):
+    """Run a due scan whose agent jobs the tick will hold: they are returned due but untouched."""
+    token = _agent_dispatch_held.set(bool(held))
+    try:
+        yield
+    finally:
+        _agent_dispatch_held.reset(token)
+
+
 def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float) -> bool:
     """Decide whether one enabled, non-terminal job fires this tick, persisting any repairs.
     Ordering matters: recover missing next_run_at, repair timezone shifts, re-arm stale-error
@@ -3338,6 +3353,12 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
 
     # Only the dispatch snapshot carries this field; never infer it from a later stamp.
     job["_scheduled_instant"] = None if manual_run else scheduled_instant(job.get("next_run_at"))
+    if _agent_dispatch_held.get() and not job.get("no_agent"):
+        # Held by the tick (update fence): hand the due job over exactly as booked. Everything
+        # below acts on the slot as if it fires now (re-anchor, catch-up fast-forward + its
+        # counter and missed rows, one-shot retire/claim, pending_slot); a held job does not fire,
+        # so it stays due and meets that policy on the first tick after the fence lifts.
+        return True
 
     if not manual_run and kind == "cron" and _reanchor_stale_cron(d):
         return False
