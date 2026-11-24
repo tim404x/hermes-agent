@@ -186,6 +186,16 @@ def _active_async_delegation_count() -> int:
         return 0
 
 
+def _cron_tail_units(runner) -> list:
+    """Cron turns that finished here but whose firer has not read the receipt yet
+    (``gateway.session_cron.unobserved_cron_units``); empty if it can't be read."""
+    try:
+        from gateway.session_cron import unobserved_cron_units
+        return unobserved_cron_units(runner)
+    except Exception:  # health: allow BLE001 -- a count probe on the stop path must never raise
+        return []
+
+
 class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixin):
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
@@ -1554,6 +1564,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
             max(0, non_cron - self._wedged_chat_agent_count())
             + _active_async_delegation_count()
             + self._restart_wait_cron_counts()["awaitable"]
+            + len(_cron_tail_units(self))
         )
 
     def _describe_active_work(self) -> list:
@@ -1591,6 +1602,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
                               "wedged": job["job_id"] in wedged,
                               "restart_safe": bool(job.get("restart_safe"))})
         units.extend(uncounted_runtime_work_units(self))
+        units.extend(_cron_tail_units(self))
         for kind, count in (("api", self._active_api_run_count()), ("deferred", self._active_deferred_agent_worker_count())):
             units.extend({"kind": kind, "pid": os.getpid()} for _ in range(count))
         with suppress(Exception):
