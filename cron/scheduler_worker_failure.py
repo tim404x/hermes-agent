@@ -28,9 +28,15 @@ def record_unknown_worker_outcome(
         scope_tokens = scheduler._install_fire_secret_scope()
         delivery_error = None
         try:
-            delivery_error, _ = scheduler._deliver_crash_failure(
-                job, error, adapters=adapters, loop=loop
-            )
+            from cron.scheduler_authority import park_unknown_notice
+            # A worker that lost the gateway mid-observation leaves its admission journal: the run
+            # may have completed (a restart cut only the connection). Receipt recovery delivers the
+            # real outcome; the notice waits on the journal and goes out only if that outcome is
+            # unknown. Without a journal nothing will settle it later, so tell the owner now.
+            if not park_unknown_notice(job, job["execution_id"], error):
+                delivery_error, _ = scheduler._deliver_crash_failure(
+                    job, error, adapters=adapters, loop=loop
+                )
         finally:
             scheduler._reset_fire_secret_scope(scope_tokens)
             scheduler.mark_job_run(
