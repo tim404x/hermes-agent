@@ -53,8 +53,16 @@ def make_cron_provider():
 @pytest.fixture(autouse=True)
 def _no_managed_store(tmp_path, monkeypatch):
     """Point PM's store at an empty dir: script runs must not select the host install's
-    dependency venv (POSIX cron scripts run on it when a store is committed)."""
+    dependency venv (POSIX cron scripts run on it when a store is committed).
+
+    The checkout is not a sealed payload either: every script run probes
+    ``<checkout>/../manifest.json`` (``pm.environments._payload_manifest``), which is the real
+    Hermes home itself for the default install (``~/.hermes/hermes-agent``) and inside it for any
+    worktree under ``~/.hermes``. There the home I/O guard refuses the read, the script run fails,
+    and every no-agent job looks like it never fired. The answer must not depend on where the
+    checkout lives."""
     monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "no-pm-store"))
+    monkeypatch.setattr("pm.environments._payload_manifest", lambda root: None)
 
 
 @pytest.fixture(autouse=True)
