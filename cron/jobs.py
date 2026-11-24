@@ -2468,6 +2468,7 @@ def mark_job_run(
     ladder_rung: bool = False,
     quota_hold_seconds: Optional[float] = None,
     recover_consumed_fire: bool = False,
+    provisional: bool = False,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached. A manual run
@@ -2490,11 +2491,20 @@ def mark_job_run(
     it on every tick. ``recover_consumed_fire`` lets a scheduled sparse cron recover its
     consumed fire when the provider reopens; manual runs retain the natural schedule
     (cron/quota_hold.py, #89376).
+
+    ``provisional`` (with ``execution_id``): a stand-in outcome for a fire whose real outcome
+    receipt recovery may still book (a restart-safe worker gave up as ``unknown`` while its
+    admission journal exists). It counts the fire and retires its claim as usual, and the later
+    canonical mark for the same execution REPLACES its outcome instead of counting the fire again
+    (``cron/jobs_provisional.py``).
     """
+    from cron import jobs_provisional
+
     def apply(jobs, _i, job):
         if execution_id is not None and execution_id in job.get("canonical_completions", []):
             return True
-        if expected_fire_owner is not None:
+        replacing = not provisional and jobs_provisional.take(job, execution_id)
+        if expected_fire_owner is not None and not replacing:
             claim = job.get("fire_claim")
             if not isinstance(claim, dict) or claim.get("by") != expected_fire_owner:
                 logger.warning(
@@ -2502,17 +2512,34 @@ def mark_job_run(
                     job_id)
                 return False
         now = _hermes_now().isoformat()
-        extra = extra_fire.is_extra(job)  # read before the outcome clears the claim
-        held = extra_fire.held_markers(job) if extra else {}
-        _record_run_outcome(job, success, error, delivery_error, status, now)
-        job.update(held)  # a run-now queued mid-run is its own fire, not this one
-        if execution_id is not None:  # retire ids recovery can no longer replay; latest stays last
+        if replacing:
+            # The provisional mark already counted this fire, advanced the schedule and retired
+            # its claim: only the outcome changes. Claims and a manual run queued since then
+            # belong to newer fires and stay.
+            if not jobs_provisional.replace_outcome(
+                    job, replacing,
+                    lambda: _record_run_outcome(job, success, error, delivery_error, status, now)):
+                # A newer run was booked since: its outcome, ladders and delivery settlement
+                # (``canonical_completions[-1]``) stay; this id is kept only so a replay is a no-op.
+                job["canonical_completions"] = [execution_id, *(job.get("canonical_completions") or [])]
+                save_jobs(jobs)
+                return True
+        else:
+            extra = extra_fire.is_extra(job)  # read before the outcome clears the claim
+            held = extra_fire.held_markers(job) if extra else {}
+            before = jobs_provisional.snapshot(job) if provisional else None
+            _record_run_outcome(job, success, error, delivery_error, status, now)
+            job.update(held)  # a run-now queued mid-run is its own fire, not this one
+            if provisional and execution_id is not None:
+                jobs_provisional.remember(job, execution_id, before)
+            if extra:  # a manual run: repeat budget and pending occurrence untouched
+                extra_fire.settle(job, now)
+            else:
+                _advance_after_run(job, now, ladder_rung=ladder_rung)
+        if execution_id is not None and not provisional:
+            # Retire ids recovery can no longer replay; latest stays last.
             from cron.scheduler_authority import replayable_completions as live
             job["canonical_completions"] = [*live(job_id, job.get("canonical_completions")), execution_id]
-        if extra:  # a manual run: repeat budget and pending occurrence untouched
-            extra_fire.settle(job, now)
-        else:
-            _advance_after_run(job, now, ladder_rung=ladder_rung)
         from cron import quota_hold
         from cron.unreachable_retry import clear_state, plan_retry
 
