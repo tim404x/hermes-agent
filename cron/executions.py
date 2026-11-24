@@ -407,7 +407,7 @@ def record_missed_occurrences(
     return record
 
 
-def recover_receipted_execution(execution_id, job_id, *, success, error=None, delivery_outcome=None):
+def recover_receipted_execution(execution_id, job_id, *, success, error=None, delivery_outcome=None, cancelled=False):
     """Settle a verified canonical receipt after owner loss, including its unknown audit row.
 
     Terminal verdicts stay immutable. A live firer still owns its bookkeeping
@@ -424,7 +424,7 @@ def recover_receipted_execution(execution_id, job_id, *, success, error=None, de
         conn.execute(
             """UPDATE executions SET status=?, finished_at=?, error=?, handoff_pending=0,
                handoff_started_at=NULL, delivery_outcome=? WHERE id=?""",
-            ('completed' if success else 'failed', now, detail, delivery_outcome, execution_id))
+            ('cancelled' if cancelled else ('completed' if success else 'failed'), now, detail, delivery_outcome, execution_id))
         _prune_unlocked(conn)
         record = _fetch(conn, execution_id)
     _emit_execution_state(record, delivery_outcome=delivery_outcome)

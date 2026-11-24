@@ -2864,7 +2864,8 @@ def claim_job_for_fire(
         # scheduler tick ``next_run_at`` is the NEXT occurrence, not the one being run, so
         # stamping it would make completed_occurrence() skip that slot when it arrives.
         manual_fire = force or manual or job.get("manual_run_at") == job.get("next_run_at")
-        instant = None if manual_fire else scheduled_instant(job.get("next_run_at"))
+        raw_slot = job.get("next_run_at")
+        instant = None if manual_fire else scheduled_instant(raw_slot)
         # A scheduled tick only ever fires when now >= next_run_at
         # (_evaluate_due_job returns False while the stored occurrence is still
         # in the future), so a claim arriving BEFORE the stored next occurrence
@@ -2904,7 +2905,10 @@ def claim_job_for_fire(
             if nxt:
                 job["next_run_at"] = nxt
         save_jobs(jobs)
-        return dict(copy.deepcopy(job), _scheduled_instant=instant) if return_job else True
+        if not return_job:
+            return True
+        return dict(copy.deepcopy(job), _scheduled_instant=instant,
+                    _refused_slot=raw_slot if instant or raw_slot == job.get("manual_run_at") else None)
 
     return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
 
@@ -3292,7 +3296,7 @@ def _restore_unclaimed_slot(job: dict[str, Any], scan: _DueScan) -> Optional[str
 
 # The tick read the update fence before this scan and holds every agent job (``no_agent`` scripts
 # still fire): see ``cron.scheduler_gateway_gate.update_fence_holds_agent_jobs``.
-_agent_dispatch_held: ContextVar[bool] = ContextVar("cron_agent_dispatch_held", default=False)
+_agent_dispatch_held: ContextVar[Optional[bool]] = ContextVar("cron_agent_dispatch_held", default=None)
 
 
 @contextlib.contextmanager
@@ -3365,7 +3369,8 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     grace = _compute_grace_seconds(d.schedule, job.get("grace_minutes"))
     from cron.missed_runs import fast_forward_missed_recurring, retire_expired_oneshot
 
-    if not manual_run and recurring and fast_forward_missed_recurring(d, grace):
+    if not manual_run and recurring and fast_forward_missed_recurring(
+            d, grace, worker_books=(_agent_dispatch_held.get() is False and not job.get("no_agent"))):
         return False
     if kind == "once":
         if retire_expired_oneshot(d) or _oneshot_dispatch_limit_reached(job, scan):

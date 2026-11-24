@@ -281,6 +281,14 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
     except Exception as exc:
         if attempted:
             raise CronExecutionUnknown(f'Cron execution unverified; reconcile {journal}: {exc}') from exc
+        from hermes_cli.gateway_client import GatewayUnavailableError
+        from cron.update_refusal import UpdateRefusedBeforeSubmit
+        if (isinstance(exc, GatewayUnavailableError) and exc.state == 'draining'
+                and exc.reason_code == 'update_paused' and job.get('fire_claim')
+                and not job.get('_monitor_source_started')):
+            # No prior journal, no submit, and no user monitor source ran in this worker.
+            # A terminal result with exactly this text (or a disconnect after submit) is NOT proof.
+            raise UpdateRefusedBeforeSubmit(str(exc)) from exc
         error = f'{error_type_name(exc)}: {exc}'
         return False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error
 
@@ -316,6 +324,13 @@ def reconcile_pending(*, allow_connect=True):
             if execution_owner_live(params['request_id'], params['job_id']):
                 # Its firer (this process included) still owns the row and its tail: re-saving the
                 # output or re-marking the job on every tick would duplicate its side effects.
+                continue
+            if 'update_refused' in record:
+                from cron.update_refusal import settle_refusal
+                fire = record['update_refused']
+                if (fire['id'], fire['execution_id']) != (params['job_id'], params['request_id']):
+                    raise ValueError('cron refusal identity conflict')
+                settle_refusal(fire, recovered=True)
                 continue
             row = get_execution(params['request_id'])
             if row is not None and row['job_id'] == params['job_id'] and row['status'] in FIRER_FINISHED_STATES:

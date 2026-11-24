@@ -3318,6 +3318,9 @@ def _run_one_job_body(
         if outcome is None:  # an operator cancel stopped it and is already booked
             return True
         success, output, final_response, error = outcome
+        if job.get("_catch_up_report"):
+            from cron.missed_runs import book_catch_up
+            book_catch_up(job, job["_catch_up_report"])
 
         if _fire_claim_ownership_lost():
             _teardown_deferred()
@@ -3378,6 +3381,12 @@ def _run_one_job_body(
 
     except BaseException as e:
         from cron.scheduler_authority import CronExecutionUnknown
+        from cron.update_refusal import UpdateRefusedBeforeSubmit, settle_refusal
+        if isinstance(e, UpdateRefusedBeforeSubmit):
+            # Cancel the transport attempt, not the job; the waiter must not book it again.
+            detail = settle_refusal(job)
+            logger.warning("Cron %s: %s", job["id"], detail)
+            return True
         if isinstance(e, CronExecutionUnknown):
             from cron.executions import give_up_execution
             from cron.jobs_error_text import sanitize_persisted_error
@@ -4205,6 +4214,10 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    from cron.update_refusal import attach_tick_slot
+    attach_tick_slot(claimed_job, job)
+    if job.get("_catch_up_report"):
+        claimed_job["_catch_up_report"] = job["_catch_up_report"]
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 

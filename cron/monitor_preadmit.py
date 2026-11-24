@@ -263,6 +263,7 @@ def preadmit_monitor_decision(job: dict, *, extra_prompt: Optional[str] = None,
         from cron.monitor import peek_monitor
 
         with _owner_like_scope():
+            job["_monitor_source_started"] = True  # this user source may have side effects, even on error
             peek = peek_monitor(fresh)
     except Exception as exc:
         record_decision(job_id, "admit", reason=f"peek_unavailable:{type(exc).__name__}",

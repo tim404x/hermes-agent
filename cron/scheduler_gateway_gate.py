@@ -65,6 +65,8 @@ def _note_fire_refused(job_ids, detail: str, *, update_slots=None) -> None:
                 slot = update_slots[job['id']]
                 if not slot or slot != job.get('next_run_at') or job.get('run_claim') or job.get('fire_claim'):
                     continue
+                if held_update_slot(job, now.timestamp(), 2 * TICK_SLACK_SECONDS):
+                    error['update_slot'] = slot  # preserve a worker's proof through subsequent held ticks
                 if (job.get('schedule') or {}).get('kind') == 'once':
                     due = _parse_aware(slot)
                     age = now.timestamp() - due.timestamp() if due is not None else float('inf')
