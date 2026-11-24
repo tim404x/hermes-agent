@@ -50,6 +50,14 @@ def _classify_delivery_outcome(
     return "suppressed"
 
 
+def _other_incarnation(job) -> bool:
+    """True when the stored record with *job*'s id was created after the fire's job was."""
+    from cron.jobs import get_job
+    current = get_job(job["id"])
+    created = job.get("created_at")
+    return current is not None and bool(created) and current.get("created_at") != created
+
+
 def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, recovered=False,
                          lift_pause=None, recovered_claim=None) -> bool:
     """mark_job_run (owner-fenced) + execution ledger row for a run that reached delivery.
@@ -58,7 +66,9 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
     ``cron.scheduler`` facade, which is where tests and the receipt-recovery path patch them.
     ``lift_pause``: receipt recovery's record of the pause this fire's unknown outcome caused;
     the mark lifts it in the same write, before the retry ladder and quota hold plan.
-    ``recovered_claim``: the fire claim the recovered fire held, so a newer fire's claim survives."""
+    ``recovered_claim``: the fire claim the recovered fire held, so a newer fire's claim survives.
+    False for a recovered fire whose booking must be retried: its mark was refused while the job
+    still exists, or a live foreign firer still owns its ledger row."""
     from cron import scheduler
     job = d.job
     if not d.should_deliver and job.get("last_delivery_queued"):
@@ -91,18 +101,42 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
         mark_kwargs["recover_consumed_fire"] = bool(job.get("_scheduled_instant"))
     if d.success and not d.delivery_error and d.should_deliver and job.get("last_delivery_queued"):
         mark_kwargs["status"] = "delivery_queued"
+        if recovered:
+            # A drain may have finished this send while the booking waited (a refused mark is
+            # retried later), and its settlement only lands on the latest ledger attempt: book
+            # the known verdict now instead of a queued one a newer attempt would strand.
+            from cron.delivery_outcome import _terminal
+            terminal = _terminal(execution_id)
+            if terminal is not None:
+                del mark_kwargs["status"]
+                mark_kwargs["delivery_error"] = terminal[1]
     if fire_owner is not None:
         mark_kwargs["expected_fire_owner"] = fire_owner
     if d.blocked_config:
         mark_kwargs["status"] = "blocked_config"
+    # A recovered fire of a job removed and re-created under the same id (a definition
+    # re-import) is not the current record's run: settle its ledger row only, as for a removal.
+    other_record = recovered and _other_incarnation(job)
     # A run that removed its own record has nothing left to mark; the delivery above is its result.
-    marked = scheduler.self_removal_delivery_allowed(job["id"]) or scheduler.mark_job_run(
-        job["id"], d.success, d.error, **mark_kwargs)
+    marked = not other_record and (
+        scheduler.self_removal_delivery_allowed(job["id"]) or scheduler.mark_job_run(
+            job["id"], d.success, d.error, **mark_kwargs))
     if fire_owner is not None and not marked:
         scheduler.finish_execution(
             execution_id, success=False,
             error="Fire claim ownership lost before terminal completion.")
         return True
+    if recovered and not marked and not other_record:
+        from cron.jobs import get_job
+        if get_job(job["id"]) is not None:
+            # The fence timed out (a newer fire holds it): the outcome is not booked. Keep the
+            # journal and the ledger row unsettled so the next tick books it from the journal's
+            # booking stamp (``scheduler_authority``), never delivering again. A removed job has
+            # nothing left to book: finalize below as before.
+            scheduler.logger.warning(
+                "Cron %s receipt recovery: booking of %s refused (fire fence busy); retrying next tick",
+                job["id"], execution_id)
+            return False
     delivery_outcome = _classify_delivery_outcome(
         delivery_error=d.delivery_error,
         delivery_queued=job.get("last_delivery_queued"),
@@ -119,8 +153,11 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
     if delivery_outcome == "queued":
         # A drain that already finished this send (cron/delivery_outcome.py) is the real outcome.
         delivery_outcome = settled_outcome(execution_id) or "queued"
-    if delivery_outcome in ("delivered", "not_configured") and not d.success:
+    if delivery_outcome in ("delivered", "not_configured") and not d.success and not (
+            recovered and job.get("last_delivery_queued")):
         # Failure ping left the process (or had a configured target): mark the incident alerted.
+        # A recovered queued send is acked by the drain that sent it; acking it again here, maybe
+        # a deferred booking later, could reopen an incident a newer run has resolved since.
         scheduler._mark_incident_alerted(d.failure_incident_id)
     from functools import partial
     from cron.executions import FIRER_FINISHED_STATES, get_execution, recover_receipted_execution
