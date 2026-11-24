@@ -53,25 +53,69 @@ def _skill_usage():
     return skill_usage
 
 
+def _skill_mds(base) -> Iterable[str]:
+    """Every ``SKILL.md`` under *base* that :func:`is_excluded_skill_path` can keep, from one
+    ``os.scandir`` walk that never enters a subtree whose every ``SKILL.md`` it would exclude: a
+    VCS/dependency/cache dir, or a support dir (references/templates/assets/scripts) beside a
+    ``SKILL.md``. Symlinked directories are listed but not entered, as ``Path.rglob`` does.
+
+    This guard runs on every terminal, write_file and patch call of every in-process agent. A full
+    ``rglob`` walked each skill's support trees too (~19k entries, ~80 ms of GIL-held Python per call
+    on Tim's profile) and was the largest GIL consumer in the gateway owner (20% of GIL samples,
+    24 Nov 2026), starving its event loop into >10 s stalls."""
+    from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
+    pending = [os.fspath(base)]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as listing:
+                entries = sorted(listing, key=lambda entry: entry.name)
+        except OSError:
+            continue
+        marker = next((entry for entry in entries if entry.name == "SKILL.md"), None)
+        if marker is not None:
+            yield marker.path  # rglob yields the name, even a dangling link
+        # The support-dir exclusion asks ``(dir / "SKILL.md").exists()``: a dangling marker does not count.
+        supports = marker is not None and os.path.exists(marker.path)
+        subdirs = []
+        for entry in entries:
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            if entry.name in EXCLUDED_SKILL_DIRS or (supports and entry.name in SKILL_SUPPORT_DIRS):
+                continue
+            subdirs.append(entry.path)
+        pending.extend(reversed(subdirs))  # depth-first in name order
+
+
 def _skill_dirs(names: set[str] | None) -> list[tuple[str, str]]:
     """``(name, realpath)`` of skills in the active profile from ONE walk of the skills dirs; *names*
     limits the result to them (None = every skill). Locks are keyed by directory name, so no
-    frontmatter is read."""
+    frontmatter is read. The first skills dir holding a name wins, as before; inside it every
+    directory of that name is listed (two categories can hold the same name, and which one a
+    filesystem walk meets first is arbitrary: a lock on the name covers both)."""
     if names is not None and not names:
         return []
+    from pathlib import Path
     from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
-    found: dict[str, str] = {}
+    found: set[tuple[str, str]] = set()
+    claimed: set[str] = set()
     for base in get_all_skills_dirs():
         if not base.is_dir():
             continue
-        for skill_md in base.rglob("SKILL.md"):
-            name = skill_md.parent.name
+        here: set[tuple[str, str]] = set()
+        for skill_md in _skill_mds(base):
+            name = os.path.basename(os.path.dirname(skill_md))
             if names is not None and name not in names:
                 continue
-            if name in found or is_excluded_skill_path(skill_md, root=base):
+            if name in claimed or is_excluded_skill_path(Path(skill_md), root=base):
                 continue
-            found[name] = os.path.realpath(skill_md.parent)
-    return sorted(found.items())
+            here.add((name, os.path.realpath(os.path.dirname(skill_md))))
+        found |= here
+        claimed |= {name for name, _ in here}
+    return sorted(found)
 
 
 def _guard_state() -> tuple[list[tuple[str, str]], str | None]:
