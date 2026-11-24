@@ -2,11 +2,27 @@
 import asyncio
 import hashlib
 import json
+import logging
+import time
 import uuid
 
 
 class CronExecutionUnknown(RuntimeError):
     """The owner may have accepted this fire; never book it as failed or re-fire."""
+
+
+# How long a firer whose gateway connection dropped mid-fire keeps redialing (backoff from
+# RECONNECT_FIRST_DELAY_S, capped at RECONNECT_MAX_DELAY_S) before it gives the fire up as
+# unknown. Covers a stalled owner loop and a gateway restart; a gateway down longer fails closed.
+RECONNECT_BUDGET_S = 600.0
+RECONNECT_FIRST_DELAY_S, RECONNECT_MAX_DELAY_S = 0.5, 30.0
+
+
+class _ConnectionLost(Exception):
+    """An observer RPC lost its socket (disconnect, reply timeout): the owner never answered, so
+    nothing is known about the fire. Not a ``GatewayClientError`` subclass on purpose:
+    ``connect_gateway`` then lets it through unchanged, so it is never mistaken for a failure of
+    the firer's own work (a journal write) that the dial wraps the same way."""
 
 
 def journal_path(job_id, request_id):
@@ -213,34 +229,65 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
         # write (file and directory) waits in a worker, and still completes before the next step.
         await asyncio.to_thread(write_journal)
 
-    async def observe(call):
-        nonlocal attempted
+    async def refuse(exc):
+        """The owner answered the submit with an error and holds no admission: the booked failure."""
+        error = f'{error_type_name(exc)}: {exc}'
+        result = [False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error]
+        record['refusal'] = result
+        record['job'] = dict(job)
+        await save()
+        return tuple(result)
+
+    # A submit the owner answered with an error, and the last owner progress stamp mirrored into
+    # our ledger row: both outlive a dropped connection (a redial must neither forget the refusal
+    # nor re-stamp a wedged run's unchanged progress as fresh).
+    answered = progress = None
+
+    async def submit(call):
+        nonlocal attempted, answered
         attempted = True
         await save()
         try:
-            receipt = await call('submit', params)
+            return await call('submit', params)
         except Exception as exc:
             from hermes_cli.gateway_client import GatewayRPCError
             # A returned owner exception is definite; a transport disconnect is not. Even an
             # owner error after commit must retain the admitted identity, so verify its absence.
             if owner is not None or isinstance(exc, GatewayRPCError):
+                answered = exc  # the owner finished handling this submit: none of it is in flight
                 state = await call('recover', params)
                 if state['status'] == 'missing':
-                    error = f'{error_type_name(exc)}: {exc}'
-                    result = [False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error]
-                    record['refusal'] = result
-                    record['job'] = dict(job)
-                    await save()
-                    return tuple(result)
+                    return await refuse(exc)
                 if state['status'] not in {'queued', 'started', 'terminal'}:
                     raise
                 # Admitted before the answer was lost: observe it through the recovered receipt.
-                receipt = {'session_id': state['session_id'], 'admission_id': state['admission_id']}
-            else:
-                raise
-        record['receipt'] = receipt
-        await save()
-        delay, progress = .1, None
+                return {'session_id': state['session_id'], 'admission_id': state['admission_id']}
+            raise
+
+    async def readmit(call):
+        """A reconnect's receipt for a fire whose submit answer went down with the socket: read
+        back by ``recover``, never submitted again. ``missing`` cannot prove a lost submit is not
+        still in flight on the owner, so it fails closed and leaves the journal to receipt recovery;
+        only a submit the owner already answered with an error (``answered``) books that refusal."""
+        state = await call('recover', params)
+        if state['status'] == 'missing' and answered is not None:
+            return await refuse(answered)
+        if state['status'] not in {'queued', 'started', 'terminal'}:
+            raise CronExecutionUnknown(f'cron admission {state["status"]} after the gateway connection dropped')
+        return {'session_id': state['session_id'], 'admission_id': state['admission_id']}
+
+    async def observe(call, *, resumed=False):
+        """Admit the fire (``resumed``: on a fresh connection after a drop, from the saved receipt
+        or ``recover``) and poll its receipt to the outcome."""
+        nonlocal progress
+        receipt = record['receipt'] if resumed else None
+        if receipt is None:
+            receipt = await (readmit if resumed else submit)(call)
+            if isinstance(receipt, tuple):
+                return receipt  # the owner refused the submit: the booked failure
+            record['receipt'] = receipt
+            await save()
+        delay = .1
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 await call('cancel', receipt)
@@ -263,8 +310,48 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
             delay = min(delay * 2, 2.0)
 
     async def remote():
-        async with connect_gateway() as client:
-            return await observe(lambda op, data: client.rpc('cron.' + op, **data))
+        """Observe over the gateway socket. The one socket lives for the whole agent turn (30+ min);
+        once the fire is journaled, a lost socket says nothing about the run (a stalled owner loop
+        failed a ``cron.status`` reply, 24 Nov 2026): redial with backoff and resume from the saved
+        receipt, never submitting again. Only a gateway unreachable for ``RECONNECT_BUDGET_S``
+        gives the fire up as unknown."""
+        from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError
+        resumed, lost_at, backoff = False, None, RECONNECT_FIRST_DELAY_S
+        while True:
+            dialed = False
+            try:
+                async with connect_gateway() as client:
+                    dialed = True
+
+                    async def call(op, data):
+                        nonlocal lost_at, backoff
+                        try:
+                            answer = await client.rpc('cron.' + op, **data)
+                        except GatewayRPCError:
+                            raise  # the owner answered: definite, never a reason to redial
+                        except (GatewayClientError, OSError, TimeoutError) as exc:
+                            raise _ConnectionLost(str(exc) or error_type_name(exc)) from exc
+                        if op != 'cancel':  # only an observation proves the owner is back
+                            lost_at, backoff = None, RECONNECT_FIRST_DELAY_S
+                        return answer
+                    return await observe(call, resumed=resumed)
+            except Exception as exc:
+                # A dial refused before anything was journaled is no attempt at all. A failed redial
+                # (refused ticket, upgrade cut by a restarting owner) is transport like a lost socket;
+                # out of an open connection anything else is final: an owner answer, the firer's own
+                # journal write, or ``CronExecutionUnknown``.
+                if not attempted or (dialed and not isinstance(exc, _ConnectionLost)):
+                    raise
+                now = time.monotonic()
+                lost_at = now if lost_at is None else lost_at
+                left = RECONNECT_BUDGET_S - (now - lost_at)
+                if left <= 0:
+                    raise
+                logging.getLogger(__name__).warning(
+                    'Cron %s: gateway connection lost while observing execution %s (%s); redialing in %.1fs '
+                    '(%.0fs of reconnect budget left)', job['id'], request_id, exc, min(backoff, left), left)
+                await asyncio.sleep(min(backoff, left))
+                resumed, backoff = True, min(backoff * 2, RECONNECT_MAX_DELAY_S)
 
     try:
         if owner is not None:

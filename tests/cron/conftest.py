@@ -66,6 +66,16 @@ def _no_managed_store(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _short_observer_reconnect_budget(monkeypatch):
+    """A firer whose gateway socket drops redials for up to ``RECONNECT_BUDGET_S`` (10 min) before it
+    gives the fire up as unknown. Tests whose fake gateway stays disconnected assert that fail-closed
+    outcome; they still walk the redial path, only against a budget measured in milliseconds."""
+    from cron import scheduler_authority
+    monkeypatch.setattr(scheduler_authority, "RECONNECT_BUDGET_S", 0.2)
+    monkeypatch.setattr(scheduler_authority, "RECONNECT_FIRST_DELAY_S", 0.01)
+
+
+@pytest.fixture(autouse=True)
 def _default_cron_test_model(monkeypatch):
     """Pin a default HERMES_MODEL so cron run_job tests have a resolvable model."""
     monkeypatch.setenv("HERMES_MODEL", "test-cron-default-model")
