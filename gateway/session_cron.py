@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import threading
+import time
 
 from gateway.session_contract import SessionActor, SessionRef
 from gateway.session_persistence import authority_persistence
@@ -19,6 +20,55 @@ from persistence.core.errors import AuthorityRefusal
 
 _execution: ContextVar[tuple | None] = ContextVar('cron_owner_execution', default=None)
 _owners = {}
+
+# How long a finished cron turn holds a restart-when-idle wait for its firer to read the terminal
+# receipt. The firer polls ``status`` at most every 2 s; a firer that never comes back (crashed
+# worker) stops holding after this, and receipt recovery settles its run after the restart.
+CRON_TAIL_GRACE_S = 60.0
+# After the owner answers a terminal ``status``/``recover``, the reply still has to leave on the
+# firer's connection: keep holding this long so a restart can't close the socket under it.
+CRON_TAIL_ACK_LINGER_S = 3.0
+
+
+def _unobserved(authority):
+    """``admission_id -> (monotonic deadline, job_id, session_id)`` for cron turns this owner
+    executed whose firer has not yet received the terminal receipt."""
+    unobserved = getattr(authority, '_cron_unobserved', None)
+    if unobserved is None:
+        unobserved = authority._cron_unobserved = {}
+    return unobserved
+
+
+def _note_terminal_read(authority, admission_id):
+    """The firer is being answered with the outcome: release its hold once the reply has left."""
+    unobserved = _unobserved(authority)
+    held = unobserved.get(admission_id)
+    if held is not None:
+        unobserved[admission_id] = (min(held[0], time.monotonic() + CRON_TAIL_ACK_LINGER_S),) + held[1:]
+
+
+def unobserved_cron_units(runner):
+    """One restart-wait unit per cron turn that finished here but whose firer has not received the
+    result yet (a restart-safe worker polls ``cron.status`` over the gateway connection).
+
+    The turn itself holds the wait while it executes (an executing session); the scheduler's
+    in-flight key of a scoped worker does not (``get_restart_wait_cron_counts``: the worker outlives
+    the gateway). Between the turn ending and the worker's next poll neither held it, so a deferred
+    restart stopped the gateway in that gap: the worker lost its connection before it saw the
+    receipt, gave up as ``unknown``, paused the job and sent a false failure notice (morning brief,
+    24 Nov 2026). Bounded by ``CRON_TAIL_GRACE_S`` per turn."""
+    from gateway.session_authorities import all_authorities
+    now = time.monotonic()
+    units = []
+    for authority in all_authorities(runner):
+        unobserved = getattr(authority, '_cron_unobserved', None) or {}
+        for admission_id, (deadline, job_id, session_id) in list(unobserved.items()):
+            if now >= deadline:
+                unobserved.pop(admission_id, None)
+                continue
+            units.append({'kind': 'cron_tail', 'job_id': job_id, 'session': session_id,
+                          'id': admission_id, 'pid': os.getpid()})
+    return units
 
 
 def bind_owner(authority):
@@ -237,6 +287,8 @@ async def operation(authority, name, params, actor=None):
         return {'ok': True}
     result, flags = None, {}
     if row['status'] == 'terminal':
+        # The firer is answered with the outcome: its turn stops holding a restart once it has left.
+        _note_terminal_read(authority, row['admission_id'])
         result = saved['result'].get('cron_result') if saved else None
         flags = (saved['result'].get('cron_job_flags') or {}) if saved else {}
         if result is None:
@@ -336,3 +388,5 @@ async def execute(authority, ref, row, policy):
         owner_progress.pop(execution_id, None)
         _execution.reset(token)
         cancellations.pop(row['admission_id'], None)
+        # Hold a restart until the firer reads this turn's receipt (bounded): see unobserved_cron_units.
+        _unobserved(authority)[row['admission_id']] = (time.monotonic() + CRON_TAIL_GRACE_S, job['id'], ref.session_id)

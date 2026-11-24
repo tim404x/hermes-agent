@@ -52,6 +52,77 @@ def _lift_pause(job_id, pause):
             pass
 
 
+# A parked notice is retried this many times when its delivery fails, then dropped with a warning.
+_PARKED_NOTICE_ATTEMPTS = 3
+
+
+def _notice_path(journal):
+    """Sidecar of an admission journal holding its parked unknown-outcome notice. Its own file, so
+    recovery's journal rewrites (``pause_recorded``) can never drop it, and not ``*.json``, so the
+    journal scan never reads it as an admission."""
+    return journal.with_suffix('.notice')
+
+
+def _builtin_ticker():
+    """Receipt recovery (``reconcile_pending``) runs only in the built-in ticker's housekeeping."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        name = (cfg_get(load_config(), 'cron', 'provider', default='') or '').strip()
+    except Exception:
+        return True
+    return name in ('', 'builtin', 'in-process', 'inprocess')
+
+
+def park_unknown_notice(job, execution_id, notice):
+    """Hold the failure notice of a fire whose firer gave up as unknown while its admission journal
+    still exists: the owner may have finished the run (a restart cut only the firer's connection), and
+    receipt recovery (``reconcile_pending``) books and delivers the real outcome. The notice goes out
+    only if recovery settles the fire ``unknown``. False (send it now) when there is no journal or no
+    built-in ticker to run that recovery."""
+    from utils import atomic_json_write
+    journal = journal_path(job['id'], execution_id)
+    if not journal.exists() or not _builtin_ticker():
+        return False
+    snapshot = json.loads(json.dumps(dict(job), default=str))
+    atomic_json_write(_notice_path(journal), {'notice': str(notice or ''), 'job': snapshot, 'attempts': 0},
+                      mode=0o600, fsync_dir=True)
+    return True
+
+
+def _send_parked_notice(journal):
+    """Deliver a parked unknown-outcome notice once recovery proved the outcome is really unknown.
+    Sent first and cleared after, so a crash can repeat it but never lose it; a failing delivery is
+    retried on later ticks, ``_PARKED_NOTICE_ATTEMPTS`` times at most."""
+    import logging
+    from cron import scheduler
+    from cron.jobs import get_job
+    from utils import atomic_json_write
+    path = _notice_path(journal)
+    try:
+        parked = json.loads(path.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError):
+        return
+    job = dict(parked.get('job') or {})
+    current = get_job(job.get('id')) if job.get('id') else None
+    job = dict(current or job, execution_id=job.get('execution_id'))  # a removed one-shot keeps its snapshot
+    tokens = scheduler._install_fire_secret_scope()
+    try:
+        delivery_error, _ = scheduler._deliver_crash_failure(job, parked.get('notice') or '', adapters=None, loop=None)
+    except Exception as exc:  # health: allow BLE001 -- retried on the next tick
+        delivery_error = str(exc)
+    finally:
+        scheduler._reset_fire_secret_scope(tokens)
+    attempts = int(parked.get('attempts') or 0) + 1
+    if not delivery_error or attempts >= _PARKED_NOTICE_ATTEMPTS:
+        if delivery_error:
+            logging.getLogger(__name__).warning(
+                'Cron %s unknown-outcome notice not delivered after %d attempts: %s', job.get('id'), attempts, delivery_error)
+        path.unlink(missing_ok=True)
+    else:
+        parked['attempts'] = attempts
+        atomic_json_write(path, parked, mode=0o600, fsync_dir=True)
+
+
 def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id=None):
     from gateway.session_cron import owner_for_home, operation
     from hermes_cli.gateway_client import connect_gateway
@@ -170,6 +241,9 @@ def reconcile_pending(*, allow_connect=True):
     import logging
 
     root = get_hermes_home() / 'cron' / 'admissions'
+    for parked in root.glob('*.notice'):
+        if not parked.with_suffix('.json').exists():
+            parked.unlink(missing_ok=True)  # its fire was settled: the real outcome went out instead
     for journal in sorted(root.glob('*.json')):
         try:
             record = json.loads(journal.read_text(encoding='utf-8-sig'))
@@ -212,6 +286,10 @@ def reconcile_pending(*, allow_connect=True):
                 state = {'status': 'terminal', 'job': current,
                          'result': [False, f'# Cron Job: {params["job_id"]} (FAILED)\n\n{error}\n', '', error]}
             if state['status'] != 'terminal':
+                if state['status'] == 'unknown' and _notice_path(journal).exists():
+                    # Recovery confirmed the outcome is unknown: the parked notice is true now. Sent
+                    # before the pause below, which a finished one-shot refuses.
+                    _send_parked_notice(journal)
                 if state['status'] == 'unknown' and not record.get('pause_recorded'):
                     reason = 'Canonical cron unknown; no automatic re-execution'
                     record['pause_recorded'] = _pause_identity(pause_job(params['job_id'], reason=reason))
