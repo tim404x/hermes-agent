@@ -50,6 +50,40 @@ def replayable_completions(job_id, completions):
     return [eid for eid in completions or () if journal_path(job_id, eid).exists()]
 
 
+def _booking_stamp(delivery, recovered_claim, aged_at):
+    """What booking a recovered fire needs once its output is saved and its notice delivered: the
+    job as composed (run flags included) and the delivery verdicts. Stamped on the journal before
+    the booking, so a booking the store refuses (a newer fire holds the fire fence past its
+    timeout) is retried from it on the next tick without saving or delivering the output again,
+    and without asking the owner, which may have forgotten the admission by then. ``aged_at``: when
+    the quota hold was last aged, so a retry holds only what is left of the window."""
+    from dataclasses import fields
+
+    from cron.jobs_error_text import sanitize_persisted_error
+    from cron.quota_hold import HOLD_FROM_KEY
+    job = json.loads(json.dumps(dict(delivery.job), default=str))
+    if job.get('_quota_hold_seconds'):
+        job[HOLD_FROM_KEY] = aged_at
+    if not delivery.should_deliver:
+        # The first booking clears a stale receipt; a retry must not clear a newer fire's.
+        job['last_delivery_queued'] = None
+    verdicts = {f.name: getattr(delivery, f.name) for f in fields(delivery) if f.name != 'job'}
+    for key in ('error', 'delivery_error'):  # stored the way jobs.json stores them
+        if verdicts.get(key):
+            verdicts[key] = sanitize_persisted_error(str(verdicts[key]))
+    return {'job': job, 'delivery': json.loads(json.dumps(verdicts, default=str)),
+            'recovered_claim': recovered_claim}
+
+
+def _from_booking_stamp(stamp):
+    from cron.quota_hold import age_hold_flag
+    from cron.scheduler import _RunDelivery
+    job = dict(stamp['job'])
+    age_hold_flag(job)
+    verdicts = dict(stamp.get('delivery') or {})
+    return _RunDelivery(job, verdicts.pop('success'), verdicts.pop('error', None), **verdicts)
+
+
 def pause_for_unknown(job_id, execution_id, reason):
     """The firer pauses the job for this fire's unverified admission and records that exact pause
     on the fire's journal, so the receipt that later proves the run terminal can lift it."""
@@ -260,7 +294,9 @@ def reconcile_pending(*, allow_connect=True):
     from hermes_constants import get_hermes_home
     from hermes_cli.gateway_client import connect_gateway
     from cron.executions import FIRER_FINISHED_STATES, execution_owner_live, get_execution
+    from cron import jobs_newer_fire
     from cron.jobs import get_job, hold_for_unknown
+    from hermes_time import now as _hermes_now
     from cron.scheduler import (_RunDelivery, _FireOwnership, _apply_agent_failure_marker,
                                 _save_compose_deliver)
     from cron.scheduler_bookkeeping import fail_empty_response, finish_completed_run
@@ -286,6 +322,14 @@ def reconcile_pending(*, allow_connect=True):
                 # The firer booked this attempt's terminal outcome itself (ownership lost, shutdown
                 # interrupt, a crashed tail): the receipt is not a result to save or deliver again.
                 journal.unlink(missing_ok=True)
+                continue
+            if isinstance(record.get('booking'), dict):
+                # Output saved and notice delivered on an earlier tick; only the booking is left.
+                stamp = record['booking']
+                if finish_completed_run(_from_booking_stamp(stamp), None, params['request_id'],
+                                        recovered=True, lift_pause=record.get('pause_recorded'),
+                                        recovered_claim=stamp.get('recovered_claim')):
+                    _lift_pause(params['job_id'], record.get('pause_recorded'))
                 continue
             frozen = None  # the job as admitted, never the current record
             if 'refusal' in record:
@@ -329,22 +373,38 @@ def reconcile_pending(*, allow_connect=True):
             job = dict(state['job'], **(state.get('job_flags') or {}))
             from cron.quota_hold import age_hold_flag
             age_hold_flag(job)  # a receipt read late holds only what is left of the window
+            aged_at = _hermes_now().isoformat()
             job['execution_id'] = params['request_id']
             if record.get('scheduled_instant'):
                 job['_scheduled_instant'] = record['scheduled_instant']
             # The same result verdicts as the ordinary tail: an agent-declared [CRON_FAILURE] and a
             # blank answer are failures, whichever process books them.
             success, error, declared = _apply_agent_failure_marker(job, success, error, answer)
+            recovered_claim = _recovered_claim(record, frozen)
+            # The booking will leave the re-run ladder and quota hold to a newer fire: the notice
+            # must neither announce a hold nor wait for a re-run that is never planned. Only the
+            # notice is composed without them; the fenced booking still gets the real flags and
+            # decides against the store as it is then.
+            masked = {}
+            if jobs_newer_fire.planners_skipped(get_job(params['job_id']), params['request_id'],
+                                                recovered_claim):
+                masked = {key: job.pop(key) for key in ('_quota_hold_seconds', '_model_unreachable')
+                          if key in job}
             delivery = _RunDelivery(job, success, error, agent_declared=declared)
             # The canonical receipt supplies the result; a dead scheduler's fire claim does not
             # authorize replay and must not prevent finishing its durable bookkeeping.
             fence = _FireOwnership(dict(job, fire_claim=None))
-            _save_compose_deliver(delivery, fence, answer, output, adapters=None, loop=None,
-                                 verbose=False, execution_token=None)
+            try:
+                _save_compose_deliver(delivery, fence, answer, output, adapters=None, loop=None,
+                                     verbose=False, execution_token=None)
+            finally:
+                job.update(masked)
             fail_empty_response(delivery, answer)
+            record['booking'] = _booking_stamp(delivery, recovered_claim, aged_at)
+            atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
             if finish_completed_run(delivery, None, params['request_id'], recovered=True,
                                     lift_pause=record.get('pause_recorded'),
-                                    recovered_claim=_recovered_claim(record, frozen)):
+                                    recovered_claim=recovered_claim):
                 _lift_pause(params['job_id'], record.get('pause_recorded'))
         except Exception:
             logging.getLogger(__name__).warning('Cron receipt recovery deferred: %s', journal, exc_info=True)
