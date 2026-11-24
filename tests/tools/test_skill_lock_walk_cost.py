@@ -39,35 +39,51 @@ def tree(tmp_path, monkeypatch):
     # A symlinked directory is listed, never entered (as rglob does).
     outside = _skill(tmp_path / "elsewhere", "linked-skill")
     os.symlink(outside.parent, skills / "linked-category")
+    # The same name in two categories: a lock on the name covers both.
+    _skill(skills, "a-cat/twin")
+    _skill(skills, "z-cat/twin")
+    # A dangling SKILL.md link is listed (rglob yields the name) but does not make its scripts/ a
+    # support dir, so a skill under it stays a skill.
+    dangling = skills / "dangling"
+    dangling.mkdir()
+    os.symlink(tmp_path / "gone.md", dangling / "SKILL.md")
+    _skill(dangling, "scripts/kept-under-dangling")
     monkeypatch.setenv("HERMES_HOME", str(home))
     return skills
 
 
 def _rglob_reference(names):
-    """The guard's previous result: rglob + the shared exclusion filter, first match per name."""
+    """The guard's previous walk: rglob + the shared exclusion filter, the first skills dir holding a
+    name winning; every directory of that name in it (which one rglob met first was arbitrary)."""
     from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
-    found = {}
+    found, claimed = set(), set()
     for base in get_all_skills_dirs():
         if not base.is_dir():
             continue
-        for skill_md in base.rglob("SKILL.md"):
-            name = skill_md.parent.name
-            if names is not None and name not in names:
-                continue
-            if name in found or is_excluded_skill_path(skill_md, root=base):
-                continue
-            found[name] = os.path.realpath(skill_md.parent)
-    return sorted(found.items())
+        here = {(skill_md.parent.name, os.path.realpath(skill_md.parent)) for skill_md in base.rglob("SKILL.md")
+                if (names is None or skill_md.parent.name in names) and skill_md.parent.name not in claimed
+                and not is_excluded_skill_path(skill_md, root=base)}
+        found |= here
+        claimed |= {name for name, _ in here}
+    return sorted(found)
 
 
 @pytest.mark.parametrize("names", [None, {"locked-skill"}, {"nested-skill", "decoy-skill", "shadow-skill"},
-                                   {"script-category-skill", "linked-skill", "missing"}])
+                                   {"script-category-skill", "linked-skill", "missing"}, {"twin"},
+                                   {"kept-under-dangling"}])
 def test_same_skills_as_the_full_rglob(tree, names):
     from tools.skill_lock import _skill_dirs
-    assert _skill_dirs(names) == _rglob_reference(names)
+    # Whether rglob yields a dangling SKILL.md link depends on the interpreter (3.11 no, 3.14 yes, the
+    # owner's): the walk lists it, as the live owner's rglob did; compare everything else exactly.
+    dangling = {("dangling", os.path.realpath(tree / "dangling"))}
+    assert set(_skill_dirs(names)) - dangling == set(_rglob_reference(names)) - dangling
+    assert _skill_dirs(names) == sorted(_skill_dirs(names))
     if names is None:
         assert {name for name, _ in _skill_dirs(None)} == {
-            "locked-skill", "free-skill", "solo", "nested-skill", "script-category-skill"}
+            "locked-skill", "free-skill", "solo", "nested-skill", "script-category-skill", "twin", "dangling",
+            "kept-under-dangling"}
+    if names == {"twin"}:
+        assert [os.path.basename(os.path.dirname(path)) for _, path in _skill_dirs(names)] == ["a-cat", "z-cat"]
 
 
 def test_the_walk_never_enters_a_support_or_excluded_tree(tree, monkeypatch):
@@ -84,8 +100,11 @@ def test_the_walk_never_enters_a_support_or_excluded_tree(tree, monkeypatch):
                                                   "node_modules", ".archive", "__pycache__", "linked-category"}
                                         for part in os.path.relpath(p, tree).split(os.sep))]
     # Only the top-level ``scripts`` category (no SKILL.md beside it) is walked.
-    assert entered and all(os.path.relpath(p, tree).split(os.sep)[0] == "scripts" for p in entered), entered
-    assert len(listed) <= 12, listed  # the skill dirs and categories, not the ~250 support dirs
+    # Only the top-level ``scripts`` category and the ``scripts`` beside a dangling marker (no SKILL.md
+    # exists beside either) are walked.
+    assert entered and all(os.path.relpath(p, tree).split(os.sep)[0] in {"scripts", "dangling"}
+                           for p in entered), entered
+    assert len(listed) <= 20, listed  # the skill dirs and categories, not the ~250 support dirs
 
 
 def test_a_locked_skill_inside_the_tree_is_still_guarded(tree, monkeypatch):

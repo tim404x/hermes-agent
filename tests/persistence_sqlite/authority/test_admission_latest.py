@@ -1,5 +1,5 @@
-"""``latest_admission`` on SQLite: one newest-first cursor per status, merged by ``seq``, read only as far as the first
-row carrying the marker, every cursor closed inside its one read context."""
+"""``latest_admission`` on SQLite: one newest-first statement (index-ordered per-status arms merged by ``seq``, one
+snapshot), read only as far as the first row carrying the marker, its cursor closed inside its one read context."""
 
 from __future__ import annotations
 
@@ -88,9 +88,9 @@ def test_latest_admission_stops_at_the_first_marked_row(seeded):
     with _counted_reads(store.holder()) as probe:
         latest = store.admissions.latest_admission(session_id="s1", payload_marker=_MARKER)
     assert latest.admission_id == marked["admission_id"]
-    # One cursor per status; the queued row and the marked terminal row are the only rows read, the older history
-    # never leaves SQLite.
-    assert (probe["reads"], len(probe["cursors"]), probe["rows"]) == (1, 4, 2)
+    # One statement; the queued row and the marked terminal row are the only rows read, the older history never
+    # leaves SQLite.
+    assert (probe["reads"], len(probe["cursors"]), probe["rows"]) == (1, 1, 2)
     assert probe["open_at_exit"] == 0
 
 
@@ -98,5 +98,17 @@ def test_latest_admission_without_a_match_reads_the_whole_session_and_closes_eve
     _path, store, _marked = seeded(_history)
     with _counted_reads(store.holder()) as probe:
         assert store.admissions.latest_admission(session_id="s1", payload_marker="absent") is None
-    assert (probe["reads"], len(probe["cursors"]), probe["rows"]) == (1, 4, _OLDER + 2)
+    assert (probe["reads"], len(probe["cursors"]), probe["rows"]) == (1, 1, _OLDER + 2)
     assert probe["open_at_exit"] == 0
+
+
+def test_latest_admission_is_one_snapshot_that_never_sorts_the_history(seeded):
+    """One statement keeps the read one snapshot (per-status cursors opened one after another could miss a
+    row moving between statuses, t_7e4c9e3c review); its arms walk the (target, status, seq) index newest
+    first and merge, so the first row needs no sort of the session (11 ms -> 0.02 ms on a 2,007-row chat)."""
+    from persistence.sqlite.authority._admission_store import _LATEST_ADMISSION_SQL
+    _path, store, _marked = seeded(_history)
+    with store.holder()._read_ctx() as conn:
+        plan = " | ".join(str(row[3]) for row in conn.execute("EXPLAIN QUERY PLAN " + _LATEST_ADMISSION_SQL,
+                                                              {"target": "s1"}))
+    assert "TEMP B-TREE" not in plan and plan.count("USING INDEX session_admissions_pending") == 4, plan

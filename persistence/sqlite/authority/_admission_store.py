@@ -8,7 +8,6 @@ values and run at a fixed point inside that transaction; their bodies live in :m
 
 from __future__ import annotations
 
-import heapq
 import json
 import uuid
 
@@ -130,24 +129,26 @@ def list_session_admissions(holder, *, session_id: str, pending_only: bool = Tru
 
 
 _ADMISSION_STATUSES = ('queued', 'started', 'unknown', 'terminal')  # the table's status CHECK
+_LATEST_ADMISSION_SQL = ' UNION ALL '.join(
+    f"SELECT * FROM session_admissions WHERE target_session_id=:target AND status='{status}'"
+    for status in _ADMISSION_STATUSES) + ' ORDER BY seq DESC'
 
 
 def latest_session_admission(holder, *, session_id: str, payload_marker: str, match=None) -> dict | None:
     """The newest admission whose decoded payload holds the top-level key ``payload_marker`` (and, when given, for
-    which ``match(row)`` is true), stopping at the first match: a restored lane needs only its latest envelope, not
-    the session's whole history. One newest-first stream per status, merged by ``seq``, so each walks the (target,
-    status, seq) index with no sort."""
-    sql = "SELECT * FROM session_admissions WHERE target_session_id=? AND status=? ORDER BY seq DESC"
+    which ``match(row)`` is true), stopping at the first match: a restored lane and a borrowed envelope need only
+    the latest row, not the session's whole history. One statement, so one snapshot (a row moving between
+    statuses mid-read is seen exactly once; per-status cursors opened one after another could miss it), whose
+    per-status arms each walk the (target, status, seq) index newest first and merge by ``seq`` with no sort.
+    Only the rows down to the match are decoded; ``match`` runs inside the read and must not call the store."""
     with holder._read_ctx() as conn:
-        cursors = [conn.execute(sql, (session_id, status)) for status in _ADMISSION_STATUSES]
+        cursor = conn.execute(_LATEST_ADMISSION_SQL, {'target': session_id})
         try:
-            rows = heapq.merge(*cursors, key=lambda row: row['seq'], reverse=True)
-            return next((row for row in map(_row, rows)
+            return next((row for row in map(_row, cursor)
                          if isinstance(row['payload'], dict) and payload_marker in row['payload']
                          and (match is None or match(row))), None)
         finally:
-            for cursor in cursors:  # before the connection goes back to the pool
-                cursor.close()
+            cursor.close()  # before the connection goes back to the pool
 
 
 def session_admissions_mentioning(holder, *, session_id: str, value: str) -> list[dict]:
@@ -160,8 +161,16 @@ def session_admissions_mentioning(holder, *, session_id: str, value: str) -> lis
     the two encodings below verbatim; inside a longer string its quotes would be escaped, so the token cannot
     match there, and any other false hit is dropped by the exact check."""
     from persistence.authority.admissions import payload_holds_string
-    _text(value)
-    tokens = {json.dumps(value, ensure_ascii=False), json.dumps(value, ensure_ascii=True)}
+    if not isinstance(value, str):
+        raise AuthorityRefusal('invalid_params')
+    tokens = set()
+    for ensure_ascii in (False, True):
+        token = json.dumps(value, ensure_ascii=ensure_ascii)
+        try:
+            token.encode('utf-8')
+        except UnicodeEncodeError:  # a lone surrogate: no stored payload holds this spelling
+            continue
+        tokens.add(token)
     where = ' OR '.join('instr(payload_json, ?) > 0' for _ in tokens)
     with holder._read_ctx() as conn:
         rows = conn.execute(f'SELECT * FROM session_admissions WHERE target_session_id=? AND ({where}) ORDER BY seq',

@@ -202,6 +202,11 @@ def test_mentioning_is_every_row_holding_the_string_in_seq_order(backend, scope_
     _admit(store, epoch, "odd-longer", payload={"text": odd + "!"})
     assert [r.request_id for r in store.admissions.mentioning(session_id=SESSION, value=odd)] == ["odd"]
     assert store.admissions.mentioning(session_id=SESSION, value="never") == []
+    # CONTRACT: any string is a valid probe, however long, and an unstorable one simply matches nothing.
+    long = "x" * 2000
+    _admit(store, epoch, "long", payload={"text": "h", "identity": long})
+    assert [r.request_id for r in store.admissions.mentioning(session_id=SESSION, value=long)] == ["long"]
+    assert store.admissions.mentioning(session_id=SESSION, value="\ud800") == []
     assert store.admissions.mentioning(session_id="absent", value=identity) == []
 
 
