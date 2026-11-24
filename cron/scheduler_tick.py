@@ -137,14 +137,20 @@ def _tick_admitted(
         except Exception as _wt_exc:
             _sched.logger.debug("Worktree maintenance dispatch failed: %s", _wt_exc)
 
-        due_jobs = _sched.get_due_jobs()
+        # Cron update-fence hold: an agent job's worker cannot attach while `hermes update` owns the
+        # install. Read once, BEFORE the due scan, so the scan hands held agent jobs over untouched
+        # (a catch-up slot is not fast-forwarded, a one-shot not claimed) and both agree.
+        from cron.jobs import agent_dispatch_held
+        from cron.scheduler_gateway_gate import (
+            hold_agent_jobs_while_update_fenced, update_fence_holds_agent_jobs)
+        update_fenced = update_fence_holds_agent_jobs()
+        with agent_dispatch_held(update_fenced):
+            due_jobs = _sched.get_due_jobs()
         _sched._sweep_stale_inflight_for_tick(due_jobs)
         if headless:
             from cron.scheduler_gateway_gate import refuse_agent_jobs_without_gateway
             due_jobs = refuse_agent_jobs_without_gateway(due_jobs)
-        # Cron update-fence hold: an agent job's worker cannot attach while `hermes update` owns the install.
-        from cron.scheduler_gateway_gate import hold_agent_jobs_while_update_fenced
-        due_jobs = hold_agent_jobs_while_update_fenced(due_jobs)
+        due_jobs = hold_agent_jobs_while_update_fenced(due_jobs, fenced=update_fenced)
 
         if not due_jobs:
             # Idle tick: skip config load + pool setup, but still reap crashed jobs' MCP orphans.
