@@ -91,12 +91,12 @@ async def test_completion_identity_probe_decodes_only_the_rows_that_carry_it(tmp
     _forbid_full_history_reads(monkeypatch)
     decoded = _count_decoded_rows(monkeypatch)
     # A lost-ACK redelivery is still found (same admission), from the one row that carries its identity.
-    assert completion_admission(runner, first)['admission_id'] == rows[-1].admission_id
+    assert (await completion_admission(runner, first))['admission_id'] == rows[-1].admission_id
     assert decoded == [rows[-1].admission_id]
     decoded.clear()
     # A new completion is not admitted yet: nothing in the 31-row history is decoded to say so.
     fresh = dict(pending(key, 'second-completion'), parent_session_id=first['parent_session_id'])
-    assert completion_admission(runner, fresh) is None
+    assert await completion_admission(runner, fresh) is None
     assert decoded == []
     await asyncio.sleep(0)
 

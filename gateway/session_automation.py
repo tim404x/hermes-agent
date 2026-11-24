@@ -47,20 +47,31 @@ def producer_identity(runner, event):
     return json.dumps(identity, separators=(',', ':'))
 
 
-def completion_admission(runner, event):
+async def completion_admission(runner, event):
+    """Look up a lost producer ACK without occupying the gateway's socket/liveness loop."""
     from gateway.session_authorities import active_authority
     authority = active_authority(runner)
     if authority is None:
         return None
-    from gateway.session_detached import route_entry
-    entry = route_entry(authority, str(event.get('session_key') or ''))
+    route = str(event.get('session_key') or '')
+    store = authority_persistence(authority).aio
+    entry = await runner.async_session_store.lookup_by_session_key(route)
     if entry is None:
-        return None
+        # This key already names the logical owner. Verify the live pin on the loop; a
+        # read of the ledger need not synthesize a routing entry or mutate owner hints.
+        from gateway.session_detached import detached_live
+        found = detached_live(authority, route)
+        if found is None:
+            return None
+        owner = found[0].session_id
+    elif entry.origin is not None and entry.origin.platform == Platform.LOCAL:
+        owner = entry.origin.chat_id
+    else:
+        owner = await store.lineage.lineage_root(entry.session_id)
     identity = producer_identity(runner, event)
-    # Only the rows that carry the identity string: this runs on the owner loop for every completion and
-    # watch notice, and a long-lived chat's full history decode stalled it for seconds (24 Nov 2026).
-    rows = authority_persistence(authority).admissions.mentioning(session_id=_route_owner(authority, entry),
-                                                                  value=identity)
+    # Even when no row is returned, SQLite must inspect the route's payloads. Use the
+    # store's own executor, not the owner loop or the default executor used by resume.
+    rows = await store.admissions.mentioning(session_id=owner, value=identity)
     for row in rows:
         descriptor = row.payload.get('local_automation_v1') or row.payload.get('native_text_v1', {}).get('automation', {})
         if identity in descriptor.get('identities', [descriptor.get('identity')]):
