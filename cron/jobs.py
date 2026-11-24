@@ -2532,6 +2532,7 @@ def mark_job_run(
     recover_consumed_fire: bool = False,
     provisional: bool = False,
     lift_pause: Optional[dict[str, Any]] = None,
+    recovered_claim: Optional[dict[str, Any]] = None,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached. A manual run
@@ -2565,8 +2566,13 @@ def mark_job_run(
     recorded on its admission journal. The real outcome is booked, so that exact pause is lifted in
     this same write (``_lift_recovery_pause``, schedule kept as booked), before the retry ladder and
     quota hold plan: both refuse a paused job.
+
+    ``recovered_claim`` (receipt recovery): the fire claim this fire held when it was admitted. A
+    stored claim held by anyone else, or a queued run-now, belongs to a newer fire: its claim,
+    markers, slot and schedule stay; if a fire acquired after this one is already booked (claim
+    ``seq`` vs ``booked_fire_seq``) this outcome is historical (``cron/jobs_newer_fire.py``).
     """
-    from cron import jobs_provisional
+    from cron import jobs_newer_fire, jobs_provisional
 
     def apply(jobs, _i, job):
         if execution_id is not None and execution_id in job.get("canonical_completions", []):
@@ -2598,10 +2604,32 @@ def mark_job_run(
                 _lift_recovery_pause(job, lift_pause)
                 save_jobs(jobs)
                 return True
-        else:
-            extra = extra_fire.is_extra(job)  # read before the outcome clears the claim
+        newer = jobs_newer_fire.order(job, recovered_claim, replacing=bool(replacing),
+                                      provisional=provisional)
+        own_extra = jobs_newer_fire.own_extra(job, recovered_claim)  # this fire's, not a newer one's
+        newer_pending = newer is not None and newer.pending
+        if newer is not None and newer.booked_after:
+            # A newer run is booked: this old fire is history. Count it, keep its id so a replay is
+            # a no-op; outcome, streak, schedule and claims stay with the newer run.
+            jobs_newer_fire.count(job, extra=own_extra, ladder_rung=ladder_rung, historical=True)
+            job["canonical_completions"] = [execution_id, *(job.get("canonical_completions") or [])]
+            _lift_recovery_pause(job, lift_pause)
+            for stored_job in jobs:
+                jobs_error_text.scrub_retained_stamps(stored_job)
+            save_jobs(jobs)
+            return True
+        if newer_pending and not replacing:
+            # A newer fire is running or queued: book this outcome and count the fire, but that
+            # fire's claim, markers, slot and schedule stay for its own booking.
+            kept = jobs_newer_fire.keep(job)
+            _record_run_outcome(job, success, error, delivery_error, status, now)
+            jobs_newer_fire.restore(job, kept)
+            jobs_newer_fire.count(job, extra=own_extra, ladder_rung=ladder_rung, historical=False)
+        elif not replacing:
+            extra = own_extra  # read before the outcome clears the claim
             held = extra_fire.held_markers(job) if extra else {}
             before = jobs_provisional.snapshot(job) if provisional else None
+            booked_claim = job.get("fire_claim")
             _record_run_outcome(job, success, error, delivery_error, status, now)
             job.update(held)  # a run-now queued mid-run is its own fire, not this one
             if provisional and execution_id is not None:
@@ -2610,6 +2638,9 @@ def mark_job_run(
                 extra_fire.settle(job, now)
             else:
                 _advance_after_run(job, now, ladder_rung=ladder_rung)
+            jobs_newer_fire.note_booked(job, recovered_claim or booked_claim)
+        if newer_pending and not replacing:
+            jobs_newer_fire.note_booked(job, recovered_claim)
         jobs_provisional.note_booked(job, execution_id)
         if execution_id is not None and not provisional:
             # Retire ids recovery can no longer replay; latest stays last.
@@ -2620,15 +2651,16 @@ def mark_job_run(
         from cron import quota_hold
         from cron.unreachable_retry import clear_state, plan_retry
 
-        if not success and model_unreachable and not is_terminal_job(job):
-            plan_retry(job)
-        else:
-            # Any run that reached the model (either outcome) resets the re-run ladder.
-            clear_state(job)
-        if not success and quota_hold_seconds and not is_terminal_job(job):
-            quota_hold.plan_hold(job, quota_hold_seconds, recover_consumed_fire=recover_consumed_fire)
-        else:
-            quota_hold.clear_state(job)
+        if not newer_pending:  # else the newer fire's own booking settles ladder and quota hold
+            if not success and model_unreachable and not is_terminal_job(job):
+                plan_retry(job)
+            else:
+                # Any run that reached the model (either outcome) resets the re-run ladder.
+                clear_state(job)
+            if not success and quota_hold_seconds and not is_terminal_job(job):
+                quota_hold.plan_hold(job, quota_hold_seconds, recover_consumed_fire=recover_consumed_fire)
+            else:
+                quota_hold.clear_state(job)
         # A run rewrites all jobs, including legacy failure stamps on idle siblings.
         for stored_job in jobs:
             jobs_error_text.scrub_retained_stamps(stored_job)
@@ -2814,6 +2846,8 @@ def claim_job_for_fire(
     ``claim_ttl_seconds`` exists (the TTL lets another fire reclaim after a crash; mark_job_run
     clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
     ``next_run_at`` so a stale re-delivery cannot re-fire."""
+    from cron import jobs_newer_fire
+
     def apply(jobs, _i, job):
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False
@@ -2858,7 +2892,8 @@ def claim_job_for_fire(
             _activate_job_record(job)
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the
         # previous runner must not heartbeat the new claim merely because hostname + PID match.
-        job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
+        job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}",
+                             "seq": jobs_newer_fire.next_seq(job)}  # acquisition order of fires
         # Claimed: the occurrence is now owned by a run (its ledger row + fire claim carry it).
         job.pop("pending_slot", None)
         if slot := extra_fire.pending_slot(job, now, manual_fire):
