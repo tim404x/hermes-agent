@@ -46,10 +46,11 @@ def _gateway_unavailable(home) -> str | None:
             "is ready. Check it with `hermes gateway status`.")
 
 
-def _note_fire_refused(job_ids, detail: str) -> None:
+def _note_fire_refused(job_ids, detail: str, *, update_slots=None) -> None:
     """Stamp ``last_fire_error`` (shown by ``hermes cron list``) and drop the dispatch marks the
     due scan just wrote: the slot was never handed over, so nothing must "restore" or "reclaim" it."""
-    from cron.jobs import _hermes_now, _jobs_lock, load_jobs, save_jobs
+    from cron.jobs import ONESHOT_GRACE_SECONDS, _hermes_now, _jobs_lock, _parse_aware, load_jobs, save_jobs
+    from cron.dispatch_hold import TICK_SLACK_SECONDS, held_update_slot
 
     ids = set(job_ids)
     with _jobs_lock():
@@ -57,7 +58,21 @@ def _note_fire_refused(job_ids, detail: str) -> None:
         for job in jobs:
             if job["id"] not in ids:
                 continue
-            job["last_fire_error"] = {"at": _hermes_now().isoformat(), "detail": detail[:500]}
+            now = _hermes_now()
+            error = {"at": now.isoformat(), "detail": detail[:500]}
+            if update_slots is not None:
+                # The update-fenced scan has NOT claimed/advanced anything. Never undo a newer claim/edit.
+                slot = update_slots[job['id']]
+                if not slot or slot != job.get('next_run_at') or job.get('run_claim') or job.get('fire_claim'):
+                    continue
+                if (job.get('schedule') or {}).get('kind') == 'once':
+                    due = _parse_aware(slot)
+                    age = now.timestamp() - due.timestamp() if due is not None else float('inf')
+                    if 0 <= age <= ONESHOT_GRACE_SECONDS or held_update_slot(job, now.timestamp(), 2 * TICK_SLACK_SECONDS):
+                        error['update_slot'] = slot  # never extend a reminder already stale before the fence
+                job['last_fire_error'] = error
+                continue
+            job["last_fire_error"] = error
             job.pop("pending_slot", None)
             if job.get("run_claim") is not None:
                 job["run_claim"] = None
@@ -136,7 +151,7 @@ def hold_agent_jobs_while_update_fenced(due_jobs: list, fenced: bool | None = No
     from cron.jobs import _current_cron_store
 
     ids = [str(job["id"]) for job in agent_jobs]
-    _note_fire_refused(ids, f"Held: {UPDATE_HOLD_HINT}")
+    _note_fire_refused(ids, f"Held: {UPDATE_HOLD_HINT}", update_slots={str(j['id']): j.get('next_run_at') for j in agent_jobs})
     held = dispatch_hold.read(_current_cron_store().cron_dir)
     dispatch_hold.note_held()
     # One warning per update window, not one per minute while it lasts.

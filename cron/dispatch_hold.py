@@ -17,6 +17,7 @@ downtime).
 from __future__ import annotations
 
 import contextlib
+from datetime import datetime
 import json
 import time
 from pathlib import Path
@@ -72,6 +73,18 @@ def read(cron_dir: Path) -> Optional[dict]:
         return {"since": float(data["since"]), "last": float(data["last"])}
     except (OSError, ValueError, TypeError, KeyError):
         return None
+
+
+def held_update_slot(job: dict, now: float, max_age: float) -> bool:
+    """A fresh witness for this exact never-claimed slot, refreshed only during an actual update fence."""
+    stamp = job.get('last_fire_error')
+    if not isinstance(stamp, dict) or not stamp.get('update_slot') or stamp['update_slot'] != job.get('next_run_at'):
+        return False
+    try:
+        when = datetime.fromisoformat(stamp['at'])
+        return when.tzinfo is not None and 0 <= now - when.timestamp() <= max_age
+    except (ValueError, TypeError, KeyError, OverflowError):
+        return False
 
 
 def grace_starts_at(cron_dir: Path, due_at: float, grace: float) -> float:

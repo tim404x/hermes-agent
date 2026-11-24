@@ -126,7 +126,7 @@ def retire_expired_oneshot(d: Any) -> bool:
     from cron import store_health
     from cron.jobs import (
         ONESHOT_GRACE_SECONDS, _current_cron_store, _elapsed_seconds, record_cron_missed)
-    from cron.dispatch_hold import grace_starts_at
+    from cron.dispatch_hold import TICK_SLACK_SECONDS, grace_starts_at, held_update_slot
     from cron.jobs_oneshot_diagnostics import write_missed
 
     if _elapsed_seconds(d.scan.now, d.next_run_dt) <= ONESHOT_GRACE_SECONDS:
@@ -134,6 +134,8 @@ def retire_expired_oneshot(d: Any) -> bool:
     # Due while a gateway drain held dispatch: its grace counts from the end of the hold. A claimed
     # one-shot already fired once, so it never gets the extension (that would re-dispatch it).
     claimed = d.job.get("run_claim") or d.job.get("fire_claim")
+    if not claimed and held_update_slot(d.job, d.scan.now.timestamp(), ONESHOT_GRACE_SECONDS + TICK_SLACK_SECONDS):
+        return False
     grace_start = d.next_run_dt.timestamp() if claimed else grace_starts_at(
         _current_cron_store().cron_dir, d.next_run_dt.timestamp(), ONESHOT_GRACE_SECONDS)
     if d.scan.now.timestamp() - grace_start <= ONESHOT_GRACE_SECONDS:
