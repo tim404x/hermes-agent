@@ -16,8 +16,14 @@ def journal_path(job_id, request_id):
 
 
 def _pause_identity(paused):
-    """The exact pause this recovery uncertainty caused, so only that pause is ever lifted."""
-    return {'paused_at': paused.get('paused_at'), 'reason': paused.get('paused_reason')} if paused else True
+    """The exact pause this recovery uncertainty caused, so only that pause is ever lifted (``True``:
+    nothing was paused, the job was already held). ``plan`` lets the lift notice a schedule edited
+    while the job was held."""
+    if not paused:
+        return True
+    from cron.jobs import _plan_fingerprint
+    return {'paused_at': paused.get('paused_at'), 'reason': paused.get('paused_reason'),
+            'plan': _plan_fingerprint(paused)}
 
 
 def replayable_completions(job_id, completions):
@@ -29,9 +35,9 @@ def replayable_completions(job_id, completions):
 def pause_for_unknown(job_id, execution_id, reason):
     """The firer pauses the job for this fire's unverified admission and records that exact pause
     on the fire's journal, so the receipt that later proves the run terminal can lift it."""
-    from cron.jobs import pause_job
+    from cron.jobs import hold_for_unknown
     from utils import atomic_json_write
-    paused = pause_job(job_id, reason=reason)
+    paused = hold_for_unknown(job_id, reason)  # an operator's pause is never adopted
     journal = journal_path(job_id, execution_id)
     if paused and journal.exists():
         record = json.loads(journal.read_text(encoding='utf-8-sig'))
@@ -41,15 +47,13 @@ def pause_for_unknown(job_id, execution_id, reason):
 
 def _lift_pause(job_id, pause):
     """A verified terminal receipt resolved the uncertainty that paused the schedule: resume it iff
-    the job is still held by exactly that pause (an operator's own pause/resume is never touched)."""
-    from cron.jobs import get_job, resume_job
-    job = get_job(job_id) if isinstance(pause, dict) else None
-    if (job is not None and job.get('state') == 'paused'
-            and (job.get('paused_at'), job.get('paused_reason')) == (pause['paused_at'], pause['reason'])):
-        try:
-            resume_job(job_id)
-        except ValueError:  # a one-shot whose instant has passed stays paused for the operator
-            pass
+    the job is still held by exactly that pause (an operator's own pause/resume is never touched).
+    ``mark_job_run(lift_pause=...)`` already lifts it inside the outcome's own write, before the
+    retry ladder and quota hold plan (both refuse a paused job); this is the fallback for a booking
+    that never reached the store. Either way ``next_run_at`` stays as booked (``resume_job`` would
+    recompute it from now and drop a ladder rung, a quota hold or a manual run's kept slot)."""
+    from cron.jobs import lift_recovery_pause
+    lift_recovery_pause(job_id, pause)
 
 
 # A parked notice is retried this many times when its delivery fails, then dropped with a warning.
@@ -195,6 +199,8 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                 await asyncio.to_thread(touch_execution_progress, request_id)
             if state['status'] == 'terminal':
                 job.update(state.get('job_flags') or {})
+                from cron.quota_hold import age_hold_flag
+                age_hold_flag(job)
                 return tuple(state['result'])
             if state['status'] == 'unknown':
                 raise CronExecutionUnknown('unknown_execution: cron admission was not replayed')
@@ -233,7 +239,7 @@ def reconcile_pending(*, allow_connect=True):
     from hermes_constants import get_hermes_home
     from hermes_cli.gateway_client import connect_gateway
     from cron.executions import FIRER_FINISHED_STATES, execution_owner_live, get_execution
-    from cron.jobs import get_job, pause_job
+    from cron.jobs import get_job, hold_for_unknown
     from cron.scheduler import (_RunDelivery, _FireOwnership, _apply_agent_failure_marker,
                                 _save_compose_deliver)
     from cron.scheduler_bookkeeping import fail_empty_response, finish_completed_run
@@ -292,11 +298,13 @@ def reconcile_pending(*, allow_connect=True):
                     _send_parked_notice(journal)
                 if state['status'] == 'unknown' and not record.get('pause_recorded'):
                     reason = 'Canonical cron unknown; no automatic re-execution'
-                    record['pause_recorded'] = _pause_identity(pause_job(params['job_id'], reason=reason))
+                    record['pause_recorded'] = _pause_identity(hold_for_unknown(params['job_id'], reason))
                     atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
                 continue
             success, output, answer, error = state['result']
             job = dict(state['job'], **(state.get('job_flags') or {}))
+            from cron.quota_hold import age_hold_flag
+            age_hold_flag(job)  # a receipt read late holds only what is left of the window
             job['execution_id'] = params['request_id']
             # The same result verdicts as the ordinary tail: an agent-declared [CRON_FAILURE] and a
             # blank answer are failures, whichever process books them.
@@ -308,7 +316,8 @@ def reconcile_pending(*, allow_connect=True):
             _save_compose_deliver(delivery, fence, answer, output, adapters=None, loop=None,
                                  verbose=False, execution_token=None)
             fail_empty_response(delivery, answer)
-            if finish_completed_run(delivery, None, params['request_id'], recovered=True):
+            if finish_completed_run(delivery, None, params['request_id'], recovered=True,
+                                    lift_pause=record.get('pause_recorded')):
                 _lift_pause(params['job_id'], record.get('pause_recorded'))
         except Exception:
             logging.getLogger(__name__).warning('Cron receipt recovery deferred: %s', journal, exc_info=True)

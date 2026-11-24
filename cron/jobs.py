@@ -1660,6 +1660,81 @@ def _activate_job_record(job: dict[str, Any]) -> None:
     job.update(enabled=True, state="scheduled", paused_at=None, paused_reason=None)
 
 
+def _plan_fingerprint(job: dict[str, Any]) -> str:
+    """What decides a job's next instant (schedule + pinned zone): a recovery pause records it, so
+    the lift can tell whether the schedule was edited while the job was held."""
+    import json
+    return json.dumps({"schedule": job.get("schedule"), "timezone": job.get("timezone")},
+                      sort_keys=True, default=str)
+
+
+def _resumed_next_run(job: dict[str, Any]) -> Optional[str]:
+    """The instant a paused *job* resumes at (``resume_job``): a recurring slot that elapsed while
+    paused stays due (the late / catch-up policy decides it, #113603); otherwise the schedule's next
+    instant from now. None for a one-shot with nothing left to fire."""
+    stored_next = job.get("next_run_at")
+    stored_dt = _parse_aware(stored_next) if stored_next else None
+    if (job["schedule"].get("kind") in {"cron", "interval"} and stored_dt is not None
+            and _instant_at_or_before(stored_dt, _hermes_now())):
+        logger.info(
+            "Job '%s' resumed with occurrence %s that elapsed while paused kept due; the next "
+            "tick fires it (late/catch-up) or logs the skip.",
+            job.get("name", job["id"]), stored_next)
+        return stored_next
+    return compute_next_run(job["schedule"], timezone=job.get("timezone"))
+
+
+def hold_for_unknown(job_id: str, reason: str) -> Optional[dict[str, Any]]:
+    """Pause *job_id* for a fire whose outcome is unknown, unless it is already paused: one locked
+    check-and-pause, so receipt recovery can never adopt (and later lift) an operator's pause or
+    another fire's. The paused record, or None when nothing was paused."""
+    with _jobs_lock():
+        job = get_job(job_id)
+        if job is None or job.get("state") == "paused" or job.get("paused_at"):
+            return None
+        return pause_job(job_id, reason=reason)
+
+
+def _lift_recovery_pause(job: dict[str, Any], pause: Any) -> bool:
+    """Clear, in place, the pause an unknown fire put on *job* once its receipt proved the run
+    terminal, iff *job* is still held by exactly that pause (``{"paused_at", "reason"}``, recorded
+    on the fire's admission journal); an operator's own pause or resume is never touched.
+
+    Unlike ``resume_job`` this keeps ``next_run_at``: the pause only held the schedule while the
+    outcome was unknown, and the instant on file is the one the run's own booking left (its natural
+    next occurrence, a manual run's kept slot, a retry rung or a quota hold), never a stale one.
+    Two exceptions follow ``resume_job``: a schedule edited while held (a paused edit defers the
+    recompute to the resume) takes its next instant, and a one-shot with nothing left to fire stays
+    paused for the operator."""
+    if not (isinstance(pause, dict) and job.get("state") == "paused"
+            and (job.get("paused_at"), job.get("paused_reason")) == (pause.get("paused_at"), pause.get("reason"))):
+        return False
+    schedule = job.get("schedule") or {}
+    edited = "plan" in pause and pause["plan"] != _plan_fingerprint(job)
+    if edited:
+        next_run_at = _resumed_next_run(job)
+    else:
+        next_run_at = job.get("next_run_at")
+    if schedule.get("kind") == "once" and (
+            not next_run_at or compute_next_run(schedule, timezone=job.get("timezone")) is None):
+        return False
+    if edited:
+        job["next_run_at"] = next_run_at
+    _activate_job_record(job)
+    return True
+
+
+def lift_recovery_pause(job_id: str, pause: Any) -> bool:
+    """Store form of :func:`_lift_recovery_pause` (one locked write); True when it lifted."""
+    def apply(jobs, _i, job):
+        if not _lift_recovery_pause(job, pause):
+            return False
+        save_jobs(jobs)
+        return True
+
+    return bool(isinstance(pause, dict) and _with_job(job_id, apply, False))
+
+
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     """Workdir -> absolute path, or None when empty. ``~`` expands; relative paths are rejected
     (cron runs detached from any cwd); must be an existing dir now but is deliberately NOT
@@ -2170,20 +2245,7 @@ def resume_job(job_id: str) -> Optional[dict[str, Any]]:
     job = resolve_job_ref(job_id)
     if not job:
         return None
-    stored_next = job.get("next_run_at")
-    stored_dt = _parse_aware(stored_next) if stored_next else None
-    if (
-        job["schedule"].get("kind") in {"cron", "interval"}
-        and stored_dt is not None
-        and _instant_at_or_before(stored_dt, _hermes_now())
-    ):
-        next_run_at = stored_next
-        logger.info(
-            "Job '%s' resumed with occurrence %s that elapsed while paused kept due; the next "
-            "tick fires it (late/catch-up) or logs the skip.",
-            job.get("name", job["id"]), stored_next)
-    else:
-        next_run_at = compute_next_run(job["schedule"], timezone=job.get("timezone"))
+    next_run_at = _resumed_next_run(job)
     if next_run_at is None and job["schedule"].get("kind") == "once":
         run_at = job["schedule"].get("run_at", "unknown")
         raise ValueError(
@@ -2469,6 +2531,7 @@ def mark_job_run(
     quota_hold_seconds: Optional[float] = None,
     recover_consumed_fire: bool = False,
     provisional: bool = False,
+    lift_pause: Optional[dict[str, Any]] = None,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached. A manual run
@@ -2497,11 +2560,19 @@ def mark_job_run(
     admission journal exists). It counts the fire and retires its claim as usual, and the later
     canonical mark for the same execution REPLACES its outcome instead of counting the fire again
     (``cron/jobs_provisional.py``).
+
+    ``lift_pause`` (receipt recovery): the pause this fire's unknown outcome put on the job, as
+    recorded on its admission journal. The real outcome is booked, so that exact pause is lifted in
+    this same write (``_lift_recovery_pause``, schedule kept as booked), before the retry ladder and
+    quota hold plan: both refuse a paused job.
     """
     from cron import jobs_provisional
 
     def apply(jobs, _i, job):
         if execution_id is not None and execution_id in job.get("canonical_completions", []):
+            # A replayed receipt: the outcome is booked, only a pause left behind may remain.
+            if _lift_recovery_pause(job, lift_pause):
+                save_jobs(jobs)
             return True
         replacing = not provisional and jobs_provisional.take(job, execution_id)
         if expected_fire_owner is not None and not replacing:
@@ -2521,7 +2592,10 @@ def mark_job_run(
                     lambda: _record_run_outcome(job, success, error, delivery_error, status, now)):
                 # A newer run was booked since: its outcome, ladders and delivery settlement
                 # (``canonical_completions[-1]``) stay; this id is kept only so a replay is a no-op.
+                # Only this fire's own share of the streak and failure stamp is corrected.
+                jobs_provisional.correct_history(job, replacing, success, error, status)
                 job["canonical_completions"] = [execution_id, *(job.get("canonical_completions") or [])]
+                _lift_recovery_pause(job, lift_pause)
                 save_jobs(jobs)
                 return True
         else:
@@ -2536,10 +2610,13 @@ def mark_job_run(
                 extra_fire.settle(job, now)
             else:
                 _advance_after_run(job, now, ladder_rung=ladder_rung)
+        jobs_provisional.note_booked(job, execution_id)
         if execution_id is not None and not provisional:
             # Retire ids recovery can no longer replay; latest stays last.
             from cron.scheduler_authority import replayable_completions as live
             job["canonical_completions"] = [*live(job_id, job.get("canonical_completions")), execution_id]
+        # Lift the fire's own unknown pause before the planners below, which refuse a paused job.
+        _lift_recovery_pause(job, lift_pause)
         from cron import quota_hold
         from cron.unreachable_retry import clear_state, plan_retry
 
