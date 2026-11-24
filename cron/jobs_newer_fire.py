@@ -93,6 +93,28 @@ def order(job: dict[str, Any], recovered_claim: Any, *, replacing: bool,
     return Order(pending=pending, booked_after=booked_after)
 
 
+def planners_skipped(job: Optional[dict[str, Any]], execution_id: Optional[str],
+                     recovered_claim: Any) -> bool:
+    """Read-only preview of ``mark_job_run``'s planner decision for a recovered fire: True when its
+    booking will leave the re-run ladder and quota hold to a newer fire (one pending, or one already
+    booked), so the recovered notice must not announce a hold or hold back a failure alert for a
+    ladder re-run that will never be planned. A replay (already booked, its plan applied or not) is
+    not known to skip anything. Works on a copy; *job* is the stored record."""
+    import copy
+
+    from cron import jobs_provisional
+    if not isinstance(job, dict):
+        return False
+    if execution_id is not None and execution_id in (job.get("canonical_completions") or []):
+        return False
+    probe = copy.deepcopy(job)
+    replacing = jobs_provisional.take(probe, execution_id)
+    if replacing and probe.get("last_run_at") != replacing.get("at"):
+        return True  # replace_outcome refuses: a newer run is booked
+    newer = order(probe, recovered_claim, replacing=bool(replacing), provisional=False)
+    return newer is not None and (newer.pending or newer.booked_after)
+
+
 def keep(job: dict[str, Any]) -> dict[str, Any]:
     """The newer fire's claim, markers and slot, before the old outcome is written."""
     return {field: job.get(field, _ABSENT) for field in _NEWER_FIRE_FIELDS}
