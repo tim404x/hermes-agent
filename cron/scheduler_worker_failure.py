@@ -45,6 +45,10 @@ def record_unknown_worker_outcome(
                 error,
                 delivery_error=delivery_error,
                 expected_fire_owner=owner,
+                # Receipt recovery may still book this fire's real outcome: that mark replaces this
+                # one instead of counting the fire twice (cron/jobs_provisional.py).
+                execution_id=str(job["execution_id"]),
+                provisional=True,
                 # A ladder re-run's occurrence already counted toward repeat.
                 **({"ladder_rung": True} if is_retry_run(job) else {}),
             )
