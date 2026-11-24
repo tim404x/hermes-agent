@@ -16,11 +16,25 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger(__name__)
 
 _worker_process = False
+
+# A journaled ``worker.persist`` whose owner link drops (an owner loop stall past the receipt wait,
+# a reset socket, a restarting owner) is sent again, unchanged, on a fresh connection for this long,
+# measured from the first loss until any answer. The owner replays a committed sequence's stored
+# result (same payload digest), so the resend can never apply an operation twice. Past the budget
+# the journal entry stays pending and the store fails closed, as before.
+RECONNECT_BUDGET_S = 600.0
+# Owner answers that say only that its store could not take the write right now (the in-process
+# writer mutex past its patience, a busy database): the same sequence is sent again, on the same
+# connection, under the same budget. Every other owner answer is final.
+RETRYABLE_OWNER_REASONS = frozenset({'storage_unavailable'})
+# How long one call waits for the owner's reply on an open connection before the link counts as lost.
+RECEIPT_WAIT_S = 20.0
 
 
 def is_worker_process():
@@ -45,6 +59,16 @@ def apply_row_annotations(messages, annotations):
 
 class WorkerPersistenceError(RuntimeError):
     pass
+
+
+class WorkerLinkLost(WorkerPersistenceError):
+    """The owner connection failed: the dial, the send or the reply never completed (the original
+    transport error is ``__cause__``). Once sent, the call's outcome is unknown; only a caller that
+    holds a durable, replayable identity for it (the outbox journal's sequence) may send it again."""
+
+
+class WorkerOwnerRefusal(WorkerPersistenceError):
+    """The owner answered the call with an error; its reason is the message."""
 
 
 def _caller_summary(limit=8):
@@ -144,7 +168,8 @@ class WorkerRPC:
         if discovery.state == 'ready' and discovery.endpoint is not None:
             self.endpoint = discovery.endpoint
         elif discovery.state != 'draining' or self.endpoint is None:
-            raise WorkerPersistenceError('owner_unavailable')
+            # No owner to dial right now (stopped, restarting): a lost link, not an owner answer.
+            raise WorkerLinkLost('owner_unavailable')
         from hermes_cli.gateway_runtime import control_home_for
         endpoint = self.endpoint
         descriptor = query_identify(control_home_for(self.home, endpoint), timeout=5)
@@ -194,13 +219,22 @@ class WorkerRPC:
                     self._drop()
                     link = self._connection()
                     link.send(request_id, message)
-                response = link.receive(20)
+                response = link.receive(RECEIPT_WAIT_S)
+            except WorkerPersistenceError:
+                # A lost link already classified (no owner to dial), or this worker's own refusal
+                # before anything was sent (a self-RPC to its owner).
+                self._drop()
+                raise
+            except Exception as exc:
+                # Outcome unknown once sent: surface the loss and never resend here; the next call
+                # redials, and only a caller with a replayable identity (the journal) sends it again.
+                self._drop()
+                raise WorkerLinkLost(str(exc) or type(exc).__name__) from exc
             except BaseException:
-                # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()
                 raise
             if 'error' in response:
-                raise WorkerPersistenceError(response['error'].get('message', 'persistence_failed'))
+                raise WorkerOwnerRefusal(response['error'].get('message', 'persistence_failed'))
             if method in ('worker.register', 'worker.adopt') and params.get('pid') == os.getpid():
                 global _worker_process
                 _worker_process = True
@@ -336,7 +370,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             try:
                 while self.journal['pending']:
                     entry = self.journal['pending'][0]
-                    result = self.rpc('worker.persist', **self.scope, **entry)
+                    result = self._persist(entry)
                     candidate = dict(self.journal, pending=self.journal['pending'][1:])
                     candidate = self._compression_receipt_journal(candidate, result)
                     self._save(candidate)
@@ -348,6 +382,34 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 raise
             self.failure = None
             return results
+
+    def _persist(self, entry):
+        """Send one journal entry until the owner answers it. A lost link (or an owner whose store
+        is only busy) is not an answer: the identical entry, same sequence and payload, goes again on
+        a fresh connection with backoff, and the owner's receipt replay returns the stored result if
+        the earlier send had committed. Owner refusals end it at once; so does ``RECONNECT_BUDGET_S``
+        of answerless retries, leaving the entry pending (fail closed)."""
+        from agent.retry_utils import jittered_backoff
+        lost_at, attempt = None, 0
+        while True:
+            try:
+                return self.rpc('worker.persist', **self.scope, **entry)
+            except (WorkerLinkLost, WorkerOwnerRefusal) as exc:
+                if isinstance(exc, WorkerOwnerRefusal) and str(exc) not in RETRYABLE_OWNER_REASONS:
+                    raise
+                now = time.monotonic()
+                lost_at = now if lost_at is None else lost_at
+                left = RECONNECT_BUDGET_S - (now - lost_at)
+                if left <= 0:
+                    logger.warning('worker.persist %s (sequence %s): owner unanswered for %.0fs, giving up: %s',
+                                   entry.get('operation'), entry.get('sequence'), now - lost_at, exc)
+                    raise
+                attempt += 1
+                delay = min(jittered_backoff(attempt, base_delay=0.5, max_delay=15.0, jitter_ratio=0.5), left)
+                logger.warning('worker.persist %s (sequence %s) got no answer (%s: %s); sending it again in '
+                               '%.1fs (%.0fs of reconnect budget left)', entry.get('operation'),
+                               entry.get('sequence'), type(exc).__name__, exc, delay, left)
+                time.sleep(delay)
 
     def adopt(self, epoch):
         """Install only a separately verified worker.adopt result; never self-adopt."""
