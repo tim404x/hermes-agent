@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
-from typing import TYPE_CHECKING, Any, Iterable, Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, Mapping, Sequence
 
 from persistence.authority.admissions import (
     ANY_HEAD,
@@ -181,10 +181,17 @@ class SQLiteAdmissionRepository:
         with refused():
             return _record(store.get_session_admission(self._store.holder(), admission_id=admission_id))
 
-    def latest_admission(self, *, session_id: str, payload_marker: str) -> AdmissionRecord | None:
+    def latest_admission(self, *, session_id: str, payload_marker: str,
+                         match: Callable[[AdmissionRecord], bool] | None = None) -> AdmissionRecord | None:
         with refused():
-            return _record(store.latest_session_admission(self._store.holder(), session_id=session_id,
-                                                          payload_marker=payload_marker))
+            return _record(store.latest_session_admission(
+                self._store.holder(), session_id=session_id, payload_marker=payload_marker,
+                match=None if match is None else (lambda row: match(_record(row)))))
+
+    def mentioning(self, *, session_id: str, value: str) -> list[AdmissionRecord]:
+        with refused():
+            rows = store.session_admissions_mentioning(self._store.holder(), session_id=session_id, value=value)
+        return [_record(row) for row in rows]
 
     def settled_result(self, *, admission_id: str, epoch: int | None = None,
                        generation: int | None = None) -> AdmissionResult | None:

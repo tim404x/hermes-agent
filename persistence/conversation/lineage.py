@@ -100,6 +100,10 @@ class LineageRepository(Protocol):
         """The compression lineage holding the session, root first through its oldest continuations; ``()`` for an unknown id, ``(session_id,)`` for a fork child or when the session is off the walked chain."""
         ...
 
+    def lineage_root(self, session_id: SessionId) -> SessionId:
+        """``lineage(session_id)[0]``, the session itself when that lineage is empty: the admission identity of a route, read without walking the chain past the session."""
+        ...
+
     def chain(self, session_id: SessionId) -> tuple[SessionId, ...]:
         """The compression chain walked forward from the session to its tip (``tip`` is the last element), without ancestors."""
         ...

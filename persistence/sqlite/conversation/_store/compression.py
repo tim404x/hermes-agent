@@ -752,6 +752,58 @@ def get_compression_lineage(holder: StoreHolder, session_id: str) -> list[str]:
     return lineage if session_id in lineage else [session_id]
 
 
+_LINEAGE_COLUMNS = "id, source, model_config, parent_session_id, end_reason"
+
+
+def get_compression_lineage_root(holder: StoreHolder, session_id: str) -> Optional[str]:
+    """``get_compression_lineage(session_id)[0]``, ``None`` for an unknown id: the same walk up to the root, then
+    the same forward walk, stopped as soon as it reaches *session_id* (its tail is not needed for the root).
+
+    The admission identity of a route (``SessionAuthority.logical_owner``) is read this way several times per
+    notification on the gateway owner loop. The full lineage read there re-fetched each parent with
+    ``get_session`` (``SELECT *`` + prompt JOINs) and every chain node's children whole, 53 queries for Tim's
+    14-deep main chat; under a busy owner each query and row re-takes the GIL, so each call took seconds
+    (loop stalls >10 s, 24 Nov 2026). Here: one read connection, one query per hop, lineage columns only, and
+    the same fork / continuation predicates."""
+    with holder._read_ctx() as conn:
+        def read(sid):
+            row = conn.execute(f"SELECT {_LINEAGE_COLUMNS} FROM sessions WHERE id = ?", (sid,)).fetchone()
+            return dict(row) if row is not None else None
+
+        session = read(session_id)
+        if session is None:
+            return None
+        if _is_explicit_fork_child_row(holder, session):
+            return session_id
+        root, ancestors = session, {session["id"]}
+        while True:  # _is_compression_child_row on the parent row this hop reads once
+            parent_id = root.get("parent_session_id")
+            if not parent_id or _is_explicit_fork_child_row(holder, root, include_reset=True):
+                break
+            parent = read(parent_id)
+            if not parent or parent.get("end_reason") != "compression" or parent["id"] in ancestors:
+                break
+            root = parent
+            ancestors.add(root["id"])
+        if root["id"] == session_id:
+            return session_id
+        current, seen = root, {root["id"]}
+        while current.get("end_reason") == "compression":
+            # The parent (``current``) ended by compression, so a child continues it unless it is a fork.
+            children = conn.execute(f"SELECT {_LINEAGE_COLUMNS} FROM sessions WHERE parent_session_id = ? "
+                                    "ORDER BY started_at ASC", (current["id"],)).fetchall()
+            next_child = next((dict(row) for row in children
+                               if not _is_explicit_fork_child_row(holder, dict(row), include_reset=True)), None)
+            if not next_child or next_child["id"] in seen:
+                break
+            if next_child["id"] == session_id:
+                return root["id"]
+            seen.add(next_child["id"])
+            current = next_child
+        # Off the walked chain: its lineage is itself.
+        return session_id
+
+
 def get_tool_rotation_root(holder: StoreHolder, session_id: str) -> str:
     """Root of a ``--source tool`` run's compression chain. ``get_compression_lineage`` treats every ``tool`` row as a
     fork, but rotation copies the parent's source onto its continuation, so climb only hops where both rows are

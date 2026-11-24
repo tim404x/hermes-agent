@@ -53,6 +53,7 @@ __all__ = [
     "retarget_local_automation",
     "return_session_claim",
     "revert_steer_input",
+    "session_admissions_mentioning",
     "settle_session_input",
     "steer_session_input",
 ]
@@ -131,20 +132,41 @@ def list_session_admissions(holder, *, session_id: str, pending_only: bool = Tru
 _ADMISSION_STATUSES = ('queued', 'started', 'unknown', 'terminal')  # the table's status CHECK
 
 
-def latest_session_admission(holder, *, session_id: str, payload_marker: str) -> dict | None:
-    """The newest admission whose decoded payload holds the top-level key ``payload_marker``, stopping at the first
-    match: a restored lane needs only its latest envelope, not the session's whole history. One newest-first stream
-    per status, merged by ``seq``, so each walks the (target, status, seq) index with no sort."""
+def latest_session_admission(holder, *, session_id: str, payload_marker: str, match=None) -> dict | None:
+    """The newest admission whose decoded payload holds the top-level key ``payload_marker`` (and, when given, for
+    which ``match(row)`` is true), stopping at the first match: a restored lane needs only its latest envelope, not
+    the session's whole history. One newest-first stream per status, merged by ``seq``, so each walks the (target,
+    status, seq) index with no sort."""
     sql = "SELECT * FROM session_admissions WHERE target_session_id=? AND status=? ORDER BY seq DESC"
     with holder._read_ctx() as conn:
         cursors = [conn.execute(sql, (session_id, status)) for status in _ADMISSION_STATUSES]
         try:
             rows = heapq.merge(*cursors, key=lambda row: row['seq'], reverse=True)
             return next((row for row in map(_row, rows)
-                         if isinstance(row['payload'], dict) and payload_marker in row['payload']), None)
+                         if isinstance(row['payload'], dict) and payload_marker in row['payload']
+                         and (match is None or match(row))), None)
         finally:
             for cursor in cursors:  # before the connection goes back to the pool
                 cursor.close()
+
+
+def session_admissions_mentioning(holder, *, session_id: str, value: str) -> list[dict]:
+    """The session's admissions, in ``seq`` order, whose payload holds the string ``value`` (``payload_holds_string``).
+
+    SQLite narrows them by the value's JSON string token in ``payload_json`` and only those rows are decoded and
+    checked exactly: a producer-identity probe on a long-lived chat must not decode its whole history on the owner
+    loop (2,007 rows on Tim's main chat, the loop stalls of 24 Nov 2026). Every writer stores payloads with
+    ``json.dumps`` (canonical or not, ``ensure_ascii`` either way), so a payload that holds ``value`` contains one of
+    the two encodings below verbatim; inside a longer string its quotes would be escaped, so the token cannot
+    match there, and any other false hit is dropped by the exact check."""
+    from persistence.authority.admissions import payload_holds_string
+    _text(value)
+    tokens = {json.dumps(value, ensure_ascii=False), json.dumps(value, ensure_ascii=True)}
+    where = ' OR '.join('instr(payload_json, ?) > 0' for _ in tokens)
+    with holder._read_ctx() as conn:
+        rows = conn.execute(f'SELECT * FROM session_admissions WHERE target_session_id=? AND ({where}) ORDER BY seq',
+                            (session_id, *sorted(tokens))).fetchall()
+    return [row for row in map(_row, rows) if payload_holds_string(row['payload'], value)]
 
 
 _ANY_HEAD = object()

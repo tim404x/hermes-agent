@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
-from persistence.authority.admissions import AdmissionRecord, AdmissionResult
+from persistence.authority.admissions import AdmissionRecord, AdmissionResult, payload_holds_string
 from persistence.core.canonical import canonical_json
 from persistence.core.errors import AuthorityRefusal, PermanentStoreError
 from session_rules.api_payloads import compacted_api_payload
@@ -74,10 +74,16 @@ class AdmissionReadsMixin:
         row = rows.lookup(self._committed(), admission_id)
         return rows.record(row) if row is not None else None
 
-    def latest_admission(self, *, session_id: str, payload_marker: str) -> AdmissionRecord | None:
+    def latest_admission(self, *, session_id: str, payload_marker: str,
+                         match: Callable[[AdmissionRecord], bool] | None = None) -> AdmissionRecord | None:
         selected = rows.session_rows(self._committed(), session_id)
-        row = next((r for r in reversed(selected) if isinstance(r["payload"], dict) and payload_marker in r["payload"]), None)
+        row = next((r for r in reversed(selected) if isinstance(r["payload"], dict) and payload_marker in r["payload"]
+                    and (match is None or match(rows.record(r)))), None)
         return rows.record(row) if row is not None else None
+
+    def mentioning(self, *, session_id: str, value: str) -> list[AdmissionRecord]:
+        selected = rows.session_rows(self._committed(), session_id)
+        return [rows.record(r) for r in selected if payload_holds_string(r["payload"], value)]
 
     def settled_result(self, *, admission_id: str, epoch: int | None = None, generation: int | None = None) -> AdmissionResult | None:
         if (epoch is None) != (generation is None):

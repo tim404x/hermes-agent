@@ -175,6 +175,9 @@ class InMemoryLineageRepository:
             current = following
         return tuple(SessionId(sid) for sid in walked) if session_id in walked else (session_id,)
 
+    def lineage_root(self, session_id: SessionId) -> SessionId:
+        return (self.lineage(session_id) or (session_id,))[0]
+
     def conversation_root(self, session_id: SessionId) -> SessionId:
         scope = self._backend.scope
         table = _sessions_table(self._backend, scope)

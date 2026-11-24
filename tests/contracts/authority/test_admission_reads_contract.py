@@ -151,6 +151,60 @@ def test_latest_admission_is_the_newest_row_carrying_the_marker(backend, scope_a
     assert settled.seq < started.seq < queued.seq
 
 
+def test_latest_admission_with_a_match_skips_newer_rows_it_refuses(backend, scope_a):
+    store = backend.open(scope_a)
+    epoch = _seed(store, SESSION, "other")
+
+    def marked(text, **extra):
+        return {"native_text_v1": {"text": text, **extra}}
+
+    human = _admit(store, epoch, "human", payload=marked("one", source={"user_id": "7"}))
+    _admit(store, epoch, "wake", payload=marked("two", automation={"identity": "x"}))
+    _admit(store, epoch, "plain")
+    _admit(store, epoch, "elsewhere", session_id="other", payload=marked("three"))
+
+    def human_only(record):
+        return "automation" not in record.payload["native_text_v1"]
+    # CONTRACT: the newest row by seq that carries the marker AND passes ``match``; a newer refused row is skipped.
+    assert store.admissions.latest_admission(session_id=SESSION, payload_marker="native_text_v1",
+                                             match=human_only) == store.admissions.get(admission_id=human.admission_id)
+    assert store.admissions.latest_admission(session_id=SESSION, payload_marker="native_text_v1",
+                                             match=lambda record: False) is None
+    # CONTRACT: ``match`` sees only rows that carry the marker, never another session's.
+    seen = []
+    store.admissions.latest_admission(session_id=SESSION, payload_marker="native_text_v1",
+                                      match=lambda record: seen.append(record.request_id) or False)
+    assert seen == ["wake", "human"]
+
+
+def test_mentioning_is_every_row_holding_the_string_in_seq_order(backend, scope_a):
+    store = backend.open(scope_a)
+    epoch = _seed(store, SESSION, "other")
+    identity = '{"kind":"process","id":"p-1"}'
+    listed = _admit(store, epoch, "listed", payload={"text": "a", "local_automation_v1": {"identities": [identity, "z"]}})
+    _admit(store, epoch, "longer", payload={"text": "b", "note": identity + " and more"})
+    _admit(store, epoch, "escaped", payload={"text": "c", "note": f"wrapped {identity}"})
+    _admit(store, epoch, "keyed", payload={"text": "d", "deep": [{identity: 1}]})
+    _admit(store, epoch, "plain", payload={"text": "e"})
+    _admit(store, epoch, "nested", payload={"text": "f", "native_text_v1": {"automation": {"identity": identity}}})
+    _admit(store, epoch, "elsewhere", session_id="other", payload={"text": "g", "x": identity})
+    _settle_next(store, epoch)
+    # CONTRACT: rows of any status holding the exact string as a key or a string value at any depth, in seq order;
+    # a longer string that only contains it does not count, nor does another session's row.
+    assert [r.request_id for r in store.admissions.mentioning(session_id=SESSION, value=identity)] == [
+        "listed", "keyed", "nested"]
+    assert store.admissions.mentioning(session_id=SESSION, value=identity)[0] == store.admissions.get(
+        admission_id=listed.admission_id)
+    assert [r.request_id for r in store.admissions.mentioning(session_id=SESSION, value="z")] == ["listed"]
+    # CONTRACT: non-ASCII, quotes, backslashes and control characters match exactly as stored.
+    odd = 'café "quoted" back\\slash\ttab'
+    _admit(store, epoch, "odd", payload={"text": odd})
+    _admit(store, epoch, "odd-longer", payload={"text": odd + "!"})
+    assert [r.request_id for r in store.admissions.mentioning(session_id=SESSION, value=odd)] == ["odd"]
+    assert store.admissions.mentioning(session_id=SESSION, value="never") == []
+    assert store.admissions.mentioning(session_id="absent", value=identity) == []
+
+
 def test_compact_api_payloads_rewrites_the_settled_candidates(backend, scope_a):
     store = backend.open(scope_a)
     epoch = _seed(store)
