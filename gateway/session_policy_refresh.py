@@ -143,7 +143,8 @@ def _prepare(authority, session_id, mcp_only=False, adopt_only=False):
     from tools.terminal_scope import build_profile_terminal_scope
     store = authority_persistence(authority)
     generation = store.sessions.get(session_id).runtime_generation
-    stored = store.bindings.receipt(session_id).policy
+    receipt = store.bindings.receipt(session_id)
+    stored = receipt.policy
     old = restore_policy(stored)
     # A bypass launch never reads the profile; cron, Kanban and room routes are not resumed CLI sessions.
     if old.ignore_user_config or old.source not in SURFACES:
@@ -157,9 +158,9 @@ def _prepare(authority, session_id, mcp_only=False, adopt_only=False):
         from gateway.session_local_migration import follow_bot_chat
         base = follow_bot_chat(authority, session_id, old, live, picked)
     if adopt_only:
-        return None if base is old else (stored, old, base, {}, set(), generation)
+        return None if base is old else (stored, old, base, {}, set(), generation, receipt.current_target)
     policy, secrets, replaced = refreshed_policy(base, live, terminal, picked=picked, mcp_only=mcp_only)
-    return None if policy is old else (stored, old, policy, secrets, replaced, generation)
+    return None if policy is old else (stored, old, policy, secrets, replaced, generation, receipt.current_target)
 
 
 def _rebind(authority, session_id, old, policy, fresh, replaced):
@@ -201,21 +202,22 @@ async def refresh_settled(authority, session_id):
         await asyncio.wait({running})  # its outcome is its caller's; a cancelled waiter leaves it running
 
 
-async def commit_refresh(authority, ref, *, mcp_only=False, adopt_only=False):
+async def commit_refresh(authority, ref, *, mcp_only=False, adopt_only=False, skip_busy=False):
     """Commit an idle local session's refresh as its next policy generation: True when one was committed,
     False when nothing moved. Raises the store's refusal (``session_busy`` while a turn runs or waits).
     One refresh per session at a time, run to its publication even when the caller is cancelled: a second
-    waits for the first, then usually finds nothing moved."""
+    waits for the first, then usually finds nothing moved. A viewer's optional refresh (``skip_busy``)
+    also returns False if the ledger already rules out a commit."""
     from gateway.session_runtime_workers import track_mutation
     await refresh_settled(authority, ref.session_id)
     refreshes = _in_flight(authority)
-    task = refreshes[ref.session_id] = track_mutation(authority, _commit_refresh(authority, ref, mcp_only, adopt_only))
+    task = refreshes[ref.session_id] = track_mutation(authority, _commit_refresh(authority, ref, mcp_only, adopt_only, skip_busy))
     task.add_done_callback(lambda done: refreshes.pop(ref.session_id, None) if refreshes.get(ref.session_id)
                            is done else None)
     return await asyncio.shield(task)
 
 
-async def _commit_refresh(authority, ref, mcp_only, adopt_only=False):
+async def _commit_refresh(authority, ref, mcp_only, adopt_only, skip_busy):
     from gateway.session_persistence import authority_persistence
     from gateway.session_runtime_workers import tracked_write
     prepared = await asyncio.to_thread(_prepare, authority, ref.session_id, mcp_only, adopt_only)
@@ -225,15 +227,20 @@ async def _commit_refresh(authority, ref, mcp_only, adopt_only=False):
     if prepared is None:
         pending.discard(ref.session_id)
         return False
-    stored, old, policy, secrets, replaced, generation = prepared
+    stored, old, policy, secrets, replaced, generation, target = prepared
     if policy.follows_profile and not old.follows_profile:
         pending.add(ref.session_id)  # until this commit lands
+    store = authority_persistence(authority)
+    # Do not make a reader queue for the profile writer just to learn that the running
+    # turn keeps its policy. An idle read grants nothing: the write still fences all races.
+    if skip_busy and await store.aio.admissions.ledger_busy(ref.session_id, target):
+        return False
     moved = json.loads(policy.terminal_json) != json.loads(old.terminal_json)
     policy = _rebind(authority, ref.session_id, old, policy, secrets, replaced)
     # Compare-and-swap against the receipt as stored (JSON lists), not its restored tuple form. The
     # publication is the commit's own shielded follow-up: a caller cancelled mid-commit cannot leave the
     # stored policy ahead of the live one (restore_local_session refuses that pair).
-    await tracked_write(authority, partial(authority_persistence(authority).runtime.commit_refreshed_policy,
+    await tracked_write(authority, partial(store.runtime.commit_refreshed_policy,
                                            authority.epoch, session_id=ref.session_id, old=stored,
                                            new=asdict(policy), generation=generation),
                         then=lambda _generation: _publish(authority, ref, moved))
@@ -251,7 +258,7 @@ async def refresh_resumed_policy(authority, ref, *, attached=False):
     if attached and ref.session_id not in _pending_adoptions(authority):
         return
     try:
-        await (commit_refresh(authority, ref, adopt_only=True) if attached else commit_refresh(authority, ref))
+        await commit_refresh(authority, ref, adopt_only=attached, skip_busy=True)
     except Exception as exc:  # health: allow BLE001 -- a refresh is best-effort; the resume itself must proceed
         from persistence.core.errors import TransientStoreError
         from storage_user_copy import error_type_name
