@@ -281,7 +281,7 @@ def test_source_profile_home_preserves_policy_allowlist_and_credential_isolation
 def test_clean_exec_discards_the_manager_environment(tmp_path):
     from hermes_cli.kanban_isolation import clean_exec
     manifest = tmp_path / 'launch.json'
-    manifest.write_text(json.dumps({'HOME': str(tmp_path), 'ASSIGNEE_ONLY': 'fixture'}))
+    manifest.write_text(json.dumps({'environment': {'HOME': str(tmp_path), 'ASSIGNEE_ONLY': 'fixture'}}))
     check = ('import os,sys; sys.exit(not (os.environ["ASSIGNEE_ONLY"] == "fixture" '
              'and os.environ["INVOCATION_ID"] == "our-unit" and "MANAGER_ONLY" not in os.environ))')
     subprocess.run([sys.executable, '-IS', clean_exec.__file__, str(manifest), sys.executable, '-IS', '-c', check],
@@ -442,63 +442,64 @@ def test_disallowed_source_aliases_and_nested_targets_fail_closed(tmp_path, case
     (other / "skills").mkdir(mode=0o700)
     (other / "memories").mkdir(mode=0o700)
 
-    target_profile = profile
-    if case == "default_profile_alias":
+    def default_profile_alias():
         outside = tmp_path / "outside-skills"
         outside.mkdir(mode=0o700)
         (fleet / "skills").rename(tmp_path / "orig-skills")
         (fleet / "skills").symlink_to("../outside-skills")
-        target_profile = fleet
-    elif case == "nonstandard_parent_alias":
+        return fleet
+
+    def nonstandard_parent_alias():
         custom = tmp_path / "custom" / "alpha"
         custom.mkdir(parents=True, mode=0o700)
         (custom / "skills").symlink_to("../../.hermes/skills")
-        target_profile = custom
-    elif case == "cross_profile_alias":
-        (profile / "skills").unlink()
-        (profile / "skills").symlink_to("../beta/skills")
-    elif case == "wrong_asset_alias":
-        (profile / "skills").unlink()
-        (profile / "skills").symlink_to("../../plugins")
-    elif case == "absolute_top_level_alias":
-        (profile / "skills").unlink()
-        (profile / "skills").symlink_to((fleet / "skills").resolve())
-    elif case == "chained_top_level_alias":
+        return custom
+
+    def replace_skill_alias(target):
+        (profile / 'skills').unlink()
+        (profile / 'skills').symlink_to(target)
+
+    def chained_top_level_alias():
         real_skills = tmp_path / "real-skills"
         (fleet / "skills").rename(real_skills)
         (fleet / "skills").symlink_to(real_skills)
-    elif case == "private_config_alias":
-        (fleet / "config.yaml").write_text("model: {}\n", encoding="utf-8")
-        (profile / "config.yaml").unlink()
-        (profile / "config.yaml").symlink_to("../../config.yaml")
-    elif case == "private_env_alias":
-        (fleet / ".env").write_text("SECRET=1\n", encoding="utf-8")
-        (profile / ".env").unlink()
-        (profile / ".env").symlink_to("../../.env")
-    elif case == "private_auth_alias":
-        (fleet / "auth.json").write_text("{}\n", encoding="utf-8")
-        (profile / "auth.json").symlink_to("../../auth.json")
-    elif case == "nested_absolute_inside_skills":
-        (fleet / "skills" / "demo" / "abs.md").symlink_to((fleet / "skills" / "demo" / "SKILL.md").resolve())
-    elif case == "nested_escaping_inside_skills":
-        (fleet / "skills" / "demo" / "esc.md").symlink_to("../../../SOUL.md")
-    elif case == "nested_escape_and_reenter":
-        (fleet / "skills" / "demo" / "bounce.md").symlink_to("../../skills/demo/SKILL.md")
-    elif case == "nested_chained_escape":
-        (fleet / "skills" / "demo" / "hop1.md").symlink_to("hop2.md")
-        (fleet / "skills" / "demo" / "hop2.md").symlink_to("../../../SOUL.md")
-    elif case == "nested_loop":
-        (fleet / "skills" / "demo" / "a.md").symlink_to("b.md")
-        (fleet / "skills" / "demo" / "b.md").symlink_to("a.md")
-    elif case == "nested_dangling":
-        (fleet / "skills" / "demo" / "broken.md").symlink_to("does-not-exist.md")
-    elif case == "nested_fifo_direct":
-        os.mkfifo(fleet / "skills" / "demo" / "pipe")
-    elif case == "nested_fifo_target":
-        os.mkfifo(fleet / "skills" / "demo" / "pipe")
-        (fleet / "skills" / "demo" / "to-pipe").symlink_to("pipe")
-    elif case == "nested_link_in_memories":
-        (fleet / "memories" / "link.md").symlink_to("MEMORY.md")
+
+    def private_alias(name, content):
+        (fleet / name).write_text(content, encoding='utf-8')
+        (profile / name).unlink(missing_ok=True)
+        (profile / name).symlink_to(f'../../{name}')
+
+    demo = fleet / 'skills' / 'demo'
+
+    def skill_links(*links):
+        for name, target in links:
+            (demo / name).symlink_to(target)
+
+    def linked_fifo():
+        os.mkfifo(demo / 'pipe')
+        skill_links(('to-pipe', 'pipe'))
+
+    cases = {
+        'default_profile_alias': default_profile_alias,
+        'nonstandard_parent_alias': nonstandard_parent_alias,
+        'cross_profile_alias': lambda: replace_skill_alias('../beta/skills'),
+        'wrong_asset_alias': lambda: replace_skill_alias('../../plugins'),
+        'absolute_top_level_alias': lambda: replace_skill_alias((fleet / 'skills').resolve()),
+        'chained_top_level_alias': chained_top_level_alias,
+        'private_config_alias': lambda: private_alias('config.yaml', 'model: {}\n'),
+        'private_env_alias': lambda: private_alias('.env', 'SECRET=1\n'),
+        'private_auth_alias': lambda: private_alias('auth.json', '{}\n'),
+        'nested_absolute_inside_skills': lambda: skill_links(('abs.md', (demo / 'SKILL.md').resolve())),
+        'nested_escaping_inside_skills': lambda: skill_links(('esc.md', '../../../SOUL.md')),
+        'nested_escape_and_reenter': lambda: skill_links(('bounce.md', '../../skills/demo/SKILL.md')),
+        'nested_chained_escape': lambda: skill_links(('hop1.md', 'hop2.md'), ('hop2.md', '../../../SOUL.md')),
+        'nested_loop': lambda: skill_links(('a.md', 'b.md'), ('b.md', 'a.md')),
+        'nested_dangling': lambda: skill_links(('broken.md', 'does-not-exist.md')),
+        'nested_fifo_direct': lambda: os.mkfifo(demo / 'pipe'),
+        'nested_fifo_target': linked_fifo,
+        'nested_link_in_memories': lambda: (fleet / 'memories' / 'link.md').symlink_to('MEMORY.md'),
+    }
+    target_profile = cases[case]() or profile
 
     attempt = fleet / "kanban-worker-plane" / "t_bad" / "run-1" / "home"
     with pytest.raises(ValueError):
@@ -604,6 +605,13 @@ def test_launch_passes_bind_readonly_paths_and_fails_closed_without_copy_fallbac
     def fake_run(argv, **kwargs):
         call_order.append("systemd_run")
         seen_cmd.extend(argv)
+        launch_path = Path(argv[-1])
+        payload = json.loads(launch_path.read_text())
+        assert launch_path.stat().st_mode & 0o777 == 0o600
+        assert payload['claim']['claim_lock'] == claimed.claim_lock
+        assert all(claimed.claim_lock not in arg for arg in argv)
+        assert claimed.claim_lock not in payload['environment'].values()
+        assert {mount['name'] for mount in payload['readonly_mounts']} == {'skills', 'plugins'}
         return SimpleNamespace(returncode=1, stdout="", stderr="Failed to set up mount namespacing: Operation not permitted")
 
     monkeypatch.setattr(kwp.subprocess, "run", fake_run)

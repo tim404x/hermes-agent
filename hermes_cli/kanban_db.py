@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_admission import claims as admission
+from hermes_cli.kanban_db_graph import _parents_satisfied, unsatisfied_parents
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from hermes_cli.kanban_admission.declarations import _normalize_task_skills, _validate_model_override
 from utils import unlink_files_older_than
@@ -2073,30 +2074,6 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
 
 
 # --- Claim / complete / block ---
-
-def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return whether every direct parent is terminal for dependency gating."""
-    return conn.execute(
-        "SELECT 1 FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1", (task_id,),
-    ).fetchone() is None
-
-
-def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
-    """``(parent_id, status)`` for every direct parent :func:`_parents_satisfied`
-    still counts as open (``done`` / ``archived`` release the child), in id
-    order, so a refusal or a board view can name the blockers instead of the
-    caller guessing. Read-only."""
-    rows = conn.execute(
-        "SELECT p.id, p.status FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') "
-        "ORDER BY p.id", (task_id,),
-    ).fetchall()
-    return [(row["id"], row["status"]) for row in rows]
-
 
 def _admit_task(conn, task_id, source, *, claim=False, expect_assignee=None):
     return admission.admit(conn, task_id, source, home=kanban_home(),

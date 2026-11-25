@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 import shlex
 import shutil
@@ -266,13 +267,13 @@ def _read_gateway_identify(hermes_home: Path) -> Optional[dict[str, Any]]:
 
     try:
         return query_identify(hermes_home, timeout=2.0)
-    except Exception:
+    except (OSError, ValueError):
         return None
 
 
 def _start_gateway(unit_name, python_exe, environment, log_path):
     manifest = log_path.parent / 'gateway-env.json'
-    manifest.write_text(json.dumps(environment))
+    manifest.write_text(json.dumps({'environment': environment}))
     subprocess.run([
         'systemd-run', '--user', '--quiet', '--collect', '--service-type=exec', '--unit', unit_name,
         '--working-directory', str(REPO_ROOT), '-p', 'TimeoutStopSec=15',
@@ -281,6 +282,194 @@ def _start_gateway(unit_name, python_exe, environment, log_path):
         str(REPO_ROOT / 'hermes_cli/kanban_isolation/clean_exec.py'), str(manifest), python_exe,
         '-m', 'hermes_cli.main', 'gateway', 'run',
     ], check=True, timeout=20, env=_manager_env())
+
+
+def _seed_fleet_profile(hermes_home: Path, base_url: str, worker_plane: str) -> tuple[str, Path]:
+    (hermes_home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: custom\n"
+        f"  base_url: {base_url}\n"
+        "  default: staging-deterministic\n"
+        "  context_length: 128000\n"
+        "agent:\n"
+        "  api_max_retries: 1\n"
+        "updates:\n"
+        "  check: false\n"
+        "auxiliary:\n"
+        "  title_generation:\n"
+        "    enabled: false\n"
+        "gateway:\n"
+        "  standalone: true\n"
+        "kanban:\n"
+        "  dispatch_in_gateway: true\n"
+        "  notify_in_gateway: false\n"
+        "  auto_decompose: false\n"
+        "  dispatch_interval_seconds: 1\n"
+        f"  worker_plane: {worker_plane}\n",
+        encoding="utf-8",
+    )
+    (hermes_home / ".env").write_text("B4_OTHER_PROFILE_ONLY=synthetic\n", encoding="utf-8")
+    (hermes_home / ".env").chmod(0o600)
+    (hermes_home / "models_dev_cache.json").write_text(
+        json.dumps({"hermes-test-offline": {"id": "hermes-test-offline", "env": [], "models": {}}}),
+        encoding="utf-8",
+    )
+
+    # Seed shared fleet public assets + nested internal relative link inside skills.
+    skill_dir = hermes_home / "skills" / "b4-staging-skill"
+    refs_dir = skill_dir / "references"
+    refs_dir.mkdir(parents=True, mode=0o700)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: b4-staging-skill\ndescription: B4 staging shared skill fixture\n---\n# B4 Staging Skill\n",
+        encoding="utf-8",
+    )
+    (refs_dir / "guide.md").write_text(_FLEET_GUIDE_TEXT, encoding="utf-8")
+    (refs_dir / "guide-link.md").symlink_to("guide.md")
+
+    plugin_dir = hermes_home / "plugins" / "b4-staging-plugin"
+    plugin_dir.mkdir(parents=True, mode=0o700)
+    (plugin_dir / "marker.txt").write_text(_FLEET_PLUGIN_TEXT, encoding="utf-8")
+
+    memories_dir = hermes_home / "memories"
+    memories_dir.mkdir(parents=True, mode=0o700)
+    (memories_dir / "MEMORY.md").write_text(_FLEET_MEMORY_TEXT, encoding="utf-8")
+    (hermes_home / "SOUL.md").write_text(_FLEET_SOUL_TEXT, encoding="utf-8")
+
+    # Initialize board and create one real card via CLI (scratch HOME/HERMES_HOME).
+    assignee = 'b4-worker' if worker_plane == 'isolated_systemd' else 'default'
+    profile = hermes_home / 'profiles' / assignee if assignee != 'default' else hermes_home
+    if profile != hermes_home:
+        profile.mkdir(mode=0o700, parents=True)
+        for name in ('config.yaml', 'models_dev_cache.json'):
+            shutil.copyfile(hermes_home / name, profile / name)
+        # Model real named-profile canonical top-level relative aliases.
+        for asset_name in ('skills', 'plugins', 'memories', 'SOUL.md'):
+            (profile / asset_name).symlink_to(f"../../{asset_name}")
+    (profile / '.env').write_text('OPENAI_API_KEY=local-fixture-only\nHTTPS_PROXY=http://127.0.0.1:1\n'
+                                  'HTTP_PROXY=http://127.0.0.1:1\nNO_PROXY=127.0.0.1,localhost,::1\n')
+    return assignee, profile
+
+
+def _create_staging_card(python_exe: str, staging_root: Path, hermes_home: Path, assignee: str):
+    scratch_base = staging_root.parent
+    staging_home = hermes_home.parent
+    runtime = staging_root / 'r'
+    runtime.mkdir(mode=0o700)
+    cli_env = {
+        'PATH': f'{Path(python_exe).parent}:/usr/bin:/bin', 'LANG': 'C.UTF-8',
+        'XDG_RUNTIME_DIR': str(runtime), 'DBUS_SESSION_BUS_ADDRESS': f'unix:path={scratch_base}/bus',
+        'HERMES_GATEWAY_LOCK_DIR': str(runtime / 'locks'), 'HERMES_RUNTIME_DIR': str(runtime / 'pm'),
+        'TMPDIR': str(runtime), 'HERMES_DISABLE_LAZY_INSTALLS': '1', 'GIT_ALLOW_PROTOCOL': 'file',
+        'HTTPS_PROXY': 'http://127.0.0.1:1', 'HTTP_PROXY': 'http://127.0.0.1:1',
+        'ALL_PROXY': 'http://127.0.0.1:1', 'NO_PROXY': '127.0.0.1,localhost,::1',
+        'HERMES_SUPERVISED_CHILD': '1', 'HERMES_KANBAN_CRASH_GRACE_SECONDS': '0',
+        "HOME": str(staging_home),
+        'HERMES_REAL_HOME': str(staging_home), 'PYTHONDONTWRITEBYTECODE': '1',
+        "HERMES_HOME": str(hermes_home),
+        "PYTHONPATH": str(REPO_ROOT),
+        "NO_COLOR": "1",
+    }
+    subprocess.run(
+        [python_exe, "-m", "hermes_cli.main", "kanban", "init"],
+        cwd=str(REPO_ROOT), env=cli_env, check=True, capture_output=True, text=True, timeout=60,
+    )
+    created_proc = subprocess.run(
+        [
+            python_exe, "-m", "hermes_cli.main", "kanban", "create",
+            "staging restart isolation card",
+            "--body", "Run one terminal tool effect then call kanban_complete.",
+            "--assignee", assignee, "--json",
+        ],
+        cwd=str(REPO_ROOT), env=cli_env, check=True, capture_output=True, text=True, timeout=60,
+    )
+    created_json = json.loads(created_proc.stdout[created_proc.stdout.index("{"):])
+    return created_json['id'], cli_env
+
+
+def _restart_gateway(receipt, gw_unit, hermes_home, old_gw_pid, bound_pid_before):
+    receipt["markers"]["during_restart"] = {"ts": time.time(), "action": f"systemctl --user restart {gw_unit}"}
+    subprocess.run(["systemctl", "--user", "restart", gw_unit], check=True, timeout=45, env=_manager_env())
+    receipt['markers']['during_restart'].update(manager_returned=time.time(), live_birth=_live_birth(bound_pid_before))
+
+    new_ident = _wait_until(
+        lambda: (
+            (d := _read_gateway_identify(hermes_home))
+            and d.get("state") == "ready"
+            and int(d.get("pid", 0)) != old_gw_pid
+            and d
+        ),
+        timeout=90, what="restarted staging gateway ready with new PID",
+    )
+    new_gw_props = _systemctl_show(gw_unit)
+    new_gw_pid = int(new_ident["pid"])
+    receipt["new_gateway"] = {
+        "pid": new_gw_pid,
+        "unit": gw_unit,
+        "invocation_id": new_gw_props.get("InvocationID"),
+        "cgroup": new_gw_props.get("ControlGroup") or _proc_cgroup(new_gw_pid),
+    }
+    return new_gw_pid, new_gw_props
+
+
+def _record_fleet_assertions(receipt, *, hermes_home, profile, before_admitted, ro_probe):
+    attempt_home_path = Path((before_admitted or {}).get("payload", {}).get("attempt_home", ""))
+    host_skills_empty = (
+        attempt_home_path.is_dir()
+        and (attempt_home_path / "skills").is_dir()
+        and not (attempt_home_path / "skills").is_symlink()
+        and os.listdir(attempt_home_path / "skills") == []
+    )
+    host_plugins_empty = (
+        attempt_home_path.is_dir()
+        and (attempt_home_path / "plugins").is_dir()
+        and not (attempt_home_path / "plugins").is_symlink()
+        and os.listdir(attempt_home_path / "plugins") == []
+    )
+    fleet_unmutated = (
+        (hermes_home / "memories" / "MEMORY.md").read_text(encoding="utf-8") == _FLEET_MEMORY_TEXT
+        and (hermes_home / "SOUL.md").read_text(encoding="utf-8") == _FLEET_SOUL_TEXT
+        and (hermes_home / "skills" / "b4-staging-skill" / "references" / "guide.md").read_text(encoding="utf-8") == _FLEET_GUIDE_TEXT
+        and (hermes_home / "plugins" / "b4-staging-plugin" / "marker.txt").read_text(encoding="utf-8") == _FLEET_PLUGIN_TEXT
+        and not (hermes_home / "skills" / "b4-staging-skill" / ".ro-probe").exists()
+        and not (hermes_home / "plugins" / "b4-staging-plugin" / ".ro-probe").exists()
+    )
+    profile_links = {
+        name: os.readlink(profile / name)
+        for name in ("skills", "plugins", "memories", "SOUL.md")
+        if (profile / name).is_symlink()
+    }
+    nested_link_target = os.readlink(hermes_home / "skills" / "b4-staging-skill" / "references" / "guide-link.md")
+    receipt["shared_assets"] = {
+        "profile_links": profile_links,
+        "nested_skill_link": nested_link_target,
+        "worker_probe": ro_probe,
+        "host_mountpoints_empty": {"skills": host_skills_empty, "plugins": host_plugins_empty},
+        "fleet_sources_unmutated": fleet_unmutated,
+        "readonly_assets_admitted": (before_admitted or {}).get("payload", {}).get("readonly_assets"),
+    }
+    receipt["assertions"]["canonical_relative_links_modeled"] = (
+        profile_links == {name: f"../../{name}" for name in ("skills", "plugins", "memories", "SOUL.md")}
+        and nested_link_target == "guide.md"
+        and ro_probe.get("nested_skill_link_text") == _FLEET_GUIDE_TEXT
+        and ro_probe.get("nested_skill_link_is_symlink") is True
+        and ro_probe.get("plugin_marker_text") == _FLEET_PLUGIN_TEXT
+        and ro_probe.get("memories_is_symlink") is False
+        and ro_probe.get("soul_is_symlink") is False
+        and ro_probe.get("skills_is_symlink") is False
+        and ro_probe.get("plugins_is_symlink") is False
+    )
+    receipt["assertions"]["shared_assets_readonly"] = (
+        ro_probe.get("skills_readonly") is True
+        and ro_probe.get("plugins_readonly") is True
+        and host_skills_empty
+        and host_plugins_empty
+        and set((before_admitted or {}).get("payload", {}).get("readonly_assets") or ()) == {"skills", "plugins"}
+    )
+    receipt["assertions"]["no_source_mutation"] = (
+        ro_probe.get("memory_private_copy") is True
+        and ro_probe.get("soul_private_copy") is True
+        and fleet_unmutated
+    )
 
 
 def run_staging(*, worker_plane: str, python_exe: str, keep_scratch: bool = False) -> dict[str, Any]:
@@ -323,100 +512,8 @@ def run_staging(*, worker_plane: str, python_exe: str, keep_scratch: bool = Fals
     }
 
     try:
-        (hermes_home / "config.yaml").write_text(
-            "model:\n"
-            "  provider: custom\n"
-            f"  base_url: {base_url}\n"
-            "  default: staging-deterministic\n"
-            "  context_length: 128000\n"
-            "agent:\n"
-            "  api_max_retries: 1\n"
-            "updates:\n"
-            "  check: false\n"
-            "auxiliary:\n"
-            "  title_generation:\n"
-            "    enabled: false\n"
-            "gateway:\n"
-            "  standalone: true\n"
-            "kanban:\n"
-            "  dispatch_in_gateway: true\n"
-            "  notify_in_gateway: false\n"
-            "  auto_decompose: false\n"
-            "  dispatch_interval_seconds: 1\n"
-            f"  worker_plane: {worker_plane}\n",
-            encoding="utf-8",
-        )
-        (hermes_home / ".env").write_text("B4_OTHER_PROFILE_ONLY=synthetic\n", encoding="utf-8")
-        (hermes_home / ".env").chmod(0o600)
-        (hermes_home / "models_dev_cache.json").write_text(
-            json.dumps({"hermes-test-offline": {"id": "hermes-test-offline", "env": [], "models": {}}}),
-            encoding="utf-8",
-        )
-
-        # Seed shared fleet public assets + nested internal relative link inside skills.
-        skill_dir = hermes_home / "skills" / "b4-staging-skill"
-        refs_dir = skill_dir / "references"
-        refs_dir.mkdir(parents=True, mode=0o700)
-        (skill_dir / "SKILL.md").write_text(
-            "---\nname: b4-staging-skill\ndescription: B4 staging shared skill fixture\n---\n# B4 Staging Skill\n",
-            encoding="utf-8",
-        )
-        (refs_dir / "guide.md").write_text(_FLEET_GUIDE_TEXT, encoding="utf-8")
-        (refs_dir / "guide-link.md").symlink_to("guide.md")
-
-        plugin_dir = hermes_home / "plugins" / "b4-staging-plugin"
-        plugin_dir.mkdir(parents=True, mode=0o700)
-        (plugin_dir / "marker.txt").write_text(_FLEET_PLUGIN_TEXT, encoding="utf-8")
-
-        memories_dir = hermes_home / "memories"
-        memories_dir.mkdir(parents=True, mode=0o700)
-        (memories_dir / "MEMORY.md").write_text(_FLEET_MEMORY_TEXT, encoding="utf-8")
-        (hermes_home / "SOUL.md").write_text(_FLEET_SOUL_TEXT, encoding="utf-8")
-
-        # Initialize board and create one real card via CLI (scratch HOME/HERMES_HOME).
-        assignee = 'b4-worker' if worker_plane == 'isolated_systemd' else 'default'
-        profile = hermes_home / 'profiles' / assignee if assignee != 'default' else hermes_home
-        if profile != hermes_home:
-            profile.mkdir(mode=0o700, parents=True)
-            for name in ('config.yaml', 'models_dev_cache.json'):
-                shutil.copyfile(hermes_home / name, profile / name)
-            # Model real named-profile canonical top-level relative aliases.
-            for asset_name in ('skills', 'plugins', 'memories', 'SOUL.md'):
-                (profile / asset_name).symlink_to(f"../../{asset_name}")
-        (profile / '.env').write_text('OPENAI_API_KEY=local-fixture-only\nHTTPS_PROXY=http://127.0.0.1:1\n'
-                                      'HTTP_PROXY=http://127.0.0.1:1\nNO_PROXY=127.0.0.1,localhost,::1\n')
-        runtime = staging_root / 'r'
-        runtime.mkdir(mode=0o700)
-        cli_env = {
-            'PATH': f'{Path(python_exe).parent}:/usr/bin:/bin', 'LANG': 'C.UTF-8',
-            'XDG_RUNTIME_DIR': str(runtime), 'DBUS_SESSION_BUS_ADDRESS': f'unix:path={scratch_base}/bus',
-            'HERMES_GATEWAY_LOCK_DIR': str(runtime / 'locks'), 'HERMES_RUNTIME_DIR': str(runtime / 'pm'),
-            'TMPDIR': str(runtime), 'HERMES_DISABLE_LAZY_INSTALLS': '1', 'GIT_ALLOW_PROTOCOL': 'file',
-            'HTTPS_PROXY': 'http://127.0.0.1:1', 'HTTP_PROXY': 'http://127.0.0.1:1',
-            'ALL_PROXY': 'http://127.0.0.1:1', 'NO_PROXY': '127.0.0.1,localhost,::1',
-            'HERMES_SUPERVISED_CHILD': '1', 'HERMES_KANBAN_CRASH_GRACE_SECONDS': '0',
-            "HOME": str(staging_home),
-            'HERMES_REAL_HOME': str(staging_home), 'PYTHONDONTWRITEBYTECODE': '1',
-            "HERMES_HOME": str(hermes_home),
-            "PYTHONPATH": str(REPO_ROOT),
-            "NO_COLOR": "1",
-        }
-        subprocess.run(
-            [python_exe, "-m", "hermes_cli.main", "kanban", "init"],
-            cwd=str(REPO_ROOT), env=cli_env, check=True, capture_output=True, text=True, timeout=60,
-        )
-        created_proc = subprocess.run(
-            [
-                python_exe, "-m", "hermes_cli.main", "kanban", "create",
-                "staging restart isolation card",
-                "--body", "Run one terminal tool effect then call kanban_complete.",
-                "--assignee", assignee, "--json",
-            ],
-            cwd=str(REPO_ROOT), env=cli_env, check=True, capture_output=True, text=True, timeout=60,
-        )
-        created_json = json.loads(created_proc.stdout[created_proc.stdout.index("{"):])
-        task_id = created_json["id"]
-        board_db = hermes_home / "kanban.db"
+        assignee, profile = _seed_fleet_profile(hermes_home, base_url, worker_plane)
+        task_id, cli_env = _create_staging_card(python_exe, staging_root, hermes_home, assignee)
         receipt["task_id"] = task_id
         receipt["board_db"] = str(board_db)
 
@@ -491,28 +588,7 @@ def run_staging(*, worker_plane: str, python_exe: str, keep_scratch: bool = Fals
             "side_effect_count": len(side_effects_before),
         }
 
-        # Restart ONLY the private staging gateway unit!
-        receipt["markers"]["during_restart"] = {"ts": time.time(), "action": f"systemctl --user restart {gw_unit}"}
-        subprocess.run(["systemctl", "--user", "restart", gw_unit], check=True, timeout=45, env=_manager_env())
-        receipt['markers']['during_restart'].update(manager_returned=time.time(), live_birth=_live_birth(bound_pid_before))
-
-        new_ident = _wait_until(
-            lambda: (
-                (d := _read_gateway_identify(hermes_home))
-                and d.get("state") == "ready"
-                and int(d.get("pid", 0)) != old_gw_pid
-                and d
-            ),
-            timeout=90, what="restarted staging gateway ready with new PID",
-        )
-        new_gw_props = _systemctl_show(gw_unit)
-        new_gw_pid = int(new_ident["pid"])
-        receipt["new_gateway"] = {
-            "pid": new_gw_pid,
-            "unit": gw_unit,
-            "invocation_id": new_gw_props.get("InvocationID"),
-            "cgroup": new_gw_props.get("ControlGroup") or _proc_cgroup(new_gw_pid),
-        }
+        new_gw_pid, new_gw_props = _restart_gateway(receipt, gw_unit, hermes_home, old_gw_pid, bound_pid_before)
 
         # Let the restarted gateway run at least 2 dispatcher ticks (interval=1s) while worker is paused!
         time.sleep(3.5)
@@ -652,64 +728,8 @@ def run_staging(*, worker_plane: str, python_exe: str, keep_scratch: bool = Fals
             "persisted_attempt_receipt_no_shared_writer": persisted_receipt,
         }
         if worker_plane == "isolated_systemd":
-            attempt_home_path = Path((before_admitted or {}).get("payload", {}).get("attempt_home", ""))
-            host_skills_empty = (
-                attempt_home_path.is_dir()
-                and (attempt_home_path / "skills").is_dir()
-                and not (attempt_home_path / "skills").is_symlink()
-                and os.listdir(attempt_home_path / "skills") == []
-            )
-            host_plugins_empty = (
-                attempt_home_path.is_dir()
-                and (attempt_home_path / "plugins").is_dir()
-                and not (attempt_home_path / "plugins").is_symlink()
-                and os.listdir(attempt_home_path / "plugins") == []
-            )
-            fleet_unmutated = (
-                (hermes_home / "memories" / "MEMORY.md").read_text(encoding="utf-8") == _FLEET_MEMORY_TEXT
-                and (hermes_home / "SOUL.md").read_text(encoding="utf-8") == _FLEET_SOUL_TEXT
-                and (hermes_home / "skills" / "b4-staging-skill" / "references" / "guide.md").read_text(encoding="utf-8") == _FLEET_GUIDE_TEXT
-                and (hermes_home / "plugins" / "b4-staging-plugin" / "marker.txt").read_text(encoding="utf-8") == _FLEET_PLUGIN_TEXT
-                and not (hermes_home / "skills" / "b4-staging-skill" / ".ro-probe").exists()
-                and not (hermes_home / "plugins" / "b4-staging-plugin" / ".ro-probe").exists()
-            )
-            profile_links = {
-                name: os.readlink(profile / name)
-                for name in ("skills", "plugins", "memories", "SOUL.md")
-                if (profile / name).is_symlink()
-            }
-            nested_link_target = os.readlink(hermes_home / "skills" / "b4-staging-skill" / "references" / "guide-link.md")
-            receipt["shared_assets"] = {
-                "profile_links": profile_links,
-                "nested_skill_link": nested_link_target,
-                "worker_probe": ro_probe,
-                "host_mountpoints_empty": {"skills": host_skills_empty, "plugins": host_plugins_empty},
-                "fleet_sources_unmutated": fleet_unmutated,
-                "readonly_assets_admitted": (before_admitted or {}).get("payload", {}).get("readonly_assets"),
-            }
-            receipt["assertions"]["canonical_relative_links_modeled"] = (
-                profile_links == {name: f"../../{name}" for name in ("skills", "plugins", "memories", "SOUL.md")}
-                and nested_link_target == "guide.md"
-                and ro_probe.get("nested_skill_link_text") == _FLEET_GUIDE_TEXT
-                and ro_probe.get("nested_skill_link_is_symlink") is True
-                and ro_probe.get("plugin_marker_text") == _FLEET_PLUGIN_TEXT
-                and ro_probe.get("memories_is_symlink") is False
-                and ro_probe.get("soul_is_symlink") is False
-                and ro_probe.get("skills_is_symlink") is False
-                and ro_probe.get("plugins_is_symlink") is False
-            )
-            receipt["assertions"]["shared_assets_readonly"] = (
-                ro_probe.get("skills_readonly") is True
-                and ro_probe.get("plugins_readonly") is True
-                and host_skills_empty
-                and host_plugins_empty
-                and set((before_admitted or {}).get("payload", {}).get("readonly_assets") or ()) == {"skills", "plugins"}
-            )
-            receipt["assertions"]["no_source_mutation"] = (
-                ro_probe.get("memory_private_copy") is True
-                and ro_probe.get("soul_private_copy") is True
-                and fleet_unmutated
-            )
+            _record_fleet_assertions(receipt, hermes_home=hermes_home, profile=profile,
+                                    before_admitted=before_admitted, ro_probe=ro_probe)
             receipt["assertions"]["no_duplicate_runs_or_effects"] = (
                 len(final_runs) == 1
                 and len(final_side_effects) == 1
@@ -718,6 +738,7 @@ def run_staging(*, worker_plane: str, python_exe: str, keep_scratch: bool = Fals
         receipt["passed"] = all(receipt["assertions"].values())
         return receipt
     except Exception as exc:
+        logging.getLogger(__name__).exception('Private restart stage failed')
         receipt['error'] = str(exc)
         return receipt
     finally:

@@ -8,7 +8,7 @@ import sys
 def main():
     path, *command = sys.argv[1:]
     with open(path, encoding="utf-8") as launch_file:
-        environment = json.load(launch_file)
+        environment = json.load(launch_file)["environment"]
     environment["INVOCATION_ID"] = os.environ["INVOCATION_ID"]
     os.umask(0o077)
     os.execve(command[0], command, environment)

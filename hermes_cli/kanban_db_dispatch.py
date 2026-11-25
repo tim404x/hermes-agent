@@ -20,7 +20,6 @@ from dataclasses import field
 from pathlib import Path
 from typing import Any
 from typing import Callable
-from typing import Iterable
 from typing import Iterator
 from typing import Mapping
 from typing import Optional
@@ -28,6 +27,8 @@ from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli._startup_fast import project_root_str
+from hermes_cli.kanban_dispatch.results import DispatchResult, describe_suppression
+from hermes_cli.kanban_worker_env import _worker_terminal_timeout_env
 from hermes_cli.kanban_worker_log import open_task_worker_log as _open_worker_log
 
 if TYPE_CHECKING:
@@ -37,11 +38,6 @@ if TYPE_CHECKING:
 # After this many consecutive non-success attempts on a task/profile the
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
-
-# Keep a little wall-clock budget for the worker to observe a terminal timeout
-# and make a terminal board call (kanban_block/kanban_complete/kanban_request_review)
-# before max_runtime_seconds kills it.
-KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
 
 # A healthy worker is still alive for a while after kanban_complete /
 # kanban_request_review returns (final assistant turn, session persistence), so
@@ -85,103 +81,6 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
 )
-
-
-@dataclass
-class DispatchResult:
-    """Outcome of a single ``dispatch`` pass.
-
-    ``kanban.default_assignee`` applied this tick before spawning (#27145). Surfaces the auto-assignment to
-    telemetry / CLI / dashboard so the operator can see when the dispatcher is acting on the fallback rule
-    ``kanban.max_in_progress_per_profile`` (#21582). Each entry is ``(task_id, assignee,
-    current_running_count)``. NOT an operator-actionable failure — the task will be picked up on a
-    subsequent tick when the assignee has capacity. Separate bucket so telemetry / dashboards can show "this
-    profile is busy" vs
-    the board's dispatch lock (issue #35240). A losing dispatcher does no DB writes this tick — the lock
-    holder is making progress on the same board. This is the steady-state signal that a single-writer guard
-    is
-    """
-
-    reclaimed: int = 0
-    promoted: int = 0
-    reconciled_orphans: list[str] = field(default_factory=list)
-    """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
-    claim bookkeeping, dead/gone worker)."""
-    reaped_terminal_workers: list[str] = field(default_factory=list)
-    """Task ids whose worker outlived its closed run and was terminated by
-    :func:`reap_terminal_workers`."""
-    spawned: list[tuple[str, str, str]] = field(default_factory=list)
-    """``(task_id, assignee, workspace_path)`` triples."""
-    skipped_unassigned: list[str] = field(default_factory=list)
-    """Ready task ids with no assignee at all — operator-actionable (usually a
-    misfiled task waiting for routing)."""
-    auto_assigned_default: list[str] = field(default_factory=list)
-    """Unassigned task ids that had ``kanban.default_assignee`` applied this
-    tick before spawning, so telemetry/CLI/dashboard can show the dispatcher
-    acting on the fallback rule rather than explicit assignments."""
-    skipped_nonspawnable: list[str] = field(default_factory=list)
-    """Ready task ids whose assignee names a control-plane lane (e.g. a Claude
-    Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
-    on multi-lane setups, NOT operator-actionable; tracked apart so health
-    telemetry can tell "stuck" from "correctly idle"."""
-    skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
-    """``(task_id, assignee, current_running_count)`` deferred because the
-    assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
-    tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
-    crashed: list[str] = field(default_factory=list)
-    """Task ids reclaimed because their worker PID disappeared."""
-    auto_blocked: list[str] = field(default_factory=list)
-    """Task ids auto-blocked by the spawn-failure circuit breaker."""
-    timed_out: list[str] = field(default_factory=list)
-    """Task ids whose workers exceeded ``max_runtime_seconds``."""
-    stale: list[str] = field(default_factory=list)
-    """Task ids reclaimed for no heartbeat within ``dispatch_stale_timeout_seconds``."""
-    respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
-    """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
-    (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
-    within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
-    rate_limited: list[str] = field(default_factory=list)
-    """Task ids whose workers bailed on a provider rate-limit / quota wall
-    (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
-    a failure — a long quota window must never trip the circuit breaker."""
-    skipped_locked: bool = False
-    """True when another process held the board's dispatch lock: this tick did
-    no DB writes; the lock holder is making progress on the same board."""
-    memory_pressure: Optional[str] = None
-    """Memory pressure that restricted this tick: ``"critical"`` (no new
-    workers), ``"elevated"`` (at most one), ``None`` (no restriction).
-    Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
-    adopted: list[str] = field(default_factory=list)  # tasks adopted from verified receipts without spawning
-    corrupt_receipts: list[str] = field(default_factory=list)  # tasks refused fail-closed on receipt corruption
-
-
-def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
-    """One line naming why the tick(s) held ready work back, or ``""``.
-
-    ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
-    memory_pressure=critical`` — the respawn-guard reasons counted per task
-    plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
-    CLI daemon and the embedded gateway dispatcher, which otherwise report a
-    bare zero-spawn count while ``hermes kanban tail`` is the only place the
-    guard reason is written (#111910).
-    """
-    counts: dict[str, int] = {}
-    pressure: Optional[str] = None
-    for res in results:
-        if res is None:
-            continue
-        for _task_id, reason in res.respawn_guarded:
-            counts[reason] = counts.get(reason, 0) + 1
-        if res.rate_limited:
-            counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
-        if res.skipped_locked:
-            counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
-        if res.memory_pressure:
-            pressure = res.memory_pressure
-    parts = [f"{k}={v}" for k, v in sorted(counts.items())]
-    if pressure:
-        parts.append(f"memory_pressure={pressure}")
-    return ", ".join(parts)
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -2135,6 +2034,16 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _publish_worker_spawn(conn, claimed, workspace, pid, board):
+    if pid:
+        spawn_meta = getattr(pid, 'metadata', None)
+        _set_worker_pid(
+            conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock,
+            spawn_metadata=spawn_meta if isinstance(spawn_meta, dict) else None,
+        )
+    _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2232,15 +2141,7 @@ def _dispatch_lane_task(
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
-        if pid:
-            spawn_meta = getattr(pid, "metadata", None)
-            _set_worker_pid(
-                conn, claimed.id, int(pid),
-                run_id=claimed.current_run_id, claim_lock=claimed.claim_lock,
-                spawn_metadata=spawn_meta if isinstance(spawn_meta, dict) else None,
-            )
-        # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
-        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
+        _publish_worker_spawn(conn, claimed, workspace, pid, board)
         # consecutive_failures is deliberately NOT reset here: resetting on
         # spawn would let a task that keeps timing out loop forever. Cleared
         # only on successful completion (complete_task).
@@ -2584,35 +2485,6 @@ def _resolve_hermes_argv() -> list[str]:
     if hermes_bin:
         return _hermes_path_argv(hermes_bin)
     return _module_hermes_argv()
-
-
-def _worker_terminal_timeout_env(
-    max_runtime_seconds: Optional[int],
-    current_timeout: Optional[str],
-) -> Optional[str]:
-    """Return a worker-scoped TERMINAL_TIMEOUT override, if needed.
-
-    When ``max_runtime_seconds`` exceeds the terminal tool's default timeout,
-    raise only the child's default so a long command isn't killed by the
-    generic terminal default first.
-    """
-    if max_runtime_seconds is None:
-        return None
-    try:
-        runtime = int(max_runtime_seconds)
-    except (TypeError, ValueError):
-        return None
-    if runtime <= 0:
-        return None
-
-    desired = max(1, runtime - KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS)
-    try:
-        existing = int(str(current_timeout).strip()) if current_timeout else 0
-    except (TypeError, ValueError):
-        existing = 0
-    if existing >= desired:
-        return None
-    return str(desired)
 
 
 @contextlib.contextmanager

@@ -14,7 +14,41 @@ Hermes' own location before the dispatcher adds the claim.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Optional
+
+# Keep a little wall-clock budget for the worker to observe a terminal timeout
+# and make a terminal board call (kanban_block/kanban_complete/kanban_request_review)
+# before max_runtime_seconds kills it.
+KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
+
+
+def _worker_terminal_timeout_env(
+    max_runtime_seconds: Optional[int],
+    current_timeout: Optional[str],
+) -> Optional[str]:
+    """Return a worker-scoped TERMINAL_TIMEOUT override, if needed.
+
+    When ``max_runtime_seconds`` exceeds the terminal tool's default timeout,
+    raise only the child's default so a long command isn't killed by the
+    generic terminal default first.
+    """
+    if max_runtime_seconds is None:
+        return None
+    try:
+        runtime = int(max_runtime_seconds)
+    except (TypeError, ValueError):
+        return None
+    if runtime <= 0:
+        return None
+
+    desired = max(1, runtime - KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS)
+    try:
+        existing = int(str(current_timeout).strip()) if current_timeout else 0
+    except (TypeError, ValueError):
+        existing = 0
+    if existing >= desired:
+        return None
+    return str(desired)
 
 # Exact names (Windows matches case-insensitively). Host plumbing, never a profile's settings.
 _HOST_NAMES = frozenset({

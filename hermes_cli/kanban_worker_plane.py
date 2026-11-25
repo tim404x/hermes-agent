@@ -268,7 +268,7 @@ def systemd_user_service_available(
                         detail = stderr_bytes.decode("utf-8", "replace").strip() or f"rc={proc.returncode}"
                         reason = f"systemd-run --user read-only bind-mount probe failed: {detail}"
                     break
-        except Exception as exc:
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             available = False
             reason = f"systemd-run --user read-only bind-mount probe error: {exc}"
         _PROBE_AVAILABLE = available
@@ -315,7 +315,7 @@ def inspect_systemd_unit(
             encoding="utf-8", errors="replace", timeout=5,
             env=_bus_env(env), check=False,
         )
-    except Exception:
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         return {}
     if proc.returncode != 0:
         return {}
@@ -374,32 +374,28 @@ def launch_isolated_worker_service(
     # Plan, validate, and materialize outside any board write lock; never copies skills/plugins.
     plan = prepare_attempt_home_plan(root_dir / "home", resolved_profile)
     attempt_home = plan.attempt_home
-    launch_env_path = root_dir / "launch.env"
+    launch_path = root_dir / "launch.json"
 
     boot_id = current_instantiation_epoch()
     if not boot_id:
         raise RestartSafeScopeUnavailable('cannot verify isolated worker boot identity')
     from hermes_cli.kanban_worker_env import isolated_owner_env
     worker_env = isolated_owner_env(env, resolved_profile)
-    for name in ('HERMES_KANBAN_BOARD', 'HERMES_KANBAN_DB', 'HERMES_KANBAN_WORKSPACES_ROOT',
-                 'HERMES_KANBAN_TASK', 'HERMES_KANBAN_RUN_ID', 'HERMES_KANBAN_CLAIM_LOCK', 'PYTHONPATH'):
-        worker_env[name] = env[name]
+    worker_env['PYTHONPATH'] = env['PYTHONPATH']
     worker_env['HERMES_HOME'] = str(attempt_home)
-    worker_env["HERMES_KANBAN_ISOLATED_PROFILE_HOME"] = str(resolved_profile)
-    worker_env["HERMES_KANBAN_ATTEMPT_HOME"] = str(attempt_home)
-    worker_env["HERMES_KANBAN_WORKER_UNIT"] = unit_name
-    worker_env["HERMES_KANBAN_WORKER_BOOT_ID"] = boot_id
-    worker_env["HERMES_KANBAN_LAUNCH_ENV_FILE"] = str(launch_env_path)
-    worker_env["HERMES_KANBAN_REQUIRED_RO_MOUNTS"] = json.dumps(
-        [proj.to_manifest() for proj in plan.readonly_projections]
-    )
-    with launch_env_path.open('x', encoding='utf-8') as launch_file:
-        os.fchmod(launch_file.fileno(), 0o600)
-        json.dump(worker_env, launch_file)
+    board_label = board or env['HERMES_KANBAN_BOARD'] or 'default'
+    with os.fdopen(os.open(launch_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), 'w', encoding='utf-8') as launch_file:
+        json.dump({
+            'environment': worker_env,
+            'claim': {'board': env['HERMES_KANBAN_BOARD'], 'task_id': task.id,
+                      'run_id': int(task.current_run_id), 'claim_lock': task.claim_lock},
+            'board_db': str(resolved_db), 'profile_home': str(resolved_profile),
+            'attempt_home': str(attempt_home), 'unit_name': unit_name, 'boot_id': boot_id,
+            'readonly_mounts': [proj.to_manifest() for proj in plan.readonly_projections],
+        }, launch_file)
 
     resolved_log = Path(log_path).expanduser().resolve()
     working_dir = workspace if workspace and os.path.isdir(workspace) else str(attempt_home)
-    board_label = board or worker_env.get("HERMES_KANBAN_BOARD") or "default"
     description = f"Hermes Kanban isolated worker {board_label}/{task.id}/run-{int(task.current_run_id)}"
 
     ro_bind_args: list[str] = []
@@ -423,7 +419,7 @@ def launch_isolated_worker_service(
         *ro_bind_args,
         *no_expand,
         "--", sys.executable, "-IS", str(Path(__file__).with_name('kanban_isolation') / 'clean_exec.py'),
-        str(launch_env_path), sys.executable, "-P", "-m", "hermes_cli.kanban_isolated_worker",
+        str(launch_path), sys.executable, "-P", "-m", "hermes_cli.kanban_isolated_worker", str(launch_path),
     ]
     intent = {'worker_plane': WORKER_PLANE_ISOLATED_SYSTEMD, 'systemd_unit': unit_name, 'boot_id': boot_id}
     _record_launch_intent(resolved_db, task, intent)
@@ -439,7 +435,7 @@ def launch_isolated_worker_service(
         if isolated_unit_state(intent) != UnitState.GONE:
             raise LaunchUnconfirmed('cannot confirm isolated launch failed; holding claim')
         try:
-            launch_env_path.unlink(missing_ok=True)
+            launch_path.unlink(missing_ok=True)
         except OSError:
             pass
         detail = (proc.stderr or proc.stdout or f"rc={proc.returncode}").strip()

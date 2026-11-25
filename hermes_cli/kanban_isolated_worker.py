@@ -57,13 +57,6 @@ class _CardOwnerConnection:
             await asyncio.to_thread(refresh_profile_hooks, policy)
 
 
-def _cleanup_launch_env_file(path_str: str) -> None:
-    if not path_str:
-        return
-    with contextlib.suppress(OSError):
-        Path(path_str).unlink(missing_ok=True)
-
-
 def _strip_task_env() -> None:
     """Remove per-card identity env vars before initializing the card-local owner."""
     for key in list(os.environ):
@@ -242,29 +235,24 @@ async def _execute_card_with_local_owner(
             process_ownership.release(attempt_home)
 
 
-def _run_isolated() -> int:
+def _run_isolated(launch_path: Path) -> int:
     try:
-        params = {
-            "board": os.environ["HERMES_KANBAN_BOARD"],
-            "task_id": os.environ["HERMES_KANBAN_TASK"],
-            "run_id": int(os.environ["HERMES_KANBAN_RUN_ID"]),
-            "claim_lock": os.environ["HERMES_KANBAN_CLAIM_LOCK"],
-        }
-        board_db = Path(os.environ["HERMES_KANBAN_DB"]).expanduser().resolve()
-        assignee_home = Path(os.environ["HERMES_KANBAN_ISOLATED_PROFILE_HOME"]).expanduser().resolve()
-        attempt_home = Path(os.environ["HERMES_KANBAN_ATTEMPT_HOME"]).expanduser().resolve()
-        unit_name = os.environ.get("HERMES_KANBAN_WORKER_UNIT", "").strip()
-        boot_id = os.environ.get("HERMES_KANBAN_WORKER_BOOT_ID", "").strip()
-        launch_env_file = os.environ.get("HERMES_KANBAN_LAUNCH_ENV_FILE", "").strip()
+        with launch_path.open(encoding='utf-8') as launch_file:
+            launch = json.load(launch_file)
+        params = launch['claim']
+        board_db = Path(launch['board_db']).resolve()
+        assignee_home = Path(launch['profile_home']).resolve()
+        attempt_home = Path(launch['attempt_home']).resolve()
+        unit_name = launch['unit_name']
+        boot_id = launch['boot_id']
         invocation_id = os.environ.get("INVOCATION_ID", "").strip()
-        required_ro_mounts = json.loads(os.environ["HERMES_KANBAN_REQUIRED_RO_MOUNTS"])
+        required_ro_mounts = launch['readonly_mounts']
         if not isinstance(required_ro_mounts, list):
-            raise ValueError("HERMES_KANBAN_REQUIRED_RO_MOUNTS must be a JSON list")
-    except (KeyError, ValueError, OSError) as exc:
+            raise ValueError('readonly_mounts must be a list')
+    except (KeyError, TypeError, ValueError, OSError) as exc:
         print(f"Kanban isolated worker refused: {exc}", file=sys.stderr, flush=True)
         return 1
 
-    _cleanup_launch_env_file(launch_env_file)
     _strip_task_env()
     from hermes_cli.kanban_db_connect import connect_closing
     from hermes_cli.kanban_db_dispatch import _process_fingerprint, adopt_worker_pid
@@ -279,8 +267,11 @@ def _run_isolated() -> int:
     apply_subprocess_home_env(os.environ)
     if (unit_name != isolated_worker_unit_name(board_db, params['task_id'], params['run_id'])
             or attempt_home != attempt_home_dir(board_db, params['task_id'], params['run_id'])
+            or launch_path != attempt_home.parent / 'launch.json'
             or os.environ.get('HERMES_HOME') != str(attempt_home)):
         raise RuntimeError('mismatched isolated attempt home or unit')
+    with contextlib.suppress(OSError):
+        launch_path.unlink()
     worker_plane_meta: dict[str, Any] = {
         "worker_plane": WORKER_PLANE_ISOLATED_SYSTEMD,
         "systemd_unit": unit_name,
@@ -331,7 +322,10 @@ def main() -> int:
 
     rc = 1
     try:
-        rc = _run_isolated()
+        if len(sys.argv) != 2:
+            print('Kanban isolated worker requires a private launch file', file=sys.stderr)
+            return rc
+        rc = _run_isolated(Path(sys.argv[1]))
     finally:
         print(f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(rc)}", file=sys.stderr, flush=True)
     return rc
