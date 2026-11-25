@@ -3299,6 +3299,8 @@ delegation:
   launch_wave_size: 0                       # Launch waves: at most N subagents START per launch_wave_seconds, per profile and provider account (nested batches included); the rest wait their turn. Paces starts only. 0 = off.
   launch_wave_seconds: 10                   # Window for launch_wave_size (max 300).
   max_children_per_child: 0                 # Most tasks one subagent (depth >= 1) may put in a delegate_task call; bounds depth-2 fan-out (N children x max_concurrent_children). 0 = off.
+  max_in_process_children: 10               # Most subagents RUNNING at once as threads of one Hermes process (gateway, dashboard, CLI), all parents, profiles and depths counted. Over it a child waits for a slot in launch order; a parent blocked on its own children lends its slot meanwhile. 0 = no cap.
+  in_process_wait_seconds: 1800             # Longest a child waits for an in-process slot before it is refused (the parent sees why). 0 = wait until one frees.
   worktree_isolation: false                 # Give each child its own git worktree branched from HEAD (local backend + git repos only; inspired by Muse Code). See Subagent Delegation → Worktree Isolation.
   max_spawn_depth: 1                        # Delegation tree depth cap (floor 1, no ceiling). 1 = flat (default): parent spawns leaves that cannot delegate. 2 = orchestrator children can spawn leaf grandchildren. 3 = three levels.
   orchestrator_enabled: true                # Global kill switch. When false, every child is a leaf regardless of max_spawn_depth.

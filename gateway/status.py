@@ -4,6 +4,7 @@ home/profile) that tell whether the gateway daemon is running."""
 import asyncio
 import contextlib
 import copy
+import functools
 import hashlib
 import json
 import logging
@@ -538,12 +539,18 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
     return None
 
 
+@functools.lru_cache(maxsize=256)
 def _gateway_command_subcommand(command: str | None) -> str | None:
     """Hermes gateway lifecycle subcommand from a command line, or None. No loose substring matches
     (``"gateway" in cmdline`` also matched ``gateway status`` / ``python -m tui_gateway``): needs a
     Hermes entrypoint plus the ``gateway`` subcommand, or a gateway-dedicated entrypoint. Tokenizes
     quote-aware (Windows paths with spaces); ``--profile``/``-p`` selectors are stripped anywhere in
-    argv since ``_apply_profile_override`` removes them before argparse."""
+    argv since ``_apply_profile_override`` removes them before argparse.
+
+    A pure function of the string, memoized: the supervised-gateway probe behind every terminal call
+    (``tools.process_registry._is_supervised_gateway_process`` -> ``get_running_pid``) parses the live
+    gateway's own command line, a multi-KB inline bootstrap whose shlex + regex pass is ~8 ms of
+    GIL-held Python per call."""
     if not command:
         return None
     try:

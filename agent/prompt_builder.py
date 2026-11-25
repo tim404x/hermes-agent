@@ -1095,9 +1095,13 @@ def _skills_prompt_snapshot_path() -> Path:
 
 
 def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
-    """Drop the in-process skills prompt cache (and optionally the disk snapshot)."""
+    """Drop the in-process skills prompt cache (and optionally the disk snapshot). Every in-process
+    skill writer (skill_manage, hub install, the web editor, curator mutations) calls this, so it also
+    bumps the shared skills-tree index generation (``agent.skill_index``)."""
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE.clear()
+    from agent.skill_index import bump_generation
+    bump_generation()
     try:
         if clear_snapshot:
             _skills_prompt_snapshot_path().unlink(missing_ok=True)
