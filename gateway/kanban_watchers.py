@@ -228,8 +228,8 @@ class GatewayKanbanWatchersMixin:
     def _kanban_dispatcher_boot(self) -> Optional[tuple]:
         """Resolve config, kanban_db and the singleton lock; None when the dispatcher must not run.
 
-        Config is read once at boot (restart to apply), except the auto-decompose
-        toggle which is re-read every tick. The env var is an escape hatch to
+        Config is read at boot; the concurrency caps and auto-decompose settings
+        are re-read every tick. The env var is an escape hatch to
         disable without editing YAML.
         """
         try:
