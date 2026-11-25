@@ -113,7 +113,16 @@ def _(rid, params: dict) -> dict:
         # rotating session_key mid-turn).
         with session["history_lock"]:
             active_marker_key = str(session.pop("_active_turn_marker_key", "") or "")
+            still_running = bool(session.get("running"))
         _retire_turn_marker(session, active_marker_key)
+        if not still_running:
+            # Resync a client whose busy flag outlived the turn (a lost message.complete across a reconnect, a
+            # turn cancelled before its agent was built): nothing will emit idle for it later, and the iPhone app
+            # then refuses every new live-voice request with "The previous request hasn't stopped yet".
+            try:
+                _emit("session.info", sid, _session_info(session.get("agent"), session))
+            except Exception:  # health: allow BLE001 -- a resync emit must never fail the Stop itself
+                logger.debug("session.interrupt idle resync emit failed for %s", sid, exc_info=True)
         return _ok(rid, {"status": "interrupted"})
     finally:
         if resume_wake:
