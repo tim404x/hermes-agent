@@ -83,7 +83,7 @@ def note_storage_error(db_path, exc: BaseException) -> bool:
 def storage_state(db_path) -> str:
     """``"corrupt"`` once this process has seen structural corruption on *db_path*, else ``"ok"``."""
     with _lock:
-        return STORAGE_CORRUPT if _key(db_path) in _corrupt else STORAGE_OK
+        return STORAGE_CORRUPT if _corrupt and _key(db_path) in _corrupt else STORAGE_OK
 
 
 def storage_corrupt_reason(db_path) -> Optional[str]:

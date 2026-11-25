@@ -63,6 +63,17 @@ def clear() -> None:
         _roots.clear()
 
 
+def stat_ctime_is_change_time() -> bool:
+    """Whether ``os.stat().st_ctime_ns`` advances on directory mutations and cannot be backdated.
+
+    On POSIX, ``st_ctime_ns`` is the metadata change time. On Windows, ``st_ctime_ns`` is the
+    creation time (never NTFS ChangeTime, including on Python 3.12+ where ``st_birthtime``
+    replaced it), so restoring a parent directory's mtime after adding a child leaves the stat
+    key unchanged and callers must re-list instead of trusting cached directory listings.
+    """
+    return os.name != "nt"
+
+
 def stat_key(path) -> Optional[tuple[int, int, int, int]]:
     """(dev, inode, mtime_ns, ctime_ns) of *path* (links followed), None when it cannot be stat-ed."""
     try:
@@ -209,10 +220,11 @@ class _RootIndex:
 
     # ── validation (module lock held) ─────────────────────────────────────────────────────────
     def still_valid(self) -> bool:
+        trust_stat = stat_ctime_is_change_time()
         for path, record in self.dirs.items():
             key, relevant, racy = record
             current = stat_key(path)
-            if current == key and not racy:
+            if trust_stat and current == key and not racy:
                 continue
             if current is None or key is None or relevant is None:
                 return False
