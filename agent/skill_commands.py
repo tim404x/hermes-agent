@@ -494,22 +494,24 @@ def published_scopes_signature() -> tuple:
     Only command maps/catalogs refetch; a conversation's stored system prompt is never rebuilt.
     """
     from agent.runtime_cwd import reset_session_cwd, set_session_cwd
+    from agent.skill_utils import bind_poll_realpath
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from tools.skills_tool import _signature_reader
     with _publish_lock:
         keys = list(_skill_commands_by_key)
     scopes = sorted({(home, project) for _platform, home, project in keys if home})[:_MAX_WATCHED_SCOPES]
-    read_root = _signature_reader()
-    rows = [("", None, _skill_dirs_signature(read_root))]
-    for home, project in scopes:
-        home_token = set_hermes_home_override(home)
-        # No project: an empty session cwd would fall back to the process cwd; "/" resolves no repo.
-        cwd_token = set_session_cwd(project or os.path.sep)
-        try:
-            rows.append((home, project, _skill_dirs_signature(read_root)))
-        finally:
-            reset_session_cwd(cwd_token)
-            reset_hermes_home_override(home_token)
+    with bind_poll_realpath() as realpath:
+        read_root = _signature_reader(realpath)
+        rows = [("", None, _skill_dirs_signature(read_root))]
+        for home, project in scopes:
+            home_token = set_hermes_home_override(home)
+            # No project: an empty session cwd would fall back to the process cwd; "/" resolves no repo.
+            cwd_token = set_session_cwd(project or os.path.sep)
+            try:
+                rows.append((home, project, _skill_dirs_signature(read_root)))
+            finally:
+                reset_session_cwd(cwd_token)
+                reset_hermes_home_override(home_token)
     return tuple(rows)
 
 

@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -213,3 +214,61 @@ def test_windows_restored_mtime_after_child_add_changes_signature(tmp_path, monk
     (category / "restored-mtime-skill").mkdir()
     os.utime(category, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
     assert _signature(tmp_path) != before
+
+
+def test_published_scopes_share_realpath_across_project_root_discovery_and_reading(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    shared_project_skills = tmp_path / "real-project-skills"
+    (shared_project_skills / "proj-skill").mkdir(parents=True)
+    (shared_project_skills / "proj-skill" / "SKILL.md").write_text("---\nname: proj-skill\n---\n")
+    (repo / ".hermes").mkdir()
+    project_skills_link = repo / ".hermes" / "skills"
+    project_skills_link.symlink_to(shared_project_skills, target_is_directory=True)
+
+    homes = [tmp_path / name for name in ("home-a", "home-b")]
+    for home in homes:
+        (home / "skills").mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            f"skills:\n  trusted_project_dirs:\n    - {repo}\n", encoding="utf-8"
+        )
+
+    monkeypatch.setattr(
+        skill_commands,
+        "_skill_commands_by_key",
+        {("cli", str(home), str(repo)): {} for home in homes},
+    )
+    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", set)
+
+    resolutions = Counter()
+    real_realpath = os.path.realpath
+
+    def _from_home_io_guard():
+        frame = sys._getframe(2)
+        for _ in range(6):
+            if frame is None:
+                return False
+            if frame.f_code.co_filename.endswith("home_io_guard.py"):
+                return True
+            frame = frame.f_back
+        return False
+
+    def counted_realpath(path, *args, **kwargs):
+        if not _from_home_io_guard():
+            resolutions[os.fspath(path)] += 1
+        return real_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", counted_realpath)
+    sig = skill_commands.published_scopes_signature()
+
+    # Both scopes discovered the trusted project skills root (canonical target).
+    resolved_target = real_realpath(project_skills_link)
+    for row in sig[1:]:
+        roots_in_sig = [entry[0] for entry in row[2][0]]
+        assert resolved_target in roots_in_sig
+
+    # The candidate symlink was resolved once across discovery + signature reading for both scopes,
+    # and its canonical target was never re-resolved.
+    assert resolutions[str(project_skills_link)] == 1
+    assert resolutions[resolved_target] == 0
+    assert resolutions[str(repo)] == 1

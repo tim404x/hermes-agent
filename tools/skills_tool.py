@@ -160,10 +160,11 @@ def _root_tree_signature(root: str) -> tuple:
     return tuple(sig)
 
 
-def _signature_reader():
+def _signature_reader(realpath=None):
     """Share one validation per physical root for this poll, not across polls."""
-    realpath, read = cache(os.path.realpath), cache(_root_tree_signature)
-    return lambda root: read(realpath(root))
+    resolve = realpath or cache(os.path.realpath)
+    read = cache(_root_tree_signature)
+    return lambda root: read(resolve(root))
 
 
 def _skills_scan_signature(dirs_to_scan, disabled, read_root=None) -> tuple:
