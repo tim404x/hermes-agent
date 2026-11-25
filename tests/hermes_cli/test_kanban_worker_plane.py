@@ -335,7 +335,7 @@ def _build_fleet_with_canonical_links(tmp_path: Path) -> tuple[Path, Path]:
     (fleet / "plugins" / "sample").mkdir(parents=True, mode=0o700)
     (fleet / "plugins" / "sample" / "data.txt").write_text("plugin-data\n", encoding="utf-8")
 
-    (fleet / "memories").mkdir(mode=0o700)
+    (fleet / "memories").mkdir(mode=0o700, exist_ok=True)
     (fleet / "memories" / "MEMORY.md").write_text("fleet-memory\n", encoding="utf-8")
     (fleet / "SOUL.md").write_text("fleet-soul\n", encoding="utf-8")
 
