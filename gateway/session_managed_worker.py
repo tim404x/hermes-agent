@@ -102,7 +102,8 @@ def _worker_config(authority, policy):
     from the live profile file, as it did before the child's config was frozen. Bypass sessions
     never read the profile."""
     config = policy.config(authority)
-    home = Path(str(authority.profile_id))
+    source_home = getattr(authority, 'source_profile_home', None)
+    home = Path(str(source_home or authority.profile_id))
     if policy.ignore_user_config or not home.is_absolute():
         return config
     from gateway.run import _load_gateway_config
@@ -427,6 +428,18 @@ def _worker_env(authority):
     home = Path(str(authority.profile_id))
     if not home.is_absolute():
         return None
+    source_home = getattr(authority, 'source_profile_home', None)
+    if source_home:
+        from agent.secret_scope import build_profile_secret_scope
+        from hermes_cli.kanban_worker_env import isolated_owner_env
+        from hermes_constants import apply_subprocess_home_env
+        profile_path = Path(str(source_home)).resolve()
+        env = isolated_owner_env(os.environ, profile_path)
+        secrets = build_profile_secret_scope(profile_path)
+        env.update({k: v for k, v in secrets.items() if v is not None})
+        env['HERMES_HOME'] = str(home)
+        apply_subprocess_home_env(env)
+        return env
     # Keyed on the worker's OWNING profile, not only the process-wide multiplex flag: a worker for
     # another profile must never inherit the launch environ even when that flag reads False.
     routed = _is_routed_home(home)

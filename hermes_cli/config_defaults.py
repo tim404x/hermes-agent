@@ -1849,12 +1849,12 @@ DEFAULT_CONFIG = {
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.
         "auto_subscribe_on_create": True,
-        # Poll and deliver Kanban subscriptions from this gateway. Disable on profiles that do
-        # not own notification subscriptions to avoid an idle five-second board probe.
+        # Disable on profiles without subscriptions to avoid the idle five-second probe.
         "notify_in_gateway": True,
-        # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
-        # run it as a separate unit or don't want the gateway spawning workers.
+        # Disable when running a separate dispatcher or when this gateway must not spawn workers.
         "dispatch_in_gateway": True,
+        # isolated_systemd uses a restart-independent per-attempt service or defers if unavailable.
+        "worker_plane": "profile_owner",
         # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
         # sdlc-review skill. Disable where every review is done manually from the dashboard.
         "review_dispatch": True,
