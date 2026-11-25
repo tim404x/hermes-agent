@@ -51,6 +51,7 @@ from utils import RACY_MTIME_WINDOW_NS, file_signature
 T = TypeVar("T")
 
 _MAX_ENTRIES = 512
+_MAX_STORE_PATHS = 256
 # Kept listing rows across every answer (a compact row is one frozen entry, a few KB): bounds memory when a
 # client pages deep (``limit + offset`` windows) on many stores. A Desktop working set is ~3-4k rows.
 _MAX_ROWS = 10_000
@@ -63,6 +64,8 @@ _DISABLE_ENV = "HERMES_LISTING_MEMO"
 _memo: OrderedDict[tuple, tuple[tuple, Any, int, float]] = OrderedDict()
 _weight = [0]
 _lock = threading.Lock()
+_store_paths: OrderedDict[str, tuple[tuple[int, int], str]] = OrderedDict()
+_store_paths_lock = threading.Lock()
 
 
 def enabled() -> bool:
@@ -88,11 +91,37 @@ def _file_parts(path: str, now_ns: int, *, wal: bool) -> Optional[tuple]:
     return (st.st_dev, *file_signature(st))
 
 
+def _resolved_store_path(db_path) -> str:
+    """Reuse a store's spelling across browse handles only while it names the same file."""
+    path = os.fspath(db_path)
+    try:
+        info = os.stat(path)
+    except OSError:
+        with _store_paths_lock:
+            _store_paths.pop(path, None)
+        return os.path.realpath(path)
+    with _store_paths_lock:
+        cached = _store_paths.get(path)
+        if cached is not None and (info.st_dev, info.st_ino) == cached[0]:
+            _store_paths.move_to_end(path)
+            return cached[1]
+        resolved = os.path.realpath(path)
+        try:
+            info = os.stat(resolved)
+        except OSError:
+            _store_paths.pop(path, None)
+            return resolved
+        _store_paths[path] = ((info.st_dev, info.st_ino), resolved)
+        if len(_store_paths) > _MAX_STORE_PATHS:
+            _store_paths.popitem(last=False)
+        return resolved
+
+
 def store_signature(db_path) -> Optional[tuple]:
     """The committed-content signature of the store at *db_path*, or None when it cannot vouch for one."""
     if db_path is None:
         return None
-    return _signature(os.path.realpath(db_path))  # SQLite puts the -wal beside the symlink's target
+    return _signature(_resolved_store_path(db_path))  # SQLite puts the -wal beside the symlink's target
 
 
 def _signature(path: str) -> Optional[tuple]:
@@ -125,7 +154,7 @@ def _memo_store(holder) -> Optional[str]:
 
     if storage_state(path) != STORAGE_OK:
         return None  # latched corrupt: every listing reads (and fails) as every other read of it does
-    return os.path.realpath(path)
+    return _resolved_store_path(path)
 
 
 def _reads_this_file(holder, signature: tuple) -> bool:
@@ -322,3 +351,5 @@ def clear() -> None:
         _memo.clear()
         _weight[0] = 0
         _counts.clear()
+    with _store_paths_lock:
+        _store_paths.clear()

@@ -7,10 +7,12 @@ import sqlite3
 import time
 from contextlib import closing
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from persistence.conversation.sessions import NewSession, SessionCountQuery, SessionQuery, SessionWindow
+from persistence.sqlite._holder import StoreHolder
 from persistence.sqlite.conversation import sessions as sessions_module
 from persistence.sqlite.conversation._store import local_lineage_memo
 from persistence.sqlite.conversation._store.local import POLICY_PREFIX
@@ -95,6 +97,38 @@ def test_a_quiet_store_is_read_once_across_browse_handles(store, scope_a, monkey
         assert _browse(scope_a, lambda r: _listed(r, limit=10)) == first
     assert sorted(first) == ["a", "b", "c"]
     assert len(reads) == 1
+
+
+def test_store_realpath_is_shared_by_fresh_readers_but_not_across_retarget(store, backend, scope_a, scope_b):
+    memo = _listing_memo()
+    _quiet(scope_a)
+    other = backend.open(scope_b)
+    other.sessions.create(NewSession("other", "cli"))
+    link = store_for(scope_a).with_name("link.db")
+    link.symlink_to(store_for(scope_a))
+    resolutions = []
+
+    def listed():
+        with closing(StoreHolder(link, read_only=True)) as holder:
+            def read():
+                with holder._read_ctx() as conn:
+                    return tuple(row[0] for row in conn.execute("SELECT id FROM sessions ORDER BY id"))
+
+            with patch.object(memo, "os", wraps=os) as calls:
+                answer = memo.memoized(holder, "ids", (), read)
+                resolutions.extend(calls.path.realpath.call_args_list)
+                return answer
+
+    for _ in range(50):
+        assert listed() == ("a", "b", "c")
+    assert len(resolutions) == 1
+    link.unlink()
+    link.symlink_to(store_for(scope_b))
+    assert listed() == ("other",)
+    assert len(resolutions) == 2
+    link.unlink()
+    assert memo.store_signature(link) is None
+    assert memo._memo_store(_holder(db_path=link)) == os.path.realpath(link)
 
 
 def test_a_commit_is_seen_by_the_next_listing(store, scope_a, monkeypatch):
