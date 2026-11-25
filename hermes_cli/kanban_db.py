@@ -2335,7 +2335,7 @@ def release_stale_claims(
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error
+    from hermes_cli.kanban_owner_recovery import _latest_run_event, owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error
     for row in stale:
         if owner_reclaim_blocked(conn, row["id"]):
             continue
@@ -2368,6 +2368,10 @@ def release_stale_claims(
             if owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
                 continue
             retry_status, error = _retry_status_for_run(conn, row["id"]), reclaim_error(conn, row["id"], row["claim_lock"])
+            # A dead worker its owner lost (stall/restart) is a host event: no failure charged.
+            infra = infra_loss_booking(
+                conn, row["id"], str(_latest_run_event(conn, row["id"], "worker_lost").get("reason") or ""),
+            )
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -2380,7 +2384,7 @@ def release_stale_claims(
             if cur.rowcount != 1:
                 continue
             run_id = _record_reclaim(
-                conn, row["id"], termination,
+                conn, row["id"], {**termination, **infra},
                 error=error,
                 payload={
                     "stale_lock": row["claim_lock"],
@@ -2402,6 +2406,7 @@ def release_stale_claims(
             outcome="reclaimed", failure_limit=failure_limit,
             release_claim=False, end_run=False,
             event_payload_extra={"worker_pid": _opt_int(row["worker_pid"]), "retry_status": retry_status},
+            infrastructure=bool(infra.get("infra_loss")),
         )
         # Post-commit observer; every non-reclaim branch ``continue``d above.
         if _kanban_observer_consumed("on_kanban_worker_stale_claim"):
@@ -4172,6 +4177,7 @@ from hermes_cli.kanban_db_dispatch import (
     _worker_alive_for_run,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+    infra_loss_booking,
 )
 from hermes_cli.kanban_result_receipts import (
     CorruptResultReceiptError,

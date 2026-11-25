@@ -135,9 +135,22 @@ def test_a_killed_managed_worker_is_disposed_of_within_one_tick(board):
     assert (row["claim_lock"], row["worker_pid"], row["current_run_id"]) == (None, None, None)
     assert run["outcome"] == "crashed"
     assert "managed worker lost: managed_worker_failed" in run["error"]
-    assert json.loads(run["metadata"])["attempt_note"] == "managed worker lost: managed_worker_failed"
-    assert row["consecutive_failures"] == 1               # A3: the breaker sees it
+    meta = json.loads(run["metadata"])
+    assert meta["attempt_note"] == "managed worker lost: managed_worker_failed"
+    # A host loss (owner stall/restart) is not the card's failure: re-queued, budget untouched.
+    assert meta["infra_loss"] is True
+    assert row["consecutive_failures"] == 0
     assert row["last_failure_error"]
+
+
+def test_a_non_infra_worker_loss_still_charges_the_breaker(board):
+    """Control: a loss reason outside the host-loss set (never said hello) still counts."""
+    run_id = board.running("t_hello", claim_expires_in=900, heartbeat_age=30,
+                           worker_lost="managed_worker_hello_timeout")
+    board.tick(failure_limit=2)
+    row, run = board.state("t_hello"), board.run(run_id)
+    assert run["outcome"] == "crashed" and "infra_loss" not in json.loads(run["metadata"])
+    assert row["consecutive_failures"] == 1               # A3: the breaker sees it
 
 
 def test_a_killed_managed_worker_blocks_the_card_at_the_failure_limit(board):
@@ -149,7 +162,7 @@ def test_a_killed_managed_worker_blocks_the_card_at_the_failure_limit(board):
     this path never reads.
     """
     board.running("t_killed", claim_expires_in=900, heartbeat_age=30,
-                  worker_lost="managed_worker_failed")
+                  worker_lost="managed_worker_hello_timeout")
     board.conn.execute("UPDATE tasks SET consecutive_failures = ? WHERE id = 't_killed'",
                        (kbd.DEFAULT_FAILURE_LIMIT - 1,))
     board.conn.commit()
@@ -180,12 +193,13 @@ def test_a_lost_worker_that_exited_cleanly_still_charges_the_breaker(board):
     assert "I fixed the protocol violation" in run["error"]  # the worker's own output is kept
     assert run["error"].index("[managed worker lost") < run["error"].index("Worker's last output")
     assert "without kanban_complete" not in run["error"]
-    assert board.state("t_clean")["consecutive_failures"] == 1
+    # The owner lost it (host event): re-queued without a failure, still not a protocol violation.
+    assert board.state("t_clean")["consecutive_failures"] == 0
     # Not a protocol violation as well: one loss is charged to one budget.
     assert "protocol_violation" not in json.loads(run["metadata"] or "{}")
     kinds = [r[0] for r in board.conn.execute(
         "SELECT kind FROM task_events WHERE task_id='t_clean' AND run_id=?", (run_id,))]
-    assert "protocol_violation" not in kinds and "crashed" in kinds
+    assert "protocol_violation" not in kinds and kbd.INFRA_REQUEUED_EVENT in kinds
     assert kbd._protocol_violation_streak(board.conn, "t_clean") == 0
 
 
@@ -218,7 +232,10 @@ def test_an_elapsed_claim_never_stays_running_after_one_tick(board, shape, error
     assert row["status"] == "ready"
     assert run["outcome"] == "reclaimed"
     assert error in run["error"]
-    assert row["consecutive_failures"] == 1
+    # TTL reclaim of a worker the owner lost (host event) charges nothing; plain lapses still do.
+    lost = shape.get("worker_lost") == "managed_worker_failed"
+    assert row["consecutive_failures"] == (0 if lost else 1)
+    assert bool(json.loads(run["metadata"] or "{}").get("infra_loss")) is lost
 
 
 def test_a_settled_receipt_with_a_live_gateway_owner_no_longer_holds_the_claim(board):
@@ -288,7 +305,7 @@ async def test_the_owner_records_the_loss_on_the_board_and_one_tick_disposes_of_
     run = board.run(run_id)
     assert run["outcome"] == "crashed"
     assert "managed worker lost: managed_worker_failed" in run["error"]
-    assert board.state("t_owner")["consecutive_failures"] == 1
+    assert board.state("t_owner")["consecutive_failures"] == 0   # host loss: re-queued, not charged
 
 
 def test_a_loss_recorded_against_a_superseded_run_is_dropped(board):
