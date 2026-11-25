@@ -122,22 +122,23 @@ def _record_embed_locked(key: tuple[str, str]) -> None:
         _repeat_counts.pop(next(iter(_repeat_counts)))
 
 
-def record_embed(image_url: str) -> None:
+def record_embed(image_url: str, *, key: Optional[tuple[str, str]] = None) -> None:
     """Count one successful native embed of ``image_url`` for the current session (uncapped
     sessions only — capped ones are counted by the reservation in :func:`repeat_refusal`)."""
+    embed_key = _count_key(image_url) if key is None else key
     with _repeat_lock:
-        _record_embed_locked(_count_key(image_url))
+        _record_embed_locked(embed_key)
 
 
-def release_embed(image_url: str) -> None:
+def release_embed(image_url: str, *, key: Optional[tuple[str, str]] = None) -> None:
     """Give back a slot reserved by :func:`repeat_refusal` when the embed did not happen."""
-    key = _count_key(image_url)
+    embed_key = _count_key(image_url) if key is None else key
     with _repeat_lock:
-        count = _repeat_counts.get(key, 0)
+        count = _repeat_counts.get(embed_key, 0)
         if count > 1:
-            _repeat_counts[key] = count - 1
+            _repeat_counts[embed_key] = count - 1
         else:
-            _repeat_counts.pop(key, None)
+            _repeat_counts.pop(embed_key, None)
 
 
 # Images already riding the ACTIVE user turn as native content parts (#76411). Every surface that

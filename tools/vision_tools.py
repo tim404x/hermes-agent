@@ -710,9 +710,10 @@ async def _vision_analyze_native(
         return already_native
     # A cap > 0 RESERVES the slot here (atomic check-and-count); released below if no embed happens.
     cap = _resolve_repeat_cap()
+    count_key = await asyncio.to_thread(_count_key, image_url)
     reserved = cap > 0
     if reserved:
-        refusal = reserve_embed(await asyncio.to_thread(_count_key, image_url), cap)
+        refusal = reserve_embed(count_key, cap)
         if refusal is not None:
             return refusal
     prepared: Optional[_PreparedImage] = None
@@ -745,7 +746,7 @@ async def _vision_analyze_native(
                 return tool_error(_too_large_message(image_data_url), success=False)
         embedded = True
         if not reserved:
-            _record_embed(image_url)
+            _record_embed(image_url, key=count_key)
         return _build_native_vision_tool_result(
             image_url=image_url, question=question, image_data_url=image_data_url,
             image_size_bytes=prepared.size_bytes,
@@ -755,7 +756,7 @@ async def _vision_analyze_native(
         return tool_error(f"Native vision failed: {exc}", success=False)
     finally:
         if reserved and not embedded:
-            _release_embed(image_url)
+            _release_embed(image_url, key=count_key)
         # Only delete temp files we created — never user-provided paths.
         if prepared is not None:
             _unlink_quietly(prepared.path)
