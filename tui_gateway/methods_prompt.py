@@ -708,8 +708,10 @@ def _run_after_agent_ready(
             session["last_active"] = time.time()
         _emit("session.info", sid, _session_info(session.get("agent"), session))
         return
+    queued_behind = False
     with session["history_lock"]:
-        if session.get("_turn_cancel_requested") or not session.get("running"):
+        cancelled = bool(session.get("_turn_cancel_requested") or not session.get("running"))
+        if cancelled:
             session["running"] = False
             _clear_inflight_turn(session)
             # Without this emit the turn vanishes silently after {"status": "streaming"}.
@@ -717,11 +719,48 @@ def _run_after_agent_ready(
                 "Turn cancelled before the agent was ready"
                 if session.get("_turn_cancel_requested")
                 else "Session no longer running before the agent was ready")})
-            return
+            queued_behind = bool(session.get("queued_prompt"))
+    if cancelled:
+        # The idle state must reach the client too: a busy flag set by the cancelled submit is otherwise never
+        # cleared (no message.complete follows), and every later request looks blocked behind it.
+        _emit("session.info", sid, _session_info(session.get("agent"), session))
+        if queued_behind:
+            _drain_after_cancelled_build(rid, sid, session)
+        return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
         image_paths=hosted_images, terminal_callback=hosted_terminal_callback, turn_author=turn_author,
         person_turn=hosted_terminal_callback is None and turn_author is None)
+
+
+def _drain_after_cancelled_build(rid, sid, session) -> None:
+    """Run the prompt queued behind a turn that was cancelled while the agent was still building.
+
+    Live voice supersedes a request with a NEW one: the client interrupts the busy turn, then submits. On a
+    fresh chat the first turn is usually still waiting for the cold agent build (20 s+ on a loaded box), so
+    the interrupt lands in the build wait, the new submit sees ``running`` and is queued behind it, and the
+    cancelled thread used to return without draining: the newer request never ran, and the iPhone app said
+    "The previous request hasn't stopped yet" for every later one (25 Nov 2026). The user's newest message
+    is the one that must run, so wait for the build it needs (bounded like any first turn) and drain it.
+    A submit that arrives meanwhile starts its own turn; the drain then finds ``running`` and leaves the
+    queue to that turn's own post-turn drain."""
+    ready = session.get("agent_ready")
+    if ready is not None and not ready.wait(timeout=_agent_build_wait_cap()):
+        _emit_terminal_turn_error(
+            sid, session, "agent initialization timed out; your message was not sent, send it again",
+            error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True})
+        return
+    if session.get("agent_error"):
+        _emit_terminal_turn_error(
+            sid, session, str(session.get("agent_error")),
+            error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True})
+        return
+    with session["history_lock"]:
+        # The interrupt that cancelled the build turn purged the queue BEFORE these prompts were queued, so
+        # they are newer than the Stop; their turn must not inherit its cancel latch.
+        if not session.get("running"):
+            session["_turn_cancel_requested"] = False
+    _drain_queued_prompt(rid, sid, session)
 
 
 _TRUNCATION_PARAMS = (
