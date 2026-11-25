@@ -546,15 +546,22 @@ def _skill_readiness(frontmatter: dict[str, Any], skill_name: str) -> tuple[dict
             refused = register_env_passthrough(available_env_names)
         except Exception:
             logger.debug("Could not register env passthrough for skill %s", skill_name, exc_info=True)
-    # Credential files for remote sandboxes: existing host files are registered,
-    # missing ones flag setup_needed.
+    # Credential files for remote sandboxes: existing host files are registered; absent ones flag
+    # setup_needed; refused ones are a mount decision only and do not mark the skill unavailable.
     required_cred_files_raw = frontmatter.get("required_credential_files", [])
     missing_cred_files: list = []
+    refused_cred_files: list[str] = []
     if isinstance(required_cred_files_raw, list) and required_cred_files_raw:
         try:
-            from tools.credential_files import register_credential_files
-            missing_cred_files = register_credential_files(required_cred_files_raw)
+            from tools.credential_files import register_credential_files_report
+            report = register_credential_files_report(required_cred_files_raw)
+            missing_cred_files = report.missing
+            refused_cred_files = report.refused
             setup_needed = setup_needed or bool(missing_cred_files)
+            if refused_cred_files:
+                logger.debug(
+                    "Credential files for skill %s exist on host but were refused by mount guard: %s",
+                    skill_name, ", ".join(refused_cred_files))
         except Exception:
             logger.debug("Could not register credential files for skill %s", skill_name, exc_info=True)
     status = SkillReadinessStatus.SETUP_NEEDED if setup_needed else SkillReadinessStatus.AVAILABLE
@@ -573,6 +580,12 @@ def _skill_readiness(frontmatter: dict[str, Any], skill_name: str) -> tuple[dict
         extras["env_passthrough_refused"] = (
             f"{', '.join(refused)} is a Hermes-managed credential and is never passed to the "
             "terminal or execute_code; commands in this skill that need it will not see it.")
+    if refused_cred_files and _is_remote_env_backend(backend):
+        extras["unmountable_credential_files"] = refused_cred_files
+        extras["credential_files_note"] = (
+            f"{', '.join(refused_cred_files)} exist on the host but the credential mount guard "
+            f"refuses them, so commands inside the {backend} sandbox will not see them "
+            "(place the file itself, not a symlink into a protected store, at the HERMES_HOME root).")
     missing_items = [f"env ${n}" for n in remaining] + [f"file {p}" for p in missing_cred_files]
     if setup_needed and (setup_note := _build_setup_note(status, missing_items, setup_help)):
         if _is_remote_env_backend(backend):
