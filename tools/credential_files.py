@@ -124,20 +124,27 @@ class CredentialFileReport(NamedTuple):
 
 
 def _register_one(relative_path: str, container_base: str = "/root/.hermes") -> str:
+    """One registration attempt: ``"registered"``, ``"missing"`` (absent, dangling, or outside
+    HERMES_HOME) or ``"refused"`` (present, but the mount guard denies it). Any earlier registration
+    for the same destination is dropped unless this attempt registers it again, so a file that
+    turned into a refused store never keeps mounting from a stale entry."""
     hermes_home = get_hermes_home()
+    container_path = f"{container_base.rstrip('/')}/{relative_path}"
     resolved = _contained_host_path(
         relative_path, hermes_home,
         "credential_files: rejected absolute path %r (must be relative to HERMES_HOME)",
         "credential_files: rejected path traversal %r (%s)")
     if resolved is None:
+        _get_registered().pop(container_path, None)
         return "missing"
     if not resolved.is_file():
         logger.debug("credential_files: skipping %s (not found)", resolved)
+        _get_registered().pop(container_path, None)
         return "missing"
     if not _read_guard_allows_mount(relative_path, resolved, hermes_home, _SKILL_REFUSALS):
+        _get_registered().pop(container_path, None)
         return "refused"
 
-    container_path = f"{container_base.rstrip('/')}/{relative_path}"
     _get_registered()[container_path] = str(resolved)
     logger.debug("credential_files: registered %s -> %s", resolved, container_path)
     return "registered"
@@ -184,10 +191,7 @@ def register_credential_files(entries: list, container_base: str = "/root/.herme
     Readiness callers must use :func:`register_credential_files_report` so existing files
     refused by the mount guard are not reported as missing.
     """
-    paths = list(_iter_entry_paths(entries))
-    report = register_credential_files_report(paths, container_base)
-    unmounted = set(report.missing) | set(report.refused)
-    return [p for p in paths if p in unmounted]
+    return [p for p in _iter_entry_paths(entries) if _register_one(p, container_base) != "registered"]
 
 
 def _load_config_files() -> list[dict[str, str]]:

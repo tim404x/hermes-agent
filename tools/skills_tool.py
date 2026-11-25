@@ -584,8 +584,9 @@ def _skill_readiness(frontmatter: dict[str, Any], skill_name: str) -> tuple[dict
         extras["unmountable_credential_files"] = refused_cred_files
         extras["credential_files_note"] = (
             f"{', '.join(refused_cred_files)} exist on the host but the credential mount guard "
-            f"refuses them, so commands inside the {backend} sandbox will not see them "
-            "(place the file itself, not a symlink into a protected store, at the HERMES_HOME root).")
+            f"refuses them, so commands inside the {backend} sandbox will not see them. A skill's own "
+            "service token mounts only as a regular file at the HERMES_HOME root, not as a symlink "
+            "into a protected store; master stores (.env, auth.json) never mount.")
     missing_items = [f"env ${n}" for n in remaining] + [f"file {p}" for p in missing_cred_files]
     if setup_needed and (setup_note := _build_setup_note(status, missing_items, setup_help)):
         if _is_remote_env_backend(backend):

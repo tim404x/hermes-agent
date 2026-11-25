@@ -169,6 +169,7 @@ class TestGenuinelyMissingStillFlags:
         assert payload["setup_needed"] is True
 
 
+@pytest.mark.platforms("posix")
 def test_register_report_separates_missing_from_refused(tmp_path):
     home, _skills = _make_home(tmp_path)
     with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
@@ -177,3 +178,29 @@ def test_register_report_separates_missing_from_refused(tmp_path):
     assert report.missing == ["nope.json"]
     assert sorted(report.refused) == [".env", "google_token.json"]
     assert get_credential_file_mounts() == []
+
+
+@pytest.mark.platforms("posix")
+def test_allowed_then_refused_drops_the_stale_registration(tmp_path):
+    """A token registered while it was a plain file stops mounting once it becomes a refused link."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "google_token.json").write_text("{}")
+    (home / ".env").write_text("SECRET=1\n")
+    with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+        assert _cred_mod.register_credential_files_report(["google_token.json"]).registered == ["google_token.json"]
+        assert len(get_credential_file_mounts()) == 1
+        (home / "google_token.json").unlink()
+        (home / "google_token.json").symlink_to(home / ".env")
+        report = _cred_mod.register_credential_files_report(["google_token.json"])
+        assert report.refused == ["google_token.json"]
+        assert get_credential_file_mounts() == []
+
+
+def test_legacy_wrapper_reports_each_occurrence_once(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+        assert _cred_mod.register_credential_files(["a.json", "a.json"]) == ["a.json", "a.json"]
+        (home / "a.json").write_text("{}")
+        assert _cred_mod.register_credential_files(["a.json", "nope.json"]) == ["nope.json"]
