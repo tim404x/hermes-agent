@@ -481,6 +481,15 @@ def _print_section(title: str, lines) -> None:
         print(line)
 
 
+def _show_admission(task, field):
+    if task.admission_reason:
+        field("admission", task.admission_reason)
+    if task.resource_class:
+        field("resource", task.resource_class)
+    if task.write_scopes is not None:
+        field("writes", ", ".join(task.write_scopes) or "(read-only)")
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
     rsk, rc = _run_state_kwargs(args, "show")
     if rc:
@@ -515,12 +524,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     field("status", task.status)
-    if task.admission_reason:
-        field("admission", task.admission_reason)
-    if task.resource_class:
-        field("resource", task.resource_class)
-    if task.write_scopes is not None:
-        field("writes", ", ".join(task.write_scopes) or "(read-only)")
+    _show_admission(task, field)
     field("assignee", task.assignee or "-")
     if task.tenant:
         field("tenant", task.tenant)
