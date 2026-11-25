@@ -321,6 +321,10 @@ up on the next tick (60s by default).
 # config.yaml
 kanban:
   dispatch_in_gateway: true        # default
+  worker_plane: profile_owner      # default: shared profile gateway execution.
+                                   # Set `isolated_systemd` for opt-in per-card
+                                   # transient systemd user services that survive
+                                   # gateway restarts.
   dispatch_interval_seconds: 60    # default
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
@@ -366,6 +370,64 @@ install give the user one with `sudo loginctl enable-linger <user>`.
   worker within a second of the pass finishing; either enable linger so the
   scope can be created, or set `KillMode=process` on that unit so its exit
   only kills the dispatcher itself.
+
+#### Isolated systemd worker plane (`kanban.worker_plane: isolated_systemd`)
+
+By default (`kanban.worker_plane: profile_owner`), the scoped worker client submits
+each claimed card to the assignee profile's shared gateway, which forks
+`agent.managed_worker` inside the gateway unit's cgroup. Restarting that gateway
+stops in-flight Kanban attempts.
+
+Setting `kanban.worker_plane: isolated_systemd` opts into restart-independent
+execution for Kanban cards (all other sources remain untouched):
+
+- **Per-card supervised unit:** each claimed run spawns its own transient systemd
+  user service (`hermes-kanban-w-<board_hash>-<task_id>-r<run_id>.service`,
+  `KillMode=control-group`) with an attempt-private `HERMES_HOME` and card-local
+  `SessionAuthority` + `agent.managed_worker`. It never opens the profile's shared
+  `state.db` for writing.
+- **Restart survival & live identity:** restarting the gateway leaves active worker
+  units running untouched. Dispatcher reclaim, timeout, stale-run, and crash sweeps
+  verify `(board, task_id, run_id, pid, birth/started_at, systemd_unit, invocation_id,
+  boot_id)` rather than bare PIDs, preventing duplicate dispatches or replayed tool
+  effects.
+- **Fail closed:** if Linux user systemd (`systemd-run --user` / user D-Bus) is
+  unavailable, spawns fail closed with an infrastructure deferral
+  (`RestartSafeScopeUnavailable`) without burning card retry budgets.
+  A missing or mismatched unit identity is not proof of exit: reclaim, timeout and
+  subsequent claims wait for a verified stop or an empty, inactive/absent unit.
+- **Profile inputs:** reusable shared asset trees (`skills`, `plugins`) are projected
+  read-only into the unit's mount namespace via `BindReadOnlyPaths=` (never copied per
+  attempt, and verified read-only inside the started unit; fails closed if mount
+  namespacing is unavailable). Tiny mutable inputs (`config.yaml`, `.env`, `auth.json`,
+  `memories`, `SOUL.md`, `hooks`, `locales`, `skins`, `models_dev_cache.json`) are
+  privately copied so attempt writes never mutate the owning profile or shared fleet
+  root. Standard named profiles (`<fleet-root>/profiles/<name>`) may use explicit
+  top-level relative aliases (`../../<asset>`) for `skills`, `plugins`, `memories`, and
+  `SOUL.md`; inside `skills`/`plugins`, only relative symlinks resolving within that
+  same asset root are allowed. Arbitrary aliases, escaping links, and special files are
+  refused. Supply credentials through the assignee's secret sources, not the systemd
+  manager; approval grants are read from the assignee's current policy.
+- **Session visibility:** the canonical board's `owner_admitted`, `worker_bound`,
+  and `worker_result` events plus the task worker log record the attempt's
+  `session_id`, `systemd_unit`, `cgroup`, and attempt-private `state.db` path
+  (readable with `open_persistence_reader`).
+
+**Operator enable & rollback:**
+
+1. Verify user systemd works for the gateway user (`systemctl --user is-system-running`
+   or `loginctl enable-linger <user>`).
+2. Enable in `config.yaml`: set `kanban.worker_plane: isolated_systemd` and reload/restart
+   the dispatching gateway. In-flight `profile_owner` attempts finish or reclaim normally;
+   new claims launch on `isolated_systemd`.
+3. Roll back at any time by setting `kanban.worker_plane: profile_owner` (or removing the key).
+   Already-running `isolated_systemd` units continue to be tracked and stopped/reclaimed by
+   their recorded unit identity until they finish; new claims return to `profile_owner`.
+
+To verify privately on Linux, use the installed test environment's interpreter to run
+`scripts/kanban_worker_plane_staging.py --receipt /path/to/private/receipt.json`.
+The harness uses a scratch home and board under the user's runtime directory, a
+loopback model and a transient gateway. No service installation or daemon reload is required.
 
 Running `hermes kanban daemon` as a separate process is **deprecated**;
 use the gateway. If you truly cannot run the gateway (headless host

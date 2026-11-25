@@ -1061,7 +1061,7 @@ def reopen_task(
     """
     if target_status not in ("ready", "todo", "triage"):
         raise ValueError(f"target_status must be 'ready', 'todo', or 'triage', got {target_status!r}")
-    terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+    terminations = []
     with _kb.write_txn(conn):
         row = conn.execute(
             "SELECT status, reopen_epoch FROM tasks WHERE id = ?",
@@ -1111,8 +1111,8 @@ def reopen_task(
         if prior_status in ("done", "archived"):
             inv = _kb.invalidate_descendants_for_parent_reopen(conn, task_id, author=author)
             terminations.extend(inv["terminations"])
-    for pid, claim_lock, started_at in terminations:
-        _kb._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
+    for pid, claim_lock, started_at, child_id, run_id in terminations:
+        _kb._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at, conn=conn, task_id=child_id, run_id=run_id)
     return True
 
 

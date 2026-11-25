@@ -14,7 +14,41 @@ Hermes' own location before the dispatcher adds the claim.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Optional
+
+# Keep a little wall-clock budget for the worker to observe a terminal timeout
+# and make a terminal board call (kanban_block/kanban_complete/kanban_request_review)
+# before max_runtime_seconds kills it.
+KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
+
+
+def _worker_terminal_timeout_env(
+    max_runtime_seconds: Optional[int],
+    current_timeout: Optional[str],
+) -> Optional[str]:
+    """Return a worker-scoped TERMINAL_TIMEOUT override, if needed.
+
+    When ``max_runtime_seconds`` exceeds the terminal tool's default timeout,
+    raise only the child's default so a long command isn't killed by the
+    generic terminal default first.
+    """
+    if max_runtime_seconds is None:
+        return None
+    try:
+        runtime = int(max_runtime_seconds)
+    except (TypeError, ValueError):
+        return None
+    if runtime <= 0:
+        return None
+
+    desired = max(1, runtime - KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS)
+    try:
+        existing = int(str(current_timeout).strip()) if current_timeout else 0
+    except (TypeError, ValueError):
+        existing = 0
+    if existing >= desired:
+        return None
+    return str(desired)
 
 # Exact names (Windows matches case-insensitively). Host plumbing, never a profile's settings.
 _HOST_NAMES = frozenset({
@@ -65,3 +99,16 @@ def worker_client_env(env: Mapping[str, str], assignee_home: str | Path) -> dict
     # credential is not part of it: the assignee resolves its own and fails closed without it.
     names = _HOST_NAMES | {name.upper() for name in deployment_env_names()}
     return {k: v for k, v in host.items() if k.upper() in names or k.upper().startswith(_HOST_PREFIXES)}
+
+
+def isolated_owner_env(env: Mapping[str, str], assignee_home: str | Path) -> dict[str, str]:
+    """Service bootstrap plumbing only. Auth agents, proxies and passthrough belong to the assignee."""
+    host = worker_client_env(env, assignee_home)
+    names = {'PATH', 'HOME', 'LANG', 'LC_ALL', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'PYTHONPATH',
+             'HERMES_REAL_HOME', 'HERMES_RUNTIME_DIR', 'HERMES_PYTHON_SRC_ROOT', 'HERMES_INSTALL_ROOT',
+             'HERMES_INSTALL_STATE_DIR', 'HERMES_DISABLE_LAZY_INSTALLS', 'HERMES_MANAGED_DIR',
+             'HERMES_GATEWAY_LOCK_DIR', 'HERMES_KANBAN_HOME', 'HERMES_KANBAN_BUSY_TIMEOUT_MS',
+             'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'}
+    from hermes_cli.config_backend import deployment_env_names
+    names.update(deployment_env_names())
+    return {key: value for key, value in host.items() if key in names}

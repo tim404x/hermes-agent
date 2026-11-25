@@ -2324,20 +2324,20 @@ def profile_root_for_env_home(env_home: str, default_root: Path) -> Path:
 
 
 def resolve_profile_env(profile_name: str) -> str:
-    """Resolve a profile name to a HERMES_HOME path string. Called early in the CLI entry
-    point, before hermes modules are imported, to set HERMES_HOME.
-
-    When HERMES_HOME is already set, the configured spelling IS the launch root (it may be a
-    junction/symlink alias of the platform default). Keep that spelling so profile re-home does not destroy
-    the launcher's lexical provenance -- the subprocess sanitizer needs it to match Hermes-owned PYTHONPATH
-    entries written in the same spelling (#82581 junction follow-up). Physically the paths are identical
-    (junction-transparent); only the spelling is preserved.
+    """Resolve the CLI's early HERMES_HOME without canonicalizing the launch root.
+    Its junction/symlink spelling must match the Hermes-owned PYTHONPATH entries
+    removed by the subprocess sanitizer (#82581).
     """
-    canon = _canon_valid(profile_name)
     root = profile_root_for_env_home(os.environ.get("HERMES_HOME", ""), _get_default_hermes_home())
+    return str(resolve_profile_at_root(profile_name, root))
+
+
+def resolve_profile_at_root(profile_name: str, root: Path) -> Path:
+    """Resolve and validate an assignee against its owning root, not the launch environment."""
+    canon = _canon_valid(profile_name)
     if canon == "default":
-        return str(root)
+        return root
     profile_dir = root / "profiles" / canon
     if not named_profile_is_live(profile_dir):
         raise _missing_profile_error(canon, profile_dir)
-    return str(profile_dir)
+    return profile_dir
