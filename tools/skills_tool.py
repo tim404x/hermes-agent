@@ -44,6 +44,9 @@ _SIGNATURE_MAX_DEPTH = 6
 def clear_skills_cache() -> None:
     """Drop the scanned catalog so the next listing re-scans (explicit reloads must not wait out the TTL)."""
     _SKILLS_CACHE.clear()
+    _FRONTMATTER_NAMES.clear()
+    from agent.skill_index import bump_generation
+    bump_generation()
 
 
 def _dir_tree_signature(root, sig, depth=_SIGNATURE_MAX_DEPTH) -> None:
@@ -417,12 +420,43 @@ def _is_package_owned_markdown(path: Path, search_root: Path) -> bool:
     )
 
 
+# SKILL.md path -> (stat key, parser identity, read-start ns, frontmatter ``name``). skill_view matches a
+# bare name against every skill's frontmatter name; re-parsing ~250 files per call was most of its cost.
+_FRONTMATTER_NAMES: dict[str, tuple] = {}
+_FRONTMATTER_NAMES_MAX = 8192
+
+
+def _frontmatter_name(skill_md: Path) -> Any:
+    """``_safe_frontmatter(skill_md).get("name")``, re-read only when the file's stat moved (inode, size,
+    mtime_ns, ctime_ns) or the parser was patched. A file younger than ``agent.skill_index.RACY_NS``
+    when read is re-read next time: a same-tick rewrite would leave its stat unchanged."""
+    from agent import skill_utils
+    from agent.skill_index import is_racy
+    try:
+        st = os.stat(skill_md)
+        key = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    except OSError:
+        key = None
+    parser = (_parse_frontmatter, getattr(skill_utils, "parse_frontmatter", None))
+    path = str(skill_md)
+    hit = _FRONTMATTER_NAMES.get(path)
+    if hit is not None and key is not None and hit[0] == key and hit[1] == parser and not is_racy(key, hit[2]):
+        return hit[3]
+    read_at = time.time_ns()
+    name = _safe_frontmatter(skill_md).get("name")
+    if key is not None:
+        if len(_FRONTMATTER_NAMES) >= _FRONTMATTER_NAMES_MAX:
+            _FRONTMATTER_NAMES.clear()
+        _FRONTMATTER_NAMES[path] = (key, parser, read_at, name)
+    return name
+
+
 def _collect_skill_candidates(name, local_category_name, all_dirs):
     """ALL (skill_dir, skill_md) candidates across every dir and lookup strategy (direct path,
     recursive by dir / frontmatter name, legacy flat <name>.md), deduped by resolved path.
     Every copy is returned so the caller resolves them via ``agent.skill_utils.pick_skill_candidate``
     (cross-tier precedence; a same-tier tie of different skills is refused, never guessed)."""
-    from agent.skill_utils import iter_skill_index_files
+    from agent.skill_index import root_index
     candidates: list[tuple[Optional[Path], Path]] = []
     seen_md: set = set()
 
@@ -445,15 +479,18 @@ def _collect_skill_candidates(name, local_category_name, all_dirs):
     for search_dir in all_dirs:
         for direct in filter(None, (name, local_category_name)):  # "p:x" with no plugin p → "p/x"
             _record_direct(search_dir / direct, search_dir)
+        # The tree walk is cached (agent.skill_index): re-walking every root and re-reading every
+        # SKILL.md per skill_view was ~190 ms of GIL-held Python per call on Tim's profile.
+        index = root_index(search_dir)
         # Recursive by directory name plus frontmatter `name:` — skills_list()
         # exposes the frontmatter name, so skill_view(name) must accept it too.
-        for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
-            if (found_skill_md.parent.name == name
-                    or _safe_frontmatter(found_skill_md).get("name") == name):
+        for found_skill_md in index.skill_index_files():
+            if found_skill_md.parent.name == name or _frontmatter_name(found_skill_md) == name:
                 _record(found_skill_md.parent, found_skill_md)
-        # Legacy flat <name>.md anywhere under the dir. Markdown owned by an ancestor
+        # Legacy flat <name>.md anywhere under the dir (VCS/dependency/cache dirs such as .archive
+        # and node_modules excluded, as for every other lookup). Markdown owned by an ancestor
         # directory skill loads through file_path and must not shadow a real skill.
-        for found_md in search_dir.rglob(f"{name}.md"):
+        for found_md in index.flat_markdown(f"{name}.md"):
             if (found_md.name != "SKILL.md" and not _is_skill_support_path(found_md)
                     and not _is_package_owned_markdown(found_md, search_dir)):
                 _record(None, found_md)

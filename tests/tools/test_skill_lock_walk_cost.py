@@ -99,12 +99,13 @@ def test_the_walk_never_enters_a_support_or_excluded_tree(tree, monkeypatch):
     entered = [p for p in listed if any(part in {"references", "scripts", "assets", "templates", ".git",
                                                   "node_modules", ".archive", "__pycache__", "linked-category"}
                                         for part in os.path.relpath(p, tree).split(os.sep))]
-    # Only the top-level ``scripts`` category (no SKILL.md beside it) is walked.
     # Only the top-level ``scripts`` category and the ``scripts`` beside a dangling marker (no SKILL.md
-    # exists beside either) are walked.
-    assert entered and all(os.path.relpath(p, tree).split(os.sep)[0] in {"scripts", "dangling"}
+    # exists beside either) are walked. The symlinked category is walked once too: the same cached walk
+    # (agent.skill_index) serves skill_view's lookup, which follows links (iter_skill_index_files); its
+    # skills never reach the lock view (test_same_skills_as_the_full_rglob).
+    assert entered and all(os.path.relpath(p, tree).split(os.sep)[0] in {"scripts", "dangling", "linked-category"}
                            for p in entered), entered
-    assert len(listed) <= 20, listed  # the skill dirs and categories, not the ~250 support dirs
+    assert len(listed) <= 22, listed  # the skill dirs and categories, not the ~250 support dirs
 
 
 def test_a_locked_skill_inside_the_tree_is_still_guarded(tree, monkeypatch):
