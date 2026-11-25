@@ -97,7 +97,10 @@ def repeat_refusal(image_url: str) -> Optional[str]:
     cap = resolve_repeat_cap()
     if cap <= 0:
         return None
-    key = _count_key(image_url)
+    return reserve_embed(_count_key(image_url), cap)
+
+
+def reserve_embed(key: tuple[str, str], cap: int) -> Optional[str]:
     with _repeat_lock:
         count = _repeat_counts.get(key, 0)
         if count < cap:
