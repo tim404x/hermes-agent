@@ -10,11 +10,11 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
 
-from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, logger
+from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, _positive_int_value, logger
 
 
 def _kbc():
@@ -31,7 +31,11 @@ _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malform
 
 @dataclass
 class _DispatcherSettings:
-    """``kanban.*`` dispatch settings, read once at boot (restart to apply)."""
+    """Boot-time ``kanban.*`` settings, except for the two concurrency caps.
+
+    ``_KanbanDispatcher`` re-resolves ``max_in_progress`` and ``max_in_progress_per_profile``
+    every tick from mtime-cached config, so cap edits apply without a restart.
+    """
 
     interval: float
     max_spawn: Any
@@ -136,6 +140,38 @@ class _KanbanDispatcher:
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
 
+    def _refresh_live_caps(self) -> None:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config_backend import ConfigBackendUnavailable
+        from hermes_cli.config_read_errors import FailedConfigRead
+
+        try:
+            cfg = load_config_readonly()
+            if isinstance(cfg, FailedConfigRead):
+                # Fail-open fallback ({} / defaults / last-known-good): a failed read must never
+                # loosen or drop a cap the operator set, so keep the values we already enforce.
+                logger.debug("kanban dispatcher: config read failed (%s); keeping previous concurrency caps",
+                             cfg.read_error)
+                return
+            kanban = (cfg or {}).get("kanban") or {}
+            if not isinstance(kanban, dict):
+                kanban = {}
+            dispatch = _kbd()
+            caps = {
+                "max_in_progress": dispatch.resolve_max_in_progress(dispatch.configured_max_in_progress(kanban)),
+                "max_in_progress_per_profile": _positive_int_value(kanban, "max_in_progress_per_profile"),
+            }
+        except (Exception, ConfigBackendUnavailable):  # the latter is a SystemExit on purpose
+            logger.debug("kanban dispatcher: could not refresh concurrency caps; keeping previous values", exc_info=True)
+            return
+
+        for key, value in caps.items():
+            previous = getattr(self.settings, key)
+            if value != previous:
+                logger.info("kanban dispatcher: %s changed %s -> %s (config edit applied live)",
+                            key, previous or "unset", value or "unset")
+                self.settings = replace(self.settings, **{key: value})
+
     def board_db_fingerprint(self, slug: str) -> tuple[str, int | None, int | None]:
         from hermes_cli import kanban_db as _kb
         with _kb.pin_first_board_resolution():
@@ -182,6 +218,7 @@ class _KanbanDispatcher:
         fingerprint = self.board_db_fingerprint(slug)
         if not self._quarantine_lifted(slug, fingerprint):
             return None
+        self._refresh_live_caps()
         kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
         try:
             # No explicit init_db(): connect() runs the migration once per
