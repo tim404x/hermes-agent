@@ -421,7 +421,10 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
     plain_text = _coerce_message_text(text).strip() if not image_paths and _is_text_only_busy_payload(text) else ""
     # Text-only corrections steer/redirect in place when supported; media payloads and older agents fall through to
     # the proven interrupt + queue path.
-    if plain_text and agent is not None:
+    # A turn the user already stopped takes no corrections: a steer lands in a run that is unwinding and is lost with
+    # it (live voice interrupts the busy turn, then submits the newer request, 25 Nov 2026). Queue it instead: it
+    # runs once the stopped turn has ended.
+    if plain_text and agent is not None and not session.get("_turn_cancel_requested"):
         supported = {
             "steer": hasattr(agent, "steer"),
             "interrupt": getattr(agent, "_supports_active_turn_redirect", False) is True and hasattr(agent, "redirect")}
