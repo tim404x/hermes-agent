@@ -845,8 +845,8 @@ def get_recent_session_model_route(holder: StoreHolder, session_id: str) -> Opti
 
 def resolve_session_id(holder: StoreHolder, session_id_or_prefix: str) -> Optional[str]:
     """Exact id, else the single unambiguous prefix match, else None."""
-    exact = get_session(holder, session_id_or_prefix)
-    if exact:
+    holder.flush_for_read()
+    if exact := holder._read_one("SELECT id FROM sessions WHERE id = ?", (session_id_or_prefix,)):
         return exact["id"]
     matches = holder._read_all(
         "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
