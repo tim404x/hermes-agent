@@ -110,6 +110,27 @@ def _get_launch_waves() -> tuple[int, float]:
     return size, window
 
 
+_DEFAULT_MAX_IN_PROCESS_CHILDREN = 10
+_DEFAULT_IN_PROCESS_WAIT_SECONDS = 1800.0
+
+
+def _get_in_process_children_limits() -> tuple[int, float]:
+    """``(delegation.max_in_process_children, delegation.in_process_wait_seconds)``: at most N subagents RUN as
+    threads of this process at once, across every profile and parent it serves (0 = no cap); a child over it
+    waits for a slot, at most the wait seconds (0 = until one frees), then is refused. See
+    tools/delegate_tool_process_slots.py."""
+    cap = _knob(
+        "max_in_process_children", "DELEGATION_MAX_IN_PROCESS_CHILDREN", lambda v: max(0, int(v)),
+        _DEFAULT_MAX_IN_PROCESS_CHILDREN,
+        f"delegation.max_in_process_children=%r is not a valid integer; using {_DEFAULT_MAX_IN_PROCESS_CHILDREN}",
+    )
+    wait_s = _knob(
+        "in_process_wait_seconds", None, lambda v: max(0.0, float(v)), _DEFAULT_IN_PROCESS_WAIT_SECONDS,
+        f"delegation.in_process_wait_seconds=%r is not a number; using {_DEFAULT_IN_PROCESS_WAIT_SECONDS:g}",
+    )
+    return cap, wait_s
+
+
 def _get_max_children_per_child() -> int:
     """delegation.max_children_per_child: most tasks ONE subagent (depth >= 1) may put in a delegate_task call
     (0 = no extra cap, the default: max_concurrent_children applies at every level). Bounds depth-2 fan-out:
