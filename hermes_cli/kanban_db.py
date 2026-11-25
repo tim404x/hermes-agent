@@ -29,8 +29,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.kanban_admission import claims as admission
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
-from toolsets import get_toolset_names
+from hermes_cli.kanban_admission.declarations import _normalize_task_skills, _validate_model_override
 from utils import unlink_files_older_than
 
 _log = logging.getLogger(__name__)
@@ -131,7 +132,6 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     raise ValueError(f"reasoning_effort must be one of {allowed}, got {effort!r}")
 
 
-KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # one cap for dashboard, tools and CLI
 
@@ -233,7 +233,7 @@ def notify_task_updated(
 
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
-    "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
+    "spawned", "adopted", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
     "skipped_nonspawnable",
@@ -638,6 +638,14 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    reopen_epoch: int = 0
+    resource_class: str | None = None
+    write_scopes: list[str] | None = None
+    admission_reason: str | None = None
+
+    def admission_fields(self) -> dict:
+        return {key: value for key in ("resource_class", "write_scopes", "admission_reason")
+                if (value := getattr(self, key)) is not None}
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
@@ -654,8 +662,10 @@ class Task:
             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
+            write_scopes=_json_or(g("write_scopes")),
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            reopen_epoch=int(g("reopen_epoch") or 0),
         )
 
 
@@ -669,7 +679,7 @@ _TASK_EPOCH_COLUMNS = ("created_at", "started_at", "completed_at", "claim_expire
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "resource_class", "admission_reason",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -874,8 +884,27 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Explicit reopen counter: incremented on reopen so unchanged-body retries
+    -- start a new logical input_rev instead of adopting an old receipt.
+    reopen_epoch         INTEGER NOT NULL DEFAULT 0,
+    resource_class       TEXT,
+    write_scopes         TEXT,
+    admission_reason     TEXT
 );
+
+CREATE TABLE IF NOT EXISTS task_admission_reservations (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    project TEXT NOT NULL,
+    resource TEXT NOT NULL,
+    paths TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS release_task_admission AFTER UPDATE OF status ON tasks
+WHEN OLD.status IN ('running', 'review') AND NEW.status NOT IN ('running', 'review')
+BEGIN
+    DELETE FROM task_admission_reservations WHERE task_id = OLD.id;
+END;
 
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
@@ -922,6 +951,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     -- still be found and reaped; NULL = legacy row, never signalled.
     worker_started_at   INTEGER,
     max_runtime_seconds INTEGER,
+    input_rev           TEXT,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
     ended_at            INTEGER,
@@ -1007,17 +1037,6 @@ def _host_prefix() -> str:
 
 
 # --- Task creation / mutation ---
-
-def _validate_model_override(model: Optional[str], provider: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """Strip both; a provider without a model is rejected (a bare ``--provider``
-    would re-resolve the profile's model against another backend — exactly
-    the mismatch the override exists to kill)."""
-    model = (model or "").strip() or None
-    provider = (provider or "").strip() or None
-    if provider and not model:
-        raise ValueError("provider_override requires a model_override")
-    return model, provider
-
 
 def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
@@ -1114,46 +1133,6 @@ def _project_from_source_task(
     return project_obj, project_repo
 
 
-def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str]]:
-    """Strip/dedupe a skills list. Commas are refused (a comma-joined string must
-    not land in one argv slot); toolset names are rejected all at once because
-    agents that confuse the two usually pass several."""
-    if skills is None:
-        return None
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    toolset_typos: list[str] = []
-    for s in skills:
-        if not s:
-            continue
-        name = str(s).strip()
-        if not name:
-            continue
-        if "," in name:
-            raise ValueError(
-                f"skill name cannot contain comma: {name!r} "
-                f"(pass a list of separate names instead of a comma-joined string)"
-            )
-        if name.casefold() in KNOWN_TOOLSET_NAMES:
-            toolset_typos.append(name)
-            continue
-        if name in seen:
-            continue
-        seen.add(name)
-        cleaned.append(name)
-    if toolset_typos:
-        quoted = ", ".join(repr(n) for n in toolset_typos)
-        noun = "is a toolset name" if len(toolset_typos) == 1 else "are toolset names"
-        raise ValueError(
-            f"{quoted} {noun}, not skill name(s). "
-            "Put toolsets in the assignee profile's `toolsets:` config "
-            "instead of per-task skills. Skills are named skill bundles "
-            "(e.g. `blogwatcher`, `github-code-review`); toolsets are runtime "
-            "capabilities (e.g. `web`, `browser`, `terminal`)."
-        )
-    return cleaned
-
-
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1168,6 +1147,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    resource_class: str | None = None, write_scopes: list[str] | None = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1221,6 +1201,7 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    declared_paths = admission.encode_declaration(resource_class, write_scopes)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1267,8 +1248,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract, resource_class, write_scopes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1278,6 +1259,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        resource_class, declared_paths,
                     ),
                 )
                 for pid in parents:
@@ -2078,15 +2060,10 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                     )
                     if failures >= effective_limit:
                         continue
-                    conn.execute(
-                        "UPDATE tasks SET status = ? "
-                        "WHERE id = ? AND status = 'blocked'", (resume_status, task_id),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
-                        (resume_status, task_id),
-                    )
+                if resume_status == "review" and _admit_task(conn, task_id, cur_status):
+                    continue
+                conn.execute("UPDATE tasks SET status = ? WHERE id = ? AND status = ?",
+                             (resume_status, task_id, cur_status))
                 _append_event(
                     conn, task_id, "promoted",
                     {"status": resume_status} if resume_status != "ready" else None,
@@ -2121,16 +2098,24 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
     return [(row["id"], row["status"]) for row in rows]
 
 
+def _admit_task(conn, task_id, source, *, claim=False, expect_assignee=None):
+    return admission.admit(conn, task_id, source, home=kanban_home(),
+                           claim=claim, expect_assignee=expect_assignee)
+
+
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
     *, event_extra: Optional[dict] = None, expect_assignee: Optional[str] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running`` (and still ``expect_assignee``'s, when given), open a
     run row, emit ``claimed``; None when the CAS lost. Caller holds the txn."""
+    if _admit_task(conn, task_id, source_status, claim=True, expect_assignee=expect_assignee):
+        return None
     cur = conn.execute(
         f"""
         UPDATE tasks
            SET status        = 'running',
+               admission_reason = NULL,
                claim_lock    = ?,
                claim_expires = ?,
                started_at    = COALESCE(started_at, ?)
@@ -2151,12 +2136,12 @@ def _claim_and_open_run(
         INSERT INTO task_runs (
             task_id, profile, step_key, status,
             claim_lock, claim_expires, max_runtime_seconds,
-            started_at
-        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+            started_at, input_rev
+        ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
         """,
         (
             task_id, trow["assignee"] if trow else None, trow["current_step_key"] if trow else None,
-            lock, expires, trow["max_runtime_seconds"] if trow else None, now,
+            lock, expires, trow["max_runtime_seconds"] if trow else None, now, compute_input_rev(conn, task_id),
         ),
     )
     run_id = run_cur.lastrowid
@@ -2170,13 +2155,18 @@ def _claim_and_open_run(
 
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None, expect_assignee: Optional[str] = None,
+    claimer: Optional[str] = None, expect_assignee: Optional[str] = None, board: str | None = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not ``ready``, or no longer ``expect_assignee``'s).
+    already claimed (or is not ``ready``, or no longer ``expect_assignee``'s,
+    or a verified durable result receipt for this logical revision was adopted).
     """
+    # Separate pre-admission check at claim entry (before claim admission/mutation):
+    # adopt an existing verified receipt for (board_id, task_id, current input_rev).
+    if try_adopt_before_claim(conn, task_id) is not None:
+        return None
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -2198,6 +2188,9 @@ def claim_task(
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
             return None
         # Close a leaked prior run so the CAS below doesn't strand it.
+        if conn.execute('SELECT 1 FROM kanban_result_receipts WHERE task_id=? LIMIT 1', (task_id,)).fetchone():
+            if get_receipt_for_input_rev(conn, task_id, input_rev=compute_input_rev(conn, task_id)) is not None:
+                return None
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
@@ -2211,7 +2204,7 @@ def claim_task(
 
 def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None, expect_assignee: Optional[str] = None,
+    claimer: Optional[str] = None, expect_assignee: Optional[str] = None, board: str | None = None,
 ) -> Optional[Task]:
     """Atomic ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
@@ -2683,78 +2676,109 @@ def complete_task(
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    # Post-commit replay of the SAME winning run: if this exact run already
+    # committed an immutable receipt for the current logical revision on this
+    # board, verify fail-closed, finish idempotent post-commit housekeeping,
+    # and return True without duplicating events, receipts, or outbox rows.
+    status = _task_status(conn, task_id)
+    if status == 'ready' or (expected_run_id is not None and status == 'done'):
+        if adopt_result_receipt(conn, task_id, expected_run_id=expected_run_id) is not None:
+            return True
+    entry = completion_attempt(conn, task_id, expected_run_id=expected_run_id, force=force)
+    if entry is None:
+        return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    validate_declared_outputs(metadata)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
-    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
+    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata, attempt=entry)
     if acceptance is False:
         return False
-    with write_txn(conn):
-        # Hard invariant even for human review approval: a parent may have
-        # reopened while this task waited.
-        if not _parents_satisfied(conn, task_id):
-            return False
-        if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
-            return False
-        trow = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        prior_status = trow["status"] if trow else None
-        # Refuse to close a LIVE worker's run without proof of ownership
-        # (expected_run_id) or an explicit human override (force=True); see
-        # _claim_is_live for what "live" means.
-        if expected_run_id is None and not force and trow and _claim_is_live(trow):
-            raise LiveClaimError(task_id)
-        sql = """
-                UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
-                       block_kind   = NULL,
-                       block_recurrences = 0
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
-                """
-        params: tuple = (result, now, task_id)
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params = (*params, int(expected_run_id))
-        if conn.execute(sql, params).rowcount != 1:
-            return False
-        if isinstance(metadata, dict):
-            _stage_completion_artifacts(conn, task_id, metadata, now)
-        run_id = _end_run(
-            conn, task_id, outcome="completed", status="done", summary=handoff_summary,
-            metadata=metadata,
-        )
-        # Never-claimed task: synthesize a run so the handoff fields survive.
-        if run_id is None and (summary or metadata or result or prior_status == "review"):
-            synth_summary, synth_metadata = handoff_summary, metadata
-            if prior_status == "review" and not synth_summary and not synth_metadata:
-                synth_summary = _REVIEW_APPROVED_NOTE
-                synth_metadata = {"source_status": "review", "approval": "manual"}
-            run_id = _synthesize_ended_run(
-                conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
+    # Hash/stage artifacts OUTSIDE SQLite's writer lock; protect against changing
+    # files and fail closed on missing/unreadable/mutating declared artifacts.
+    prepared = prepare_completion_artifacts(conn, task_id, metadata)
+    metadata = prepared.metadata
+    committed = False
+    try:
+        with write_txn(conn):
+            # Hard invariant even for human review approval: a parent may have
+            # reopened while this task waited.
+            if not entry.matches(conn, task_id):
+                return False
+            if get_receipt_for_input_rev(conn, task_id, input_rev=entry.input_rev) is not None:
+                return False
+            if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
+                return False
+            trow = conn.execute(
+                "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            prior_status = trow["status"] if trow else None
+            # Refuse to close a LIVE worker's run without proof of ownership
+            # (expected_run_id) or an explicit human override (force=True); see
+            # _claim_is_live for what "live" means.
+            if expected_run_id is None and not force and trow and _claim_is_live(trow):
+                raise LiveClaimError(task_id)
+            sql = """
+                    UPDATE tasks
+                       SET status       = 'done',
+                           result       = ?,
+                           completed_at = ?,
+                           claim_lock   = NULL,
+                           claim_expires= NULL,
+                           worker_pid   = NULL,
+                           consecutive_failures = 0,
+                           last_failure_error = NULL,
+                           block_kind   = NULL,
+                           block_recurrences = 0
+                     WHERE id = ?
+                       AND status IN ('running', 'ready', 'blocked', 'review')
+                    """
+            params: tuple = (result, now, task_id)
+            if expected_run_id is not None:
+                sql += " AND current_run_id = ?"
+                params = (*params, int(expected_run_id))
+            if conn.execute(sql, params).rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn, task_id, outcome="completed", status="done", summary=handoff_summary,
+                metadata=metadata,
             )
-        event_summary = handoff_summary
-        if prior_status == "review" and not event_summary:
-            event_summary = _REVIEW_APPROVED_NOTE
-        _append_event(
-            conn, task_id, "completed",
-            _completed_event_payload(result, event_summary, verified_cards, metadata),
-            run_id=run_id,
-        )
+            # Never-claimed task: synthesize a run so the handoff fields survive.
+            if run_id is None and (summary or metadata or result or prior_status == "review"):
+                synth_summary, synth_metadata = handoff_summary, metadata
+                if prior_status == "review" and not synth_summary and not synth_metadata:
+                    synth_summary = _REVIEW_APPROVED_NOTE
+                    synth_metadata = {"source_status": "review", "approval": "manual"}
+                run_id = _synthesize_ended_run(
+                    conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
+                )
+            event_summary = handoff_summary
+            if prior_status == "review" and not event_summary:
+                event_summary = _REVIEW_APPROVED_NOTE
+            # Same write_txn: completed event + immutable result receipt + pending outbox.
+            build_and_persist_receipt_in_txn(
+                conn,
+                task_id=task_id,
+                input_rev=entry.input_rev,
+                run_id=run_id,
+                result=result,
+                event_summary=event_summary,
+                handoff_summary=handoff_summary,
+                metadata=metadata,
+                verified_cards=verified_cards,
+                prepared=prepared,
+                now=now,
+            )
+        committed = True
+    finally:
+        if not committed:
+            discard_prepared_artifacts(conn, task_id, prepared)
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
-    # Success wipes the breaker counter (history stays on the event log).
-    _clear_failure_counter(conn, task_id)
     recompute_ready(conn)  # separate txn so children see ``done``
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -2834,7 +2858,7 @@ def _stage_completion_artifacts(
     """Copy scratch artifacts to the attachments dir and record each as an
     attachment row; returns the copies so the caller can discard them if its
     transaction rolls back."""
-    _persist_scratch_completion_artifacts(conn, task_id, metadata)
+    persist_scratch_completion_artifacts(conn, task_id, metadata)
     staged = [Path(stored_path) for stored_path in metadata.pop("_staged_artifacts", [])]
     for path in staged:
         _insert_completion_attachment(
@@ -2934,87 +2958,6 @@ def _merge_completion_prose_artifacts(
     return updated
 
 
-def _persist_scratch_completion_artifacts(
-    conn: sqlite3.Connection, task_id: str, metadata: dict,
-) -> None:
-    """Copy scratch-workspace completion artifacts before cleanup removes them."""
-    raw_artifacts = metadata.get("artifacts")
-    if not isinstance(raw_artifacts, (list, tuple)):
-        return
-
-    workspace = _scratch_workspace(conn, task_id)
-    if workspace is None:
-        return
-    is_managed, board = _managed_scratch_path_info(workspace)
-    if not is_managed:
-        return
-
-    try:
-        workspace_root = workspace.resolve()
-    except OSError:
-        return
-
-    attachment_dir = task_attachments_dir(task_id, board=board)
-    persisted: list[str] = []
-    used_destinations: set[Path] = set()
-    changed = False
-
-    def _discard_copies() -> None:
-        _discard_staged_copies(used_destinations, attachment_dir)
-
-    for item in raw_artifacts:
-        artifact = str(item).strip() if isinstance(item, str) else ""
-        if not artifact:
-            continue
-        src = Path(artifact).expanduser()
-        try:
-            resolved_src = src.resolve()
-        except OSError:
-            persisted.append(artifact)
-            continue
-
-        if not resolved_src.is_relative_to(workspace_root):
-            persisted.append(artifact)
-            continue
-
-        problem = None
-        if not src.is_file():
-            problem = f"declared scratch artifact is unavailable or not a regular file: {artifact}"
-        elif resolved_src.stat().st_size > KANBAN_ATTACHMENT_MAX_BYTES:
-            problem = (
-                f"declared scratch artifact exceeds the "
-                f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
-            )
-        if problem:
-            _discard_copies()
-            raise ArtifactPreservationError(problem)
-
-        dest: Optional[Path] = None
-        try:
-            attachment_dir.mkdir(parents=True, exist_ok=True)
-            dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            _copy_capped(resolved_src, dest, artifact)
-        except Exception as exc:
-            if dest is not None:
-                with contextlib.suppress(OSError):
-                    dest.unlink(missing_ok=True)
-            _discard_copies()
-            if isinstance(exc, ArtifactPreservationError):
-                raise
-            raise ArtifactPreservationError(
-                f"could not preserve declared scratch artifact {artifact}: {exc}"
-            ) from exc
-        used_destinations.add(dest)
-        persisted.append(str(dest.resolve()))
-        changed = True
-
-    if changed:
-        metadata["artifacts"] = persisted
-        metadata["_staged_artifacts"] = [
-            path for path in persisted if path.startswith(str(attachment_dir.resolve()))
-        ]
-
-
 def _discard_staged_copies(copies: Iterable[Path], attachment_dir: Path) -> None:
     """Remove staged attachment copies whose DB rows never committed; a leaked
     copy would make the retry stage ``name_1.ext`` next to an orphan."""
@@ -3023,19 +2966,6 @@ def _discard_staged_copies(copies: Iterable[Path], attachment_dir: Path) -> None
             Path(copied).unlink(missing_ok=True)
     with contextlib.suppress(OSError):
         attachment_dir.rmdir()
-
-
-def _copy_capped(src: Path, dest: Path, artifact: str) -> None:
-    """Chunked copy that aborts if the file grows past the attachment cap mid-copy."""
-    with src.open("rb") as source_file, dest.open("xb") as destination_file:
-        copied = 0
-        while chunk := source_file.read(1024 * 1024):
-            copied += len(chunk)
-            if copied > KANBAN_ATTACHMENT_MAX_BYTES:
-                raise ArtifactPreservationError(
-                    f"declared scratch artifact grew beyond the size limit: {artifact}"
-                )
-            destination_file.write(chunk)
 
 
 def _insert_completion_attachment(
@@ -3069,19 +2999,21 @@ def edit_task(
     body: Optional[str] = None, priority: Optional[int] = None,
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
+    resource_class: str | None = None, write_scopes: list[str] | None = None,
 ) -> bool:
     """Edit task fields, optionally backfilling a completed task's result."""
-    changed_fields = [
-        field for field, value in (("title", title), ("body", body), ("priority", priority))
-        if value is not None
-    ]
+    fields = (("title", title), ("body", body), ("priority", priority), ("resource_class", resource_class),
+              ("write_scopes", admission.encode_declaration(resource_class, write_scopes)))
+    changed_fields = [field for field, value in fields if value is not None]
     with write_txn(conn):
         status = _task_status(conn, task_id)
         if status is None or (result is not None and status != "done"):
             return False
+        if (resource_class is not None or write_scopes is not None) and status in ("running", "review"):
+            raise ValueError("requeue the task before changing its admission declaration")
         assignments = []
         params = []
-        for field, value in (("title", title), ("body", body), ("priority", priority)):
+        for field, value in fields:
             if value is not None:
                 assignments.append(f"{field} = ?")
                 params.append(value)
@@ -3339,6 +3271,10 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
             reviewer = _canonical_assignee(reviewer)
+            if trow['status'] in ('running', 'ready') and (expected_run_id is None or trow['current_run_id'] == int(expected_run_id)):
+                reason = _admit_task(conn, task_id, trow['status'])
+                if reason:
+                    return _ret(False, reason)
             # The actor is the run that did the work. ``assignee`` is the actor
             # only while a worker holds the card; on a never-claimed card it is
             # whoever the operator assigned -- possibly the reviewer itself,
@@ -3469,7 +3405,8 @@ def request_changes(
                    assignee = COALESCE(?, assignee),
                    claim_lock = NULL,
                    claim_expires = NULL,
-                   worker_pid = NULL, worker_started_at = NULL
+                   worker_pid = NULL, worker_started_at = NULL,
+                   reopen_epoch = COALESCE(reopen_epoch, 0) + 1
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
             (new_status, implementer, task_id, int(current_run_id)),
@@ -3594,6 +3531,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
+        if new_status == "review" and _admit_task(conn, task_id, "blocked"):
+            return False
         # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
         # resetting them is the amnesia that let cron-unblock <-> re-block loop
         # unbounded; only complete_task clears them. ``consecutive_failures``
@@ -3637,7 +3576,8 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             # consecutive_failures deliberately PRESERVED: review reopen is not
             # a success signal; only complete_task resets the breaker (#35072).
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+            "reopen_epoch = COALESCE(reopen_epoch, 0) + 1 "
             + (", assignee = ?" if implementer else "")
             + " WHERE id = ? AND status = 'review'",
             params,
@@ -3713,7 +3653,8 @@ def invalidate_descendants_for_parent_reopen(
             conn.execute(
                 "UPDATE tasks SET status = 'todo', completed_at = NULL, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?", (row["id"],),
+                "current_run_id = NULL, consecutive_failures = 0, "
+                "reopen_epoch = COALESCE(reopen_epoch, 0) + 1 WHERE id = ?", (row["id"],),
             )
             entry = {
                 "id": row["id"], "prior_status": previous_status,
@@ -3858,7 +3799,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
 def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
     """Delete every row referencing ``task_id`` (schema has no ON DELETE CASCADE)."""
     conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-    for table in ("task_comments", "task_events", "task_runs", "kanban_notify_subs"):
+    for table in (
+        "task_comments", "task_events", "task_runs", "kanban_notify_subs",
+        "kanban_result_receipts", "kanban_result_outbox", "kanban_result_deliveries",
+    ):
         conn.execute(f"DELETE FROM {table} WHERE task_id = ?", (task_id,))
 
 
@@ -4251,4 +4195,26 @@ from hermes_cli.kanban_db_dispatch import (
     _worker_alive_for_run,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+)
+from hermes_cli.kanban_result_receipts import (
+    CorruptResultReceiptError,
+    OutboxEntry,
+    ResultReceipt,
+    adopt_result_receipt,
+    build_and_persist_receipt_in_txn,
+    completion_attempt,
+    compute_input_rev,
+    discard_prepared_artifacts,
+    dispatch_pre_admit_receipt,
+    get_outbox_entry,
+    get_receipt_for_input_rev,
+    get_result_receipt,
+    list_pending_outbox,
+    list_result_receipts,
+    persist_scratch_completion_artifacts,
+    prepare_completion_artifacts,
+    reopen_task,
+    try_adopt_before_claim,
+    validate_declared_outputs,
+    verify_result_receipt,
 )

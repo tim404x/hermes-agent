@@ -763,9 +763,10 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             "UPDATE tasks SET status = ?, "
             "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
             "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
-            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
+            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END, "
+            "  reopen_epoch = COALESCE(reopen_epoch, 0) + CASE WHEN ? THEN 1 ELSE 0 END "
             "WHERE id = ?",
-            (effective_status,) * 4 + (task_id,))
+            (effective_status,) * 4 + (1 if reopening_satisfied_parent else 0, task_id))
         if cur.rowcount != 1:
             return False
         run_id = None

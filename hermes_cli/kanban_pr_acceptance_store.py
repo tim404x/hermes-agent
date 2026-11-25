@@ -10,7 +10,8 @@ def _snapshot(conn, task_id):
     return tuple(row) if row else None
 
 
-def prepare_acceptance(conn, task_id, expected_run_id, metadata):
+def prepare_acceptance(conn, task_id, expected_run_id, metadata, *, attempt=None):
+    from hermes_cli.kanban_db import _append_event
     snapshot = _snapshot(conn, task_id)
     if snapshot is None:
         return False
@@ -24,9 +25,10 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
     # Publication binds once. Retrying cannot replace the task's PR with a green sibling.
     if match and contract == match[1]:
         with write_txn(conn):
-            if _snapshot(conn, task_id) != snapshot:
+            if _snapshot(conn, task_id) != snapshot or (attempt is not None and not attempt.matches(conn, task_id)):
                 return False
             conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (published_pr, task_id))
+            _append_event(conn, task_id, 'pr_contract_bound', {'repository': contract, 'pr': published_pr}, run_id=run_id)
         snapshot = (run_id, status, published_pr)
         contract = published_pr
     # The assignee profile's gh login owns the repo: acceptance must not run as
