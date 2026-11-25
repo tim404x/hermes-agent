@@ -18,13 +18,17 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_ops
 
 
 @pytest.fixture
@@ -83,6 +87,31 @@ def test_run_daemon_resolves_and_passes_max_in_progress(
     kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
 
     assert captured.get("max_in_progress") == 3
+
+
+@pytest.mark.parametrize(("configured", "cli_max", "source"), [
+    (1, None, "config"), (None, None, "memory-default"), (None, 1, "--max"),
+])
+def test_daemon_stuck_warning_uses_dispatch_ticks_cap_source(
+    kanban_home, all_assignees_spawnable, monkeypatch, capsys, configured, cli_max, source,
+):
+    with kbc.connect_closing() as conn:
+        busy = kb.create_task(conn, title="running", assignee="default")
+        assert kb.claim_task(conn, busy) is not None
+        kb.create_task(conn, title="waiting", assignee="default")
+
+    read_cap = Mock(side_effect=[None if configured else 1] * 5 + [configured])
+    monkeypatch.setattr(kbd, "configured_max_in_progress", read_cap)
+    monkeypatch.setattr(kbd, "derive_default_max_in_progress", lambda: 1)
+    monkeypatch.setattr(kbd.signal, "signal", lambda *_: None)
+    stop = Mock()
+    stop.is_set.side_effect = [False] * 6 + [True]
+    monkeypatch.setattr(kbd, "run_daemon", partial(kbd.run_daemon, stop_event=stop))
+    assert kanban_ops._cmd_daemon(SimpleNamespace(force=True, interval=0, max=cli_max)) == 0
+    warning = capsys.readouterr().err.split("WARN dispatcher stuck:")[-1]
+    cap = "max_spawn" if cli_max else "max_in_progress"
+    assert f"{cap} full (running 1 >= 1)" in warning and f"source: {source}" in warning
+    assert read_cap.call_count == 6
 
 
 
