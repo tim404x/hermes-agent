@@ -114,7 +114,7 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
         finally:
             side.close()
         assert "descendant_invalidated" in kinds
-        kills.append((pid, claim_lock, started_at))
+        kills.append((pid, claim_lock, started_at, kwargs['task_id'], kwargs['run_id']))
         return {"terminated": True}
 
     monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
@@ -125,6 +125,7 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     )
 
     assert kills and kills[0][0] == 424242
+    assert kills[0][3:] == (child_id, claimed.current_run_id)
     assert result["terminations"] == kills
     child = kb.get_task(conn, child_id)
     assert child is not None
