@@ -1869,15 +1869,17 @@ def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
     return derive_default_max_in_progress()
 
 
-def configured_max_in_progress() -> Optional[int]:
+def configured_max_in_progress(kanban_cfg: Optional[dict] = None) -> Optional[int]:
     """Read ``kanban.max_in_progress`` from config, or None when unset/invalid.
 
-    Shared so every dispatch entry point agrees on "explicitly configured": a
-    positive integer wins, anything else falls through to the derived default.
+    Callers resolving multiple caps can pass the same ``kanban`` snapshot for all
+    of them. A positive integer wins; anything else falls through to the derived default.
     """
     try:
-        from hermes_cli.config import load_config_readonly
-        raw = (load_config_readonly() or {}).get("kanban", {}).get("max_in_progress")
+        if kanban_cfg is None:
+            from hermes_cli.config import load_config_readonly
+            kanban_cfg = (load_config_readonly() or {}).get("kanban", {})
+        raw = kanban_cfg.get("max_in_progress")
     except Exception:
         return None
     if raw is None:
@@ -2796,9 +2798,9 @@ def run_daemon(
 
     Calls :func:`dispatch_once` every ``interval`` seconds; exits cleanly on
     SIGINT / SIGTERM so it is systemd-friendly. ``stop_event`` and ``on_tick``
-    are test hooks. Each tick resolves ``kanban.max_in_progress`` exactly like
-    the gateway dispatcher and ``hermes kanban dispatch`` — the standalone
-    daemon must not be the one uncapped entry point.
+    are test hooks. Both this daemon and the gateway dispatcher re-resolve
+    ``kanban.max_in_progress`` every tick: explicit config wins, otherwise
+    they use the same memory-derived default as ``hermes kanban dispatch``.
     """
     import threading
 
