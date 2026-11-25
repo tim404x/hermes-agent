@@ -1696,28 +1696,36 @@ def _resume_lineage_ids(holder: StoreHolder, session_id: str) -> list[str]:
     for anything else — an explicit ``/branch`` copy, an API fork, a reset child, or a plain session.
     The raw parent walker ``_session_lineage_root_to_tip`` is intentionally NOT used here: it crosses
     fork/reset boundaries and misclassifies API forks (parent ended ``branched``, no marker) as
-    compression lineages. Shared with the resume guard so it counts exactly what a resume loads."""
-    from persistence.sqlite.conversation._store.compression import _is_compression_child_row
-    from persistence.sqlite.conversation._store.sessions import get_session
+    compression lineages. Shared with the resume guard so it counts exactly what a resume loads.
+
+    Fetch at most 100 candidate rows in one read (UNION stops cycles). SQLite checks the parent's
+    end reason; the child marker check stays in Python so inherited fork markers keep their meaning."""
     if not session_id:
         return [session_id]
-    session = get_session(holder, session_id)
-    if not session or _is_explicit_fork_child_row(holder, session):
-        return [session_id]
-    # _is_compression_child_row is the per-hop gate: the child must not be an explicit
-    # branch/delegate/tool child AND its parent must have ended 'compression'.
+    holder.flush_for_read()
+    rows = holder._read_all("""
+        WITH RECURSIVE ancestors AS (
+            SELECT id, parent_session_id, end_reason, source, model_config FROM sessions WHERE id = ?
+            UNION
+            SELECT parent.id, parent.parent_session_id, parent.end_reason, parent.source, parent.model_config
+            FROM ancestors AS child JOIN sessions AS parent ON parent.id = child.parent_session_id
+            WHERE parent.end_reason = 'compression'
+            LIMIT 100
+        )
+        SELECT * FROM ancestors""", (session_id,))
+    by_id = {row["id"]: row for row in rows}
     chain = [session_id]
-    current = session
     seen = {session_id}
-    while len(chain) < 100:  # defensive bound, same as _session_lineage_root_to_tip
-        if not _is_compression_child_row(holder, current):
+    current = by_id.get(session_id)
+    while current is not None:
+        parent_id = current["parent_session_id"]
+        if not parent_id or _is_explicit_fork_child_row(holder, dict(current), include_reset=True):
             break
-        parent = get_session(holder, current["parent_session_id"])
-        if not parent or parent["id"] in seen:
+        current = by_id.get(parent_id)
+        if current is None or parent_id in seen:
             break
-        seen.add(parent["id"])
-        chain.append(parent["id"])
-        current = parent
+        seen.add(parent_id)
+        chain.append(parent_id)
     return list(reversed(chain))
 
 
