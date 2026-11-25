@@ -284,3 +284,44 @@ def test_concurrent_guards_share_one_walk_and_keep_the_loop_responsive(home, mon
     assert len(checks) < len(refused), (len(checks), len(refused))  # coalesced, not one per call
     lags.sort()
     assert lags[-1] < 0.5, f"loop lag max {lags[-1]:.3f}s p99 {lags[int(len(lags) * 0.99)]:.3f}s"
+
+
+def test_unreliable_ctime_relists_index_when_parent_mtime_is_restored(home, monkeypatch):
+    from agent import skill_index
+
+    _settled(monkeypatch)
+    skills = home / "skills"
+    ops = skills / "ops"
+    old_stat = os.stat(ops)
+    real_stat_key = skill_index.stat_key
+
+    def windows_like_stat_key(path):
+        key = real_stat_key(path)
+        if key is not None and Path(path) == ops:
+            return (*key[:-1], old_stat.st_ctime_ns)
+        return key
+
+    monkeypatch.setattr(skill_index, "stat_key", windows_like_stat_key)
+    monkeypatch.setattr(skill_index, "stat_ctime_is_change_time", lambda: False)
+    before_key = skill_index.stat_key(ops)
+    assert (skills / "ops/sneaky-skill/SKILL.md") not in skill_index.root_index(skills).skill_index_files()
+
+    _skill(skills, "ops/sneaky-skill")
+    os.utime(ops, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+    assert skill_index.stat_key(ops) == before_key
+    assert (skills / "ops/sneaky-skill/SKILL.md") in skill_index.root_index(skills).skill_index_files()
+
+
+@pytest.mark.platforms("windows")
+def test_windows_restored_mtime_after_child_add_rebuilds_skill_index(home, monkeypatch):
+    from agent import skill_index
+
+    _settled(monkeypatch)
+    skills = home / "skills"
+    ops = skills / "ops"
+    old_stat = os.stat(ops)
+    assert (skills / "ops/sneaky-skill/SKILL.md") not in skill_index.root_index(skills).skill_index_files()
+
+    _skill(skills, "ops/sneaky-skill")
+    os.utime(ops, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+    assert (skills / "ops/sneaky-skill/SKILL.md") in skill_index.root_index(skills).skill_index_files()

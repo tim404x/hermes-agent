@@ -11,6 +11,7 @@ import ipaddress
 import os
 import re
 import socket
+import stat
 from contextlib import suppress
 from functools import lru_cache
 from pathlib import Path
@@ -60,7 +61,8 @@ def _hermes_dirs() -> list[Path]:
 def _profile_homes() -> list[Path]:
     """Resolved ``<root>/profiles/<name>`` homes, active or not."""
     with suppress(OSError):
-        return _resolve_each(p for p in (_hermes_root_path() / "profiles").iterdir() if p.is_dir())
+        profiles = _hermes_root_path() / "profiles"
+        return _resolved_children([profiles], [p.name for p in profiles.iterdir() if p.is_dir()])
     return []
 
 
@@ -78,6 +80,40 @@ def _resolve_each(paths) -> list[Path]:
         with suppress(Exception):
             out.append(p.resolve())
     return out
+
+
+def _resolved_children(dirs, names) -> list[Path]:
+    """Resolve relative child names in directory-major order, skipping unresolvable paths."""
+    return _children_of_resolved_dirs(_resolve_each(dirs), names)
+
+
+def _children_of_resolved_dirs(real_dirs, names) -> list[Path]:
+    children = []
+    parts_by_name = [(name, Path(name).parts) for name in names]
+    for directory in real_dirs:
+        for name, parts in parts_by_name:
+            candidate = directory / name
+            if _needs_child_realpath(directory, parts):
+                children.extend(_resolve_each([candidate]))
+            else:
+                children.append(candidate)
+    return children
+
+
+def _needs_child_realpath(directory: Path, parts: tuple[str, ...]) -> bool:
+    if ".." in parts:
+        return True
+    for part in parts:
+        directory = directory / part
+        try:
+            info = os.lstat(directory)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except (OSError, ValueError):
+            return True
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_reparse_tag", 0):
+            return True
+    return False
 
 
 def deny_key(path: str | Path) -> str:
@@ -579,15 +615,15 @@ def get_read_block_error(path: str) -> Optional[str]:
             "is an internal Hermes cache file and cannot be read directly to prevent "
             "prompt injection. Use the skills_list or skill_view tools instead."
         )
-    elif any(deny_key(resolved) in map(deny_key, _resolve_each(hd / name for hd in hermes_dirs))
-             for name in _CREDENTIAL_FILE_NAMES):
+    elif deny_key(resolved) in {deny_key(child) for child in
+                                _children_of_resolved_dirs(hermes_dirs, _CREDENTIAL_FILE_NAMES)}:
         reason = (
             "is a Hermes credential store and cannot be read directly. Provider tools "
             "consume these credentials through internal channels." + _DID_SUFFIX
         )
     else:
         for subdir, dir_msg, file_msg in _READ_DENIED_DIRS:
-            for blocked_dir in _resolve_each(hd / subdir for hd in hermes_dirs):
+            for blocked_dir in _children_of_resolved_dirs(hermes_dirs, (subdir,)):
                 if deny_path_under(resolved, blocked_dir):
                     reason = (dir_msg if deny_key(resolved) == deny_key(blocked_dir) else file_msg) + _DID_SUFFIX
                     break
