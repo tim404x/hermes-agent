@@ -131,6 +131,63 @@ def test_store_realpath_is_shared_by_fresh_readers_but_not_across_retarget(store
     assert memo._memo_store(_holder(db_path=link)) == os.path.realpath(link)
 
 
+def test_moved_store_replaced_with_symlink_resolves_to_new_wal(tmp_path):
+    """Moving a closed store file to Q and replacing P with a symlink P -> Q preserves (dev, ino),
+    so the memo must re-resolve P to Q instead of checking a stale P-wal beside the symlink."""
+    memo = _listing_memo()
+    old_dir = tmp_path / "old"
+    new_dir = tmp_path / "new"
+    old_dir.mkdir()
+    new_dir.mkdir()
+    path_p = old_dir / "state.db"
+    path_q = new_dir / "state.db"
+
+    with closing(sqlite3.connect(path_p)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE items (id TEXT PRIMARY KEY)")
+        conn.executemany("INSERT INTO items(id) VALUES (?)", [("a",), ("b",), ("c",)])
+        conn.commit()
+    assert not path_p.with_name("state.db-wal").exists()
+
+    def listed(target):
+        with closing(StoreHolder(target, read_only=True)) as holder:
+            def read():
+                with holder._read_ctx() as conn:
+                    return tuple(row[0] for row in conn.execute("SELECT id FROM items ORDER BY id"))
+
+            return memo.memoized(holder, "items", (), read)
+
+    _quiet(None)
+    assert listed(path_p) == ("a", "b", "c")
+    assert memo._resolved_store_path(path_p) == str(path_p.resolve())
+
+    # Move the same inode from P to Q (cleaning any empty read-only sidecars) and symlink P -> Q.
+    for suffix in ("-wal", "-shm"):
+        sidecar = path_p.with_name(f"{path_p.name}{suffix}")
+        if sidecar.exists():
+            sidecar.unlink()
+    old_stat = os.stat(path_p)
+    path_p.rename(path_q)
+    path_p.symlink_to(path_q)
+    assert (os.stat(path_p).st_dev, os.stat(path_p).st_ino) == (old_stat.st_dev, old_stat.st_ino)
+
+    # Commit a new row directly through Q into Q-wal (keep the writer open with autocheckpoint off
+    # so the new row stays in Q-wal while Q's own stat remains unchanged).
+    writer = sqlite3.connect(path_q)
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("INSERT INTO items(id) VALUES ('d')")
+        writer.commit()
+        assert path_q.with_name("state.db-wal").stat().st_size > 0
+        assert not path_p.with_name("state.db-wal").exists()
+
+        assert memo._resolved_store_path(path_p) == str(path_q.resolve())
+        assert listed(path_p) == ("a", "b", "c", "d")
+    finally:
+        writer.close()
+
+
 def test_a_commit_is_seen_by_the_next_listing(store, scope_a, monkeypatch):
     _quiet(scope_a)
     assert sorted(_browse(scope_a, lambda r: _listed(r, limit=10))) == ["a", "b", "c"]

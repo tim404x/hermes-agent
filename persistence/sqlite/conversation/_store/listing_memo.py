@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import stat
 import threading
 import time
 from collections import OrderedDict
@@ -100,11 +101,21 @@ def _resolved_store_path(db_path) -> str:
         with _store_paths_lock:
             _store_paths.pop(path, None)
         return os.path.realpath(path)
+    identity = (info.st_dev, info.st_ino)
     with _store_paths_lock:
         cached = _store_paths.get(path)
-        if cached is not None and (info.st_dev, info.st_ino) == cached[0]:
-            _store_paths.move_to_end(path)
-            return cached[1]
+        if cached is not None and identity == cached[0]:
+            try:
+                resolved_info = os.lstat(cached[1])
+            except OSError:
+                resolved_info = None
+            if (
+                resolved_info is not None
+                and stat.S_ISREG(resolved_info.st_mode)
+                and (resolved_info.st_dev, resolved_info.st_ino) == identity
+            ):
+                _store_paths.move_to_end(path)
+                return cached[1]
         resolved = os.path.realpath(path)
         try:
             info = os.stat(resolved)
