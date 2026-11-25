@@ -58,6 +58,11 @@ def owner_reclaim_paused(conn, task_id):
             return row[1] == 'interrupted'
         if row is None or row[0] in {'queued', 'unknown'}:
             return True
+        boot_id = receipt.get('boot_id')
+        if boot_id:
+            from gateway.drain_control import current_instantiation_epoch
+            if boot_id != current_instantiation_epoch():
+                return True
         from hermes_cli.process_identity import worker_birth
         return worker_birth(psutil.Process(receipt['pid'])) != receipt['birth']
     except (OSError, ValueError, KeyError, TypeError, psutil.Error):
@@ -104,6 +109,11 @@ def _owner_process_gone(receipt) -> bool:
     already exited, so liveness goes through the dispatcher's zombie-aware ``_pid_alive``. A live pid we cannot compare (no ``birth``
     recorded) and an unreadable one are never proof of death.
     """
+    boot_id = receipt.get('boot_id')
+    if boot_id:
+        from gateway.drain_control import current_instantiation_epoch
+        if boot_id != current_instantiation_epoch():
+            return True
     try:
         pid = int(receipt['pid'])
     except (KeyError, TypeError, ValueError):

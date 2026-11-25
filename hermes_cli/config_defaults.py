@@ -1852,6 +1852,12 @@ DEFAULT_CONFIG = {
         # Run the dispatcher inside the gateway process (~300µs per idle tick). False only if you
         # run it as a separate unit or don't want the gateway spawning workers.
         "dispatch_in_gateway": True,
+        # Worker execution plane for dispatched Kanban cards.
+        # "profile_owner" (default): existing shared profile gateway execution via kanban_worker_client.
+        # "isolated_systemd" (opt-in): each claimed card runs in its own transient systemd user service
+        # with an attempt-private home and card-local SessionAuthority, surviving gateway restarts.
+        # Fails closed (infrastructure deferral) if transient systemd user services are unavailable.
+        "worker_plane": "profile_owner",
         # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
         # sdlc-review skill. Disable where every review is done manually from the dashboard.
         "review_dispatch": True,

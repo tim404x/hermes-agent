@@ -2333,11 +2333,16 @@ def resolve_profile_env(profile_name: str) -> str:
     entries written in the same spelling (#82581 junction follow-up). Physically the paths are identical
     (junction-transparent); only the spelling is preserved.
     """
-    canon = _canon_valid(profile_name)
     root = profile_root_for_env_home(os.environ.get("HERMES_HOME", ""), _get_default_hermes_home())
+    return str(resolve_profile_at_root(profile_name, root))
+
+
+def resolve_profile_at_root(profile_name: str, root: Path) -> Path:
+    """Resolve and validate an assignee against its owning root, not the launch environment."""
+    canon = _canon_valid(profile_name)
     if canon == "default":
-        return str(root)
+        return root
     profile_dir = root / "profiles" / canon
     if not named_profile_is_live(profile_dir):
         raise _missing_profile_error(canon, profile_dir)
-    return str(profile_dir)
+    return profile_dir

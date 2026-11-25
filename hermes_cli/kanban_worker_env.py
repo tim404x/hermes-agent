@@ -65,3 +65,16 @@ def worker_client_env(env: Mapping[str, str], assignee_home: str | Path) -> dict
     # credential is not part of it: the assignee resolves its own and fails closed without it.
     names = _HOST_NAMES | {name.upper() for name in deployment_env_names()}
     return {k: v for k, v in host.items() if k.upper() in names or k.upper().startswith(_HOST_PREFIXES)}
+
+
+def isolated_owner_env(env: Mapping[str, str], assignee_home: str | Path) -> dict[str, str]:
+    """Service bootstrap plumbing only. Auth agents, proxies and passthrough belong to the assignee."""
+    host = worker_client_env(env, assignee_home)
+    names = {'PATH', 'HOME', 'LANG', 'LC_ALL', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'PYTHONPATH',
+             'HERMES_REAL_HOME', 'HERMES_RUNTIME_DIR', 'HERMES_PYTHON_SRC_ROOT', 'HERMES_INSTALL_ROOT',
+             'HERMES_INSTALL_STATE_DIR', 'HERMES_DISABLE_LAZY_INSTALLS', 'HERMES_MANAGED_DIR',
+             'HERMES_GATEWAY_LOCK_DIR', 'HERMES_KANBAN_HOME', 'HERMES_KANBAN_BUSY_TIMEOUT_MS',
+             'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'}
+    from hermes_cli.config_backend import deployment_env_names
+    names.update(deployment_env_names())
+    return {key: value for key, value in host.items() if key in names}

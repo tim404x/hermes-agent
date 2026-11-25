@@ -439,12 +439,45 @@ def _sigkill(kill, pid: int) -> bool:
         return False
 
 
+class _SpawnedWorkerPid(int):
+    """Worker PID int carrying optional launch metadata (isolated systemd unit receipt)."""
+
+    metadata: dict[str, Any]
+
+    def __new__(cls, pid: int, metadata: Optional[dict[str, Any]] = None):
+        obj = super().__new__(cls, int(pid))
+        obj.metadata = dict(metadata or {})
+        return obj
+
+
+def _worker_alive_for_run(
+    conn: Optional[sqlite3.Connection],
+    task_id: Optional[str],
+    pid: Optional[int],
+    started_at,
+    *,
+    run_id: Optional[int] = None,
+) -> bool:
+    """Hold the run while the PID lives or its isolated unit isn't verifiably gone."""
+    if _worker_alive(pid, started_at):
+        return True
+    if conn is not None and task_id:
+        from hermes_cli.kanban_worker_plane import isolated_unit_state, run_worker_plane_identity, UnitState
+        identity = run_worker_plane_identity(conn, task_id, run_id=run_id)
+        if identity is not None:
+            return isolated_unit_state(identity) != UnitState.GONE
+    return False
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
     signal_fn=None,
     started_at=None,
+    conn: Optional[sqlite3.Connection] = None,
+    task_id: Optional[str] = None,
+    run_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths. ``started_at`` is the spawn-time
     fingerprint: when the live process no longer matches it, the PID was recycled and nothing is
@@ -459,11 +492,23 @@ def _terminate_reclaimed_worker(
         "terminated": False,
         "sigkill": False,
     }
-    if not pid or pid <= 0 or not claim_lock:
+    info['host_local'] = bool(claim_lock and str(claim_lock).startswith(_kb._host_prefix()))
+    if conn is not None and task_id:
+        from hermes_cli.kanban_worker_plane import run_worker_plane_identity, stop_isolated_worker_unit
+        identity = run_worker_plane_identity(conn, task_id, run_id=run_id)
+        if identity is not None:
+            info['isolated'] = True
+            lock = conn.execute('SELECT claim_lock FROM task_runs WHERE id=?', (identity['run_id'],)).fetchone()
+            if not info['host_local'] or not lock or lock[0] != claim_lock:
+                return info
+            unit_stop = stop_isolated_worker_unit(identity)
+            info.update(unit_stop)
+            info['termination_attempted'] = unit_stop['unit_stop_attempted']
+            info['terminated'] = unit_stop['terminated'] and not _worker_alive(pid, started_at)
+            return info
+
+    if not info['host_local'] or not pid or pid <= 0:
         return info
-    if not str(claim_lock).startswith(_kb._host_prefix()):
-        return info
-    info["host_local"] = True
 
     kill = _kill_fn(signal_fn)
     if kill is None:
@@ -534,11 +579,13 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
         return
     if fingerprint == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
         return  # unproven identity: never signalled; its evidence is cleared once the pid is gone
-    alive = _worker_alive(pid, fingerprint)
+    alive = _worker_alive_for_run(conn, row["task_id"], pid, fingerprint, run_id=row["id"])
     termination = None
     if alive:
         termination = _terminate_reclaimed_worker(
-            pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint)
+            pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint,
+            conn=conn, task_id=row["task_id"], run_id=row["id"],
+        )
         if not termination["terminated"]:
             return  # still alive: try again next tick
     with _kb.write_txn(conn):
@@ -564,6 +611,8 @@ def _worker_survived_termination(termination: dict) -> bool:
     signalled count; a non-local lock or no-op attempt (no ``os.kill``) must fall
     through to the normal release path since we cannot manage that worker anyway.
     """
+    if termination.get('isolated'):
+        return not termination['terminated']
     return bool(
         termination.get("host_local")
         and (termination.get("termination_attempted") or termination.get("signal_refused"))
@@ -691,8 +740,15 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         # shutdown install their own SIGTERM handler. A recycled PID (fingerprint
         # mismatch) is never signalled: the worker is already gone.
         killed = False
+        from hermes_cli.kanban_worker_plane import run_worker_plane_identity
+        identity = run_worker_plane_identity(conn, tid)
+        if identity is not None:
+            termination = _terminate_reclaimed_worker(pid, lock, started_at=started_at, conn=conn,
+                                                      task_id=tid, run_id=identity['run_id'])
+            if not termination['terminated']:
+                continue
         kill = _kill_fn(signal_fn)
-        if kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
+        if identity is None and kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
             with contextlib.suppress(ProcessLookupError, OSError):
                 kill(pid, signal.SIGTERM)
             # Short polling wait — no time.sleep on the write txn.
@@ -799,7 +855,9 @@ def detect_stale_running(
         lock = row["claim_lock"] or ""
 
         termination = _kb._terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"))
+            pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"),
+            conn=conn, task_id=tid,
+        )
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -875,7 +933,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             continue
         tid = row["id"]
         pid = row["worker_pid"]
-        if pid and _worker_alive(pid, _kb._row_get(row, "worker_started_at")):
+        if _worker_alive_for_run(conn, tid, pid, _kb._row_get(row, "worker_started_at")):
             # Never requeue beside a live process. Retry next tick.
             _kb._log.debug(
                 "kanban reconcile: task %s has broken claim bookkeeping but "
@@ -1166,24 +1224,21 @@ class _CrashSweep:
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
-    with _kb.write_txn(conn):
-        rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
-            "FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
-        ).fetchall()
-        host_prefix = _kb._host_prefix()
-        from hermes_cli.kanban_owner_recovery import apply_attempt_note, managed_run_exit_code, owner_reclaim_blocked
-        for row in rows:
-            lock = row["claim_lock"] or ""
-            if not lock.startswith(host_prefix):
-                continue
-            # Launch-window grace so a freshly-spawned worker isn't reclaimed
-            # before its PID is visible on /proc.
-            started_at = _kb._to_epoch(_kb._row_get(row, "started_at"))
-            if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
-                continue
-            if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
+    rows = conn.execute('SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, current_run_id '
+                        "FROM tasks WHERE status='running' AND worker_pid IS NOT NULL").fetchall()
+    host_prefix = _kb._host_prefix()
+    from hermes_cli.kanban_owner_recovery import apply_attempt_note, managed_run_exit_code, owner_reclaim_blocked
+    for row in rows:
+        lock = row['claim_lock'] or ''
+        started_at = _kb._to_epoch(row['started_at'])
+        if not lock.startswith(host_prefix) or (started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds()):
+            continue
+        if _worker_alive_for_run(conn, row['id'], row['worker_pid'], row['worker_started_at'], run_id=row['current_run_id']):
+            continue
+        with _kb.write_txn(conn):
+            if not conn.execute("SELECT 1 FROM tasks WHERE id=? AND status='running' AND current_run_id IS ? "
+                                'AND claim_lock=? AND worker_pid=? AND worker_started_at IS ?',
+                                (row['id'], row['current_run_id'], lock, row['worker_pid'], row['worker_started_at'])).fetchone():
                 continue
             # An ambiguous receipt holds the card while the attempt may still run; once nothing
             # can be executing it (a dead bound interpreter, or a run that never bound one): crash.
@@ -1493,14 +1548,27 @@ def _record_task_failure(
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *, run_id=None, claim_lock=None) -> None:
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    run_id=None,
+    claim_lock=None,
+    spawn_metadata: Optional[dict[str, Any]] = None,
+) -> None:
     """Publish the launcher only while this claim has no executing worker yet, together with its
     restart-stable fingerprint (``_process_fingerprint``); the ``spawned`` event carries both. The
     fingerprint is what lets every later liveness/kill decision tell OUR worker from a process that
     recycled the PID after a reboot. A failed capture is persisted as ``UNVERIFIED_WORKER_FINGERPRINT``,
     never NULL: NULL is the legacy pre-fingerprint row whose bare-PID kill authority a new spawn must
     not inherit."""
-    started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
+    started_at = (spawn_metadata or {}).get('started_at') or _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
+    event_payload: dict[str, Any] = {"pid": int(pid), "started_at": started_at}
+    if spawn_metadata:
+        for key, value in spawn_metadata.items():
+            if key not in ("pid", "started_at") and value is not None:
+                event_payload[key] = value
     with _kb.write_txn(conn):
         if run_id is None:
             run_id = _kb._current_run_id(conn, task_id)
@@ -1512,10 +1580,17 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *, run_id=
         if cur.rowcount:
             conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
                          (int(pid), started_at, run_id))
-        _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
+        _kb._append_event(conn, task_id, "spawned", event_payload, run_id=run_id)
 
 
-def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: int) -> bool:
+def adopt_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    pid: int,
+    *,
+    worker_plane_meta: Optional[dict[str, Any]] = None,
+) -> bool:
     """Worker-side half of ``_set_worker_pid``, run by the worker before its first model call.
 
     A dispatcher killed between spawning the worker and ``_set_worker_pid`` leaves the run with no
@@ -1524,6 +1599,11 @@ def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: i
     ``run_id`` is no longer the card's live run: the card was reclaimed before this worker got here,
     and it must exit without working it."""
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
+    event_payload: dict[str, Any] = {"pid": int(pid), "started_at": started_at}
+    if worker_plane_meta:
+        for key, value in worker_plane_meta.items():
+            if key not in ("pid", "started_at") and value is not None:
+                event_payload[key] = value
     with _kb.write_txn(conn):
         row = conn.execute("SELECT status, current_run_id, worker_pid, claim_lock FROM tasks WHERE id = ?",
                            (task_id,)).fetchone()
@@ -1535,8 +1615,11 @@ def adopt_worker_pid(conn: sqlite3.Connection, task_id: str, run_id: int, pid: i
                          (int(pid), started_at, task_id))
             conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
                          (int(pid), started_at, int(run_id)))
-            _kb._append_event(conn, task_id, "worker_registered", {"pid": int(pid), "started_at": started_at},
-                              run_id=int(run_id))
+            _kb._append_event(conn, task_id, "worker_registered", event_payload, run_id=int(run_id))
+        elif worker_plane_meta:
+            if row['worker_pid'] != pid or not (row['claim_lock'] or '').startswith(_kb._host_prefix()):
+                return False
+            _kb._append_event(conn, task_id, 'worker_registered', event_payload, run_id=int(run_id))
     return True
 
 
@@ -2151,7 +2234,12 @@ def _dispatch_lane_task(
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
-            _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
+            spawn_meta = getattr(pid, "metadata", None)
+            _set_worker_pid(
+                conn, claimed.id, int(pid),
+                run_id=claimed.current_run_id, claim_lock=claimed.claim_lock,
+                spawn_metadata=spawn_meta if isinstance(spawn_meta, dict) else None,
+            )
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
@@ -2161,11 +2249,15 @@ def _dispatch_lane_task(
         _count_spawn(claimed.assignee)
         return True
     except Exception as exc:
+        from hermes_cli.kanban_worker_plane import LaunchUnconfirmed
         from hermes_cli.kanban_worker_preflight import ProfileConfigUnavailable
         from tools.process_registry import RestartSafeScopeUnavailable
 
         # The host refused the spawn (no restart-safe scope) or the config backend could not serve
         # the profile: nothing about the card ran, so it must not spend its retry budget (#114720).
+        if isinstance(exc, LaunchUnconfirmed):
+            _kb._log.warning('kanban: isolated launch unconfirmed for %s; holding claim', claimed.id)
+            return False
         infrastructure = isinstance(exc, (RestartSafeScopeUnavailable, ProfileConfigUnavailable))
         if infrastructure:
             _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
@@ -2793,18 +2885,39 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env.pop(DELEGATED_CHILD_ENV_MARKER, None)
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
-    # The worker is `-m hermes_cli.kanban_worker_client` with no console-script bootstrap, and the scrub
-    # above strips our PYTHONPATH entries, so a PYTHONPATH-launched dispatcher's child died on
-    # `No module named 'hermes_cli'` (#112729). Pinned last, after every other env decision.
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
     env = pin_hermes_tree_on_pythonpath(env, Path(project_root_str()))
+    from tools.process_registry import systemd_user_bus_env
+    env = systemd_user_bus_env(env)
+
+    from hermes_cli.kanban_worker_plane import (
+        WORKER_PLANE_ISOLATED_SYSTEMD,
+        launch_isolated_worker_service,
+        resolve_worker_plane,
+    )
+    if resolve_worker_plane() == WORKER_PLANE_ISOLATED_SYSTEMD:
+        if not profile_home:
+            raise RuntimeError(
+                f"isolated_systemd Kanban worker plane requires a resolved profile home for assignee {profile_arg!r}"
+            )
+        log_f = _open_worker_log(task, board)
+        log_f.close()
+        receipt = launch_isolated_worker_service(
+            task=task,
+            workspace=workspace,
+            board=board,
+            board_db=_kb.kanban_db_path(board=board),
+            profile_home=Path(profile_home),
+            env=env,
+            log_path=_kb.worker_log_path(task.id, board=board),
+        )
+        return _SpawnedWorkerPid(receipt.pid, metadata=receipt.event_metadata())
+
+    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
     cmd = _restart_safe_worker_argv(task, cmd)
-    from tools.process_registry import systemd_user_bus_env
-    env = systemd_user_bus_env(env)
     log_f = _open_worker_log(task, board)
     try:
         proc = subprocess.Popen(

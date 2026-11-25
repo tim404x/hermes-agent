@@ -2180,7 +2180,13 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    from hermes_cli.kanban_worker_plane import previous_run, previous_unit_may_run
+    previous = previous_run(conn, task_id)
+    if previous_unit_may_run(conn, task_id, previous):
+        return None
     with write_txn(conn):
+        if previous != previous_run(conn, task_id):
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2213,7 +2219,13 @@ def claim_review_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    from hermes_cli.kanban_worker_plane import previous_run, previous_unit_may_run
+    previous = previous_run(conn, task_id)
+    if previous_unit_may_run(conn, task_id, previous):
+        return None
     with write_txn(conn):
+        if previous != previous_run(conn, task_id):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2363,13 +2375,15 @@ def release_stale_claims(
         # observable progress — reclaim even if the PID is alive (logic loop).
         heartbeat_stale = hb is not None and (now - hb) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         started_at = _row_get(row, "worker_started_at")
-        if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
+        if (host_local and row["worker_pid"]
+                and _worker_alive_for_run(conn, row["id"], row["worker_pid"], started_at)
                 and not heartbeat_stale):
             _extend_live_stale_claim(conn, row, now)
             continue
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
+            conn=conn, task_id=row["id"],
         )
         # A live worker of ours must keep its claim (else a duplicate spawns beside it).
         if _worker_survived_termination(termination):
@@ -2487,14 +2501,19 @@ def reclaim_task(
         return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
+        row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"],
+        conn=conn, task_id=task_id,
+    )
+    if termination.get('isolated') and not termination['terminated']:
+        return False
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?", (retry_status, task_id, prev_lock),
+            "AND claim_lock IS ? AND worker_pid IS ? AND worker_started_at IS ?",
+            (retry_status, task_id, prev_lock, row['worker_pid'], row['worker_started_at']),
         )
         if cur.rowcount != 1:
             return False
@@ -3651,12 +3670,12 @@ def invalidate_descendants_for_parent_reopen(
     action), the opposite of :func:`reopen_review_task`.
 
     Returns ``{"invalidated": [{id, prior_status, new_status, resume_status}],
-    "terminations": [(worker_pid, claim_lock, worker_started_at)]}``.
+    "terminations": [(worker_pid, claim_lock, worker_started_at, task_id, run_id)]}``.
     """
     caller_owns_txn = bool(conn.in_transaction)
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
-    terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+    terminations = []
     with write_txn(conn, allow_nested=True):
         rows = conn.execute(
             """
@@ -3684,7 +3703,7 @@ def invalidate_descendants_for_parent_reopen(
                 resume_status = "review"
             elif previous_status == "running":
                 resume_status = _retry_status_for_run(conn, row["id"], row["current_run_id"])
-                terminations.append((row["worker_pid"], row["claim_lock"], row["worker_started_at"]))
+                terminations.append((row['worker_pid'], row['claim_lock'], row['worker_started_at'], row['id'], row['current_run_id']))
                 run_id = _end_run(
                     conn, row["id"], outcome="reclaimed", status="todo",
                     summary=f"ancestor {task_id} reopened",
@@ -3724,8 +3743,8 @@ def invalidate_descendants_for_parent_reopen(
     if not caller_owns_txn:
         # Standalone: committed above, audit trail durable, safe to kill now.
         # Composed calls leave this to the caller post-commit.
-        for pid, claim_lock, started_at in terminations:
-            _terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
+        for pid, claim_lock, started_at, child_id, run_id in terminations:
+            _terminate_reclaimed_worker(pid, claim_lock, started_at=started_at, conn=conn, task_id=child_id, run_id=run_id)
     return {"invalidated": invalidated, "terminations": terminations}
 
 
@@ -3823,7 +3842,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     if was_running:
-        termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
+        termination = _terminate_reclaimed_worker(
+            prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started,
+            conn=conn, task_id=task_id, run_id=run_id,
+        )
         with write_txn(conn):
             _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
     # ``archived`` parents no longer block children; promote them now.
@@ -4226,6 +4248,7 @@ from hermes_cli.kanban_db_dispatch import (
     _record_task_failure,
     _terminate_reclaimed_worker,
     _worker_alive,
+    _worker_alive_for_run,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
 )
