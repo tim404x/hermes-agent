@@ -3,6 +3,8 @@ import time
 from collections import Counter
 from pathlib import Path
 
+import pytest
+
 from agent import skill_commands, skill_index
 from hermes_constants import get_hermes_home
 from tools import skills_tool
@@ -173,3 +175,41 @@ def test_transient_entry_oserror_retries_without_parent_timestamp_change(tmp_pat
     scans = _count_scans(monkeypatch)
     assert _signature(root) == second
     assert not scans
+
+
+def test_unreliable_ctime_relists_when_parent_mtime_is_restored(tmp_path, monkeypatch):
+    category = tmp_path / "ml" / "training"
+    category.mkdir(parents=True)
+    _settle(tmp_path, monkeypatch)
+    old_stat = os.stat(category)
+    real_stat_key = skill_index.stat_key
+
+    def windows_like_stat_key(path):
+        key = real_stat_key(path)
+        if key is not None and Path(path) == category:
+            # Windows st_ctime_ns is creation time: stays fixed across child adds + utime.
+            return (*key[:-1], old_stat.st_ctime_ns)
+        return key
+
+    monkeypatch.setattr(skill_index, "stat_key", windows_like_stat_key)
+    monkeypatch.setattr(skill_index, "stat_ctime_is_change_time", lambda: False)
+    before_key = skill_index.stat_key(category)
+    before = _signature(tmp_path)
+
+    (category / "restored-mtime-skill").mkdir()
+    os.utime(category, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+    assert skill_index.stat_key(category) == before_key
+    assert _signature(tmp_path) != before
+
+
+@pytest.mark.platforms("windows")
+def test_windows_restored_mtime_after_child_add_changes_signature(tmp_path, monkeypatch):
+    category = tmp_path / "ml" / "training"
+    category.mkdir(parents=True)
+    _settle(tmp_path, monkeypatch)
+    old_stat = os.stat(category)
+    before = _signature(tmp_path)
+
+    (category / "restored-mtime-skill").mkdir()
+    os.utime(category, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+    assert _signature(tmp_path) != before

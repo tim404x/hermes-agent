@@ -127,7 +127,7 @@ def _catalog_dir(path: str, is_root: bool) -> Optional[_CatalogDir]:
             _catalog_dirs.pop(slot, None)
             return None
         cached = _catalog_dirs.get(slot)
-        if cached is None or key != cached.key or cached.racy:
+        if cached is None or key != cached.key or cached.racy or not skill_index.stat_ctime_is_change_time():
             try:
                 cached = _CatalogDir(path, is_root, key, read_at, cached)
             except OSError:
