@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -28,7 +29,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-from hermes_cli.kanban_isolation.home import prepare_attempt_home
+from hermes_cli.kanban_isolation.home import (
+    format_bind_readonly_path,
+    prepare_attempt_home_plan,
+    validate_systemd_bind_path,
+)
+from hermes_cli.kanban_isolation.mounts import readonly_bind_probe_script
 from hermes_platform.host.facts import os_family
 from hermes_platform.resolver import locate_command
 
@@ -63,9 +69,10 @@ class IsolatedLaunchReceipt:
     attempt_home: str
     profile_home: str
     worker_plane: str = WORKER_PLANE_ISOLATED_SYSTEMD
+    readonly_assets: tuple[str, ...] = ()
 
     def event_metadata(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             'started_at': self.started_at,
             "worker_plane": self.worker_plane,
             "systemd_unit": self.unit_name,
@@ -74,6 +81,9 @@ class IsolatedLaunchReceipt:
             "attempt_home": self.attempt_home,
             "profile_home": self.profile_home,
         }
+        if self.readonly_assets:
+            payload["readonly_assets"] = list(self.readonly_assets)
+        return payload
 
 
 class LaunchUnconfirmed(RuntimeError):
@@ -170,10 +180,24 @@ def _cached_probe() -> Optional[tuple[bool, str]]:
     return _PROBE_AVAILABLE, _PROBE_REASON
 
 
+def _probe_base_dir(probe_env: Mapping[str, str]) -> Optional[Path]:
+    for candidate in (probe_env.get("XDG_RUNTIME_DIR"), f"/run/user/{os.getuid()}", tempfile.gettempdir()):
+        if not candidate:
+            continue
+        try:
+            resolved = Path(candidate).expanduser().resolve()
+            validate_systemd_bind_path(resolved)
+        except (OSError, ValueError):
+            continue
+        if resolved.is_dir() and os.access(resolved, os.W_OK | os.X_OK):
+            return resolved
+    return None
+
+
 def systemd_user_service_available(
     env: Optional[Mapping[str, str]] = None,
 ) -> tuple[bool, str]:
-    """Return ``(available, reason)`` for launching transient systemd user services."""
+    """Return ``(available, reason)`` for launching transient systemd user services with RO mounts."""
     global _PROBE_AVAILABLE, _PROBE_REASON, _PROBE_AT, _PROBE_NO_EXPAND
     if not _IS_LINUX:
         return False, "isolated_systemd worker plane requires Linux systemd user manager"
@@ -200,33 +224,53 @@ def systemd_user_service_available(
             )
             _PROBE_AT = time.monotonic()
             return False, _PROBE_REASON
+        base_dir = _probe_base_dir(probe_env)
+        if base_dir is None:
+            _PROBE_AVAILABLE = False
+            _PROBE_REASON = "no safe writable runtime directory available for read-only bind-mount probe"
+            _PROBE_AT = time.monotonic()
+            return False, _PROBE_REASON
         probe_unit = f"hermes-kanban-probe-{os.getpid()}-{uuid.uuid4().hex[:8]}.service"
         available = False
         reason = ""
         try:
-            for _attempt in range(2):
-                no_expand = ["--expand-environment=no"] if _PROBE_NO_EXPAND else []
-                argv = [
-                    run_bin, "--user", "--quiet", "--unit", probe_unit,
-                    "--service-type=exec", "--collect", "--wait", *no_expand,
-                    "--", "/usr/bin/true",
-                ]
-                proc = subprocess.run(
-                    argv, stdin=subprocess.DEVNULL, capture_output=True,
-                    timeout=5, env=probe_env, check=False,
-                )
-                stderr_bytes = proc.stderr or b""
-                if proc.returncode != 0 and _PROBE_NO_EXPAND and b"expand-environment" in stderr_bytes:
-                    _PROBE_NO_EXPAND = False
-                    continue
-                available = proc.returncode == 0
-                if not available:
-                    detail = stderr_bytes.decode("utf-8", "replace").strip() or f"rc={proc.returncode}"
-                    reason = f"systemd-run --user transient service probe failed: {detail}"
-                break
+            with tempfile.TemporaryDirectory(prefix="hermes-kanban-ro-", dir=base_dir) as tmp_dir:
+                os.chmod(tmp_dir, 0o700)
+                src = (Path(tmp_dir) / "src").resolve()
+                dst = (Path(tmp_dir) / "dst").resolve()
+                src.mkdir(mode=0o700)
+                dst.mkdir(mode=0o700)
+                canary = "canary"
+                (src / canary).write_text("ok", encoding="utf-8")
+                src_st = src.lstat()
+                bind_spec = format_bind_readonly_path(src, dst)
+                probe_script = readonly_bind_probe_script()
+                for _attempt in range(2):
+                    no_expand = ["--expand-environment=no"] if _PROBE_NO_EXPAND else []
+                    argv = [
+                        run_bin, "--user", "--quiet", "--unit", probe_unit,
+                        "--service-type=exec", "--collect", "--wait",
+                        "--property", f"BindReadOnlyPaths={bind_spec}",
+                        *no_expand,
+                        "--", sys.executable, "-IS", "-c", probe_script,
+                        str(dst), str(src_st.st_dev), str(src_st.st_ino), canary,
+                    ]
+                    proc = subprocess.run(
+                        argv, stdin=subprocess.DEVNULL, capture_output=True,
+                        timeout=10, env=probe_env, check=False,
+                    )
+                    stderr_bytes = proc.stderr or b""
+                    if proc.returncode != 0 and _PROBE_NO_EXPAND and b"expand-environment" in stderr_bytes:
+                        _PROBE_NO_EXPAND = False
+                        continue
+                    available = proc.returncode == 0
+                    if not available:
+                        detail = stderr_bytes.decode("utf-8", "replace").strip() or f"rc={proc.returncode}"
+                        reason = f"systemd-run --user read-only bind-mount probe failed: {detail}"
+                    break
         except Exception as exc:
             available = False
-            reason = f"systemd-run --user transient service probe error: {exc}"
+            reason = f"systemd-run --user read-only bind-mount probe error: {exc}"
         _PROBE_AVAILABLE = available
         _PROBE_REASON = reason
         _PROBE_AT = time.monotonic()
@@ -327,7 +371,9 @@ def launch_isolated_worker_service(
     resolved_profile = Path(profile_home).expanduser().resolve()
     unit_name = isolated_worker_unit_name(resolved_db, task.id, int(task.current_run_id))
     root_dir = attempt_root_dir(resolved_db, task.id, int(task.current_run_id))
-    attempt_home = prepare_attempt_home(root_dir / "home", resolved_profile)
+    # Plan, validate, and materialize outside any board write lock; never copies skills/plugins.
+    plan = prepare_attempt_home_plan(root_dir / "home", resolved_profile)
+    attempt_home = plan.attempt_home
     launch_env_path = root_dir / "launch.env"
 
     boot_id = current_instantiation_epoch()
@@ -344,6 +390,9 @@ def launch_isolated_worker_service(
     worker_env["HERMES_KANBAN_WORKER_UNIT"] = unit_name
     worker_env["HERMES_KANBAN_WORKER_BOOT_ID"] = boot_id
     worker_env["HERMES_KANBAN_LAUNCH_ENV_FILE"] = str(launch_env_path)
+    worker_env["HERMES_KANBAN_REQUIRED_RO_MOUNTS"] = json.dumps(
+        [proj.to_manifest() for proj in plan.readonly_projections]
+    )
     with launch_env_path.open('x', encoding='utf-8') as launch_file:
         os.fchmod(launch_file.fileno(), 0o600)
         json.dump(worker_env, launch_file)
@@ -352,6 +401,10 @@ def launch_isolated_worker_service(
     working_dir = workspace if workspace and os.path.isdir(workspace) else str(attempt_home)
     board_label = board or worker_env.get("HERMES_KANBAN_BOARD") or "default"
     description = f"Hermes Kanban isolated worker {board_label}/{task.id}/run-{int(task.current_run_id)}"
+
+    ro_bind_args: list[str] = []
+    for proj in plan.readonly_projections:
+        ro_bind_args.extend(["--property", f"BindReadOnlyPaths={proj.bind_spec}"])
 
     no_expand = ["--expand-environment=no"] if _PROBE_NO_EXPAND else []
     argv = [
@@ -367,6 +420,7 @@ def launch_isolated_worker_service(
         "--property", "TimeoutStopSec=15",
         "--property", "MemoryAccounting=yes",
         "--property", f"MemoryMax={_worker_memory_max_bytes()}",
+        *ro_bind_args,
         *no_expand,
         "--", sys.executable, "-IS", str(Path(__file__).with_name('kanban_isolation') / 'clean_exec.py'),
         str(launch_env_path), sys.executable, "-P", "-m", "hermes_cli.kanban_isolated_worker",
@@ -389,7 +443,10 @@ def launch_isolated_worker_service(
         except OSError:
             pass
         detail = (proc.stderr or proc.stdout or f"rc={proc.returncode}").strip()
-        if any(tok in detail.lower() for tok in ("bus", "dbus", "failed to connect", "systemd")):
+        if any(
+            tok in detail.lower()
+            for tok in ("bus", "dbus", "failed to connect", "systemd", "mount", "namespace", "bind", "operation not permitted")
+        ):
             reset_systemd_service_probe_cache()
             raise RestartSafeScopeUnavailable(
                 f"cannot create isolated systemd service for Kanban worker: {detail}"
@@ -412,6 +469,7 @@ def launch_isolated_worker_service(
         boot_id=boot_id,
         attempt_home=str(attempt_home),
         profile_home=str(resolved_profile),
+        readonly_assets=tuple(proj.name for proj in plan.readonly_projections),
     )
 
 

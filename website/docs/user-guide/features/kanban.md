@@ -396,10 +396,18 @@ execution for Kanban cards (all other sources remain untouched):
   (`RestartSafeScopeUnavailable`) without burning card retry budgets.
   A missing or mismatched unit identity is not proof of exit: reclaim, timeout and
   subsequent claims wait for a verified stop or an empty, inactive/absent unit.
-- **Profile inputs:** the owner takes private copies of the assignee's configuration,
-  auth, memories and extensions, not writable links to the profile. Linked or special
-  inputs are refused. Supply credentials through the assignee's secret sources, not
-  the systemd manager; approval grants are read from the assignee's current policy.
+- **Profile inputs:** reusable shared asset trees (`skills`, `plugins`) are projected
+  read-only into the unit's mount namespace via `BindReadOnlyPaths=` (never copied per
+  attempt, and verified read-only inside the started unit; fails closed if mount
+  namespacing is unavailable). Tiny mutable inputs (`config.yaml`, `.env`, `auth.json`,
+  `memories`, `SOUL.md`, `hooks`, `locales`, `skins`, `models_dev_cache.json`) are
+  privately copied so attempt writes never mutate the owning profile or shared fleet
+  root. Standard named profiles (`<fleet-root>/profiles/<name>`) may use explicit
+  top-level relative aliases (`../../<asset>`) for `skills`, `plugins`, `memories`, and
+  `SOUL.md`; inside `skills`/`plugins`, only relative symlinks resolving within that
+  same asset root are allowed. Arbitrary aliases, escaping links, and special files are
+  refused. Supply credentials through the assignee's secret sources, not the systemd
+  manager; approval grants are read from the assignee's current policy.
 - **Session visibility:** the canonical board's `owner_admitted`, `worker_bound`,
   and `worker_result` events plus the task worker log record the attempt's
   `session_id`, `systemd_unit`, `cgroup`, and attempt-private `state.db` path

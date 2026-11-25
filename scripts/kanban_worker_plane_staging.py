@@ -31,6 +31,7 @@ import argparse
 import contextlib
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -108,6 +109,30 @@ def _inactive(unit):
             and props.get('ActiveState') == 'inactive' and props.get('MainPID') == '0' and props.get('ControlGroup') == '')
 
 
+_FLEET_GUIDE_TEXT = "B4_SHARED_GUIDE_CONTENT\n"
+_FLEET_PLUGIN_TEXT = "B4_SHARED_PLUGIN_CONTENT\n"
+_FLEET_MEMORY_TEXT = "B4_FLEET_MEMORY_ORIGINAL\n"
+_FLEET_SOUL_TEXT = "B4_FLEET_SOUL_ORIGINAL\n"
+
+
+def _inspect_fixture_views(pid, attempt, staging_root, fleet):
+    """Observe the bound worker's fixture mounts. No test commands or writes inside the agent."""
+    attempt = Path(attempt)
+    assert attempt.is_relative_to(staging_root) and fleet.is_relative_to(staging_root)
+    view = Path('/proc') / str(pid) / 'root' / attempt.relative_to('/')
+    link = view / 'skills/b4-staging-skill/references/guide-link.md'
+    marker = view / 'plugins/b4-staging-plugin/marker.txt'
+    result = {'nested_skill_link_text': link.read_text(), 'nested_skill_link_is_symlink': link.is_symlink(),
+              'plugin_marker_text': marker.read_text()}
+    for label, name in [('skills','skills'), ('plugins','plugins'), ('soul','SOUL.md'), ('memories','memories')]:
+        result[label+'_is_symlink'] = (view / name).is_symlink()
+    for name in ('skills', 'plugins'):
+        result[name+'_readonly'] = bool(os.statvfs(view / name).f_flag & os.ST_RDONLY)
+    for label, path in [('memory','memories/MEMORY.md'), ('soul','SOUL.md')]:
+        result[label+'_private_copy'] = not (view / path).samefile(fleet / path) and (view / path).read_bytes() == (fleet / path).read_bytes()
+    return result
+
+
 def _has_env_name(pid, name):
     prefix = name.encode() + b'='
     return any(entry.startswith(prefix) for entry in Path(f'/proc/{pid}/environ').read_bytes().split(b'\0'))
@@ -161,9 +186,9 @@ class _DeterministicModelHandler(BaseHTTPRequestHandler):
             with srv.lock:
                 srv.first_turn_calls += 1
             effect_cmd = (
-                f"printf 'EFFECT pid=%s ts=%s\\n' \"$$\" \"$(date +%s)\" >> {srv.side_effect_file} "
-                f"&& echo STAGING_EFFECT_OK"
+                f"printf 'EFFECT pid=%s ts=%s\\n' \"$$\" \"$(date +%s)\" >> {shlex.quote(srv.side_effect_file)}"
             )
+            effect_cmd += " && echo STAGING_EFFECT_OK"
             message = {
                 "role": "assistant",
                 "content": None,
@@ -328,6 +353,26 @@ def run_staging(*, worker_plane: str, python_exe: str, keep_scratch: bool = Fals
             encoding="utf-8",
         )
 
+        # Seed shared fleet public assets + nested internal relative link inside skills.
+        skill_dir = hermes_home / "skills" / "b4-staging-skill"
+        refs_dir = skill_dir / "references"
+        refs_dir.mkdir(parents=True, mode=0o700)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: b4-staging-skill\ndescription: B4 staging shared skill fixture\n---\n# B4 Staging Skill\n",
+            encoding="utf-8",
+        )
+        (refs_dir / "guide.md").write_text(_FLEET_GUIDE_TEXT, encoding="utf-8")
+        (refs_dir / "guide-link.md").symlink_to("guide.md")
+
+        plugin_dir = hermes_home / "plugins" / "b4-staging-plugin"
+        plugin_dir.mkdir(parents=True, mode=0o700)
+        (plugin_dir / "marker.txt").write_text(_FLEET_PLUGIN_TEXT, encoding="utf-8")
+
+        memories_dir = hermes_home / "memories"
+        memories_dir.mkdir(parents=True, mode=0o700)
+        (memories_dir / "MEMORY.md").write_text(_FLEET_MEMORY_TEXT, encoding="utf-8")
+        (hermes_home / "SOUL.md").write_text(_FLEET_SOUL_TEXT, encoding="utf-8")
+
         # Initialize board and create one real card via CLI (scratch HOME/HERMES_HOME).
         assignee = 'b4-worker' if worker_plane == 'isolated_systemd' else 'default'
         profile = hermes_home / 'profiles' / assignee if assignee != 'default' else hermes_home
@@ -335,6 +380,9 @@ def run_staging(*, worker_plane: str, python_exe: str, keep_scratch: bool = Fals
             profile.mkdir(mode=0o700, parents=True)
             for name in ('config.yaml', 'models_dev_cache.json'):
                 shutil.copyfile(hermes_home / name, profile / name)
+            # Model real named-profile canonical top-level relative aliases.
+            for asset_name in ('skills', 'plugins', 'memories', 'SOUL.md'):
+                (profile / asset_name).symlink_to(f"../../{asset_name}")
         (profile / '.env').write_text('OPENAI_API_KEY=local-fixture-only\nHTTPS_PROXY=http://127.0.0.1:1\n'
                                       'HTTP_PROXY=http://127.0.0.1:1\nNO_PROXY=127.0.0.1,localhost,::1\n')
         runtime = staging_root / 'r'
@@ -413,6 +461,10 @@ def run_staging(*, worker_plane: str, python_exe: str, keep_scratch: bool = Fals
         worker_unit = (before_admitted or {}).get("payload", {}).get("systemd_unit") or (before_spawned or {}).get("payload", {}).get("systemd_unit")
         if worker_plane == 'isolated_systemd':
             assert worker_unit == isolated_worker_unit_name(board_db, task_id, before_task['current_run_id'])
+        ro_probe = {}
+        if worker_plane == 'isolated_systemd':
+            assert before_admitted is not None
+            ro_probe = _inspect_fixture_views(bound_pid_before, before_admitted['payload']['attempt_home'], staging_root, hermes_home)
         before_birth = _live_birth(bound_pid_before)
         owner_pid = (before_admitted or {}).get('payload', {}).get('pid')
         isolated_environment = bool(owner_pid) and all(
@@ -588,7 +640,7 @@ def run_staging(*, worker_plane: str, python_exe: str, keep_scratch: bool = Fals
             'isolated_environment': gateway_clean and not _has_env_name(new_gw_pid, 'B4_MANAGER_ONLY') and isolated_environment,
             'single_tool_sequence': server.call_count == 3 and sum(event['kind'] == 'worker_result' and event['payload'].get('exit_code') == 0 for event in final_events) == 1,
             'named_assignee': before_task['assignee'] == assignee and (before_admitted or {}).get('payload', {}).get('profile_home') == str(profile),
-            'same_unit_invocation': bool(first_unit.get('InvocationID')) and first_unit['InvocationID'] == second_unit.get('InvocationID') == (before_admitted or {}).get('payload', {}).get('invocation_id'),
+            'same_unit_invocation': bool(first_unit.get('InvocationID')) and first_unit['InvocationID'] == second_unit['InvocationID'] == (before_admitted or {}).get('payload', {}).get('invocation_id'),
             'same_active_cgroup': first_unit.get('ActiveState') == second_unit.get('ActiveState') == 'active' and first_unit.get('ControlGroup') == second_unit.get('ControlGroup') == bound_cgroup_before,
             'one_effect_while_paused': len(side_effects_before) == len(side_effects_after_restart) == 1,
             'same_claim_while_paused': first['run_id'] == second['run_id'] and second['run_count'] == 1 and second['task_status'] == 'running',
@@ -599,6 +651,70 @@ def run_staging(*, worker_plane: str, python_exe: str, keep_scratch: bool = Fals
             "one_side_effect": one_side_effect,
             "persisted_attempt_receipt_no_shared_writer": persisted_receipt,
         }
+        if worker_plane == "isolated_systemd":
+            attempt_home_path = Path((before_admitted or {}).get("payload", {}).get("attempt_home", ""))
+            host_skills_empty = (
+                attempt_home_path.is_dir()
+                and (attempt_home_path / "skills").is_dir()
+                and not (attempt_home_path / "skills").is_symlink()
+                and os.listdir(attempt_home_path / "skills") == []
+            )
+            host_plugins_empty = (
+                attempt_home_path.is_dir()
+                and (attempt_home_path / "plugins").is_dir()
+                and not (attempt_home_path / "plugins").is_symlink()
+                and os.listdir(attempt_home_path / "plugins") == []
+            )
+            fleet_unmutated = (
+                (hermes_home / "memories" / "MEMORY.md").read_text(encoding="utf-8") == _FLEET_MEMORY_TEXT
+                and (hermes_home / "SOUL.md").read_text(encoding="utf-8") == _FLEET_SOUL_TEXT
+                and (hermes_home / "skills" / "b4-staging-skill" / "references" / "guide.md").read_text(encoding="utf-8") == _FLEET_GUIDE_TEXT
+                and (hermes_home / "plugins" / "b4-staging-plugin" / "marker.txt").read_text(encoding="utf-8") == _FLEET_PLUGIN_TEXT
+                and not (hermes_home / "skills" / "b4-staging-skill" / ".ro-probe").exists()
+                and not (hermes_home / "plugins" / "b4-staging-plugin" / ".ro-probe").exists()
+            )
+            profile_links = {
+                name: os.readlink(profile / name)
+                for name in ("skills", "plugins", "memories", "SOUL.md")
+                if (profile / name).is_symlink()
+            }
+            nested_link_target = os.readlink(hermes_home / "skills" / "b4-staging-skill" / "references" / "guide-link.md")
+            receipt["shared_assets"] = {
+                "profile_links": profile_links,
+                "nested_skill_link": nested_link_target,
+                "worker_probe": ro_probe,
+                "host_mountpoints_empty": {"skills": host_skills_empty, "plugins": host_plugins_empty},
+                "fleet_sources_unmutated": fleet_unmutated,
+                "readonly_assets_admitted": (before_admitted or {}).get("payload", {}).get("readonly_assets"),
+            }
+            receipt["assertions"]["canonical_relative_links_modeled"] = (
+                profile_links == {name: f"../../{name}" for name in ("skills", "plugins", "memories", "SOUL.md")}
+                and nested_link_target == "guide.md"
+                and ro_probe.get("nested_skill_link_text") == _FLEET_GUIDE_TEXT
+                and ro_probe.get("nested_skill_link_is_symlink") is True
+                and ro_probe.get("plugin_marker_text") == _FLEET_PLUGIN_TEXT
+                and ro_probe.get("memories_is_symlink") is False
+                and ro_probe.get("soul_is_symlink") is False
+                and ro_probe.get("skills_is_symlink") is False
+                and ro_probe.get("plugins_is_symlink") is False
+            )
+            receipt["assertions"]["shared_assets_readonly"] = (
+                ro_probe.get("skills_readonly") is True
+                and ro_probe.get("plugins_readonly") is True
+                and host_skills_empty
+                and host_plugins_empty
+                and set((before_admitted or {}).get("payload", {}).get("readonly_assets") or ()) == {"skills", "plugins"}
+            )
+            receipt["assertions"]["no_source_mutation"] = (
+                ro_probe.get("memory_private_copy") is True
+                and ro_probe.get("soul_private_copy") is True
+                and fleet_unmutated
+            )
+            receipt["assertions"]["no_duplicate_runs_or_effects"] = (
+                len(final_runs) == 1
+                and len(final_side_effects) == 1
+                and server.first_turn_calls == 1
+            )
         receipt["passed"] = all(receipt["assertions"].values())
         return receipt
     except Exception as exc:

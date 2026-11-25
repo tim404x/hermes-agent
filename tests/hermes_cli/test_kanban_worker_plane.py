@@ -321,3 +321,317 @@ def test_attempt_session_summary_exposes_session_and_unit_visibility(isolated_bo
     assert summary["bound_pid"] == 1235
     assert summary["bound_cgroup"] == "/user.slice/hermes-kanban-w-00112233-t_vis-r1.service"
     assert summary["exit_code"] == 0
+
+
+def _build_fleet_with_canonical_links(tmp_path: Path) -> tuple[Path, Path]:
+    fleet = tmp_path / ".hermes"
+    fleet.mkdir(mode=0o700, exist_ok=True)
+    (fleet / "skills" / "demo" / "refs").mkdir(parents=True, mode=0o700, exist_ok=True)
+    (fleet / "skills" / "demo" / "SKILL.md").write_text("demo skill\n", encoding="utf-8")
+    (fleet / "skills" / "demo" / "refs" / "target.md").write_text("guide\n", encoding="utf-8")
+    (fleet / "skills" / "demo" / "refs" / "alias.md").symlink_to("target.md")
+    (fleet / "skills" / "demo" / "refs" / "up.md").symlink_to("../SKILL.md")
+
+    (fleet / "plugins" / "sample").mkdir(parents=True, mode=0o700)
+    (fleet / "plugins" / "sample" / "data.txt").write_text("plugin-data\n", encoding="utf-8")
+
+    (fleet / "memories").mkdir(mode=0o700)
+    (fleet / "memories" / "MEMORY.md").write_text("fleet-memory\n", encoding="utf-8")
+    (fleet / "SOUL.md").write_text("fleet-soul\n", encoding="utf-8")
+
+    profile = fleet / "profiles" / "alpha"
+    profile.mkdir(parents=True, mode=0o700)
+    (profile / "config.yaml").write_text("model:\n  default: test-model\n", encoding="utf-8")
+    (profile / ".env").write_text("ALPHA_KEY=fixture\n", encoding="utf-8")
+    for asset in ("skills", "plugins", "memories", "SOUL.md"):
+        (profile / asset).symlink_to(f"../../{asset}")
+    return fleet, profile
+
+
+@pytest.mark.platforms("linux")
+def test_canonical_relative_links_project_ro_assets_and_copy_mutable_assets(tmp_path):
+    from hermes_cli.kanban_isolation.home import (
+        plan_attempt_home,
+        prepare_attempt_home_plan,
+        validate_public_asset_sources,
+    )
+
+    fleet, profile = _build_fleet_with_canonical_links(tmp_path)
+    pub = validate_public_asset_sources(profile)
+    assert pub.fleet_root == fleet.resolve()
+    assert {p.name for p in pub.readonly_projections} == {"skills", "plugins"}
+    assert all(p.aliased for p in pub.readonly_projections)
+    assert {c.name for c in pub.copy_assets} == {"memories", "SOUL.md"}
+    assert all(c.aliased for c in pub.copy_assets)
+
+    attempt = fleet / "kanban-worker-plane" / "t_links" / "run-1" / "home"
+    plan = prepare_attempt_home_plan(attempt, profile)
+    assert plan == plan_attempt_home(attempt, profile)
+
+    # Shared skills/plugins are NOT copied; empty 0o700 mountpoints await BindReadOnlyPaths.
+    ro_by_name = {p.name: p for p in plan.readonly_projections}
+    assert set(ro_by_name) == {"skills", "plugins"}
+    for name in ("skills", "plugins"):
+        proj = ro_by_name[name]
+        assert proj.source == (fleet / name).resolve()
+        assert proj.target == (attempt / name).resolve()
+        assert proj.bind_spec == f"{proj.source}:{proj.target}"
+        mountpoint = attempt / name
+        assert mountpoint.is_dir() and not mountpoint.is_symlink()
+        assert (mountpoint.lstat().st_mode & 0o077) == 0
+        assert list(mountpoint.iterdir()) == []
+    assert ro_by_name["skills"].stats.links == 2
+
+    # Shared memories and SOUL.md MUST be privately copied with zero write-through.
+    assert not (attempt / "memories").is_symlink()
+    assert not (attempt / "SOUL.md").is_symlink()
+    assert (attempt / "memories" / "MEMORY.md").read_text(encoding="utf-8") == "fleet-memory\n"
+    assert (attempt / "SOUL.md").read_text(encoding="utf-8") == "fleet-soul\n"
+    (attempt / "memories" / "MEMORY.md").write_text("attempt-private-memory\n", encoding="utf-8")
+    (attempt / "SOUL.md").write_text("attempt-private-soul\n", encoding="utf-8")
+    assert (fleet / "memories" / "MEMORY.md").read_text(encoding="utf-8") == "fleet-memory\n"
+    assert (fleet / "SOUL.md").read_text(encoding="utf-8") == "fleet-soul\n"
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize(
+    "case",
+    [
+        "default_profile_alias",
+        "nonstandard_parent_alias",
+        "cross_profile_alias",
+        "wrong_asset_alias",
+        "absolute_top_level_alias",
+        "chained_top_level_alias",
+        "private_config_alias",
+        "private_env_alias",
+        "private_auth_alias",
+        "nested_absolute_inside_skills",
+        "nested_escaping_inside_skills",
+        "nested_escape_and_reenter",
+        "nested_chained_escape",
+        "nested_loop",
+        "nested_dangling",
+        "nested_fifo_direct",
+        "nested_fifo_target",
+        "nested_link_in_memories",
+    ],
+)
+def test_disallowed_source_aliases_and_nested_targets_fail_closed(tmp_path, case):
+    import os
+
+    from hermes_cli.kanban_isolation.home import plan_attempt_home
+
+    fleet, profile = _build_fleet_with_canonical_links(tmp_path)
+    other = fleet / "profiles" / "beta"
+    other.mkdir(parents=True, mode=0o700)
+    (other / "skills").mkdir(mode=0o700)
+    (other / "memories").mkdir(mode=0o700)
+
+    target_profile = profile
+    if case == "default_profile_alias":
+        outside = tmp_path / "outside-skills"
+        outside.mkdir(mode=0o700)
+        (fleet / "skills").rename(tmp_path / "orig-skills")
+        (fleet / "skills").symlink_to("../outside-skills")
+        target_profile = fleet
+    elif case == "nonstandard_parent_alias":
+        custom = tmp_path / "custom" / "alpha"
+        custom.mkdir(parents=True, mode=0o700)
+        (custom / "skills").symlink_to("../../.hermes/skills")
+        target_profile = custom
+    elif case == "cross_profile_alias":
+        (profile / "skills").unlink()
+        (profile / "skills").symlink_to("../beta/skills")
+    elif case == "wrong_asset_alias":
+        (profile / "skills").unlink()
+        (profile / "skills").symlink_to("../../plugins")
+    elif case == "absolute_top_level_alias":
+        (profile / "skills").unlink()
+        (profile / "skills").symlink_to((fleet / "skills").resolve())
+    elif case == "chained_top_level_alias":
+        real_skills = tmp_path / "real-skills"
+        (fleet / "skills").rename(real_skills)
+        (fleet / "skills").symlink_to(real_skills)
+    elif case == "private_config_alias":
+        (fleet / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+        (profile / "config.yaml").unlink()
+        (profile / "config.yaml").symlink_to("../../config.yaml")
+    elif case == "private_env_alias":
+        (fleet / ".env").write_text("SECRET=1\n", encoding="utf-8")
+        (profile / ".env").unlink()
+        (profile / ".env").symlink_to("../../.env")
+    elif case == "private_auth_alias":
+        (fleet / "auth.json").write_text("{}\n", encoding="utf-8")
+        (profile / "auth.json").symlink_to("../../auth.json")
+    elif case == "nested_absolute_inside_skills":
+        (fleet / "skills" / "demo" / "abs.md").symlink_to((fleet / "skills" / "demo" / "SKILL.md").resolve())
+    elif case == "nested_escaping_inside_skills":
+        (fleet / "skills" / "demo" / "esc.md").symlink_to("../../../SOUL.md")
+    elif case == "nested_escape_and_reenter":
+        (fleet / "skills" / "demo" / "bounce.md").symlink_to("../../skills/demo/SKILL.md")
+    elif case == "nested_chained_escape":
+        (fleet / "skills" / "demo" / "hop1.md").symlink_to("hop2.md")
+        (fleet / "skills" / "demo" / "hop2.md").symlink_to("../../../SOUL.md")
+    elif case == "nested_loop":
+        (fleet / "skills" / "demo" / "a.md").symlink_to("b.md")
+        (fleet / "skills" / "demo" / "b.md").symlink_to("a.md")
+    elif case == "nested_dangling":
+        (fleet / "skills" / "demo" / "broken.md").symlink_to("does-not-exist.md")
+    elif case == "nested_fifo_direct":
+        os.mkfifo(fleet / "skills" / "demo" / "pipe")
+    elif case == "nested_fifo_target":
+        os.mkfifo(fleet / "skills" / "demo" / "pipe")
+        (fleet / "skills" / "demo" / "to-pipe").symlink_to("pipe")
+    elif case == "nested_link_in_memories":
+        (fleet / "memories" / "link.md").symlink_to("MEMORY.md")
+
+    attempt = fleet / "kanban-worker-plane" / "t_bad" / "run-1" / "home"
+    with pytest.raises(ValueError):
+        plan_attempt_home(attempt, target_profile)
+
+
+@pytest.mark.parametrize(
+    "bad_segment",
+    ["has space", "has:colon", "has%spec", 'has"quote', "has'quote", "has\\slash", "has\ttab"],
+)
+def test_unsafe_systemd_bind_paths_are_rejected_unambiguously(bad_segment):
+    from hermes_cli.kanban_isolation.home import format_bind_readonly_path, validate_systemd_bind_path
+
+    bad_path = Path(f"/tmp/{bad_segment}/skills")
+    with pytest.raises(ValueError, match="unsafe systemd BindReadOnlyPaths path"):
+        validate_systemd_bind_path(bad_path)
+    with pytest.raises(ValueError, match="unsafe systemd BindReadOnlyPaths path"):
+        format_bind_readonly_path(bad_path, Path("/tmp/safe/skills"))
+    with pytest.raises(ValueError, match="unsafe systemd BindReadOnlyPaths path"):
+        format_bind_readonly_path(Path("/tmp/safe/skills"), bad_path)
+
+
+@pytest.mark.platforms("linux")
+def test_verify_required_readonly_mounts_fails_closed_when_not_ro(tmp_path):
+    import os
+
+    from hermes_cli.kanban_isolation.mounts import verify_required_readonly_mounts
+
+    attempt = tmp_path / "home"
+    skills = attempt / "skills"
+    skills.mkdir(parents=True, mode=0o700)
+    st = skills.lstat()
+    manifest = [{
+        "name": "skills",
+        "source": str(tmp_path / "src-skills"),
+        "target": str(skills),
+        "source_dev": st.st_dev,
+        "source_ino": st.st_ino,
+    }]
+    ro_mountinfo = f"99 28 8:1 /src {skills} ro,nosuid,nodev,relatime - ext4 /dev/sda1 rw\n"
+    rw_mountinfo = f"99 28 8:1 /src {skills} rw,nosuid,nodev,relatime - ext4 /dev/sda1 rw\n"
+    ro_vfs = SimpleNamespace(f_flag=getattr(os, "ST_RDONLY", 1))
+    rw_vfs = SimpleNamespace(f_flag=0)
+
+    assert verify_required_readonly_mounts(
+        attempt, manifest, mountinfo_text=ro_mountinfo, statvfs_fn=lambda _p: ro_vfs, access_fn=lambda _p, _m: False
+    ) == ["skills"]
+
+    with pytest.raises(RuntimeError, match="mountinfo"):
+        verify_required_readonly_mounts(
+            attempt, manifest, mountinfo_text=rw_mountinfo, statvfs_fn=lambda _p: ro_vfs, access_fn=lambda _p, _m: False
+        )
+    with pytest.raises(RuntimeError, match="ST_RDONLY"):
+        verify_required_readonly_mounts(
+            attempt, manifest, mountinfo_text=ro_mountinfo, statvfs_fn=lambda _p: rw_vfs, access_fn=lambda _p, _m: False
+        )
+    with pytest.raises(RuntimeError, match="writable"):
+        verify_required_readonly_mounts(
+            attempt, manifest, mountinfo_text=ro_mountinfo, statvfs_fn=lambda _p: ro_vfs, access_fn=lambda _p, _m: True
+        )
+    with pytest.raises(RuntimeError, match="inode"):
+        bad_manifest = [dict(manifest[0], source_ino=st.st_ino + 1)]
+        verify_required_readonly_mounts(
+            attempt, bad_manifest, mountinfo_text=ro_mountinfo, statvfs_fn=lambda _p: ro_vfs, access_fn=lambda _p, _m: False
+        )
+    with pytest.raises(RuntimeError, match="unverified projected asset"):
+        verify_required_readonly_mounts(
+            attempt, [], mountinfo_text=ro_mountinfo, statvfs_fn=lambda _p: ro_vfs, access_fn=lambda _p, _m: False
+        )
+
+
+@pytest.mark.platforms("linux")
+def test_launch_passes_bind_readonly_paths_and_fails_closed_without_copy_fallback(isolated_board, monkeypatch):
+    home, conn = isolated_board
+    fleet, profile = _build_fleet_with_canonical_links(home.parent)
+    assert fleet == home
+    tid = kb.create_task(conn, title="bind launch", assignee="alpha")
+    kb.recompute_ready(conn)
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+
+    monkeypatch.setattr(kwp, "systemd_user_service_available", lambda env=None: (True, ""))
+    monkeypatch.setattr(kwp, "_command", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr("gateway.drain_control.current_instantiation_epoch", lambda: "boot-1")
+    monkeypatch.setattr(kwp, "isolated_unit_state", lambda _intent: kwp.UnitState.GONE)
+
+    seen_cmd: list[str] = []
+    call_order: list[str] = []
+    orig_prepare = kwp.prepare_attempt_home_plan
+    orig_intent = kwp._record_launch_intent
+
+    def trace_prepare(attempt_home, profile_home):
+        call_order.append("prepare")
+        return orig_prepare(attempt_home, profile_home)
+
+    def trace_intent(database, task, metadata):
+        call_order.append("record_intent")
+        return orig_intent(database, task, metadata)
+
+    monkeypatch.setattr(kwp, "prepare_attempt_home_plan", trace_prepare)
+    monkeypatch.setattr(kwp, "_record_launch_intent", trace_intent)
+
+    def fake_run(argv, **kwargs):
+        call_order.append("systemd_run")
+        seen_cmd.extend(argv)
+        return SimpleNamespace(returncode=1, stdout="", stderr="Failed to set up mount namespacing: Operation not permitted")
+
+    monkeypatch.setattr(kwp.subprocess, "run", fake_run)
+
+    from tools.process_registry import RestartSafeScopeUnavailable
+
+    base_env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(home.parent),
+        "HERMES_KANBAN_BOARD": "default",
+        "HERMES_KANBAN_DB": str(home / "kanban.db"),
+        "HERMES_KANBAN_WORKSPACES_ROOT": str(home / "workspaces"),
+        "HERMES_KANBAN_TASK": claimed.id,
+        "HERMES_KANBAN_RUN_ID": str(claimed.current_run_id),
+        "HERMES_KANBAN_CLAIM_LOCK": claimed.claim_lock,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+    }
+    with pytest.raises(RestartSafeScopeUnavailable, match="mount namespacing"):
+        kwp.launch_isolated_worker_service(
+            task=claimed,
+            workspace=str(home),
+            board="default",
+            board_db=home / "kanban.db",
+            profile_home=profile,
+            env=base_env,
+            log_path=home / "worker.log",
+        )
+
+    attempt = kwp.attempt_home_dir(home / "kanban.db", claimed.id, int(claimed.current_run_id))
+    assert call_order == ["prepare", "record_intent", "systemd_run"]
+    assert f"BindReadOnlyPaths={(fleet / 'skills').resolve()}:{attempt / 'skills'}" in seen_cmd
+    assert f"BindReadOnlyPaths={(fleet / 'plugins').resolve()}:{attempt / 'plugins'}" in seen_cmd
+    # Never falls back to copying skills/plugins on mount failure.
+    assert list((attempt / "skills").iterdir()) == []
+    assert list((attempt / "plugins").iterdir()) == []
+
+
+@pytest.mark.platforms("linux")
+def test_systemd_probe_verifies_readonly_bind_mount_live(tmp_path):
+    kwp.reset_systemd_service_probe_cache()
+    available, reason = kwp.systemd_user_service_available()
+    if not available:
+        pytest.skip(f"systemd user mount namespace unavailable in test runner: {reason}")
+    assert available is True
+    assert reason == ""

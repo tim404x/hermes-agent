@@ -25,6 +25,7 @@ except ModuleNotFoundError as exc:
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import signal
@@ -256,6 +257,9 @@ def _run_isolated() -> int:
         boot_id = os.environ.get("HERMES_KANBAN_WORKER_BOOT_ID", "").strip()
         launch_env_file = os.environ.get("HERMES_KANBAN_LAUNCH_ENV_FILE", "").strip()
         invocation_id = os.environ.get("INVOCATION_ID", "").strip()
+        required_ro_mounts = json.loads(os.environ["HERMES_KANBAN_REQUIRED_RO_MOUNTS"])
+        if not isinstance(required_ro_mounts, list):
+            raise ValueError("HERMES_KANBAN_REQUIRED_RO_MOUNTS must be a JSON list")
     except (KeyError, ValueError, OSError) as exc:
         print(f"Kanban isolated worker refused: {exc}", file=sys.stderr, flush=True)
         return 1
@@ -264,6 +268,7 @@ def _run_isolated() -> int:
     _strip_task_env()
     from hermes_cli.kanban_db_connect import connect_closing
     from hermes_cli.kanban_db_dispatch import _process_fingerprint, adopt_worker_pid
+    from hermes_cli.kanban_isolation.mounts import verify_required_readonly_mounts
     from hermes_cli.kanban_worker_plane import (
         WORKER_PLANE_ISOLATED_SYSTEMD,
         UnitState, attempt_home_dir, isolated_unit_state, isolated_worker_unit_name,
@@ -276,7 +281,7 @@ def _run_isolated() -> int:
             or attempt_home != attempt_home_dir(board_db, params['task_id'], params['run_id'])
             or os.environ.get('HERMES_HOME') != str(attempt_home)):
         raise RuntimeError('mismatched isolated attempt home or unit')
-    worker_plane_meta = {
+    worker_plane_meta: dict[str, Any] = {
         "worker_plane": WORKER_PLANE_ISOLATED_SYSTEMD,
         "systemd_unit": unit_name,
         "invocation_id": invocation_id,
@@ -287,6 +292,9 @@ def _run_isolated() -> int:
     cgroup = read_current_cgroup_path()
     if isolated_unit_state(dict(worker_plane_meta, pid=os.getpid(), started_at=_process_fingerprint(os.getpid()))) != UnitState.LIVE:
         raise RuntimeError('cannot verify live isolated unit identity')
+    verified_ro_assets = verify_required_readonly_mounts(attempt_home, required_ro_mounts)
+    if verified_ro_assets:
+        worker_plane_meta["readonly_assets"] = verified_ro_assets
     if cgroup:
         worker_plane_meta["cgroup"] = cgroup
 
