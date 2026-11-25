@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 
 @dataclass
@@ -72,9 +72,19 @@ class DispatchResult:
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
     adopted: list[str] = field(default_factory=list)  # tasks adopted from verified receipts without spawning
     corrupt_receipts: list[str] = field(default_factory=list)  # tasks refused fail-closed on receipt corruption
+    capacity_held: Optional[tuple[str, int, int]] = None
+    """Binding (cap name, running workers, limit); host-wide for max_in_progress, board-local for max_spawn."""
+    capacity_source: Optional[str] = None
+    """Origin of the binding cap, when supplied by the dispatcher that resolved it."""
 
 
-def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
+def describe_capacity(name: str, running: int, limit: int) -> str:
+    return f"{name} full (running {running} >= {limit})"
+
+
+def describe_suppression(
+    results: Iterable[Optional[DispatchResult]], *, format_capacity: Callable[[str, int, int], str] = describe_capacity,
+) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
 
     ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
@@ -86,6 +96,7 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
+    capacities: set[tuple[str, int, int]] = set()
     for res in results:
         if res is None:
             continue
@@ -95,9 +106,14 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+        if res.skipped_per_profile_capped:
+            counts["per_profile_capped"] = counts.get("per_profile_capped", 0) + len(res.skipped_per_profile_capped)
+        if res.capacity_held:
+            capacities.add(res.capacity_held)
         if res.memory_pressure:
             pressure = res.memory_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
+    parts.extend(format_capacity(*cap) for cap in sorted(capacities))
     return ", ".join(parts)
