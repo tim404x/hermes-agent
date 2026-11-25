@@ -14,6 +14,9 @@ from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from hermes_cli.config_backend import ConfigBackendUnavailable
+from hermes_cli.config_read_errors import FailedConfigRead
+
 # Keep the logger name run.py used so extracted log records are unchanged.
 logger = logging.getLogger("gateway.run")
 
@@ -46,30 +49,25 @@ def _board_slugs(kb: Any) -> list:
     return [b.get("slug") or kb.DEFAULT_BOARD for b in _list_boards(kb)]
 
 
-def _positive_int_value(kanban_cfg: dict, key: str) -> Optional[int]:
-    """Return a positive cap or None, without logging on each tick."""
-    try:
-        value = int(kanban_cfg.get(key))
-    except (TypeError, ValueError):
-        return None
-    return value if value >= 1 else None
-
-
-def _positive_int_setting(kanban_cfg: dict, key: str) -> Optional[int]:
-    """Parse an optional ``kanban.<key>`` cap and log its boot-time diagnostic."""
+def _positive_int_setting(
+    kanban_cfg: dict, key: str, *, log: bool = True, fallback: Optional[int] = None, strict: bool = False,
+) -> Optional[int]:
+    """Parse an optional cap; always warn about invalid values."""
     raw = kanban_cfg.get(key)
     if raw is None:
         return None
-    value = _positive_int_value(kanban_cfg, key)
-    if value is None:
-        try:
-            int(raw)
-        except (TypeError, ValueError):
-            logger.warning("kanban dispatcher: invalid kanban.%s=%r; ignoring", key, raw)
-        else:
-            logger.warning("kanban dispatcher: kanban.%s=%r is below 1; ignoring", key, raw)
-        return None
-    logger.info("kanban dispatcher: %s=%d", key, value)
+    try:
+        if strict and (isinstance(raw, bool) or not isinstance(raw, (int, str))):
+            raise ValueError
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("kanban dispatcher: invalid kanban.%s=%r; ignoring", key, raw)
+        return fallback
+    if value < 1:
+        logger.warning("kanban dispatcher: kanban.%s=%r is below 1; ignoring", key, raw)
+        return fallback
+    if log:
+        logger.info("kanban dispatcher: %s=%d", key, value)
     return value
 
 
@@ -87,12 +85,18 @@ def _resolve_auto_decompose_settings(load_config: Callable[[], Any]) -> tuple[bo
     """
     try:
         cfg = load_config()
-    except Exception:
+        if isinstance(cfg, FailedConfigRead):
+            logger.debug("kanban auto-decompose: config read failed (%s); disabled this tick", cfg.read_error)
+            return False, 3
+        kcfg = cfg["kanban"]
+        if not isinstance(kcfg, dict):
+            raise TypeError("kanban section is not a mapping")
+    except (Exception, ConfigBackendUnavailable):
+        logger.debug("kanban auto-decompose: config unavailable; disabled this tick", exc_info=True)
         return False, 3
-    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     try:
         per_tick = int(kcfg.get("auto_decompose_per_tick", 3) or 3)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         per_tick = 3
     return bool(kcfg.get("auto_decompose", True)), max(per_tick, 1)
 

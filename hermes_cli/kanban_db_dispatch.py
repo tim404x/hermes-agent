@@ -1773,29 +1773,26 @@ def dispatch_profile_allowlist_summary() -> str:
             "profile, or the config could not be read — omit the key to allow any)")
 
 
-def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
+def _has_spawnable(conn: sqlite3.Connection, status: str, default_assignee: Optional[str] = None) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
-        (status,),
+        "WHERE status = ? AND (assignee IS NOT NULL OR ? IS NOT NULL) AND claim_lock IS NULL",
+        (status, default_assignee),
     ).fetchall()
     if not rows:
         return False
     profile_exists = _profile_exists_fn()
-    if profile_exists is None:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
-    return any(profile_exists(row["assignee"]) for row in rows)
+    return profile_exists is None or any(profile_exists(row["assignee"] or default_assignee) for row in rows)
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
-    """True iff a ready+assigned+unclaimed task maps to a real Hermes profile.
+def has_spawnable_ready(conn: sqlite3.Connection, default_assignee: Optional[str] = None) -> bool:
+    """True iff an unclaimed ready task's assignee or fallback maps to a real Hermes profile.
 
     Lets health telemetry tell "stuck" (``0 spawned`` with spawnable work) from
     "correctly idle" (only control-plane lanes waiting on ``claim_task``). Falls
     back to "any assigned" when profiles cannot import and no allowlist is set.
     """
-    return _has_spawnable(conn, "ready")
+    return _has_spawnable(conn, "ready", default_assignee)
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
@@ -1886,7 +1883,7 @@ def configured_max_in_progress(kanban_cfg: Optional[dict] = None) -> Optional[in
         return None
     try:
         ival = int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return ival if ival >= 1 else None
 
@@ -2204,6 +2201,7 @@ def _tick_spawn_budget(
     max_spawn: Optional[int],
     max_in_progress: Optional[int],
     board: Optional[str],
+    default_assignee: Optional[str],
 ) -> tuple[bool, Optional[int]]:
     """``(may_spawn, spawn_budget)`` for this tick; ``budget None`` = uncapped.
 
@@ -2213,24 +2211,26 @@ def _tick_spawn_budget(
     every other board count against the same budget, else N boards multiply the
     cap by N — exactly the fan-out the memory-derived default exists to prevent.
     """
-    # Count already-running tasks so max_spawn enforces concurrency, not a
-    # per-tick budget: "running" tasks stay running until the worker makes a terminal
-    # board call (kanban_complete/kanban_block/kanban_request_review) or the TTL reclaims them.
-    running_count = 0
+    # Count already-running tasks so max_spawn enforces concurrency, not a per-tick budget: "running" tasks
+    # stay running until the worker makes a terminal board call or the TTL reclaims them.
+    running_count = count_running_tasks(conn) if max_spawn is not None or max_in_progress is not None else 0
     spawn_budget: Optional[int] = None
-    if max_spawn is not None or max_in_progress is not None:
-        running_count = count_running_tasks(conn)
+
+    def held(name: str, running: int, limit: int) -> tuple[bool, None]:
+        if has_spawnable_ready(conn, default_assignee) or (has_spawnable_review(conn) and review_dispatch_enabled()):
+            result.capacity_held = (name, running, limit)
+        return False, None
 
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
-            return False, None
+            return held("max_spawn", running_count, max_spawn)
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
-            return False, None
+            return held("max_in_progress", total_running, max_in_progress)
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
             spawn_budget = remaining
@@ -2312,6 +2312,7 @@ def _dispatch_once_locked(
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
+        default_assignee=default_assignee,
     )
     if not may_spawn:
         return result
@@ -2821,9 +2822,8 @@ def run_daemon(
 
     while not stop_event.is_set():
         try:
-            # Re-resolved every tick (config load is mtime-cached) so operator
-            # edits apply without a restart.
-            max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+            configured = configured_max_in_progress()
+            max_in_progress = resolve_max_in_progress(configured)
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
@@ -2831,6 +2831,9 @@ def run_daemon(
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
                 )
+            if res.capacity_held:
+                global_source = "config" if configured is not None else "memory-default"
+                res.capacity_source = "--max" if res.capacity_held[0] == "max_spawn" else global_source
             if on_tick is not None:
                 with contextlib.suppress(Exception):
                     on_tick(res)
