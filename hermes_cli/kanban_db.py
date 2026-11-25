@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli.kanban_admission import claims as admission
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
@@ -638,6 +639,13 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    resource_class: str | None = None
+    write_scopes: list[str] | None = None
+    admission_reason: str | None = None
+
+    def admission_fields(self) -> dict:
+        return {key: value for key in ("resource_class", "write_scopes", "admission_reason")
+                if (value := getattr(self, key)) is not None}
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
@@ -654,6 +662,7 @@ class Task:
             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
+            write_scopes=_json_or(g("write_scopes")),
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
@@ -669,7 +678,7 @@ _TASK_EPOCH_COLUMNS = ("created_at", "started_at", "completed_at", "claim_expire
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "resource_class", "admission_reason",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -874,8 +883,24 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    resource_class       TEXT,
+    write_scopes         TEXT,
+    admission_reason     TEXT
 );
+
+CREATE TABLE IF NOT EXISTS task_admission_reservations (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    project TEXT NOT NULL,
+    resource TEXT NOT NULL,
+    paths TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS release_task_admission AFTER UPDATE OF status ON tasks
+WHEN OLD.status IN ('running', 'review') AND NEW.status NOT IN ('running', 'review')
+BEGIN
+    DELETE FROM task_admission_reservations WHERE task_id = OLD.id;
+END;
 
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
@@ -1168,6 +1193,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    resource_class: str | None = None, write_scopes: list[str] | None = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1221,6 +1247,7 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    declared_paths = admission.encode_declaration(resource_class, write_scopes)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1267,8 +1294,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract, resource_class, write_scopes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1278,6 +1305,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        resource_class, declared_paths,
                     ),
                 )
                 for pid in parents:
@@ -2078,15 +2106,10 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) 
                     )
                     if failures >= effective_limit:
                         continue
-                    conn.execute(
-                        "UPDATE tasks SET status = ? "
-                        "WHERE id = ? AND status = 'blocked'", (resume_status, task_id),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
-                        (resume_status, task_id),
-                    )
+                if resume_status == "review" and _admit_task(conn, task_id, cur_status):
+                    continue
+                conn.execute("UPDATE tasks SET status = ? WHERE id = ? AND status = ?",
+                             (resume_status, task_id, cur_status))
                 _append_event(
                     conn, task_id, "promoted",
                     {"status": resume_status} if resume_status != "ready" else None,
@@ -2121,16 +2144,24 @@ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[st
     return [(row["id"], row["status"]) for row in rows]
 
 
+def _admit_task(conn, task_id, source, *, claim=False, expect_assignee=None):
+    return admission.admit(conn, task_id, source, home=kanban_home(),
+                           claim=claim, expect_assignee=expect_assignee)
+
+
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
     *, event_extra: Optional[dict] = None, expect_assignee: Optional[str] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running`` (and still ``expect_assignee``'s, when given), open a
     run row, emit ``claimed``; None when the CAS lost. Caller holds the txn."""
+    if _admit_task(conn, task_id, source_status, claim=True, expect_assignee=expect_assignee):
+        return None
     cur = conn.execute(
         f"""
         UPDATE tasks
            SET status        = 'running',
+               admission_reason = NULL,
                claim_lock    = ?,
                claim_expires = ?,
                started_at    = COALESCE(started_at, ?)
@@ -2170,7 +2201,7 @@ def _claim_and_open_run(
 
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None, expect_assignee: Optional[str] = None,
+    claimer: Optional[str] = None, expect_assignee: Optional[str] = None, board: str | None = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -2205,7 +2236,7 @@ def claim_task(
 
 def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None, expect_assignee: Optional[str] = None,
+    claimer: Optional[str] = None, expect_assignee: Optional[str] = None, board: str | None = None,
 ) -> Optional[Task]:
     """Atomic ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
@@ -3050,19 +3081,21 @@ def edit_task(
     body: Optional[str] = None, priority: Optional[int] = None,
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
+    resource_class: str | None = None, write_scopes: list[str] | None = None,
 ) -> bool:
     """Edit task fields, optionally backfilling a completed task's result."""
-    changed_fields = [
-        field for field, value in (("title", title), ("body", body), ("priority", priority))
-        if value is not None
-    ]
+    fields = (("title", title), ("body", body), ("priority", priority), ("resource_class", resource_class),
+              ("write_scopes", admission.encode_declaration(resource_class, write_scopes)))
+    changed_fields = [field for field, value in fields if value is not None]
     with write_txn(conn):
         status = _task_status(conn, task_id)
         if status is None or (result is not None and status != "done"):
             return False
+        if (resource_class is not None or write_scopes is not None) and status in ("running", "review"):
+            raise ValueError("requeue the task before changing its admission declaration")
         assignments = []
         params = []
-        for field, value in (("title", title), ("body", body), ("priority", priority)):
+        for field, value in fields:
             if value is not None:
                 assignments.append(f"{field} = ?")
                 params.append(value)
@@ -3320,6 +3353,10 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
             reviewer = _canonical_assignee(reviewer)
+            if trow['status'] in ('running', 'ready') and (expected_run_id is None or trow['current_run_id'] == int(expected_run_id)):
+                reason = _admit_task(conn, task_id, trow['status'])
+                if reason:
+                    return _ret(False, reason)
             # The actor is the run that did the work. ``assignee`` is the actor
             # only while a worker holds the card; on a never-claimed card it is
             # whoever the operator assigned -- possibly the reviewer itself,
@@ -3575,6 +3612,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
+        if new_status == "review" and _admit_task(conn, task_id, "blocked"):
+            return False
         # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
         # resetting them is the amnesia that let cron-unblock <-> re-block loop
         # unbounded; only complete_task clears them. ``consecutive_failures``

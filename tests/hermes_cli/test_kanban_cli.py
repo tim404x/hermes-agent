@@ -137,6 +137,15 @@ def test_show_survives_iso_strings_in_integer_timestamp_columns(kanban_home):
     assert payload["events"] and {e["created_at"] for e in payload["events"]} == {1787936336}  # iso_z
 
 
+def test_create_and_backfill_admission_declarations(kanban_home):
+    created = json.loads(kc.run_slash('create experiment --resource-class gpu --write-scope models --json'))
+    assert (created['resource_class'], created['write_scopes']) == ('gpu', ['models'])
+    task_id = created['id']
+    kc.run_slash(f'edit {task_id} --resource-class cpu --read-only')
+    updated = json.loads(kc.run_slash(f'show {task_id} --json'))['task']
+    assert (updated['resource_class'], updated['write_scopes']) == ('cpu', [])
+
+
 def test_kanban_edit_updates_documented_task_fields(kanban_home):
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title="old title", body="old body", priority=2)
