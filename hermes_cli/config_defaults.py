@@ -1328,6 +1328,11 @@ DEFAULT_CONFIG = {
         # Max parallel children per batch AND concurrent background units (async beyond it runs sync). Floor 1.
         "max_concurrent_children": 10,
         "prefix_stagger_seconds": 0, "launch_wave_size": 0, "launch_wave_seconds": 10, "max_children_per_child": 0,  # prefix: max s siblings wait for the 1st child's 1st chunk (not a stagger); waves = child starts per window, per-child = a subagent's batch cap; 0 = off
+        # Most subagents RUNNING as threads of one process (the gateway serves every profile's turns on one GIL),
+        # every parent, profile and depth counted; over it a child waits for a slot (launch order; a parent blocked
+        # on its own children lends its slot), at most in_process_wait_seconds (0 = until one frees), then is
+        # refused. 0 = no cap. tools/delegate_tool_process_slots.py.
+        "max_in_process_children": 10, "in_process_wait_seconds": 1800,
         # Background fan-outs return as ONE message when the whole call finishes. true = each task
         # (or `group`) returns on its own as it finishes — more new turns for the orchestrator.
         "independent_completions": False,

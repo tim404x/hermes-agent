@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import threading
+import time
 from contextlib import contextmanager, suppress
 from datetime import datetime, timezone, UTC
 from pathlib import Path
@@ -613,12 +614,41 @@ def is_locked(skill_name: str) -> bool:
     return bool(_load_usage_strict().get(skill_name, {}).get("locked"))
 
 
+_LOCKED_NAMES: dict[str, tuple] = {}  # usage file -> (stat key, read-start ns, locked names)
+
+
 def locked_skill_names(strict: bool = False) -> list[str]:
     """Names carrying ``locked: true``. Best-effort by default (a corrupt sidecar reads as []), because
     listings and curator rows must not break; *strict* re-raises instead, for the write guards, which
-    cannot read an unknown lock set as "nothing is locked" (#147986)."""
-    data = _load_usage_strict() if strict else load_usage()
-    return sorted(name for name, rec in data.items() if rec.get("locked"))
+    cannot read an unknown lock set as "nothing is locked" (#147986).
+
+    The strict read runs on every terminal / write_file / patch call (the skill-lock guard), and the
+    sidecar is ~200 KB of JSON on a long-lived profile: the answer is reused while the file's stat
+    (inode, size, mtime_ns, ctime_ns) holds and the file was older than ``agent.skill_index.RACY_NS``
+    when read. Only successful reads are reused, so a damaged sidecar keeps failing closed."""
+    if not strict:
+        data = load_usage()
+        return sorted(name for name, rec in data.items() if rec.get("locked"))
+    from agent.skill_index import is_racy
+    path = _usage_file()
+    key = _file_stat_key(path)
+    hit = _LOCKED_NAMES.get(str(path))
+    if hit is not None and key is not None and hit[0] == key and not is_racy(key, hit[1]):
+        return list(hit[2])
+    read_at = time.time_ns()
+    data = _load_usage_strict()
+    names = sorted(name for name, rec in data.items() if rec.get("locked"))
+    if key is not None and _file_stat_key(path) == key:  # not rewritten while it was read
+        _LOCKED_NAMES[str(path)] = (key, read_at, tuple(names))
+    return names
+
+
+def _file_stat_key(path) -> Optional[tuple[int, int, int, int, int]]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
 def forget(skill_name: str) -> None:
@@ -643,6 +673,9 @@ def _relocate(src: Path, dest: Path, skill_name: str, action: str, **capture_kwa
             shutil.move(str(src), str(dest))
         except Exception as e:
             return False, f"failed to {action}: {e}"
+    with suppress(Exception):  # the per-tool-call skill guards' cached tree walk
+        from agent.skill_index import bump_generation
+        bump_generation()
     archiving = action == "archive"
     if archiving:
         # `curator purge` ages archives by mtime; a move keeps the skill's last-edit mtime, so an

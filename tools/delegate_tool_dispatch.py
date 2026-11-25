@@ -11,6 +11,7 @@ import logging
 import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, wait as _cf_wait
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any, Dict, List, Optional
@@ -22,6 +23,7 @@ from tools.delegate_tool_child_run import (
 )
 from tools.delegate_tool_config import _get_max_async_children
 from tools.delegate_tool_launch_waves import run_child_start
+from tools.delegate_tool_process_slots import lend_in_process_child_slot
 from tools.delegate_tool_progress import (
     SUBAGENT_FAILURE_STATUSES, _print_completion_line, _quiet, describe_subagent_failure, format_batch_tag,
 )
@@ -232,6 +234,20 @@ def _run_children_parallel(batch: _Batch, results: list, *, honor_parent_interru
                 _release_unstarted_child(batch, _child_by_index.get(idx))
     results.sort(key=lambda r: r["task_index"])  # match input order
 
+def _run_batch_children(batch: _Batch, results: list, *, honor_parent_interrupt: bool) -> None:
+    """Run the batch's children into ``results``. A synchronous join (``honor_parent_interrupt``) blocks the parent
+    for its whole length, so a parent that is itself an in-process subagent lends its process slot
+    (``delegation.max_in_process_children``) to the children it waits on (tools/delegate_tool_process_slots.py)."""
+    with lend_in_process_child_slot(batch.parent_agent) if honor_parent_interrupt else nullcontext():
+        if len(batch.children) == 1:
+            results.append(_run_paced(batch, honor_parent_interrupt, *batch.children[0]))
+            # A one-child unit has no join to wait on, but everything after the child returns — host-owned finalize,
+            # transcript, manifest, then the durable write — is still owner-lifetime: record before any of it (#116000).
+            _record_finished_child(batch, results[-1], honor_parent_interrupt)
+        else:
+            _run_children_parallel(batch, results, honor_parent_interrupt=honor_parent_interrupt)
+
+
 def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True) -> dict:
     """Run the batch's built children, join, finalize (hooks + cost rollup), return the combined dict. Shared by the
     sync path and the background runner; a background runner receives a per-group unit (a subset of the call's
@@ -239,13 +255,7 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
     record (retention pruning happens on future dispatches)."""
     from tools.delegation_live_log import update_manifest_statuses
     results: list = []
-    if len(batch.children) == 1:
-        results.append(_run_paced(batch, honor_parent_interrupt, *batch.children[0]))
-        # A one-child unit has no join to wait on, but everything after the child returns — host-owned finalize,
-        # transcript, manifest, then the durable write — is still owner-lifetime: record before any of it (#116000).
-        _record_finished_child(batch, results[-1], honor_parent_interrupt)
-    else:
-        _run_children_parallel(batch, results, honor_parent_interrupt=honor_parent_interrupt)
+    _run_batch_children(batch, results, honor_parent_interrupt=honor_parent_interrupt)
 
     children_by_index = {i: child for i, _, child in batch.children}
     for entry in results:
@@ -392,7 +402,8 @@ def _batch_progress_token(child_agents: list[Any]) -> tuple:
         try:
             summary = c.get_activity_summary()
             tool = summary.get("current_tool")
-            parts.append((summary.get("api_call_count", 0), tool, summary.get("last_activity_ts")))
+            parts.append((summary.get("api_call_count", 0), tool, summary.get("last_activity_ts"),
+                          getattr(c, "_delegate_process_slot_waiting", None)))  # queued for a process slot: alive
             in_tool = in_tool or bool(tool)
         except Exception:
             parts.append(None)

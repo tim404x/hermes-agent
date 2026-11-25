@@ -16,6 +16,10 @@ TURN_AUTHOR_ENV = "HERMES_TURN_AUTHOR"
 
 _MAX_FIELD_LEN = 200
 _MAX_CHAIN_HOPS = 1000
+# Runtime-written chain fields an author may carry besides id/name/is_bot (never model input). Each one
+# must also be declared on the prompt.submit wire contract (``CanonicalTurnAuthor``): the classic CLI
+# forwards the parsed author, and the dispatcher refuses an undeclared key as ``invalid_params``.
+TURN_AUTHOR_CHAIN_FIELDS = ("hops", "tab_depth")
 
 
 _DROPPED_CATEGORIES = frozenset({"Cc", "Cs", "Cn", "Co"})
@@ -76,7 +80,7 @@ def parse_turn_author(raw: Any) -> Optional[dict[str, Any]]:
             return None
         # Runtime-written chain fields, never model input: a bot-to-bot delivery's hop (agent/bot_chain.py) and the
         # nesting depth of a task tab a bot opened for itself (message_agent new_tab, tools/bot_mode_dm.py).
-        for chain_field in ("hops", "tab_depth"):
+        for chain_field in TURN_AUTHOR_CHAIN_FIELDS:
             value = raw.get(chain_field)
             if isinstance(value, int) and not isinstance(value, bool) and 0 < value <= _MAX_CHAIN_HOPS:
                 author[chain_field] = value
