@@ -69,6 +69,25 @@ def test_fork_breaks_lineage_but_its_own_continuation_resumes(holder, marker):
     _assert_lineage(holder, "tip", ["fork", "tip"])
 
 
+@pytest.mark.parametrize("column", ["model_config", "source", "parent_session_id", "end_reason"])
+def test_undecodable_parent_is_read_only_when_reached(holder, column):
+    parent, continuation = _compression_chain(holder, 1)
+    sessions.create_session(holder, "fork", "cli", parent_session_id=parent, model_config={"_branched_from": parent})
+    sessions.end_session(holder, "fork", "compression")
+    sessions.create_session(holder, "tip", "cli", parent_session_id="fork")
+    if column == "parent_session_id":
+        holder._write_sql("INSERT INTO sessions (id, source, started_at, end_reason) "
+                          "VALUES (CAST(X'80' AS TEXT), 'cli', 0, 'compression')")
+    holder._write_sql(f"UPDATE sessions SET {column} = CAST(X'80' AS TEXT) WHERE id = ?", (parent,))
+
+    for walk in (_old_resume_lineage_ids, _resume_lineage_ids):
+        assert walk(holder, "fork") == ["fork"]
+        assert walk(holder, "tip") == ["fork", "tip"]
+        for session_id in (parent, continuation):
+            with pytest.raises(sqlite3.OperationalError, match=column):
+                walk(holder, session_id)
+
+
 def test_noncompression_parent(holder):
     sessions.create_session(holder, "root", "cli")
     sessions.end_session(holder, "root", "branched")

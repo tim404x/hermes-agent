@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from contextlib import closing
 from typing import Any, Optional
 from session_rules.turns import (
     _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, MODEL_ONLY_DISPLAY_METADATA_KEY, split_user_originated_turn,
@@ -1698,35 +1699,37 @@ def _resume_lineage_ids(holder: StoreHolder, session_id: str) -> list[str]:
     fork/reset boundaries and misclassifies API forks (parent ended ``branched``, no marker) as
     compression lineages. Shared with the resume guard so it counts exactly what a resume loads.
 
-    Fetch at most 100 candidate rows in one read (UNION stops cycles). SQLite checks the parent's
-    end reason; the child marker check stays in Python so inherited fork markers keep their meaning."""
+    Step through at most 100 candidates tip-first in one read. Stop the cursor at fork markers so
+    SQLite's text decoder only sees rows the walk reaches, including the parent it checks for compression."""
     if not session_id:
         return [session_id]
     holder.flush_for_read()
-    rows = holder._read_all("""
+    sql = """
         WITH RECURSIVE ancestors AS (
-            SELECT id, parent_session_id, end_reason, source, model_config FROM sessions WHERE id = ?
-            UNION
-            SELECT parent.id, parent.parent_session_id, parent.end_reason, parent.source, parent.model_config
+            SELECT id, parent_session_id, end_reason, source, model_config, 0 AS depth FROM sessions WHERE id = ?
+            UNION ALL
+            SELECT parent.id, parent.parent_session_id, parent.end_reason, parent.source, parent.model_config,
+                   child.depth + 1
             FROM ancestors AS child JOIN sessions AS parent ON parent.id = child.parent_session_id
-            WHERE parent.end_reason = 'compression'
+            WHERE child.depth = 0 OR child.end_reason = 'compression'
             LIMIT 100
         )
-        SELECT * FROM ancestors""", (session_id,))
-    by_id = {row["id"]: row for row in rows}
-    chain = [session_id]
-    seen = {session_id}
-    current = by_id.get(session_id)
-    while current is not None:
-        parent_id = current["parent_session_id"]
-        if not parent_id or _is_explicit_fork_child_row(holder, dict(current), include_reset=True):
-            break
-        current = by_id.get(parent_id)
-        if current is None or parent_id in seen:
-            break
-        seen.add(parent_id)
-        chain.append(parent_id)
-    return list(reversed(chain))
+        SELECT id, parent_session_id, end_reason, source, model_config FROM ancestors ORDER BY depth"""
+
+    def walk(conn):
+        chain, seen = [], set()
+        with closing(conn.execute(sql, (session_id,))) as rows:
+            for row in rows:
+                current_id = row["id"]
+                if chain and (row["end_reason"] != "compression" or current_id in seen):
+                    break
+                chain.append(current_id)
+                seen.add(current_id)
+                if not row["parent_session_id"] or _is_explicit_fork_child_row(holder, dict(row), include_reset=True):
+                    break
+        return list(reversed(chain)) or [session_id]
+
+    return holder._read_retrying_ioerr(walk)
 
 
 def _resume_count_scope(holder: StoreHolder, session_id: str, tip_only: bool) -> tuple[list[str], str]:
