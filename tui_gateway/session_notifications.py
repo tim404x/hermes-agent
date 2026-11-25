@@ -519,7 +519,7 @@ def _kb_reclaim_stray_subs(_kbn, slug: str, session_key: str, stray: tuple) -> b
         return False
 
 
-def _kb_poll_board(_kb, slug: str, session_key: str, stray: tuple = (), unreclaimed: list | None = None) -> list:
+def _kb_poll_board(_kb, slug: str, session_key: str, stray: tuple = (), unreclaimed: list | None = None, on_text=None) -> list:
     """Claim + format this session's unseen events on one board. One poller per live session: the board is not opened
     writable unless it has a subscription owned by this exact session (a failed read-only probe — locked/corrupt DB —
     falls through so delivery is preserved). A board whose stray-subscription reclaim failed lands in ``unreclaimed``."""
@@ -551,22 +551,37 @@ def _kb_poll_board(_kb, slug: str, session_key: str, stray: tuple = (), unreclai
             task = _kb.get_task(conn, sub["task_id"])
             from gateway.kanban_watchers_notifier import diagnostic_event
             from gateway.warning_notifications import DiagnosticText
+            from hermes_cli import kanban_result_receipts as _kbrr
             for ev in events:
+                cid = (
+                    str(ev.payload.get("completion_id") or "")
+                    if ev.kind == "completed" and isinstance(ev.payload, dict)
+                    else ""
+                )
+                if cid:
+                    try:
+                        signatures = _kbrr.verified_delivery_paths(conn, sub['task_id'], ev)
+                    except _kbrr.CorruptResultReceiptError as exc:
+                        _kbrr.record_outbox_delivery_failure(conn, [cid], error=str(exc), **sub_ident)
+                        continue
                 text = _format_kanban_event_text(sub, task, ev, slug)
                 if text:
-                    texts.append(DiagnosticText(text) if diagnostic_event(ev) else text)
+                    text = DiagnosticText(text) if diagnostic_event(ev) else text
+                    texts.append(text)
+                    if on_text is not None and on_text(text) and cid:
+                        _kbrr.mark_outbox_delivered(conn, [cid], verified_stats=signatures, **sub_ident)
             # Unsubscribe only on archive: ``done`` is reversible in review/controller flows, so keeping the sub lets a
             # later reopen notify the same session. The claimed cursor prevents replay.
             if task and getattr(task, "status", "") == "archived":
                 with contextlib.suppress(Exception):
-                    _kbn.remove_notify_sub(conn, **sub_ident)
+                    _kbn.remove_notify_sub(conn, only_if_settled=True, **sub_ident)
     return texts
 
 
-def _collect_kanban_notifications(session: dict) -> list:
+def _collect_kanban_notifications(session: dict, *, on_text=None) -> list:
     """Claim unseen terminal kanban events for this session's ``platform="tui"`` subscriptions (``kanban_create``
     auto-subscribes with ``chat_id=HERMES_SESSION_KEY``; no "tui" messaging adapter exists, so this poller is the
-    delivery path). Same atomic cursor-claim as the gateway notifier: exactly-once even if a gateway polls the same DB.
+    delivery path). Receipt events are leased; only an accepted presentation acknowledges them.
 
     See #59890.
     """
@@ -589,7 +604,7 @@ def _collect_kanban_notifications(session: dict) -> list:
     for slug, resolved in (_kb_board_key(_kb, board_meta) for board_meta in boards):
         unique.setdefault(resolved, slug)
     stray, unreclaimed = _kb_stray_delegate_keys(session, session_key), []
-    texts = [t for slug in unique.values() for t in _kb_poll_board(_kb, slug, session_key, stray, unreclaimed)]
+    texts = [t for slug in unique.values() for t in _kb_poll_board(_kb, slug, session_key, stray, unreclaimed, on_text)]
     if stray and not unreclaimed:
         session["_kanban_stray_keys"] = ()  # every board is clean; stop probing
     return texts
@@ -603,17 +618,21 @@ def _notif_poll_kanban(sid: str, session: dict) -> None:
 def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
     """One kanban poll: emit new texts, buffer them, and run the buffered batch as a turn if idle. Events are
     cursor-claimed (never re-queued), so they wait in the buffer instead of dropping the agent turn."""
+    def present(text):
+        from gateway.warning_notifications import DiagnosticText, render_notification
+        accepted = True
+        def emit():
+            nonlocal accepted
+            accepted = _emit("status.update", sid, {"kind": "process", "text": text}) is not False
+        render_notification(emit, platform="tui", diagnostic=isinstance(text, DiagnosticText))
+        if accepted:
+            session.setdefault("_kanban_pending", []).append(text)
+        return accepted
+
     try:
-        texts = _collect_kanban_notifications(session)
+        _collect_kanban_notifications(session, on_text=present)
     except Exception as exc:
         _notif_log_failure("kanban notification poll failed", exc)
-        texts = []
-    for text in texts:
-        from gateway.warning_notifications import DiagnosticText, render_notification
-        render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": text}),
-                            platform="tui", diagnostic=isinstance(text, DiagnosticText))
-    if texts:
-        session.setdefault("_kanban_pending", []).extend(texts)
     if not session.get("_kanban_pending") or not _notif_claim_turn(session):
         return
     with session["history_lock"]:

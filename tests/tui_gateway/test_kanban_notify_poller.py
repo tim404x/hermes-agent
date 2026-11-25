@@ -71,7 +71,7 @@ class TestCollectKanbanNotifications:
         tid = _create_subscribed_task()
         _complete(tid, summary="shipped the fix")
 
-        first = _collect_kanban_notifications(_session())
+        first = _collect_kanban_notifications(_session(), on_text=lambda text: True)
 
         assert len(first) == 1
         assert tid in first[0]
@@ -95,7 +95,7 @@ class TestCollectKanbanNotifications:
         finally:
             conn.close()
 
-        reopened = _collect_kanban_notifications(_session())
+        reopened = _collect_kanban_notifications(_session(), on_text=lambda text: True)
 
         assert len(reopened) == 2
         assert "ready" in reopened[0]

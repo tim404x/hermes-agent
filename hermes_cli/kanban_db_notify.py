@@ -263,11 +263,17 @@ def remove_notify_sub(
     platform: str,
     chat_id: str,
     thread_id: Optional[str] = None,
+    only_if_settled: bool = False,
 ) -> bool:
     with _kb.write_txn(conn):
+        key = _sub_key(task_id, platform, chat_id, thread_id)
+        if only_if_settled and conn.execute(
+            'SELECT 1 FROM kanban_result_deliveries ' + _SUB_KEY_WHERE + ' AND delivered=0 LIMIT 1', key,
+        ).fetchone():
+            return False
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs " + _SUB_KEY_WHERE,
-            _sub_key(task_id, platform, chat_id, thread_id),
+            key,
         )
     return cur.rowcount > 0
 
@@ -285,6 +291,19 @@ def retarget_notify_subs(
         for start in range(0, len(ids), 500):
             chunk = ids[start:start + 500]
             where = f"LOWER(platform) = LOWER(?) AND chat_id IN ({','.join('?' * len(chunk))})"
+            conn.execute(
+                "INSERT OR IGNORE INTO kanban_result_deliveries(completion_id,task_id,platform,chat_id,thread_id,updated_at) "
+                "SELECT completion_id,task_id,platform,?,thread_id,updated_at FROM kanban_result_deliveries "
+                f"WHERE {where} AND delivered=0", (to_chat_id, platform, *chunk),
+            )
+            removed = conn.execute(f"DELETE FROM kanban_result_deliveries WHERE {where} AND delivered=0",
+                                   (platform, *chunk))
+            if removed.rowcount:
+                conn.execute("UPDATE kanban_result_outbox SET status='delivered', delivered_at=? WHERE status='pending' "
+                             "AND completion_id IN (SELECT completion_id FROM kanban_result_deliveries WHERE chat_id=?) "
+                             "AND NOT EXISTS (SELECT 1 FROM kanban_result_deliveries d "
+                             "WHERE d.completion_id=kanban_result_outbox.completion_id AND d.delivered=0)",
+                             (int(time.time()), to_chat_id))
             moved += conn.execute(
                 f"UPDATE OR IGNORE kanban_notify_subs SET chat_id = ? WHERE {where}", (to_chat_id, platform, *chunk),
             ).rowcount
@@ -326,7 +345,9 @@ def purge_stale_done_notify_subs(conn: sqlite3.Connection, *, max_age_days: int 
             "  (SELECT MAX(e.created_at) FROM task_events e"
             "   WHERE e.task_id = t.id),"
             "  t.completed_at, t.created_at, 0"
-            " ) < ?)",
+            " ) < ?) AND NOT EXISTS (SELECT 1 FROM kanban_result_deliveries d WHERE d.delivered=0 "
+            "AND (d.task_id,d.platform,d.chat_id,d.thread_id)=(kanban_notify_subs.task_id,"
+            "kanban_notify_subs.platform,kanban_notify_subs.chat_id,kanban_notify_subs.thread_id))",
             (cutoff,),
         )
     return int(cur.rowcount or 0)
@@ -395,14 +416,34 @@ def claim_unseen_events_for_sub(
         old_cursor = _notify_cursor(conn, task_id, platform, chat_id, thread_id)
         if old_cursor is None:
             return 0, 0, []
+        kinds = tuple(kinds or ())
         new_cursor, events = unseen_events_for_sub(
             conn, task_id=task_id, platform=platform, chat_id=chat_id,
             thread_id=thread_id, kinds=kinds,
         )
-        if not events:
-            return old_cursor, old_cursor, []
-        _cas_cursor(conn, _sub_key(task_id, platform, chat_id, thread_id), new_cursor, old_cursor)
+        key = _sub_key(task_id, platform, chat_id, thread_id)
+        if new_cursor != old_cursor:
+            _cas_cursor(conn, key, new_cursor, old_cursor)
+        if not kinds or 'completed' in kinds:
+            events = _lease_result_events(conn, key, events)
         return old_cursor, new_cursor, events
+
+
+def _lease_result_events(conn: sqlite3.Connection, key: tuple, unseen: list) -> list:
+    """Legacy events keep their cursor; unacknowledged receipts survive cursor advancement."""
+    now = int(time.time())
+    events = [event for event in unseen if not (
+        event.kind == 'completed' and (event.payload or {}).get('completion_id'))]
+    eligible = _SUB_KEY_WHERE + ' AND delivered=0 AND lease_until<=?'
+    due = conn.execute(
+        'SELECT e.* FROM task_events e JOIN kanban_result_outbox o ON e.id=o.completed_event_id '
+        'WHERE o.completion_id IN (SELECT completion_id FROM kanban_result_deliveries ' + eligible + ')',
+        (*key, now),
+    ).fetchall()
+    if due:
+        conn.execute('UPDATE kanban_result_deliveries SET lease_until=? ' + eligible, (now + 300, *key, now))
+        events.extend(_kb.Event.from_row(row) for row in due)
+    return sorted(events, key=lambda event: event.id)
 
 
 def _cas_cursor(conn: sqlite3.Connection, key: tuple, new_cursor: int, expected: int) -> sqlite3.Cursor:
