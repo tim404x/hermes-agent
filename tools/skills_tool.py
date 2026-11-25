@@ -64,9 +64,10 @@ class _CatalogDir:
         self.stamp = key[-2]
         names, self.links, self.is_skill = [], [], False
         other_entries, usage = [], []
+        incomplete = False
         with os.scandir(path) as entries:
             for entry in entries:
-                with suppress(OSError):
+                try:
                     if entry.is_symlink():
                         self.links.append(entry.name)
                     elif entry.is_dir():
@@ -80,6 +81,10 @@ class _CatalogDir:
                             usage.append((entry.name, skill_index.stat_key(entry.path)))
                         else:
                             other_entries.append((entry.name, entry.inode()))
+                except OSError:
+                    incomplete = True
+        if incomplete:
+            self.racy = True
         self.names = tuple(sorted(names))
         self.other_entries = sorted(other_entries)
         self.usage = sorted(usage)

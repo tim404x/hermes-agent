@@ -117,3 +117,59 @@ def test_pruned_symlink_kind_and_atomic_skill_replacement_are_visible(tmp_path, 
     new.write_text("new command")
     new.replace(marker)
     assert _signature(root) != after
+
+
+def test_transient_entry_oserror_retries_without_parent_timestamp_change(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    (root / "flaky-skill").mkdir(parents=True)
+    (root / "steady-skill").mkdir(parents=True)
+    _settle(root, monkeypatch)
+
+    real_scandir = os.scandir
+    failed = {"once": False}
+
+    class _FlakyEntry:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+            self.name = wrapped.name
+            self.path = wrapped.path
+
+        def is_symlink(self):
+            return self._wrapped.is_symlink()
+
+        def is_dir(self, *args, **kwargs):
+            if self.name == "flaky-skill" and not failed["once"]:
+                failed["once"] = True
+                raise PermissionError("transient entry stat failure")
+            return self._wrapped.is_dir(*args, **kwargs)
+
+        def inode(self):
+            return self._wrapped.inode()
+
+    class _FlakyScandir:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            return [_FlakyEntry(e) for e in self._inner.__enter__()]
+
+        def __exit__(self, *exc):
+            return self._inner.__exit__(*exc)
+
+    monkeypatch.setattr(os, "scandir", lambda path: _FlakyScandir(real_scandir(path)))
+    first = _signature(root)
+    assert failed["once"]
+    # First answer omitted flaky-skill while keeping steady-skill.
+    root_rows = first[0][0][1]
+    assert root_rows[0][2] == ("steady-skill",)
+
+    # Next poll with NO parent timestamp change must re-list and include flaky-skill.
+    monkeypatch.setattr(os, "scandir", real_scandir)
+    second = _signature(root)
+    assert second != first
+    assert second[0][0][1][0][2] == ("flaky-skill", "steady-skill")
+
+    # Once complete and settled, subsequent polls reuse the cached listing with zero scandirs.
+    scans = _count_scans(monkeypatch)
+    assert _signature(root) == second
+    assert not scans
