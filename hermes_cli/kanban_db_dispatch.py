@@ -1010,6 +1010,9 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    infra_loss: bool = False
+    """The host lost the attempt (owner stall/restart dropped the managed worker), not the
+    card: re-queued without spending its failure budget (``_mark_infra_loss``)."""
 
     @property
     def run_outcome(self) -> str:
@@ -1108,6 +1111,88 @@ def _classify_dead_worker_exit(
     return _DeadWorker(kind, code, error_text, "crashed", event_payload)
 
 
+# A managed worker the owner lost (``worker_lost``) or a submitter whose owner refused/went
+# silent is a HOST event (owner-loop stall, gateway restart, state.db writer contention), not
+# a broken card: one stall killed 8 workers on 25 Nov 2026 and the systemic breaker parked 6
+# cards after that single death. These re-queue like a TTL reclaim, without a failure, without
+# a subscriber wake, and never count toward the systemic same-error breaker. Bounded: after
+# ``_INFRA_LOSS_REQUEUE_LIMIT`` consecutive infra losses the next ones book as plain crashes
+# (until a non-infra run breaks the streak), so a card that really kills its worker surfaces.
+_INFRA_LOSS_REASONS = frozenset({"managed_worker_failed", "managed_worker_lost"})
+_INFRA_LOSS_OUTPUT_RE = re.compile(
+    r"Kanban owner (?:refused: Kanban execution unknown; retained by owner"
+    r"|silent for \d+s: [^\n]{0,240})\s*$"
+)
+_INFRA_LOSS_REQUEUE_LIMIT = 3
+INFRA_REQUEUED_EVENT = "infra_requeued"  # not a notifier wake kind: no ping per lost worker
+
+
+def _prior_infra_losses(conn: sqlite3.Connection, task_id: str) -> int:
+    """The infra-loss streak before the open run: the count stored on the newest closed
+    non-``rate_limited`` run (quota walls are neutral at any length), 0 when that run was
+    anything else."""
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "AND COALESCE(outcome, '') != 'rate_limited' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return 0
+    meta = _kb._json_dict(row["metadata"])
+    for key in ("infra_losses", "infra_loss_limit_reached"):
+        try:
+            if meta.get(key):
+                return int(meta[key])
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _current_attempt_output(task_id: str, board: Optional[str] = None) -> str:
+    """The dying attempt's own log text: after the previous attempt's exit trailer.
+
+    The per-card log is append-only across attempts, so a tail read can still hold an
+    EARLIER attempt's owner refusal; only this attempt's segment may classify it."""
+    try:
+        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board) or ""
+    except Exception:
+        return ""
+    marks = list(_EXIT_TRAILER_RE.finditer(raw))
+    if marks and not raw[marks[-1].end():].strip():
+        # This attempt wrote its trailer: its text sits between the previous trailer and it.
+        prev_end = marks[-2].end() if len(marks) > 1 else 0
+        return raw[prev_end:marks[-1].start()]
+    return raw[marks[-1].end():] if marks else raw
+
+
+def infra_loss_booking(conn: sqlite3.Connection, task_id: str, lost_reason: str = "",
+                       output: str = "") -> dict:
+    """``{}`` when this death is not a host loss, else the run-metadata stamp:
+    ``{"infra_loss": True, "infra_losses": n}`` within budget, or
+    ``{"infra_loss_limit_reached": n}`` once the streak is over the limit (books as a crash)."""
+    if lost_reason not in _INFRA_LOSS_REASONS and not _INFRA_LOSS_OUTPUT_RE.search(output or ""):
+        return {}
+    n = _prior_infra_losses(conn, task_id) + 1
+    if n > _INFRA_LOSS_REQUEUE_LIMIT:
+        return {"infra_loss_limit_reached": n}
+    return {"infra_loss": True, "infra_losses": n}
+
+
+def _mark_infra_loss(conn: sqlite3.Connection, task_id: str, dead: _DeadWorker,
+                     board: Optional[str] = None) -> None:
+    """Flag a dead worker the HOST lost (see ``_INFRA_LOSS_REASONS``), before its run closes."""
+    if dead.rate_limited or dead.protocol_violation or dead.terminal_provider:
+        return
+    lost = dead.event_payload.get("worker_lost")
+    reason = str(lost.get("reason") or "") if isinstance(lost, dict) else ""
+    output = "" if reason in _INFRA_LOSS_REASONS else _current_attempt_output(task_id, board)
+    stamp = infra_loss_booking(conn, task_id, reason, output)
+    dead.event_payload.update(stamp)
+    if stamp.get("infra_loss"):
+        dead.infra_loss = True
+        dead.event_kind = INFRA_REQUEUED_EVENT
+
+
 @dataclass
 class _CrashSweep:
     """Everything ``detect_crashed_workers`` collects inside its reclaim txn."""
@@ -1151,6 +1236,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
             apply_attempt_note(conn, row["id"], pid, dead)
+            _mark_infra_loss(conn, row["id"], dead, board=board)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1179,7 +1265,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.protocol_violation or dead.infra_loss:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
                 # blocker; a below-budget protocol violation never reaches
@@ -1204,15 +1290,22 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     ``consecutive_failures`` (per-task ``max_retries`` takes precedence);
     systemic same-error crashes (>= 3 identical fingerprints this tick) and
     terminal provider errors (credential revoked, model gone — a retry cannot
-    heal them) trip immediately.
+    heal them) trip immediately. Host-lost workers (``infra_loss``) never count
+    and never feed the systemic fingerprint count.
     """
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
     for _, _, _, dead in crash_details:
+        if dead.infra_loss:
+            continue  # one host event is not N identical card failures
         fp = _error_fingerprint(dead.error_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
     for tid, pid, claimer, dead in crash_details:
         error_text = dead.error_text
+        if dead.infra_loss:
+            # Already back at ready with last_failure_error stamped in the reclaim txn; no
+            # counter move, never trips (bounded upstream by ``_INFRA_LOSS_REQUEUE_LIMIT``).
+            continue
         if dead.protocol_violation:
             streak = _protocol_violation_streak(conn, tid)
             trow = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()
