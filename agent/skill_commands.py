@@ -495,23 +495,25 @@ def published_scopes_signature() -> tuple:
     """
     from agent.runtime_cwd import reset_session_cwd, set_session_cwd
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.skills_tool import _signature_reader
     with _publish_lock:
         keys = list(_skill_commands_by_key)
     scopes = sorted({(home, project) for _platform, home, project in keys if home})[:_MAX_WATCHED_SCOPES]
-    rows = [("", None, _skill_dirs_signature())]
+    read_root = _signature_reader()
+    rows = [("", None, _skill_dirs_signature(read_root))]
     for home, project in scopes:
         home_token = set_hermes_home_override(home)
         # No project: an empty session cwd would fall back to the process cwd; "/" resolves no repo.
         cwd_token = set_session_cwd(project or os.path.sep)
         try:
-            rows.append((home, project, _skill_dirs_signature()))
+            rows.append((home, project, _skill_dirs_signature(read_root)))
         finally:
             reset_session_cwd(cwd_token)
             reset_hermes_home_override(home_token)
     return tuple(rows)
 
 
-def _skill_dirs_signature() -> Optional[tuple]:
+def _skill_dirs_signature(read_root=None) -> Optional[tuple]:
     """Stat-cheap change signature of every skill root (the catalog's own: the mtime and child names of
     every directory the catalog walks, depth-bounded, plus the disabled set and the platform). None when
     it cannot be computed (a root that cannot be stat'ed), which keeps the published map rather than
@@ -520,7 +522,7 @@ def _skill_dirs_signature() -> Optional[tuple]:
     from tools.skills_tool import _get_disabled_skill_names, skill_search_dirs, _skills_scan_signature
     try:
         roots, _active = skill_search_dirs()
-        return _skills_scan_signature([d for _tier, d in roots], _get_disabled_skill_names())
+        return _skills_scan_signature([d for _tier, d in roots], _get_disabled_skill_names(), read_root)
     except OSError:
         logger.debug("Skill dir signature failed", exc_info=True)
         return None
