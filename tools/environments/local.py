@@ -1307,6 +1307,11 @@ class LocalEnvironment(BaseEnvironment):
 
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
+        # Not wrapped in a hermes-worker systemd scope (background spawns are, process_registry
+        # _scope_argv): a foreground command is owned by the owner-death supervisor in our cgroup and
+        # bounded by the tool timeout; a user scope would let it outlive a gateway restart with no
+        # checkpoint to re-adopt it, and add a D-Bus round trip (~20-50 ms) to every command. Heavy or
+        # long jobs belong in background mode; a yield-to-background (adopt_local) keeps this cgroup.
         bash = _find_bash()
         run_env = _make_run_env(self.env)
         handoff = getattr(self, "_secret_handoff", None)  # absent on bare test doubles (__new__)

@@ -1,11 +1,36 @@
 """Which local background jobs die with their owner, for ProcessRegistry (process_identity layer 4)."""
 
+import logging
+import os
 import subprocess
 import threading
 from contextlib import suppress
 from typing import Any
 
 from hermes_cli.process_identity import own_process_groups, release_process_groups, spawn_owned
+
+logger = logging.getLogger("tools.process_registry")
+
+
+def in_supervised_gateway_tree() -> bool:
+    """The supervised gateway itself, or a registered managed worker it spawned (a per-turn
+    interpreter in the gateway's own cgroup). Both put background jobs in a hermes-worker scope
+    (``ProcessRegistry._scope_argv``): a worker's runaway job otherwise grows uncapped inside the
+    gateway service. Plain CLI descendants inherit the same launch markers but never register as
+    workers, so they stay unscoped. ``_is_supervised_gateway_process`` stays the PID-file-owner
+    check: it also gates the self-kill guards (#113667)."""
+    try:
+        from agent.runtime_session_store import is_worker_process
+        from gateway.restart import is_supervised_gateway_launch
+        from tools.process_registry import _is_supervised_gateway_process
+
+        if _is_supervised_gateway_process():
+            return True
+        return (os.environ.get("_HERMES_GATEWAY") == "1" and is_worker_process()
+                and is_supervised_gateway_launch())
+    except Exception:
+        logger.debug("Could not verify supervised gateway tree membership", exc_info=True)
+        return False
 
 
 class ProcessOwnershipMixin:
