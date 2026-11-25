@@ -62,12 +62,14 @@ def test_a_skill_installed_under_an_existing_category_subdir_is_served(tmp_path)
         _make_skill(training, "new-nested")
         assert set(get_skill_commands()) == {"/existing", "/new-nested"}
         # A skill's own support dirs are not walked: editing references/ is not an install.
+        refs = training / "existing" / "references"
+        refs.mkdir()
         before = sc_mod._skill_dirs_signature()
-        (training / "existing" / "references").mkdir()
-        (training / "existing" / "references" / "deep").mkdir()
-        after = sc_mod._skill_dirs_signature()
-        assert [row for row in after[0] if "references" in row[0]] == []
-        assert before != after  # the skill dir itself gained a child name
+        (refs / "deep").mkdir()
+        (refs / "deep" / "note.md").write_text("hi", encoding="utf-8")
+        assert sc_mod._skill_dirs_signature() == before
+        _make_skill(training, "another-nested")
+        assert sc_mod._skill_dirs_signature() != before
 
 
 def test_only_an_unreadable_skill_root_keeps_the_published_map():
