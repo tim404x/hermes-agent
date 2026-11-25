@@ -31,6 +31,20 @@ def _kbn():
     return kanban_db_notify
 
 
+def _kbrr():
+    from hermes_cli import kanban_result_receipts
+    return kanban_result_receipts
+
+
+def _event_completion_id(ev: Any) -> str:
+    if getattr(ev, "kind", None) != "completed":
+        return ""
+    payload = getattr(ev, "payload", None)
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("completion_id") or "")
+
+
 def _pin_first():
     """Machine-flow board resolution: env pins outrank the enumerated slug.
 
@@ -337,9 +351,23 @@ class _Collector:
         if not events:
             return None
         task = self.kb.get_task(conn, sub["task_id"])
+        pinged_cids: set[str] = set()
+        cids = [cid for ev in events if (cid := _event_completion_id(ev))]
+        if cids:
+            kbrr = _kbrr()
+            for cid in cids:
+                if kbrr.is_outbox_ping_sent(
+                    conn, cid, platform=sub["platform"], chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                ):
+                    pinged_cids.add(cid)
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        return {
+            "sub": sub, "old_cursor": old_cursor, "cursor": cursor,
+            "events": events, "task": task, "board": slug,
+            "pinged_completion_ids": pinged_cids,
+        }
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -543,8 +571,31 @@ class _KanbanNotification:
         self.adapter: Any = None
         self.is_push_adapter = True
         self.wake_kinds: set = set()
+        self.pinged_cids: set[str] = set(d.get("pinged_completion_ids") or ())
 
     # -- cursor / subscription ops (blocking, run in a fresh-context thread) --
+
+    def _batch_completion_ids(self) -> list[str]:
+        return [cid for ev in self.d["events"] if (cid := _event_completion_id(ev))]
+
+    def _outbox_op_sync(self, op: str, *args: Any, **kwargs: Any) -> None:
+        with _pin_first():
+            with _kbc().connect_closing(board=self.board_slug) as conn:
+                getattr(_kbrr(), op)(
+                    conn, *args,
+                    platform=self.sub["platform"],
+                    chat_id=self.sub["chat_id"],
+                    thread_id=self.sub.get("thread_id") or "",
+                    **kwargs,
+                )
+
+    async def _outbox_op(self, op: str, *args: Any, **kwargs: Any) -> None:
+        await _to_thread_process_service(partial(self._outbox_op_sync, op, *args, **kwargs))
+
+    def _verified_outputs(self) -> dict:
+        with _pin_first(), _kbc().connect_closing(board=self.board_slug) as conn:
+            return {cid: _kbrr().verified_delivery_paths(conn, self.task_id, ev)
+                    for ev in self.d['events'] if (cid := _event_completion_id(ev))}
 
     async def rewind(self) -> None:
         await _to_thread_process_service(
@@ -565,7 +616,10 @@ class _KanbanNotification:
         fails = self.sub_fail_counts.get(self.sub_key, 0) + 1
         self.sub_fail_counts[self.sub_key] = fails
         logger.warning(fmt, *prefix, fails, MAX_SEND_FAILURES, exc, exc_info=exc_info)
-        if fails >= MAX_SEND_FAILURES:
+        cids = self._batch_completion_ids()
+        if cids:
+            await self._outbox_op("record_outbox_delivery_failure", cids, self.task_id, error=str(exc))
+        if not cids and fails >= MAX_SEND_FAILURES:
             logger.warning(drop_fmt, self.task_id, self.platform_str, fails)
             await self.unsub()
             self.clear_failures()
@@ -692,14 +746,19 @@ class _KanbanNotification:
                                display_text=self.synth.partition("\n")[0])
         self._log_woke()
 
-    async def _send_event(self, ev: Any, msg: str) -> bool:
-        """Send one text ping; raises on adapter exception or SendResult(success=False)."""
-        from gateway.warning_notifications import present_notification
-        sub, adapter = self.sub, self.adapter
+    def _send_metadata(self) -> dict:
+        sub = self.sub
         delivery_metadata = sub.get("delivery_metadata")
         metadata: dict[str, Any] = dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
         if sub.get("thread_id") and not metadata.get("thread_id"):
             metadata["thread_id"] = sub["thread_id"]
+        return metadata
+
+    async def _send_event(self, ev: Any, msg: str) -> bool:
+        """Send one text ping; raises on adapter exception or SendResult(success=False)."""
+        from gateway.warning_notifications import present_notification
+        sub, adapter = self.sub, self.adapter
+        metadata = self._send_metadata()
         _send_res = None
         async def send_ping():
             nonlocal _send_res
@@ -718,7 +777,7 @@ class _KanbanNotification:
         # review-bound card's files exist precisely so the human sees them at
         # handoff time. Retry exposure matches ``completed`` (the sub cursor is
         # rewound only when a send failed).
-        if ev.kind in ("completed", "review_requested"):
+        if ev.kind in ("completed", "review_requested") and not _event_completion_id(ev):
             try:
                 await self.runner._deliver_kanban_artifacts(
                     adapter=adapter, chat_id=sub["chat_id"], metadata=metadata,
@@ -747,15 +806,20 @@ class _KanbanNotification:
             if not self.send_passive:
                 # Wake-only: the wake path is the sole delivery and resolves the counter.
                 continue
-            if ev.id <= self.sub.get("last_ping_event_id", 0):
+            cid = _event_completion_id(ev)
+            if not cid and ev.id <= self.sub.get("last_ping_event_id", 0):
                 continue
             try:
-                if await self._send_event(ev, msg) is False:
-                    continue
-                await _to_thread_process_service(partial(
-                    self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,
-                    event_id=ev.id,
-                ))
+                if not cid or cid not in self.pinged_cids:
+                    if await self._send_event(ev, msg) is False:
+                        continue
+                    if cid:
+                        await self._outbox_op("record_outbox_ping_sent", cid, self.task_id)
+                    await _to_thread_process_service(partial(
+                        self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub, event_id=ev.id,
+                    ))
+                if cid and self.outputs[cid]:
+                    await self.runner._send_pinned_kanban_files(self.adapter, self.sub['chat_id'], self._send_metadata(), self.outputs[cid])
                 self.clear_failures()
             except Exception as exc:
                 await self.delivery_failed(
@@ -803,6 +867,12 @@ class _KanbanNotification:
                     "kanban notifier: dropping subscription %s on %s after %d refusals", exc, False)
             return
         async with owner_scope:
+            try:
+                self.outputs = await _to_thread_process_service(self._verified_outputs) if self._batch_completion_ids() else {}
+            except _kbrr().CorruptResultReceiptError as exc:
+                await self.delivery_failed("kanban notifier: invalid result for %s (attempt %d/%d): %s",
+                                           (self.task_id,), "", exc, False)
+                return
             if not await self._send_pings():
                 return
             # All text pings delivered (or skipped for non-push / wake-only).
@@ -834,9 +904,12 @@ class _KanbanNotification:
                 for self.synth, self.wake_diagnostic, self.wake_kinds in wake_payloads:
                     await self.wake()
                 self.clear_failures()
-            except WakeNotAccepted:
+            except WakeNotAccepted as _wk_na:
                 # Startup / full queue is not a dead destination. Keep the durable
                 # subscription alive regardless of how long admission takes.
+                cids = self._batch_completion_ids()
+                if cids:
+                    await self._outbox_op("record_outbox_delivery_failure", cids, self.task_id, error=str(_wk_na))
                 await self.rewind()
                 return
             except Exception as _wk_err:
@@ -847,8 +920,13 @@ class _KanbanNotification:
                 )
                 return
 
-        # Delivery complete: advance the cursor (the dedup mechanism).
-        await self.advance()
+        # Delivery complete: advance the cursor (the dedup mechanism) and settle outbox.
+        cids = self._batch_completion_ids()
+        if cids:
+            signatures = {path: sig for files in self.outputs.values() for path, sig in files.items()}
+            await self._outbox_op("mark_outbox_delivered", cids, self.task_id, verified_stats=signatures)
+        else:
+            await self.advance()
         if not is_push:
             self.clear_failures()
         # Unsubscribe only on archive; ``done`` is reversible.

@@ -1248,6 +1248,14 @@ Coverage window: desktop notifications ride the live event stream, so they fire 
 
 ## Gateway notifications
 
+A successful completion commits the result receipt, closed run, completed event, and notification destinations in one board transaction. `metadata.artifacts` (or the `artifacts` tool argument) declares **required files**, not informational path references. Every declared file must be readable, allowed for delivery, and within the attachment size limit. Each is copied, not linked, into board storage before scratch cleanup. The receipt URI identifies the immutable SQLite manifest; its SHA-256 covers the manifest. Each file entry has its own pinned URI, byte count, and SHA-256. A summary-only result has a manifest too.
+
+The run records the logical brief at claim, including assignee, task inputs and parent handoffs. A later change to these inputs or an explicit reopen invalidates the old work. A running attempt from a board upgraded before claim snapshots existed must be reclaimed and claimed again: its original brief cannot be inferred. Replaying the winning run verifies the existing receipt rather than submitting a second completion.
+
+Receipt-backed delivery is **at least once**, not exactly once. Gateway and TUI/desktop session subscriptions use the same completed event. Each destination has a five-minute claim lease independent of its event cursor. A fresh collector retries expired leases; a recorded text ping need not be sent again for a file or wake retry. A crash after transport acceptance but before the local checkpoint can duplicate a message, file, or wake. TUI session delivery acknowledges a successful status-frame write, not that someone read it. This is separate from the desktop plugin's live toasts.
+
+`kanban_result_outbox.status` is `no_targets` when nobody was subscribed at commit, `pending` while any destination lacks an acknowledgment, and `delivered` only after all have acknowledged. A failed upload or invalid pin stays pending. Unsubscribing stops delivery; the unacknowledged destination stays queryable in `kanban_result_deliveries` and can resume if the route is subscribed again. A new subscription does not replay historical completions.
+
 When you run `/kanban create …` from the gateway (Telegram, Discord, Slack, etc.), the originating chat is automatically subscribed to the new task. The gateway's background notifier polls `task_events` every few seconds and delivers one message per terminal event (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`) to that chat. Completed tasks also send the first line of the worker's `--result` so you see the outcome without having to `/kanban show`.
 
 You can manage subscriptions explicitly from the CLI — useful when a script / cron job wants to notify a chat it didn't originate from:

@@ -886,6 +886,8 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Explicit reopen counter: incremented on reopen so unchanged-body retries get a new input_rev.
+    ("reopen_epoch", "reopen_epoch INTEGER NOT NULL DEFAULT 0"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
@@ -901,6 +903,7 @@ _NOTIFY_SUB_COLUMNS = (
 )
 
 _TASK_RUN_COLUMNS = (
+    ("input_rev", "input_rev TEXT"),
     # Spawn-time start fingerprint of the run's worker_pid (PID-reuse guard for the
     # terminal-worker reaper; NULL = legacy row, never signalled).
     ("worker_started_at", "worker_started_at INTEGER"),
@@ -995,6 +998,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     _rebuild_drifted_tables(conn)
 
+    from hermes_cli import kanban_result_receipts as _kbrr
+
+    _kbrr.ensure_receipt_schema(conn)
+    _kbrr.ensure_board_id(conn)
+
 
 def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
     """One-shot backfill: tasks 'running' before runs existed carried
@@ -1084,7 +1092,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, worker_started_at INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, input_rev TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",

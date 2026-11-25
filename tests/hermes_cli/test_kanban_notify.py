@@ -757,15 +757,12 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
 
 @pytest.mark.asyncio
 async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_path, monkeypatch):
-    """Missing artifact paths are silently skipped — they may have been
-    referenced by name only. The notifier must not crash and must still
-    deliver any artifacts that do exist."""
+    """Pre-receipt events still deliver existing files and skip informational paths."""
     import hermes_cli.kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_notify as kbn
     from gateway.run import GatewayRunner
     from gateway.config import Platform
-    from tools import kanban_tools as kt
 
     # Allow ``tmp_path`` through the media-delivery safety filter. See the
     # companion test for the full explanation.
@@ -778,23 +775,11 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     try:
         tid = kb.create_task(conn, title="t", assignee="worker1")
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
-        # A dispatcher-spawned worker completes a card it holds a run on: bind the
-        # run id like the dispatcher does, or the ownership CAS refuses (#116239).
-        assert kb.claim_task(conn, tid) is not None
-        run_id = kb._current_run_id(conn, tid)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, 'completed', {'summary': 'legacy result',
+                             'artifacts': [str(real_pdf), str(tmp_path / 'absent.pdf')]})
     finally:
         conn.close()
-
-    import os
-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
-    os.environ["HERMES_KANBAN_TASK"] = tid
-    try:
-        kt._handle_complete({
-            "summary": "one real, one ghost",
-            "artifacts": [str(real_pdf), "/tmp/definitely-does-not-exist.pdf"],
-        })
-    finally:
-        os.environ.pop("HERMES_KANBAN_TASK", None)
 
     runner = object.__new__(GatewayRunner)
     runner._owns_kanban_dispatcher_lock = lambda: True
@@ -1061,6 +1046,9 @@ def _make_done_task_with_sub(kb, conn, *, title, chat_id):
         notifier_profile="default",
     )
     assert kb.complete_task(conn, tid, summary="done")
+    from hermes_cli import kanban_result_receipts as receipts
+    receipt, = receipts.list_result_receipts(conn, tid)
+    receipts.mark_outbox_delivered(conn, [receipt.completion_id], tid, platform='telegram', chat_id=chat_id)
     return tid
 
 def _backdate_task(kb, conn, tid, *, days):

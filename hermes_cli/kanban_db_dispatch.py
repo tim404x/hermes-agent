@@ -151,6 +151,8 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    adopted: list[str] = field(default_factory=list)  # tasks adopted from verified receipts without spawning
+    corrupt_receipts: list[str] = field(default_factory=list)  # tasks refused fail-closed on receipt corruption
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
@@ -1636,7 +1638,7 @@ def check_respawn_guard(
     success = max((t for t, _ in _rows_since(
         conn, "task_runs", task_id, now - _RESPAWN_GUARD_SUCCESS_WINDOW, "AND outcome = 'completed'")), default=None)
     if success is not None and not any(_rows_since(
-            conn, "task_events", task_id, success, "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed')")):
+            conn, "task_events", task_id, success, "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', 'reopened')")):
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
@@ -2055,14 +2057,8 @@ def _dispatch_lane_task(
     row: sqlite3.Row,
     assignee: str,
     result: DispatchResult,
-    *,
-    lane: str,
-    dry_run: bool,
-    ttl_seconds: Optional[int],
-    board: Optional[str],
-    failure_limit: int,
-    spawn_fn,
-    per_profile_cap: Optional[int],
+    *, lane: str, dry_run: bool, ttl_seconds: Optional[int], board: Optional[str],
+    failure_limit: int, spawn_fn, per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
@@ -2070,6 +2066,9 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    if lane == "ready" and _kb.dispatch_pre_admit_receipt(conn, task_id, result, dry_run=dry_run):
+        return False
+
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
