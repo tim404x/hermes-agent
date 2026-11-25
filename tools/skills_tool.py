@@ -8,12 +8,17 @@ import contextvars
 import json
 import logging
 import os
+import stat
+import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager, suppress
+from functools import cache
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
+from agent import skill_index
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get
 from agent.skill_utils import (
@@ -49,27 +54,99 @@ def clear_skills_cache() -> None:
     bump_generation()
 
 
-def _dir_tree_signature(root, sig, depth=_SIGNATURE_MAX_DEPTH) -> None:
-    """Append ``(dir, mtime_ns, child dir names)`` for *root* and the dirs below it the catalog walks
-    (``iter_skill_index_files``: no excluded dirs, no support dirs of a skill), depth-bounded. The child
-    names, not only mtimes: an install and an uninstall inside one coarse mtime tick (1-2 s on some
-    filesystems) leave every mtime equal, and the change must still show. ~1 ms for 170 dirs."""
-    from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
-    try:
-        mtime = os.stat(root).st_mtime_ns
-        with os.scandir(root) as it:
-            entries = list(it)
-    except OSError:
-        return
-    names, is_skill = [], False
-    for entry in entries:
-        with suppress(OSError):
-            if entry.is_dir():
-                names.append(entry.name)
-            elif entry.name == "SKILL.md":
+class _CatalogDir:
+    """One scandir. Link kinds can change independently of their parent. At a root, sibling
+    identities distinguish a usage-only atomic write from a simultaneous replacement of SKILL.md."""
+
+    def __init__(self, path, is_root, key, read_at, previous):
+        self.key = key
+        self.racy = skill_index.is_racy(key, read_at)
+        self.stamp = key[-2]
+        names, self.links, self.is_skill = [], [], False
+        other_entries, usage = [], []
+        incomplete = False
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_symlink():
+                        self.links.append(entry.name)
+                    elif entry.is_dir():
+                        names.append(entry.name)
+                    elif entry.name == "SKILL.md":
+                        self.is_skill = True
+                    if is_root:
+                        if entry.name in (".usage.json", ".usage.json.lock") or (
+                            entry.name.startswith(".usage_") and entry.name.endswith(".tmp")
+                        ):
+                            usage.append((entry.name, skill_index.stat_key(entry.path)))
+                        else:
+                            other_entries.append((entry.name, entry.inode()))
+                except OSError:
+                    incomplete = True
+        if incomplete:
+            self.racy = True
+        self.names = tuple(sorted(names))
+        self.other_entries = sorted(other_entries)
+        self.usage = sorted(usage)
+        if previous and key[:2] == previous.key[:2] and (
+            key[-2] == previous.key[-2] or (
+                is_root and self.usage != previous.usage and self.other_entries == previous.other_entries
+            )
+        ):
+            self.stamp = previous.stamp
+
+    def children(self, path):
+        if not self.links:
+            return self.names, self.is_skill
+        names, is_skill = list(self.names), self.is_skill
+        for name in self.links:
+            try:
+                directory = stat.S_ISDIR(os.stat(os.path.join(path, name)).st_mode)
+            except (FileNotFoundError, NotADirectoryError):
+                directory = False
+            except OSError:
+                continue
+            if directory:
+                names.append(name)
+            elif name == "SKILL.md":
                 is_skill = True
-    names.sort()
-    sig.append((str(root), mtime, tuple(names)))
+        return tuple(sorted(names)), is_skill
+
+
+_catalog_dirs: OrderedDict[tuple[str, bool], _CatalogDir] = OrderedDict()
+_catalog_dirs_lock = threading.Lock()
+_MAX_CATALOG_DIRS = 8192
+
+
+def _catalog_dir(path: str, is_root: bool) -> Optional[_CatalogDir]:
+    slot = (path, is_root)
+    with _catalog_dirs_lock:
+        read_at = time.time_ns()
+        key = skill_index.stat_key(path)
+        if key is None:
+            _catalog_dirs.pop(slot, None)
+            return None
+        cached = _catalog_dirs.get(slot)
+        if cached is None or key != cached.key or cached.racy or not skill_index.stat_ctime_is_change_time():
+            try:
+                cached = _CatalogDir(path, is_root, key, read_at, cached)
+            except OSError:
+                _catalog_dirs.pop(slot, None)
+                return None
+            _catalog_dirs[slot] = cached
+        _catalog_dirs.move_to_end(slot)
+        if len(_catalog_dirs) > _MAX_CATALOG_DIRS:
+            _catalog_dirs.popitem(last=False)
+        return cached
+
+
+def _dir_tree_signature(root, sig, depth=_SIGNATURE_MAX_DEPTH) -> None:
+    from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
+    listing = _catalog_dir(root, depth == _SIGNATURE_MAX_DEPTH)
+    if listing is None:
+        return
+    names, is_skill = listing.children(root)
+    sig.append((root, listing.stamp, names, is_skill))
     if depth <= 0:
         return
     for name in names:
@@ -77,15 +154,26 @@ def _dir_tree_signature(root, sig, depth=_SIGNATURE_MAX_DEPTH) -> None:
             _dir_tree_signature(os.path.join(root, name), sig, depth - 1)
 
 
-def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
+def _root_tree_signature(root: str) -> tuple:
+    sig = []
+    _dir_tree_signature(root, sig)
+    return tuple(sig)
+
+
+def _signature_reader(realpath=None):
+    """Share one validation per physical root for this poll, not across polls."""
+    resolve = realpath or cache(os.path.realpath)
+    read = cache(_root_tree_signature)
+    return lambda root: read(resolve(root))
+
+
+def _skills_scan_signature(dirs_to_scan, disabled, read_root=None) -> tuple:
     """Stat-based change signature over every directory the catalog walks; platform is read via
     ``agent.skill_utils.sys`` so test patches are honored."""
     from agent import skill_utils as _skill_utils
     platform = getattr(getattr(_skill_utils, "sys", None), "platform", "")
-    sig: list = []
-    for d in dirs_to_scan:
-        _dir_tree_signature(str(d), sig)
-    return (tuple(sig), frozenset(disabled), platform)
+    read_root = read_root or _signature_reader()
+    return (tuple((str(root), read_root(str(root))) for root in dirs_to_scan), frozenset(disabled), platform)
 
 
 HERMES_HOME = get_hermes_home()  # all skills live in ~/.hermes/skills/ (seeded from bundled)

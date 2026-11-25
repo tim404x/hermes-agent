@@ -79,25 +79,32 @@ async def resolve_image_source(
     # Everything else is a filesystem path — including bare relative names like "pic.png"
     # (a path-shape gate here regressed them once).
     candidate = s[len("file://"):] if s.lower().startswith("file://") else s
-    p = Path(os.path.expanduser(candidate))
-    host_target = _permitted_host_read_target(p, ctx)
+    path, data = await asyncio.to_thread(_read_local_source, candidate, ctx, s, permitted)
+    if data is not None:
+        return _finalize(data, "", "file", s, permitted)
+    return await _resolve_container_fallback(path, ctx, s, permitted)
+
+
+def _read_local_source(candidate: str, ctx: ResolveContext, src: str, permitted: tuple) -> tuple[Path, Optional[bytes]]:
+    """Check and read a host path in the worker; absent bytes delegate that path to the container."""
+    path = Path(os.path.expanduser(candidate))
+    host_target = _permitted_host_read_target(path, ctx)
     # Local backend only: under a sandbox a miss must still reach the in-container read, so the
     # confinement boundary in this module's docstring holds.
     if host_target is not None and not host_target.is_file() and _is_local_terminal_backend():
-        alt = _on_disk_spelling(p)
+        alt = _on_disk_spelling(path)
         if alt is not None:
             host_target = _permitted_host_read_target(alt, ctx)
     if host_target is not None and host_target.is_file():
-        _guard_credential_read(host_target, s)
+        _guard_credential_read(host_target, src)
         # Videos are never downscaled and video_analyze refuses over 50 MB of base64, so the
         # larger host budget only helps images; videos keep the ingest cap and fail at the stat.
         cap = _MAX_HOST_READ_BYTES if "image" in permitted else _MAX_INGEST_BYTES
-        data = await asyncio.to_thread(_read_host_bytes_bounded, host_target, s, cap)
-        return _finalize(data, "", "file", s, permitted)
+        return path, _read_host_bytes_bounded(host_target, src, cap)
     if _is_local_terminal_backend():
         # Any path was host-readable, so a miss means the file doesn't exist.
-        raise SourceNotFound(f"media file not found: '{p}'", src=s, origin="file")
-    return await _resolve_container_fallback(p, ctx, s, permitted)
+        raise SourceNotFound(f"media file not found: '{path}'", src=src, origin="file")
+    return path, None
 
 
 def _read_host_bytes_bounded(path: Path, src: str, cap: int) -> bytes:
