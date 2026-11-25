@@ -143,11 +143,30 @@ class GatewayKanbanWatchersMixin:
         self._kanban_sub_op(board, "advance_notify_cursor", sub, new_cursor=cursor)
 
     def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
-        self._kanban_sub_op(board, "remove_notify_sub", sub)
+        self._kanban_sub_op(board, "remove_notify_sub", sub, only_if_settled=True)
 
     def _kanban_rewind(self, sub: dict, claimed_cursor: int, old_cursor: int, board: Optional[str] = None) -> None:
         """Undo a claimed notification cursor after send failure."""
         self._kanban_sub_op(board, "rewind_notify_cursor", sub, claimed_cursor=claimed_cursor, old_cursor=old_cursor)
+
+    async def _send_pinned_kanban_files(self, adapter, chat_id: str, metadata: dict, paths: dict) -> None:
+        from gateway.platforms.base import validate_media_delivery_path
+        from hermes_cli.kanban_result_receipts import check_verified_pins
+        from urllib.parse import quote
+
+        for path, signature in paths.items():
+            check_verified_pins({path: signature})
+            if validate_media_delivery_path(path) != path:
+                raise ValueError("completion attachment unavailable or disallowed by media policy")
+            suffix = Path(path).suffix.lower()
+            if suffix in _IMAGE_EXTS:
+                result = await adapter.send_multiple_images(chat_id=chat_id, images=[(f"file://{quote(path)}", "")], metadata=metadata)
+            elif suffix in _VIDEO_EXTS:
+                result = await adapter.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
+            else:
+                result = await adapter.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+            if getattr(result, "success", True) is False:
+                raise RuntimeError(f"completion attachment rejected: {getattr(result, 'error', '')}")
 
     async def _deliver_kanban_artifacts(self, *, adapter, chat_id: str, metadata: dict, event_payload: Optional[dict], task) -> None:
         """Upload artifact files referenced by a completed kanban task.

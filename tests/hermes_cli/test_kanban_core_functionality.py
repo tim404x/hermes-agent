@@ -442,8 +442,7 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
 
 def test_migration_backfills_inflight_run_for_legacy_db(kanban_home):
     """An existing 'running' task from before task_runs existed should
-    get a synthesized run row so subsequent operations (complete,
-    heartbeat) have something to write to."""
+    get a synthesized run row for bookkeeping, not a retroactive brief snapshot."""
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="pre-migration", assignee="worker")
@@ -472,8 +471,11 @@ def test_migration_backfills_inflight_run_for_legacy_db(kanban_home):
             task = kb.get_task(conn2, tid)
             assert task.current_run_id == runs[0].id
 
-            # Subsequent complete closes the backfilled run cleanly.
-            kb.complete_task(conn2, tid, result="done", summary="ok")
+            assert not kb.complete_task(conn2, tid, result="unwitnessed")
+            assert kb.reclaim_task(conn2, tid)
+            assert kb.get_run(conn2, runs[0].id).outcome == "reclaimed"
+            fresh = kb.claim_task(conn2, tid)
+            assert kb.complete_task(conn2, tid, expected_run_id=fresh.current_run_id, result="done", summary="ok")
             r = kb.latest_run(conn2, tid)
             assert r.outcome == "completed"
             assert r.summary == "ok"
