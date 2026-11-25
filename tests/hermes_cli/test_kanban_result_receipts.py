@@ -804,6 +804,17 @@ def test_platform_crash_replays_same_intent_on_fresh_notifier(board_env, monkeyp
         assert kb.get_outbox_entry(conn, cid).status == 'delivered'
 
 
+def test_changed_write_declaration_is_a_new_input_revision(board_env):
+    _, board = board_env
+    with _connect(board) as conn:
+        tid = kb.create_task(conn, title='publish report', resource_class='cpu', write_scopes=['out'])
+        assert kb.complete_task(conn, tid, summary='original output')
+        old = kbrr.list_result_receipts(conn, tid)[0]
+        assert kb.edit_task(conn, tid, write_scopes=['new-out'])
+        assert kbrr.compute_input_rev(conn, tid) != old.input_rev
+        assert kbrr.adopt_result_receipt(conn, tid) is None
+
+
 def test_delete_rolls_back_on_relation_failure(board_env):
     with kbc.connect_closing(board_env[1]) as conn:
         tid = kb.create_task(conn, title='atomic deletion', assignee='worker')

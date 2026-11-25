@@ -372,6 +372,8 @@ def compute_input_rev(
         "goal_max_turns": _kb._opt_int(_kb._row_get(row, "goal_max_turns")),
         "tenant": _kb._row_get(row, "tenant"),
         "project_id": _kb._row_get(row, "project_id"),
+        "resource_class": _kb._row_get(row, "resource_class"),
+        "write_scopes": _kb._json_or(_kb._row_get(row, "write_scopes")),
         "workspace_kind": workspace_kind,
         "dir_workspace_path": dir_workspace_path,
         "completion_contract": _kb._row_get(row, "completion_contract"),
