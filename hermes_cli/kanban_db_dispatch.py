@@ -2123,7 +2123,7 @@ def _dispatch_lane_task(
         _count_spawn(assignee)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task  # reassigned since the gates: CAS loses (#147534)
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds, expect_assignee=assignee)
+    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds, expect_assignee=assignee, board=board)
     if claimed is None:
         return False
     try:
@@ -2272,38 +2272,6 @@ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def _any_spawnable_review(
-    conn: sqlite3.Connection,
-    review_rows: list[sqlite3.Row],
-    *,
-    per_profile_cap: Optional[int] = None,
-    per_profile_running: Optional[dict[str, int]] = None,
-) -> bool:
-    """Mirror review dispatch gates before reserving ready-lane capacity.
-
-    Unimportable profiles fail open only when no allowlist is set. A
-    review row that :func:`_dispatch_lane_task` would refuse this tick — its
-    assignee already at the per-profile cap, or respawn-guarded — cannot
-    consume the reservation, so it must not withhold capacity from an
-    otherwise ready task (one such row would pin ``ready_budget`` to 0).
-    """
-    if not review_rows:
-        return False
-    profile_exists = _profile_exists_fn()
-    running = per_profile_running or {}
-    for row in review_rows:
-        assignee = row["assignee"]
-        if not assignee:
-            continue
-        if profile_exists is not None and not profile_exists(assignee):
-            continue
-        if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
-            continue
-        if check_respawn_guard(conn, row["id"], lane="review") is None:
-            return True
-    return False
-
-
 def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     """``kanban.default_assignee`` when it names a real profile this home may
     claim (``kanban.dispatch_profiles`` gated, same predicate as the spawn
@@ -2353,14 +2321,12 @@ def _dispatch_once_locked(
     if not may_spawn:
         return result
 
-    ready_rows = _lane_rows(conn, "ready")
+    ready_rows = iter(_lane_rows(conn, "ready"))
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
     review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
-    # Resolved BEFORE the review reservation so the reservation can see which
-    # review rows the lane loop would refuse this tick.
     per_profile_cap = max_in_progress_per_profile if (
         # Per-profile concurrency cap (#21582): when set, track how many workers each assignee already has
         # in flight, and refuse to spawn when this would push that assignee past the cap. Prevents fan-out
@@ -2379,31 +2345,29 @@ def _dispatch_once_locked(
             per_profile_running[prow["assignee"]] = int(prow["n"])
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
-    # backlog. When spawnable review work exists and there is any budget, hold
-    # one slot back.
-    ready_budget = spawn_budget
-    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
-        conn, review_rows,
-        per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
-    ):
-        ready_budget = max(spawn_budget - 1, 0)
+    # backlog. Give review first refusal on one slot, not a guaranteed charge.
+    ready_budget = spawn_budget - 1 if review_rows and spawn_budget is not None else spawn_budget
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
-    spawned = 0
-    for row in ready_rows:
-        if ready_budget is not None and spawned >= ready_budget:
-            break
-        row_assignee = row["assignee"]
-        if not row_assignee:
-            row_assignee = _kbda.fill_default_assignee(conn, row["id"], default_assignee, result, dry_run=dry_run)
+
+    def dispatch_ready(slots: Optional[int]) -> int:
+        consumed = 0
+        while slots is None or consumed < slots:
+            row = next(ready_rows, None)
+            if row is None:
+                break
+            row_assignee = row["assignee"]
             if not row_assignee:
-                continue
-        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
-            spawned += 1
+                row_assignee = _kbda.fill_default_assignee(conn, row["id"], default_assignee, result, dry_run=dry_run)
+            if row_assignee and _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
+                consumed += 1
+        return consumed
+
+    spawned = dispatch_ready(ready_budget)
 
     # A review agent (sdlc-review) approves (→ done) or requests changes
     # (→ ready/todo). Review spawns share max_spawn with ready tasks. The loop
@@ -2417,6 +2381,8 @@ def _dispatch_once_locked(
             continue
         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
             spawned += 1
+    if spawn_budget is not None and spawned < spawn_budget:
+        dispatch_ready(spawn_budget - spawned)
     return result
 
 

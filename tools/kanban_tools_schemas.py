@@ -433,6 +433,10 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "absolute workspace_path), 'worktree' (git worktree)."
             ),
         },
+        "resource_class": {"type": "string", "enum": ["cpu", "data", "gpu"],
+                           "description": "Resource lane for a guarded project."},
+        "write_scopes": {"type": "array", "items": {"type": "string"}, "maxItems": 64,
+                         "description": "Literal project write paths. [] explicitly declares read-only; omit for legacy cards."},
         "workspace_path": _prop("string", (
                 "Absolute path for 'dir' or 'worktree' workspace. "
                 "Relative paths are rejected at dispatch."
