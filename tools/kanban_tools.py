@@ -696,7 +696,7 @@ def _handle_show(args: dict, **kw) -> str:
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
         return json.dumps({
-            "task": _fields(task, _TASK_FIELDS),
+            "task": {**_fields(task, _TASK_FIELDS), **task.admission_fields()},
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
             # gate is not holding it and kanban_complete will refuse.
@@ -1153,6 +1153,7 @@ def _handle_create(args: dict, **kw) -> str:
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority"), 0),
             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
+            resource_class=args.get("resource_class"), write_scopes=args.get("write_scopes"),
             # Board-project inheritance must read the board this call opened, not the
             # session's current board.
             board=args.get("board"),

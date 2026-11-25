@@ -332,6 +332,15 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _declared_writes(args: argparse.Namespace) -> list[str] | None:
+    scopes = getattr(args, "write_scope", None)
+    if not getattr(args, "read_only", False):
+        return scopes
+    if scopes:
+        raise ValueError("--read-only and --write-scope are mutually exclusive")
+    return []
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
@@ -374,6 +383,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
+            resource_class=getattr(args, "resource_class", None), write_scopes=_declared_writes(args),
             initial_status=getattr(args, "initial_status", "running"),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
@@ -471,6 +481,15 @@ def _print_section(title: str, lines) -> None:
         print(line)
 
 
+def _show_admission(task, field):
+    if task.admission_reason:
+        field("admission", task.admission_reason)
+    if task.resource_class:
+        field("resource", task.resource_class)
+    if task.write_scopes is not None:
+        field("writes", ", ".join(task.write_scopes) or "(read-only)")
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
     rsk, rc = _run_state_kwargs(args, "show")
     if rc:
@@ -505,6 +524,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     field("status", task.status)
+    _show_admission(task, field)
     field("assignee", task.assignee or "-")
     if task.tenant:
         field("tenant", task.tenant)
@@ -739,6 +759,8 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             existing = kb.get_task(conn, args.task_id)
             if existing is None:
                 return _err(f"no such task: {args.task_id}")
+            if existing.admission_reason:
+                return _err(f"cannot claim {args.task_id}: {existing.admission_reason}")
             return _err(f"cannot claim {args.task_id}: status={existing.status} "
                         f"lock={existing.claim_lock or '(none)'}")
         workspace = kbw.resolve_workspace(task)
@@ -951,10 +973,12 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     title = getattr(args, "title", None)
     body = getattr(args, "body", None)
     priority = getattr(args, "priority", None)
+    resource = getattr(args, "resource_class", None)
+    writes = _declared_writes(args)
     if result is None and (summary is not None or raw_metadata is not None):
         return _err("kanban edit: --summary and --metadata require --result", 2)
-    if all(value is None for value in (title, body, priority, result)):
-        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
+    if all(value is None for value in (title, body, priority, result, resource, writes)):
+        return _err("kanban edit: provide a task field or admission declaration", 2)
     metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc
@@ -962,6 +986,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         ok = kb.edit_task(
             conn, args.task_id, title=title, body=body, priority=priority,
             result=result, summary=summary, metadata=metadata,
+            resource_class=resource, write_scopes=writes,
         )
     return _ok_or_err(
         ok,
