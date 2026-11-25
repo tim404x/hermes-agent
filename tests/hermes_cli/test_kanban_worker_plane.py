@@ -49,6 +49,20 @@ def test_worker_plane_config_defaults_and_fail_closed(isolated_board):
     assert kwp.resolve_worker_plane() == kwp.WORKER_PLANE_ISOLATED_SYSTEMD
 
 
+def test_receipt_reopen_carries_the_running_descendants_identity(isolated_board, monkeypatch):
+    _, conn = isolated_board
+    parent = kb.create_task(conn, title='parent')
+    child = kb.create_task(conn, title='child', parents=[parent])
+    assert kb.complete_task(conn, parent, summary='parent complete')
+    active = kb.claim_task(conn, child)
+    assert active is not None
+    calls = []
+    monkeypatch.setattr(kb, '_terminate_reclaimed_worker', lambda *args, **kwargs: calls.append(kwargs))
+    assert kb.reopen_task(conn, parent)
+    assert len(calls) == 1
+    assert (calls[0]['conn'], calls[0]['task_id'], calls[0]['run_id']) == (conn, child, active.current_run_id)
+
+
 @pytest.mark.platforms('linux')
 def test_prepare_attempt_home_isolates_mutable_state_from_profile_home(tmp_path):
     profile = tmp_path / "profile"
