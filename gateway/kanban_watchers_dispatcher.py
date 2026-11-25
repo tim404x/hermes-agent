@@ -8,13 +8,16 @@ the singleton lock and the health telemetry; everything that only needs the
 from __future__ import annotations
 
 import contextlib
+import math
 import sqlite3
 import time
-from dataclasses import asdict, dataclass, replace
+from copy import deepcopy
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Optional
 
-from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, _positive_int_value, logger
+from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, logger
+from hermes_cli.kanban_dispatch.results import DispatchResult, describe_suppression
 
 
 def _kbc():
@@ -29,16 +32,12 @@ def _kbd():
 _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malformed")
 
 
-@dataclass
+@dataclass(frozen=True)
 class _DispatcherSettings:
-    """Boot-time ``kanban.*`` settings, except for the two concurrency caps.
-
-    ``_KanbanDispatcher`` re-resolves ``max_in_progress`` and ``max_in_progress_per_profile``
-    every tick from mtime-cached config, so cap edits apply without a restart.
-    """
+    """Live settings shared by all boards for one tick. Only ``dispatch_in_gateway`` is boot-only."""
 
     interval: float
-    max_spawn: Any
+    max_spawn: Optional[int]
     max_in_progress: Optional[int]
     failure_limit: int
     stale_timeout_seconds: int
@@ -47,26 +46,33 @@ class _DispatcherSettings:
     max_in_progress_per_profile: Optional[int]
 
 
-def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
-    """Parse and log the dispatcher settings in their established order."""
+def _dispatch_interval(kanban_cfg: dict, fallback: float) -> float:
+    raw = kanban_cfg.get("dispatch_interval_seconds")
     try:
-        interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
-    except (ValueError, TypeError):
-        logger.warning("kanban dispatcher: invalid dispatch_interval_seconds=%r, using default 60",
-                       kanban_cfg.get("dispatch_interval_seconds"))
-        interval = 60.0
-    interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
+        interval = float(raw or 60)
+        if math.isfinite(interval):
+            return max(interval, 1.0)
+    except (ValueError, TypeError, OverflowError):
+        pass
+    logger.warning("kanban dispatcher: invalid dispatch_interval_seconds=%r; using %g", raw, fallback)
+    return fallback
 
-    max_spawn = kanban_cfg.get("max_spawn")
-    if max_spawn is not None:
-        logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
+
+def _resolve_dispatcher_settings(
+    kanban_cfg: dict, kb: Any, *, log: bool = True, previous: Optional[_DispatcherSettings] = None,
+) -> _DispatcherSettings:
+    """Resolve one snapshot; refreshes omit boot INFO logs, not validation warnings."""
+    interval = _dispatch_interval(kanban_cfg, previous.interval if previous else 60.0)
+    max_spawn = _positive_int_setting(
+        kanban_cfg, "max_spawn", log=log, fallback=previous.max_spawn if previous else None, strict=True,
+    )
 
     # Cap simultaneously running tasks so slow workers don't pile up and time
     # out. Explicit config wins; otherwise a memory-derived default (unbounded
     # fan-out swap-thrashes small hosts), or None where total memory can't be read.
-    max_in_progress = _positive_int_setting(kanban_cfg, "max_in_progress")
+    max_in_progress = _positive_int_setting(kanban_cfg, "max_in_progress", log=log)
     effective_max_in_progress = _kbd().resolve_max_in_progress(max_in_progress)
-    if max_in_progress is None and effective_max_in_progress is not None:
+    if log and max_in_progress is None and effective_max_in_progress is not None:
         logger.info(
             "kanban dispatcher: kanban.max_in_progress unset; using "
             "memory-derived default max_in_progress=%d "
@@ -101,7 +107,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
     # (#27145). Empty string (the schema default) means "no fallback, keep skipping" — backward-compatible
     # with existing installs.
     default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
-    if default_assignee:
+    if log and default_assignee:
         logger.info("kanban dispatcher: default_assignee=%r (unassigned ready tasks "
                     "will route to this profile)", default_assignee)
 
@@ -117,7 +123,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         default_assignee=default_assignee,
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
-        max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile", log=log),
     )
 
 
@@ -132,15 +138,24 @@ class _KanbanDispatcher:
 
     CORRUPT_BOARD_RETRY_AFTER_SECONDS = 300
 
-    def __init__(self, kb: Any, settings: _DispatcherSettings) -> None:
+    def __init__(self, kb: Any, settings: _DispatcherSettings, *, kanban_cfg: Optional[dict] = None) -> None:
         self.kb = kb
         self.settings = settings
+        self._applied_kanban = deepcopy(kanban_cfg)
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
 
-    def _refresh_live_caps(self) -> None:
+    @property
+    def max_in_progress_source(self) -> str:
+        if self.settings.max_in_progress is None:
+            return "uncapped"
+        if _kbd().configured_max_in_progress(self._applied_kanban or {}) is not None:
+            return "config"
+        return "memory-default"
+
+    def refresh_settings(self) -> None:
         from hermes_cli.config import load_config_readonly
         from hermes_cli.config_backend import ConfigBackendUnavailable
         from hermes_cli.config_read_errors import FailedConfigRead
@@ -148,29 +163,36 @@ class _KanbanDispatcher:
         try:
             cfg = load_config_readonly()
             if isinstance(cfg, FailedConfigRead):
-                # Fail-open fallback ({} / defaults / last-known-good): a failed read must never
-                # loosen or drop a cap the operator set, so keep the values we already enforce.
-                logger.debug("kanban dispatcher: config read failed (%s); keeping previous concurrency caps",
+                logger.debug("kanban dispatcher: config read failed (%s); keeping previous settings",
                              cfg.read_error)
                 return
-            kanban = (cfg or {}).get("kanban") or {}
+            kanban = cfg.get("kanban")
             if not isinstance(kanban, dict):
-                kanban = {}
-            dispatch = _kbd()
-            caps = {
-                "max_in_progress": dispatch.resolve_max_in_progress(dispatch.configured_max_in_progress(kanban)),
-                "max_in_progress_per_profile": _positive_int_value(kanban, "max_in_progress_per_profile"),
-            }
+                return
+            snapshot = self._applied_kanban
+            if kanban == snapshot and type(kanban.get("max_spawn")) is type(snapshot.get("max_spawn")):
+                if self.max_in_progress_source == "config":
+                    return
+                cap = _kbd().resolve_max_in_progress(None)
+                if cap == self.settings.max_in_progress:
+                    return
+                settings = replace(self.settings, max_in_progress=cap)
+            else:
+                snapshot = deepcopy(kanban)
+                settings = _resolve_dispatcher_settings(snapshot, self.kb, log=False, previous=self.settings)
         except (Exception, ConfigBackendUnavailable):  # the latter is a SystemExit on purpose
-            logger.debug("kanban dispatcher: could not refresh concurrency caps; keeping previous values", exc_info=True)
+            logger.debug("kanban dispatcher: could not refresh settings; keeping previous values", exc_info=True)
             return
 
-        for key, value in caps.items():
-            previous = getattr(self.settings, key)
+        for setting in fields(settings):
+            previous, value = getattr(self.settings, setting.name), getattr(settings, setting.name)
             if value != previous:
-                logger.info("kanban dispatcher: %s changed %s -> %s (config edit applied live)",
-                            key, previous or "unset", value or "unset")
-                self.settings = replace(self.settings, **{key: value})
+                logger.info(
+                    "kanban dispatcher: %s changed %s -> %s (config edit applied live)", setting.name,
+                    "unset" if previous is None else previous, "unset" if value is None else value,
+                )
+        self.settings = settings
+        self._applied_kanban = snapshot
 
     def board_db_fingerprint(self, slug: str) -> tuple[str, int | None, int | None]:
         from hermes_cli import kanban_db as _kb
@@ -209,16 +231,16 @@ class _KanbanDispatcher:
         return True
 
     def tick_once_for_board(self, slug: str) -> Optional[object]:
-        """Run one dispatch_once for a specific board.
+        """Run a standalone tick for one board, including live settings."""
+        self.refresh_settings()
+        return self._dispatch_board(slug)
 
-        The per-board DB is opened explicitly so boards never share a
-        connection or claim across each other.
-        """
+    def _dispatch_board(self, slug: str) -> Optional[object]:
+        """Open the per-board DB so boards never share a connection or claim."""
         conn = None
         fingerprint = self.board_db_fingerprint(slug)
         if not self._quarantine_lifted(slug, fingerprint):
             return None
-        self._refresh_live_caps()
         kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
         try:
             # No explicit init_db(): connect() runs the migration once per
@@ -251,10 +273,11 @@ class _KanbanDispatcher:
 
     def tick_once(self) -> list[tuple[str, Optional[object]]]:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
-        return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
+        self.refresh_settings()
+        return [(slug, self._dispatch_board(slug)) for slug in self._board_slugs()]
 
     def ready_nonempty(self) -> bool:
-        """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?
+        """Is there unclaimed ready or review work on ANY board the dispatcher could spawn for?
 
         Control-plane lanes (e.g. ``orion-cc``) are pulled by terminals via
         ``claim_task`` and never spawnable — a queue full of those is
@@ -270,7 +293,9 @@ class _KanbanDispatcher:
                 conn = None
                 try:
                     conn = _kbc().connect(board=slug)
-                    if kbd.has_spawnable_ready(conn) or (_review_probe and kbd.has_spawnable_review(conn)):
+                    if kbd.has_spawnable_ready(conn, self.settings.default_assignee) or (
+                        _review_probe and kbd.has_spawnable_review(conn)
+                    ):
                         return True
                 except Exception:
                     continue
@@ -355,6 +380,25 @@ def _default_profile_secret_scope():
         yield
     finally:
         reset_secret_scope(token)
+
+
+def _stuck_warning(
+    bad_ticks: int, results: list[Optional[DispatchResult]], max_in_progress_source: str,
+    per_profile_limit: Optional[int] = None,
+) -> str:
+    def binding_cap(name: str, running: int, limit: int) -> str:
+        source = max_in_progress_source if name == "max_in_progress" else "config"
+        return (f"Binding cap: {name}={limit} (source: {source}, running {running}). "
+                f"Raise kanban.{name} in config.yaml (applies live)")
+
+    reason = describe_suppression(results, format_capacity=binding_cap)
+    if per_profile_limit is not None and any(res and res.skipped_per_profile_capped for res in results):
+        reason += f". Binding cap: max_in_progress_per_profile={per_profile_limit} (source: config, applies live)"
+    detail = f"{reason}." if reason else (
+        "Check profile health (venv, PATH, credentials) and `hermes kanban list --status ready`."
+    )
+    return (f"kanban dispatcher stuck: ready queue non-empty for {bad_ticks} consecutive ticks "
+            f"but 0 workers spawned. {detail}")
 
 
 def _log_spawn_results(results: Optional[list]) -> bool:

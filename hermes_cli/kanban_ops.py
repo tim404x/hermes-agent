@@ -16,6 +16,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
+from hermes_cli.kanban_dispatch.results import describe_capacity
 from hermes_cli.kanban_output import _err, _fmt_ts, _print_json
 
 
@@ -113,6 +114,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
+            "capacity_held": res.capacity_held,
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -154,6 +156,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
     if res.memory_pressure:
         print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
+    if res.capacity_held:
+        print(describe_capacity(*res.capacity_held))
     return 0
 
 
@@ -224,13 +228,15 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             now = int(time.time())
             if now - health_state["last_warn_at"] >= 300:
                 held = kbd.describe_suppression([res])
-                held = f" Last tick held back: {held}." if held else ""
+                if res.capacity_source:
+                    held += f" (source: {res.capacity_source})"
+                advice = (f"Last tick held back: {held}." if held else
+                          "Check profile health (venv, PATH, credentials) and `hermes kanban list --status ready` "
+                          "/ `hermes kanban list --status blocked` for recent spawn_failed tasks.")
                 print(
                     f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
                     f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "
-                    f"successfully.{held} Check profile health (venv, PATH, credentials) and `hermes "
-                    f"kanban list --status ready` / `hermes kanban list --status blocked` for "
-                    f"recent spawn_failed tasks.",
+                    f"successfully. {advice}",
                     file=sys.stderr, flush=True,
                 )
                 health_state["last_warn_at"] = now
