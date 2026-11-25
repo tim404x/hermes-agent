@@ -388,6 +388,97 @@ that home may claim — anything else lands in the dispatcher's
 `skipped_nonspawnable` bucket instead of spawning, and no longer counts as
 spawnable work for the gateway's wake-up probe.
 
+### Admission for ranked projects (opt-in)
+
+A project owner can require an exact ranked card ID, a resource lane, and a
+non-conflicting write declaration **before a ready or review claim opens a run**.
+Nothing is enabled by default. No project is inferred from a title, prompt,
+assignee, tenant, or a `PRIORITIES.md` found by searching the checkout.
+
+**Prepare first, without enabling admission.** Choose one authoritative board
+for the project. Inventory every board/home that can dispatch into the workspace.
+Drain existing off-board work and reconcile running/review cards on the authority;
+publishing a mapping does not stop a worker. All claimers must run the admission-aware
+version and share the fleet registry and the same filesystem paths. Do not use
+independent board copies, hard links, DB-only bind mounts, or independently
+configured fleets to coordinate one guarded project.
+
+Create cards parked so that a dispatcher cannot start them before they are ranked:
+
+```bash
+hermes kanban --board research create 'Evaluate candidate' --assignee researcher \
+  --workspace dir:/srv/projects/example --initial-status blocked \
+  --resource-class gpu --write-scope evaluation/results
+
+hermes kanban --board research edit t_abcdef01 --resource-class cpu --read-only
+```
+
+Use the **returned ID**, not the example ID. `kanban_create` and the Python
+`create_task` API also accept `resource_class` (`gpu`, `data` for data/label work,
+or `cpu` for other work) and `write_scopes` (a list of literal paths). An explicit
+`[]` means read-only; omitting the field does not. `edit` can populate queued
+cards in place; `--write-scope` is repeatable and replaces the entire list on edit.
+Requeue an active card before changing its declaration. For worktree tasks,
+specify an explicit workspace path or use a project-linked worktree.
+
+Put the exact ID in the **Card** cell of a positive-numbered row in the table
+immediately under `## Ranked`. The heading may have a parenthesized caption,
+and a single `---` divider may separate it from the table:
+
+```markdown
+## Ranked
+| # | Task | Card |
+|---|------|------|
+| 1 | Compare candidates | t_abcdef01, t_0123abcd |
+```
+
+Only bare IDs or comma-separated lists consisting entirely of IDs count. A
+`later` row, an ID in another column, a stopped/history table, or “team cards”
+does not authorize a claim. Paths may be absolute or relative to the configured
+**project root**, not the card's working directory. `.` reserves the whole root;
+`..`, globs and symlinks escaping it are refused. A writer of `models` excludes
+`models/run1`, not `models-extra`. Explicit readers hold no write scope. This
+arbitrates **declared work**; it is not a filesystem sandbox for worker code.
+
+**Validate on an isolated fleet first.** The example below is a template, not a
+shipped configuration. Only after validation, publish the operator-owned JSON
+file `kanban/guarded-projects.json` under the **shared Kanban home** (not a worker's
+profile). Use an atomic file replacement for it and the ranked file. No restart
+is needed. Example for `/srv/hermes` as the shared home:
+
+```json
+{
+  "example": {
+    "workspace_root": "/srv/projects/example",
+    "priorities_file": "/srv/projects/example/PRIORITIES.md",
+    "board_db": "/srv/hermes/kanban/boards/research/kanban.db"
+  }
+}
+```
+
+The key is a stable reservation name. A workspace at or below the root matches,
+including aliases and shared `dir` tasks with **no project slug**. Optionally add
+`"project_id": "p_0123abcd"` to match the canonical stored project ID as well;
+that is not permission to use a workspace outside the root. Use disjoint mappings.
+`board_db` must name the actual default (`<home>/kanban.db`) or named board DB.
+A matching card on another board is refused, regardless of its board argument.
+The connected DB's fleet registry is also consulted when a different home opens it.
+A missing registry means opt-out; an unreadable/malformed registry fails closed
+because the fleet cannot establish which projects are guarded. A missing ranked
+file holds only the matching project. Keep both files local, regular, and ≤1 MiB.
+
+After activation, unblock the prepared cards. Limits are **three GPU, one data,
+six total per project** across all assignees. `running` and `review` both occupy
+a slot, including human review; moving from one to the other doesn't count twice.
+Pre-existing active cards count even without a managed run: an unknown class
+counts against each limited pool and undeclared writes reserve the project root.
+Leaving both active statuses releases the reservation in the same DB transaction.
+`hermes kanban show ID` reports the bounded rejection reason (e.g. `not_ranked`,
+`write_scope_busy`, `gpu_lane_cap`). No automatic merge, preemption or new run
+occurs. Fix the declaration/ranking, release a slot, or make an explicit human
+decision. Do not retarget project roots or aliases while work is active. To roll
+back, park/drain guarded work first, then remove the mapping.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash

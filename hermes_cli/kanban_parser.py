@@ -13,6 +13,7 @@ import argparse
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_notify as kbn
+from hermes_cli.kanban_admission.claims import RESOURCE_CLASSES
 
 
 def _arg(*flags: str, **kw):
@@ -83,6 +84,11 @@ _TASK_IDS = _arg("task_ids", nargs="+")
 _SLUG = _arg("slug")
 _TENANT = _arg("--tenant", help="Tenant namespace")
 _PRIORITY = _arg("--priority", type=int, default=0, help="Priority tiebreaker")
+_ADMISSION = (
+    _arg("--resource-class", choices=RESOURCE_CLASSES, help="Resource lane for guarded admission"),
+    _arg("--write-scope", action="append", metavar="PATH", help="Project write path (repeatable)"),
+    _arg("--read-only", action="store_true", help="Explicitly declare no project writes"),
+)
 _RECLAIM_REASON = _reason("Human-readable reason (recorded on the reclaimed event)")
 _NOTIFY_TARGET = (
     _arg("--platform", required=True),
@@ -217,6 +223,7 @@ _SPECS = [
              help="Initial card status. Use 'blocked' for cards "
                   "that require immediate human ops (R3 gate) "
                   "to skip the brief running-to-blocked transition."),
+        *_ADMISSION,
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [
@@ -306,6 +313,7 @@ _SPECS = [
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,
+        *_ADMISSION,
         _arg("--title", help="Replace the task title"),
         _arg("--body", help="Replace the task body"),
         _arg("--priority", type=int, help="Replace the task priority"),
