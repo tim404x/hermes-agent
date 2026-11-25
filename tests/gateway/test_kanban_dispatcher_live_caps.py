@@ -58,3 +58,36 @@ def test_unset_global_cap_uses_memory_default(dispatcher, monkeypatch):
     assert dispatcher.tick_once_for_board("default")["max_in_progress"] == 12
     del kanban["max_in_progress"]
     assert dispatcher.tick_once_for_board("default")["max_in_progress"] == 8
+
+
+def _prime_12_8(dispatcher, monkeypatch):
+    kanban = {"max_in_progress": 12, "max_in_progress_per_profile": 8}
+    monkeypatch.setattr(config, "load_config_readonly", lambda: {"kanban": kanban})
+    out = dispatcher.tick_once_for_board("default")
+    assert (out["max_in_progress"], out["max_in_progress_per_profile"]) == (12, 8)
+
+
+def test_failed_config_read_fallback_keeps_caps(dispatcher, monkeypatch):
+    """A fail-open fallback mapping (no caps in it) must not loosen or drop live caps."""
+    from hermes_cli.config_read_errors import FailedConfigRead
+
+    _prime_12_8(dispatcher, monkeypatch)
+    monkeypatch.setattr(kanban_db_dispatch, "derive_default_max_in_progress", lambda: 8)
+    monkeypatch.setattr(config, "load_config_readonly",
+                        lambda: FailedConfigRead({"kanban": {}}, error=OSError("EMFILE")))
+    out = dispatcher.tick_once_for_board("default")
+    assert (out["max_in_progress"], out["max_in_progress_per_profile"]) == (12, 8)
+
+
+def test_config_backend_outage_keeps_caps_and_still_dispatches(dispatcher, monkeypatch):
+    """ConfigBackendUnavailable is a SystemExit: it must not abort the tick."""
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+
+    _prime_12_8(dispatcher, monkeypatch)
+
+    def outage():
+        raise ConfigBackendUnavailable("config plane down")
+
+    monkeypatch.setattr(config, "load_config_readonly", outage)
+    out = dispatcher.tick_once_for_board("default")
+    assert (out["max_in_progress"], out["max_in_progress_per_profile"]) == (12, 8)

@@ -142,10 +142,18 @@ class _KanbanDispatcher:
 
     def _refresh_live_caps(self) -> None:
         from hermes_cli.config import load_config_readonly
+        from hermes_cli.config_backend import ConfigBackendUnavailable
+        from hermes_cli.config_read_errors import FailedConfigRead
 
         try:
-            cfg = load_config_readonly() or {}
-            kanban = cfg.get("kanban") or {}
+            cfg = load_config_readonly()
+            if isinstance(cfg, FailedConfigRead):
+                # Fail-open fallback ({} / defaults / last-known-good): a failed read must never
+                # loosen or drop a cap the operator set, so keep the values we already enforce.
+                logger.debug("kanban dispatcher: config read failed (%s); keeping previous concurrency caps",
+                             cfg.read_error)
+                return
+            kanban = (cfg or {}).get("kanban") or {}
             if not isinstance(kanban, dict):
                 kanban = {}
             dispatch = _kbd()
@@ -153,7 +161,7 @@ class _KanbanDispatcher:
                 "max_in_progress": dispatch.resolve_max_in_progress(dispatch.configured_max_in_progress(kanban)),
                 "max_in_progress_per_profile": _positive_int_value(kanban, "max_in_progress_per_profile"),
             }
-        except Exception:
+        except (Exception, ConfigBackendUnavailable):  # the latter is a SystemExit on purpose
             logger.debug("kanban dispatcher: could not refresh concurrency caps; keeping previous values", exc_info=True)
             return
 
