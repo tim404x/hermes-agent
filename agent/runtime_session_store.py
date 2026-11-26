@@ -30,6 +30,9 @@ _worker_process = False
 # the journal entry stays pending and the store fails closed, as before. Same wait as the Kanban
 # worker client's owner wait (kanban_worker_client.OWNER_WAIT_S), well inside a 300 s turn lease.
 RECONNECT_BUDGET_S = 180.0
+RECONNECT_BASE_DELAY_S = 0.5
+RECONNECT_MAX_DELAY_S = 15.0
+RECONNECT_JITTER_RATIO = 0.5
 # Owner answers that say only that its store could not take the write right now (the in-process
 # writer mutex past its patience, a busy database): the same sequence is sent again, on the same
 # connection, under the same budget. Every other owner answer is final.
@@ -176,9 +179,10 @@ class WorkerRPC:
         discovery = discover_gateway_endpoint(self.home, timeout=5)
         if discovery.state == 'ready' and discovery.endpoint is not None:
             self.endpoint = discovery.endpoint
-        elif (discovery.state, discovery.reason_code) == ('inaccessible', 'control_timeout') and self.endpoint:
-            # The owner this worker already talks to did not answer its control socket in time: its
-            # loop is stalled, not gone. A lost link the journal may wait out.
+        elif (discovery.state, discovery.reason_code) == ('inaccessible', 'control_timeout'):
+            # The owner did not answer its control socket in time: its loop is stalled, not gone
+            # (including on a freshly spawned worker's first connect, before an endpoint is known).
+            # A lost link an idempotent caller (worker.adopt, the outbox journal) may wait out.
             raise WorkerLinkLost('owner_unresponsive')
         elif discovery.state != 'draining' or self.endpoint is None:
             # No owner (stopped, killed, a new one starting) or none this worker can use: final here.
@@ -433,7 +437,9 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                                    entry.get('operation'), entry.get('sequence'), now - lost_at, exc)
                     raise
                 attempt += 1
-                delay = min(max(pause, jittered_backoff(attempt, base_delay=0.5, max_delay=15.0, jitter_ratio=0.5)),
+                delay = min(max(pause, jittered_backoff(attempt, base_delay=RECONNECT_BASE_DELAY_S,
+                                                        max_delay=RECONNECT_MAX_DELAY_S,
+                                                        jitter_ratio=RECONNECT_JITTER_RATIO)),
                             left)
                 logger.warning('worker.persist %s (sequence %s) got no answer (%s: %s); sending it again in '
                                '%.1fs (%.0fs of reconnect budget left)', entry.get('operation'),
