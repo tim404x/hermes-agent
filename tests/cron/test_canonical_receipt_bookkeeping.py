@@ -89,6 +89,7 @@ def test_in_process_firer_keeps_its_row_journal_and_output(tmp_path, monkeypatch
 def test_resume_survives_recovery_of_old_unknown_journal(tmp_path, monkeypatch):
     with jobs.use_cron_store(tmp_path / 'cron'):
         job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')
+        jobs.update_job(job['id'], {'pause_on_unknown': True})
         params = {'job_id': job['id'], 'request_id': 'lost-fire', 'extra_prompt': None}
         journal = scheduler_authority.journal_path(job['id'], 'lost-fire')
         journal.parent.mkdir(parents=True, exist_ok=True)

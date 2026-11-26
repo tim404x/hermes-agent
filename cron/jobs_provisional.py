@@ -95,7 +95,7 @@ def correct_history(job: dict[str, Any], entry: dict[str, Any], success: bool,
     """Recovery of an older fire after a newer run was booked: the newer run's outcome stands, but
     the streak and the sticky failure stamp are recomputed in fire order. The provisional mark
     counted this fire as one failure; a real success resets everything up to it (only failures
-    booked after it remain), a real cancel counts nothing, a real failure stays counted. The stamp
+    booked after it remain), a cancel or unknown counts nothing, a real failure stays counted. The stamp
     is this fire's only while no newer failure replaced it: a success restores the one before, a
     failure names its real error. Newer pending fires carry the same correction in their own
     ``streak`` and ``before`` snapshot, so their later recovery builds on it."""
@@ -103,7 +103,9 @@ def correct_history(job: dict[str, Any], entry: dict[str, Any], success: bool,
     cancelled = status == "cancelled"
     reset = bool(success or cancelled)
     detail = sanitize_persisted_error(error) or (status or "run failed")
-    share = (int(entry.get("streak") or 0) if success else 1) if reset and "streak" in entry else 0
+    share = 0
+    if "streak" in entry:
+        share = int(entry["streak"] or 0) if success else int(cancelled or status == "unknown")
     if share and entry.get("owes"):
         job["failure_streak"] = max(0, int(job.get("failure_streak") or 0) - share)
     from cron.jobs import _instant_after, _parse_aware
