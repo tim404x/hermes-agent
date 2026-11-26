@@ -8,6 +8,7 @@ import pytest
 from gateway.session_authority import LiveSession, SessionAuthority
 from gateway.session_contract import CANONICAL_GATEWAY_PROTOCOL
 from gateway.session_controls import AuthorityConnection
+from persistence.core.errors import PermanentStoreError, StoreContention
 from tests.fixtures.storage_seed import seed_session
 from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
@@ -175,7 +176,11 @@ async def test_stale_or_mismatched_pair_reports_detached_false_and_keeps_the_liv
 
 
 @pytest.mark.asyncio
-async def test_a_sqlite_failure_keeps_the_wire_error_and_logs_its_cause(tmp_path, caplog):
+@pytest.mark.parametrize(('failure', 'transient'), [
+    (sqlite3.OperationalError('database is locked'), True),
+    (StoreContention('database is busy'), True), (PermanentStoreError('damaged store'), False),
+], ids=['sqlite-locked', 'store-contention', 'permanent'])
+async def test_a_sqlite_failure_keeps_the_wire_error_and_logs_its_cause(tmp_path, caplog, failure, transient):
     """Storage failures retain their client contract while leaving an operator diagnostic."""
     db = storage_handle(tmp_path)
     try:
@@ -186,7 +191,7 @@ async def test_a_sqlite_failure_keeps_the_wire_error_and_logs_its_cause(tmp_path
         class Connection(AuthorityConnection):
             def handlers(self):
                 async def probe(ref, params):
-                    raise sqlite3.OperationalError('database is locked')
+                    raise failure
                 return {'session.storage_probe': probe}
 
         connection = Connection(authority, object(), {'user_id': 'human'})
@@ -194,10 +199,11 @@ async def test_a_sqlite_failure_keeps_the_wire_error_and_logs_its_cause(tmp_path
             reply = await connection.dispatch({'id': 9, 'method': 'session.storage_probe', 'params': {
                 'session_id': 'session-9'}})
         assert reply['error'] == {
-            'code': 5001, 'message': 'storage_unavailable', 'data': {'reason': 'storage_unavailable'}}
+            'code': 5001, 'message': 'storage_unavailable',
+            'data': {'reason': 'storage_unavailable', 'transient': transient}}
         assert any('session.storage_probe storage failure for profile=test session_id=' in record.getMessage()
-                   and 'database is locked' in record.getMessage() for record in caplog.records)
-        assert 'sqlite3.OperationalError: database is locked' in caplog.text
+                   and str(failure) in record.getMessage() for record in caplog.records)
+        assert f'{type(failure).__module__}.{type(failure).__name__}: {failure}' in caplog.text
     finally:
         db.close()
 

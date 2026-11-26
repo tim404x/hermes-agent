@@ -7,7 +7,9 @@ import errno
 import re
 import sqlite3
 
-from persistence.core.errors import PERSISTENCE_ERROR_CAUSES, DiskFull, PersistenceError, StoreContention
+from persistence.core.errors import (
+    PERSISTENCE_ERROR_CAUSES, DiskFull, PersistenceError, StoreContention, TransientStoreError,
+)
 
 __all__ = [
     "PERSISTENCE_ERROR_CAUSES",
@@ -17,6 +19,7 @@ __all__ = [
     "is_lock_contention",
     "is_malformed_db_error",
     "is_sqlite_lock_error",
+    "is_transient_store_failure",
 ]
 
 # Malformed schema: ``sqlite_master`` itself is inconsistent (typically a DUPLICATE
@@ -57,6 +60,13 @@ def is_sqlite_lock_error(exc_or_str) -> bool:
         return code in _SQLITE_LOCK_CODES
     text = str(exc_or_str).lower()
     return "locked" in text or "busy" in text
+
+
+def is_transient_store_failure(exc: BaseException) -> bool:
+    """Retry a typed transient failure or a raw SQLite operational refusal naming contention."""
+    return isinstance(exc, TransientStoreError) or (
+        isinstance(exc, sqlite3.OperationalError) and is_sqlite_lock_error(exc)
+    )
 
 
 def _typed_cause(exc_or_str) -> str | None:
