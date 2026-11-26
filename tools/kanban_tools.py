@@ -976,7 +976,7 @@ def _handle_comment(args: dict, **kw) -> str:
             "dispatcher-assigned task to default to. Discover task ids with "
             "kanban_list, or pass the task id you mean.")
     _reject_inherited_task_mutation(str(tid))
-    body = _redact(_require_text(args, "body"))
+    body = _require_text(args, "body")
     # Author comes from the worker's runtime identity (``_persisted_identity``), never
     # caller args: comments are injected into future workers' system prompts, so an
     # args["author"] override could forge a directive from ``hermes-system``.
