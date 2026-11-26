@@ -258,6 +258,22 @@ def _create_swarm_uncommitted(
     return created
 
 
+def redact_blackboard_comment(stripped_body: str) -> Optional[str]:
+    """If ``stripped_body`` is a valid blackboard JSON comment, redact its
+    decoded payload with :func:`agent.redact_structured.redact_structured` and
+    re-serialize with the blackboard wire format; otherwise return ``None``."""
+    if not stripped_body.startswith(BLACKBOARD_PREFIX):
+        return None
+    try:
+        payload = json.loads(stripped_body[len(BLACKBOARD_PREFIX):])
+    except json.JSONDecodeError:
+        return None
+    from agent.redact_structured import redact_structured
+
+    redacted = redact_structured(payload)
+    return BLACKBOARD_PREFIX + json.dumps(redacted, ensure_ascii=False, sort_keys=True)
+
+
 def post_blackboard_update(conn: sqlite3.Connection, root_id: str, *, author: str, key: str, value: Any) -> int:
     """Append one structured update to the swarm root blackboard."""
     _require_text(root_id, "root_id")
