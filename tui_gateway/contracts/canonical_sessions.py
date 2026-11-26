@@ -228,6 +228,14 @@ class CanonicalTurnAuthor(Params):
     name: str | None = None
     is_bot: bool = False
     origin: str | None = None
+    # The runtime-written chain fields ``agent.turn_author.parse_turn_author`` keeps (and the classic
+    # CLI forwards from HERMES_TURN_AUTHOR): a bot-to-bot delivery's hop (``agent/bot_chain.py``) and
+    # the nesting depth of a task tab a bot opened for itself (message_agent new_tab). Without them
+    # the dispatcher refused every self-tab turn and every hop>1 side-window DM as ``invalid_params``
+    # before admission (24 Nov 2026). The owner re-parses the author (``admit_cli_turn``), which
+    # bounds both values.
+    hops: int | None = None
+    tab_depth: int | None = None
 
 
 class CanonicalModelOverride(Params):

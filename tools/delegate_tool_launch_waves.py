@@ -13,7 +13,9 @@ holds a window.
 
 ``run_child_start`` is the one boundary every child start passes, batch (``delegate_tool_dispatch``) and the
 public lifecycle API (``delegate_tool_results._run_child_lifecycle``) alike: the parent's live fan-out cap
-(``delegation.max_children_per_child`` for a subagent parent), then the launch wave, exactly once per child.
+(``delegation.max_children_per_child`` for a subagent parent), then a slot of this process's in-process child
+cap (``delegation.max_in_process_children``, tools/delegate_tool_process_slots.py), then the launch wave, exactly
+once per child.
 """
 
 from __future__ import annotations
@@ -27,7 +29,10 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional, TypeVar
 
 from hermes_constants import get_hermes_home
-from tools.delegate_tool_config import _get_launch_waves, _get_max_children_per_child
+from tools.delegate_tool_config import _get_in_process_children_limits, _get_launch_waves, _get_max_children_per_child
+from tools.delegate_tool_process_slots import (
+    admit_in_process_child, in_process_children_running, release_in_process_child,
+)
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
@@ -182,18 +187,38 @@ def _release_live_slot(parent: Any) -> None:
         parent._delegate_live_children = max(0, live - 1) if isinstance(live, int) else 0
 
 
+def _claim_process_slot(child: Any, parent: Optional[Any]) -> tuple[bool, Optional[StartRefusal]]:
+    """``(holds_slot, refusal)``: wait for one of this process's in-process child slots
+    (``delegation.max_in_process_children``, tools/delegate_tool_process_slots.py)."""
+    admitted = admit_in_process_child(child, parent)
+    if admitted:
+        return True, None
+    if admitted is False:
+        return False, StartRefusal("interrupted", "Stopped while waiting for an in-process subagent slot")
+    cap, wait_s = _get_in_process_children_limits()
+    return False, StartRefusal("failed", (
+        f"Not started: this Hermes process already runs {in_process_children_running()} subagent(s) "
+        f"(delegation.max_in_process_children={cap}) and none finished within {wait_s:g}s. Retry later with fewer "
+        f"parallel tasks, or do the work yourself."))
+
+
 def run_child_start(child: Any, parent: Any, run: Callable[[], _T], refuse: Callable[[StartRefusal], _T], *,
                     honor_parent_interrupt: bool = True) -> _T:
-    """Start ``child`` through the common boundary: its parent's live fan-out cap, then its launch wave. Admitted:
-    ``run()`` (the slot is released when it returns). Refused or stopped while waiting: ``refuse(refusal)``, which
+    """Start ``child`` through the common boundary: its parent's live fan-out cap, then an in-process child slot,
+    then its launch wave. Admitted: ``run()`` (both slots are released when it returns). Refused or stopped while waiting: ``refuse(refusal)``, which
     must release the unstarted child. Exactly once per child: an already admitted child just runs. A detached
     (background or lifecycle) start ignores the parent's turn interrupt; only the child's own stop ends its wait."""
     if getattr(child, "_delegate_start_admitted", False) is True:
         return run()
     claimed, refusal = _claim_live_slot(parent)
+    slot = False
+    if refusal is None:
+        slot, refusal = _claim_process_slot(child, parent if honor_parent_interrupt else None)
     if refusal is None and not wait_for_launch_wave(child, parent if honor_parent_interrupt else None):
         refusal = StartRefusal("interrupted", "Stopped while waiting for its launch wave")
     if refusal is not None:
+        if slot:
+            release_in_process_child(child)
         if claimed:
             _release_live_slot(parent)
         return refuse(refusal)
@@ -201,5 +226,7 @@ def run_child_start(child: Any, parent: Any, run: Callable[[], _T], refuse: Call
     try:
         return run()
     finally:
+        if slot:
+            release_in_process_child(child)
         if claimed:
             _release_live_slot(parent)

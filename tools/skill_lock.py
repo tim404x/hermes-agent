@@ -54,24 +54,32 @@ def _skill_usage():
 
 
 def _skill_dirs(names: set[str] | None) -> list[tuple[str, str]]:
-    """``(name, realpath)`` of skills in the active profile from ONE walk of the skills dirs; *names*
-    limits the result to them (None = every skill). Locks are keyed by directory name, so no
-    frontmatter is read."""
+    """``(name, realpath)`` of skills in the active profile; *names* limits the result to them (None =
+    every skill). Locks are keyed by directory name, so no frontmatter is read. The first skills dir
+    holding a name wins, as before; inside it every directory of that name is listed (two categories
+    can hold the same name, and which one a filesystem walk meets first is arbitrary: a lock on the
+    name covers both).
+
+    This guard runs on every terminal, write_file and patch call of every in-process agent. Each call
+    used to walk the whole skills tree (~16k files on Tim's profile, 70-330 ms of GIL-held Python),
+    the largest GIL consumer in the gateway owner on 24 Nov 2026, starving its event loop into >10 s
+    stalls. The walk now comes from ``agent.skill_index``: one pruned walk per root (symlinked dirs
+    listed but not entered, support dirs beside an existing ``SKILL.md`` and VCS/dependency/cache
+    dirs never walked), reused until a stat check over the walked dirs sees the tree change."""
     if names is not None and not names:
         return []
-    from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
-    found: dict[str, str] = {}
+    from agent.skill_index import root_index
+    from agent.skill_utils import get_all_skills_dirs
+    found: set[tuple[str, str]] = set()
+    claimed: set[str] = set()
     for base in get_all_skills_dirs():
         if not base.is_dir():
             continue
-        for skill_md in base.rglob("SKILL.md"):
-            name = skill_md.parent.name
-            if names is not None and name not in names:
-                continue
-            if name in found or is_excluded_skill_path(skill_md, root=base):
-                continue
-            found[name] = os.path.realpath(skill_md.parent)
-    return sorted(found.items())
+        here = {(name, real) for name, reals in root_index(base).skill_lock_dirs().items()
+                if (names is None or name in names) and name not in claimed for real in reals}
+        found |= here
+        claimed |= {name for name, _ in here}
+    return sorted(found)
 
 
 def _guard_state() -> tuple[list[tuple[str, str]], str | None]:

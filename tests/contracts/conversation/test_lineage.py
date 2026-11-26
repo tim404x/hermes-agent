@@ -232,6 +232,34 @@ def test_lineage_off_chain_segment_reads_itself(backend, scope_a):
     assert store_a.lineage.lineage(SessionId("lin-o-second")) == (SessionId("lin-o-second"),)
 
 
+def test_lineage_root_is_the_first_lineage_element_on_every_shape(backend, scope_a):
+    store_a = backend.open(scope_a)
+    _chain(backend, scope_a, "lin-lr-root", "lin-lr-mid", "lin-lr-tip")
+    # A subagent and a branch under the chain, a newer sibling continuation off the walked chain, a reset
+    # continuation, a tool child and a continuation of a parent that did not compress.
+    store_a.sessions.create(_new("lin-lr-delegate", source="tool", parent_session_id=SessionId("lin-lr-mid"),
+                                 lineage_kind=SessionLineageKind.DELEGATE))
+    store_a.sessions.create(_new("lin-lr-branch", parent_session_id=SessionId("lin-lr-mid"),
+                                 lineage_kind=SessionLineageKind.BRANCH))
+    store_a.sessions.create(_new("lin-lr-sibling", parent_session_id=SessionId("lin-lr-root")))
+    store_a.sessions.create(_new("lin-lr-toolchild", source="tool", parent_session_id=SessionId("lin-lr-tip")))
+    store_a.sessions.create(_new("lin-lr-open"))
+    store_a.sessions.create(_new("lin-lr-under-open", parent_session_id=SessionId("lin-lr-open")))
+    _continue(backend, scope_a, "lin-lr-branch", "lin-lr-branch-next")
+    root = SessionId("lin-lr-root")
+    # CONTRACT: a chain segment's lineage root is the chain root, from any segment.
+    for sid in ("lin-lr-root", "lin-lr-mid", "lin-lr-tip"):
+        assert store_a.lineage.lineage_root(SessionId(sid)) == root
+    # CONTRACT: a fork is its own root and roots the chain it starts.
+    assert store_a.lineage.lineage_root(SessionId("lin-lr-branch")) == SessionId("lin-lr-branch")
+    assert store_a.lineage.lineage_root(SessionId("lin-lr-branch-next")) == SessionId("lin-lr-branch")
+    # CONTRACT: whatever the shape, it is ``lineage(sid)[0]``, the session itself when that lineage is empty.
+    for sid in ("lin-lr-root", "lin-lr-mid", "lin-lr-tip", "lin-lr-delegate", "lin-lr-branch", "lin-lr-sibling",
+                "lin-lr-toolchild", "lin-lr-open", "lin-lr-under-open", "lin-lr-branch-next", "lin-lr-ghost", ""):
+        assert store_a.lineage.lineage_root(SessionId(sid)) == (store_a.lineage.lineage(SessionId(sid))
+                                                                 or (SessionId(sid),))[0], sid
+
+
 # ── conversation_root ─────────────────────────────────────────────────────────
 
 

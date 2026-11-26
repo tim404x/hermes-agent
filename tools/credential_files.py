@@ -14,7 +14,7 @@ import stat
 import time
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 from hermes_cli.config import cfg_get
 from hermes_constants import get_hermes_dir, get_hermes_home
@@ -117,6 +117,39 @@ def _read_guard_allows_mount(rel: str, resolved: Path, hermes_home: Path, refusa
     return True
 
 
+class CredentialFileReport(NamedTuple):
+    registered: list[str]
+    missing: list[str]
+    refused: list[str]
+
+
+def _register_one(relative_path: str, container_base: str = "/root/.hermes") -> str:
+    """One registration attempt: ``"registered"``, ``"missing"`` (absent, dangling, or outside
+    HERMES_HOME) or ``"refused"`` (present, but the mount guard denies it). Any earlier registration
+    for the same destination is dropped unless this attempt registers it again, so a file that
+    turned into a refused store never keeps mounting from a stale entry."""
+    hermes_home = get_hermes_home()
+    container_path = f"{container_base.rstrip('/')}/{relative_path}"
+    resolved = _contained_host_path(
+        relative_path, hermes_home,
+        "credential_files: rejected absolute path %r (must be relative to HERMES_HOME)",
+        "credential_files: rejected path traversal %r (%s)")
+    if resolved is None:
+        _get_registered().pop(container_path, None)
+        return "missing"
+    if not resolved.is_file():
+        logger.debug("credential_files: skipping %s (not found)", resolved)
+        _get_registered().pop(container_path, None)
+        return "missing"
+    if not _read_guard_allows_mount(relative_path, resolved, hermes_home, _SKILL_REFUSALS):
+        _get_registered().pop(container_path, None)
+        return "refused"
+
+    _get_registered()[container_path] = str(resolved)
+    logger.debug("credential_files: registered %s -> %s", resolved, container_path)
+    return "registered"
+
+
 def register_credential_file(relative_path: str, container_base: str = "/root/.hermes") -> bool:
     """Register a HERMES_HOME-relative credential file for mounting; True if it exists and was registered.
 
@@ -125,36 +158,40 @@ def register_credential_file(relative_path: str, container_base: str = "/root/.h
     which are refused via the canonical read deny-list so the mount surface cannot hand a
     skill what the read surface denies. Fails CLOSED (logged) if the guard is unavailable or raises.
     """
-    resolved = _contained_host_path(
-        relative_path, get_hermes_home(),
-        "credential_files: rejected absolute path %r (must be relative to HERMES_HOME)",
-        "credential_files: rejected path traversal %r (%s)")
-    if resolved is None:
-        return False
-    if not resolved.is_file():
-        logger.debug("credential_files: skipping %s (not found)", resolved)
-        return False
-    if not _read_guard_allows_mount(relative_path, resolved, get_hermes_home(), _SKILL_REFUSALS):
-        return False
-
-    container_path = f"{container_base.rstrip('/')}/{relative_path}"
-    _get_registered()[container_path] = str(resolved)
-    logger.debug("credential_files: registered %s -> %s", resolved, container_path)
-    return True
+    return _register_one(relative_path, container_base) == "registered"
 
 
-def register_credential_files(entries: list, container_base: str = "/root/.hermes") -> list[str]:
-    """Register skill-frontmatter entries (str or dict with ``path``); return missing paths."""
-    missing = []
+def _iter_entry_paths(entries: list) -> Iterator[str]:
     for entry in entries:
         if isinstance(entry, dict):
             entry = entry.get("path") or entry.get("name") or ""
-        elif not isinstance(entry, str):
+        if not isinstance(entry, str):
             continue
         rel_path = entry.strip()
-        if rel_path and not register_credential_file(rel_path, container_base):
-            missing.append(rel_path)
-    return missing
+        if rel_path:
+            yield rel_path
+
+
+def register_credential_files_report(
+    entries: list, container_base: str = "/root/.hermes",
+) -> CredentialFileReport:
+    """Register skill-frontmatter entries (str or dict with ``path``) and classify each outcome."""
+    registered: list[str] = []
+    missing: list[str] = []
+    refused: list[str] = []
+    buckets = {"registered": registered, "missing": missing, "refused": refused}
+    for rel_path in _iter_entry_paths(entries):
+        buckets[_register_one(rel_path, container_base)].append(rel_path)
+    return CredentialFileReport(registered=registered, missing=missing, refused=refused)
+
+
+def register_credential_files(entries: list, container_base: str = "/root/.hermes") -> list[str]:
+    """Legacy wrapper returning unmounted paths (missing or refused) in input order.
+
+    Readiness callers must use :func:`register_credential_files_report` so existing files
+    refused by the mount guard are not reported as missing.
+    """
+    return [p for p in _iter_entry_paths(entries) if _register_one(p, container_base) != "registered"]
 
 
 def _load_config_files() -> list[dict[str, str]]:

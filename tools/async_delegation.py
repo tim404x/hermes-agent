@@ -29,7 +29,7 @@ from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
 from tools.async_delegation_worker import worker_ledger, require_ledger_owner
 from tools.delegate_tool_progress import SUBAGENT_FAILURE_STATUSES
-from tools.delegation_redaction import redact_child_result, redact_completion_event
+from tools.delegation_redaction import redact_child_result, redact_child_value, redact_completion_event
 
 logger = logging.getLogger(__name__)
 
@@ -673,7 +673,7 @@ def failed_delegations_for_session(
     failed: list[dict[str, Any]] = []
     for row in rows:
         delegation_id, state, dispatched_at, completed_at = row.delegation_id, row.state, row.dispatched_at, row.completed_at
-        task, result = row.task, redact_child_result(row.result)
+        task, result = row.task, row.result
         goals = task.get("goals") if isinstance(task.get("goals"), list) and task["goals"] else [task.get("goal") or ""]
         tasks = result["results"] if isinstance(result.get("results"), list) else [] if task.get("is_batch") else [result]
         from tools.delegate_tool_auto_resume import waiting_on_resume
@@ -686,13 +686,19 @@ def failed_delegations_for_session(
             if status not in _FAILED_TASK_STATES or waiting_on_resume(entry):
                 continue
             index = entry.get("task_index") if isinstance(entry.get("task_index"), int) else 0
-            error = entry.get("error") or result.get("error")
+            error = entry.get("error")
+            if error:
+                error = redact_child_value(error, force=True)
+            if not error and (fallback := result.get("error")):
+                error = redact_child_value(fallback, force=True)
             failed.append({
                 "delegation_id": delegation_id, "task_index": index, "status": status,
                 # ``goals`` is the whole call's list (split units store it too); task_index indexes it.
                 "goal": str((goals[index] if 0 <= index < len(goals) else goals[0]) or ""),
                 "error": str(error) if error else None,
                 "dispatched_at": dispatched_at, "completed_at": completed_at})
+            if len(failed) == limit:
+                return failed
     return failed[:limit]
 
 

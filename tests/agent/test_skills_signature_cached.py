@@ -1,0 +1,274 @@
+import os
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+import pytest
+
+from agent import skill_commands, skill_index
+from hermes_constants import get_hermes_home
+from tools import skills_tool
+
+
+def _signature(root):
+    return skills_tool._skills_scan_signature([root], set())
+
+
+def _settle(root, monkeypatch):
+    old = time.time() - 10
+    for path, _, _ in os.walk(root):
+        os.utime(path, (old, old))
+    now = time.time_ns
+    monkeypatch.setattr(time, "time_ns", lambda: now() + 10_000_000_000)
+
+
+def _count_scans(monkeypatch):
+    scans = Counter()
+    scan = os.scandir
+
+    def counted(path):
+        scans[os.path.realpath(path)] += 1
+        return scan(path)
+
+    monkeypatch.setattr(os, "scandir", counted)
+    return scans
+
+
+def test_quiet_tree_does_not_relist_and_nested_changes_are_seen(tmp_path, monkeypatch):
+    category = tmp_path / "ml" / "training"
+    category.mkdir(parents=True)
+    _settle(tmp_path, monkeypatch)
+    initial = _signature(tmp_path)
+    scans = _count_scans(monkeypatch)
+    assert initial == _signature(tmp_path) == _signature(tmp_path)
+    assert not scans
+    skill = category / "first"
+    skill.mkdir()
+    added = _signature(tmp_path)
+    marker = skill / "SKILL.md"
+    marker.touch()
+    marked = _signature(tmp_path)
+    marker.unlink()
+    unmarked = _signature(tmp_path)
+    renamed = skill.rename(category / "second")
+    moved = _signature(tmp_path)
+    renamed.rmdir()
+    removed = _signature(tmp_path)
+    assert all(left != right for left, right in zip(
+        (initial, added, marked, unmarked, moved), (added, marked, unmarked, moved, removed)))
+
+
+def test_marker_added_in_same_directory_tick_changes_signature(tmp_path, monkeypatch):
+    skill = tmp_path / "category" / "skill"
+    skill.mkdir(parents=True)
+    key = skill_index.stat_key(skill)
+    stat_key = skill_index.stat_key
+    monkeypatch.setattr(skill_index, "stat_key", lambda path: key if Path(path) == skill else stat_key(path))
+    before = _signature(tmp_path)
+    (skill / "SKILL.md").touch()
+    os.utime(skill, ns=(key[-2], key[-2]))
+    assert before != _signature(tmp_path)
+
+
+def test_published_scopes_share_one_walk_even_while_racy(tmp_path, monkeypatch):
+    root = tmp_path / "shared"
+    (root / "category").mkdir(parents=True)
+    homes = [tmp_path / name for name in ("first", "second")]
+    for home in homes:
+        home.mkdir()
+        (home / "skills").symlink_to(root, target_is_directory=True)
+    monkeypatch.setattr(skill_commands, "_skill_commands_by_key", {("cli", str(home), None): {} for home in homes})
+    monkeypatch.setattr(skills_tool, "skill_search_dirs", lambda: (
+        [(0, get_hermes_home() / "skills")] if get_hermes_home() in homes else [], None))
+    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", set)
+    scans = _count_scans(monkeypatch)
+    first = skill_commands.published_scopes_signature()
+    assert scans == {str(root): 1, str(root / "category"): 1}
+    (root / "category" / "new").mkdir()
+    second = skill_commands.published_scopes_signature()
+    assert all(first[index] != second[index] for index in (1, 2))
+
+
+def test_atomic_usage_rewrite_is_not_a_catalog_change(tmp_path):
+    usage = tmp_path / ".usage.json"
+    usage.write_text("{}")
+    before = _signature(tmp_path)
+    replacement = tmp_path / ".usage_staging.tmp"
+    replacement.write_text('{"count": 1}')
+    (tmp_path / ".usage.json.lock").touch()
+    assert _signature(tmp_path) == before
+    replacement.replace(usage)
+    assert _signature(tmp_path) == before
+
+
+def test_pruned_symlink_kind_and_atomic_skill_replacement_are_visible(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    root.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    (root / ".hub").symlink_to(target, target_is_directory=True)
+    marker = root / "SKILL.md"
+    marker.touch()
+    _settle(root, monkeypatch)
+    before = _signature(root)
+    target.rmdir()
+    target.touch()
+    after = _signature(root)
+    assert after != before
+    new = tmp_path / "new.md"
+    new.write_text("new command")
+    new.replace(marker)
+    assert _signature(root) != after
+
+
+def test_transient_entry_oserror_retries_without_parent_timestamp_change(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    (root / "flaky-skill").mkdir(parents=True)
+    (root / "steady-skill").mkdir(parents=True)
+    _settle(root, monkeypatch)
+
+    real_scandir = os.scandir
+    failed = {"once": False}
+
+    class _FlakyEntry:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+            self.name = wrapped.name
+            self.path = wrapped.path
+
+        def is_symlink(self):
+            return self._wrapped.is_symlink()
+
+        def is_dir(self, *args, **kwargs):
+            if self.name == "flaky-skill" and not failed["once"]:
+                failed["once"] = True
+                raise PermissionError("transient entry stat failure")
+            return self._wrapped.is_dir(*args, **kwargs)
+
+        def inode(self):
+            return self._wrapped.inode()
+
+    class _FlakyScandir:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            return [_FlakyEntry(e) for e in self._inner.__enter__()]
+
+        def __exit__(self, *exc):
+            return self._inner.__exit__(*exc)
+
+    monkeypatch.setattr(os, "scandir", lambda path: _FlakyScandir(real_scandir(path)))
+    first = _signature(root)
+    assert failed["once"]
+    # First answer omitted flaky-skill while keeping steady-skill.
+    root_rows = first[0][0][1]
+    assert root_rows[0][2] == ("steady-skill",)
+
+    # Next poll with NO parent timestamp change must re-list and include flaky-skill.
+    monkeypatch.setattr(os, "scandir", real_scandir)
+    second = _signature(root)
+    assert second != first
+    assert second[0][0][1][0][2] == ("flaky-skill", "steady-skill")
+
+    # Once complete and settled, subsequent polls reuse the cached listing with zero scandirs.
+    scans = _count_scans(monkeypatch)
+    assert _signature(root) == second
+    assert not scans
+
+
+def test_unreliable_ctime_relists_when_parent_mtime_is_restored(tmp_path, monkeypatch):
+    category = tmp_path / "ml" / "training"
+    category.mkdir(parents=True)
+    _settle(tmp_path, monkeypatch)
+    old_stat = os.stat(category)
+    real_stat_key = skill_index.stat_key
+
+    def windows_like_stat_key(path):
+        key = real_stat_key(path)
+        if key is not None and Path(path) == category:
+            # Windows st_ctime_ns is creation time: stays fixed across child adds + utime.
+            return (*key[:-1], old_stat.st_ctime_ns)
+        return key
+
+    monkeypatch.setattr(skill_index, "stat_key", windows_like_stat_key)
+    monkeypatch.setattr(skill_index, "stat_ctime_is_change_time", lambda: False)
+    before_key = skill_index.stat_key(category)
+    before = _signature(tmp_path)
+
+    (category / "restored-mtime-skill").mkdir()
+    os.utime(category, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+    assert skill_index.stat_key(category) == before_key
+    assert _signature(tmp_path) != before
+
+
+@pytest.mark.platforms("windows")
+def test_windows_restored_mtime_after_child_add_changes_signature(tmp_path, monkeypatch):
+    category = tmp_path / "ml" / "training"
+    category.mkdir(parents=True)
+    _settle(tmp_path, monkeypatch)
+    old_stat = os.stat(category)
+    before = _signature(tmp_path)
+
+    (category / "restored-mtime-skill").mkdir()
+    os.utime(category, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+    assert _signature(tmp_path) != before
+
+
+def test_published_scopes_share_realpath_across_project_root_discovery_and_reading(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    shared_project_skills = tmp_path / "real-project-skills"
+    (shared_project_skills / "proj-skill").mkdir(parents=True)
+    (shared_project_skills / "proj-skill" / "SKILL.md").write_text("---\nname: proj-skill\n---\n")
+    (repo / ".hermes").mkdir()
+    project_skills_link = repo / ".hermes" / "skills"
+    project_skills_link.symlink_to(shared_project_skills, target_is_directory=True)
+
+    homes = [tmp_path / name for name in ("home-a", "home-b")]
+    for home in homes:
+        (home / "skills").mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            f"skills:\n  trusted_project_dirs:\n    - {repo}\n", encoding="utf-8"
+        )
+
+    monkeypatch.setattr(
+        skill_commands,
+        "_skill_commands_by_key",
+        {("cli", str(home), str(repo)): {} for home in homes},
+    )
+    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", set)
+
+    resolutions = Counter()
+    real_realpath = os.path.realpath
+
+    def _from_home_io_guard():
+        frame = sys._getframe(2)
+        for _ in range(6):
+            if frame is None:
+                return False
+            if frame.f_code.co_filename.endswith("home_io_guard.py"):
+                return True
+            frame = frame.f_back
+        return False
+
+    def counted_realpath(path, *args, **kwargs):
+        if not _from_home_io_guard():
+            resolutions[os.fspath(path)] += 1
+        return real_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", counted_realpath)
+    sig = skill_commands.published_scopes_signature()
+
+    # Both scopes discovered the trusted project skills root (canonical target).
+    resolved_target = real_realpath(project_skills_link)
+    for row in sig[1:]:
+        roots_in_sig = [entry[0] for entry in row[2][0]]
+        assert resolved_target in roots_in_sig
+
+    # The candidate symlink was resolved once across discovery + signature reading for both scopes,
+    # and its canonical target was never re-resolved.
+    assert resolutions[str(project_skills_link)] == 1
+    assert resolutions[resolved_target] == 0
+    assert resolutions[str(repo)] == 1

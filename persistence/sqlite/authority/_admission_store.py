@@ -8,7 +8,6 @@ values and run at a fixed point inside that transaction; their bodies live in :m
 
 from __future__ import annotations
 
-import heapq
 import json
 import uuid
 
@@ -53,6 +52,7 @@ __all__ = [
     "retarget_local_automation",
     "return_session_claim",
     "revert_steer_input",
+    "session_admissions_mentioning",
     "settle_session_input",
     "steer_session_input",
 ]
@@ -119,32 +119,67 @@ def find_session_admission(holder, *, principal_id: str, session_id: str, reques
                                  'AND request_id=?', (principal_id, session_id, request_id)).fetchone())
 
 
+# Disjoint ranges of the existing (target, status, seq) index, merged in one snapshot.
+# An IN filter sorts full payload rows; adding a competing (target, seq) index instead
+# can make a pending-only probe scan terminal history. No schema build on existing stores.
+_ADMISSION_ARMS = tuple(
+    f"SELECT * FROM session_admissions WHERE target_session_id=:target AND status='{status}'"
+    for status in ('queued', 'started', 'unknown', 'terminal'))  # the table's status CHECK
+_PENDING_ADMISSIONS_SQL = ' UNION ALL '.join(_ADMISSION_ARMS[:-1]) + ' ORDER BY seq'
+_ALL_ADMISSIONS = ' UNION ALL '.join(_ADMISSION_ARMS)
+_ALL_ADMISSIONS_SQL = _ALL_ADMISSIONS + ' ORDER BY seq'
+_LATEST_ADMISSION_SQL = _ALL_ADMISSIONS_SQL + ' DESC'
+
+
 def list_session_admissions(holder, *, session_id: str, pending_only: bool = True) -> list[dict]:
     with holder._read_ctx() as conn:
-        # Pending is an explicit index-range IN, not ``!='terminal'``: a negated status cannot
-        # bound the (target, status, seq) index, so every probe scanned the session's history.
-        sql = ("SELECT * FROM session_admissions WHERE target_session_id=? "
-               + ("AND status IN ('queued','started','unknown') " if pending_only else "") + "ORDER BY seq")
-        return [_row(row) for row in conn.execute(sql, (session_id,))]
+        sql = _PENDING_ADMISSIONS_SQL if pending_only else _ALL_ADMISSIONS_SQL
+        return [_row(row) for row in conn.execute(sql, {'target': session_id})]
 
 
-_ADMISSION_STATUSES = ('queued', 'started', 'unknown', 'terminal')  # the table's status CHECK
-
-
-def latest_session_admission(holder, *, session_id: str, payload_marker: str) -> dict | None:
-    """The newest admission whose decoded payload holds the top-level key ``payload_marker``, stopping at the first
-    match: a restored lane needs only its latest envelope, not the session's whole history. One newest-first stream
-    per status, merged by ``seq``, so each walks the (target, status, seq) index with no sort."""
-    sql = "SELECT * FROM session_admissions WHERE target_session_id=? AND status=? ORDER BY seq DESC"
+def latest_session_admission(holder, *, session_id: str, payload_marker: str, match=None) -> dict | None:
+    """The newest admission whose decoded payload holds the top-level key ``payload_marker`` (and, when given, for
+    which ``match(row)`` is true), stopping at the first match: a restored lane and a borrowed envelope need only
+    the latest row, not the session's whole history. One statement, so one snapshot (a row moving between
+    statuses mid-read is seen exactly once; per-status cursors opened one after another could miss it), whose
+    per-status arms each walk the (target, status, seq) index newest first and merge by ``seq`` with no sort.
+    Only the rows down to the match are decoded; ``match`` runs inside the read and must not call the store."""
     with holder._read_ctx() as conn:
-        cursors = [conn.execute(sql, (session_id, status)) for status in _ADMISSION_STATUSES]
+        cursor = conn.execute(_LATEST_ADMISSION_SQL, {'target': session_id})
         try:
-            rows = heapq.merge(*cursors, key=lambda row: row['seq'], reverse=True)
-            return next((row for row in map(_row, rows)
-                         if isinstance(row['payload'], dict) and payload_marker in row['payload']), None)
+            return next((row for row in map(_row, cursor)
+                         if isinstance(row['payload'], dict) and payload_marker in row['payload']
+                         and (match is None or match(row))), None)
         finally:
-            for cursor in cursors:  # before the connection goes back to the pool
-                cursor.close()
+            cursor.close()  # before the connection goes back to the pool
+
+
+def session_admissions_mentioning(holder, *, session_id: str, value: str) -> list[dict]:
+    """The session's admissions, in ``seq`` order, whose payload holds the string ``value`` (``payload_holds_string``).
+
+    SQLite narrows them by the value's JSON string token in ``payload_json`` and only those rows are decoded and
+    checked exactly: a producer-identity probe on a long-lived chat must not decode its whole history on the owner
+    loop (2,007 rows on Tim's main chat, the loop stalls of 24 Nov 2026). Every writer stores payloads with
+    ``json.dumps`` (canonical or not, ``ensure_ascii`` either way), so a payload that holds ``value`` contains one of
+    the two encodings below verbatim; inside a longer string its quotes would be escaped, so the token cannot
+    match there, and any other false hit is dropped by the exact check."""
+    from persistence.authority.admissions import payload_holds_string
+    if not isinstance(value, str):
+        raise AuthorityRefusal('invalid_params')
+    tokens = set()
+    for ensure_ascii in (False, True):
+        token = json.dumps(value, ensure_ascii=ensure_ascii)
+        try:
+            token.encode('utf-8')
+        except UnicodeEncodeError:  # a lone surrogate: no stored payload holds this spelling
+            continue
+        tokens.add(token)
+    params = {f'token{i}': token for i, token in enumerate(sorted(tokens))}
+    where = ' OR '.join(f'instr(payload_json, :{key}) > 0' for key in params)
+    with holder._read_ctx() as conn:
+        rows = conn.execute(f'SELECT * FROM ({_ALL_ADMISSIONS}) WHERE {where} ORDER BY seq',
+                            {'target': session_id, **params}).fetchall()
+    return [row for row in map(_row, rows) if payload_holds_string(row['payload'], value)]
 
 
 _ANY_HEAD = object()

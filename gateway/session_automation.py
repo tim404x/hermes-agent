@@ -26,17 +26,31 @@ def producer_identity(runner, event):
     return json.dumps(identity, separators=(',', ':'))
 
 
-def completion_admission(runner, event):
+async def completion_admission(runner, event):
+    """Look up a lost producer ACK without occupying the gateway's socket/liveness loop."""
     from gateway.session_authorities import active_authority
     authority = active_authority(runner)
     if authority is None:
         return None
-    from gateway.session_detached import route_entry
-    entry = route_entry(authority, str(event.get('session_key') or ''))
+    route = str(event.get('session_key') or '')
+    store = authority_persistence(authority).aio
+    entry = await runner.async_session_store.lookup_by_session_key(route)
     if entry is None:
-        return None
+        # This key already names the logical owner. Verify the live pin on the loop; a
+        # read of the ledger need not synthesize a routing entry or mutate owner hints.
+        from gateway.session_detached import detached_live
+        found = detached_live(authority, route)
+        if found is None:
+            return None
+        owner = found[0].session_id
+    elif entry.origin is not None and entry.origin.platform == Platform.LOCAL:
+        owner = entry.origin.chat_id
+    else:
+        owner = await store.lineage.lineage_root(entry.session_id)
     identity = producer_identity(runner, event)
-    rows = authority_persistence(authority).admissions.list(session_id=_route_owner(authority, entry), pending_only=False)
+    # Even when no row is returned, SQLite must inspect the route's payloads. Use the
+    # store's own executor, not the owner loop or the default executor used by resume.
+    rows = await store.admissions.mentioning(session_id=owner, value=identity)
     for row in rows:
         descriptor = row.payload.get('local_automation_v1') or row.payload.get('native_text_v1', {}).get('automation', {})
         if identity in descriptor.get('identities', [descriptor.get('identity')]):
@@ -411,17 +425,21 @@ def committed_route_envelope(authority, entry, *, human_only=False, user_id=None
     borrows), or ``None`` while no matching message was admitted there. ``human_only`` skips an
     automation wake's own envelope, so a reused route cannot launder a sender through it;
     ``user_id`` keeps a shared route's wake on the producer's own authenticated sender."""
-    # Admissions belong to the logical root; ``entry.session_id`` is only the transcript tip.
-    prior = authority_persistence(authority).admissions.list(session_id=authority.logical_owner(entry.session_id),
-                                                             pending_only=False)
-    for row in reversed(prior):
+    def borrowable(row):
         envelope = row.payload.get('native_text_v1')
         if not envelope or (human_only and 'automation' in envelope):
-            continue
-        if user_id is not None and str((envelope.get('source') or {}).get('user_id') or '') != str(user_id):
-            continue
-        return envelope if 'provenance' in envelope else None
-    return None
+            return False
+        return user_id is None or str((envelope.get('source') or {}).get('user_id') or '') == str(user_id)
+
+    # Admissions belong to the logical root; ``entry.session_id`` is only the transcript tip. Newest first, stopping
+    # at the first borrowable row: this runs on the owner loop, and decoding a long-lived chat's whole history there
+    # stalled it for seconds (24 Nov 2026).
+    row = authority_persistence(authority).admissions.latest_admission(
+        session_id=authority.logical_owner(entry.session_id), payload_marker='native_text_v1', match=borrowable)
+    if row is None:
+        return None
+    envelope = row.payload['native_text_v1']
+    return envelope if 'provenance' in envelope else None
 
 
 _MAX_RESET_ANCESTORS = 64

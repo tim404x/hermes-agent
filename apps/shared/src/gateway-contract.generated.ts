@@ -5505,6 +5505,8 @@ export interface CanonicalTurnAuthor {
   name?: string | null
   is_bot?: boolean
   origin?: string | null
+  hops?: number | null
+  tab_depth?: number | null
 }
 export interface CanonicalModelOverride {
   model: string

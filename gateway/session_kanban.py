@@ -11,9 +11,16 @@ import sqlite3
 from persistence.core.errors import AuthorityRefusal
 
 
+def _resolve_assignee_home(assignee: str, source_home: str | None) -> Path:
+    from hermes_cli.profiles import profile_root_for_env_home, resolve_profile_at_root, resolve_profile_env
+    if not source_home:
+        return Path(resolve_profile_env(assignee)).resolve()
+    root = profile_root_for_env_home(str(source_home), Path(source_home))
+    return resolve_profile_at_root(assignee, root).resolve()
+
+
 def build_kanban_policy(connection, params, config):
     from hermes_cli import kanban_db as kb
-    from hermes_cli.profiles import resolve_profile_env
     authority, actor = connection.authority, connection.actor
     if not connection.native_owner or 'session:create' not in actor.capabilities:
         raise AuthorityRefusal('permission_denied')
@@ -23,6 +30,8 @@ def build_kanban_policy(connection, params, config):
             or any(not isinstance(params[k], str) or not params[k] for k in ('board', 'task_id', 'claim_lock'))
             or type(params['run_id']) is not int):
         raise AuthorityRefusal('invalid_params')
+    source_home = getattr(authority, 'source_profile_home', None)
+    expected_home = Path(source_home or authority.profile_id).resolve()
     try:
         board = kb._require_slug(params['board'])
         path = Path(params['db']).resolve(strict=True) if 'db' in params else kb.kanban_db_path(board=board).resolve()
@@ -34,7 +43,7 @@ def build_kanban_policy(connection, params, config):
                     or task.current_run_id != params['run_id'] or run['task_id'] != task.id
                     or task.claim_lock != params['claim_lock'] or run['claim_lock'] != task.claim_lock):
                 raise AuthorityRefusal('stale_kanban_claim')
-            if Path(resolve_profile_env(task.assignee)).resolve() != Path(authority.profile_id).resolve():
+            if _resolve_assignee_home(task.assignee, source_home) != expected_home:
                 raise AuthorityRefusal('profile_mismatch')
             bound = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted' ORDER BY id DESC LIMIT 1",
                                  (task.id, task.current_run_id)).fetchone()
@@ -50,11 +59,14 @@ def build_kanban_policy(connection, params, config):
     cwd = task.workspace_path
     private = {}
     policy = kanban_launch_policy(task, cwd, config, private)
+    worker_plane_meta = getattr(authority, 'kanban_worker_plane_meta', None)
     context = dict(params, workspace=cwd, branch=task.branch_name, tenant=task.tenant,
         profile=task.assignee, workspaces_root=str(kb.workspaces_root(board=board).resolve()),
         skills=skills, goal_mode=task.goal_mode, goal_max_turns=task.goal_max_turns,
         goal_text='\n\n'.join(p for p in (task.title, task.body) if p), context=context,
         max_runtime_seconds=task.max_runtime_seconds, accept_hooks=True)
+    if isinstance(worker_plane_meta, dict) and worker_plane_meta:
+        context['worker_plane_meta'] = dict(worker_plane_meta)
     context['db'] = str(path)
     request = json.loads(policy.request_json)
     request.update(source='kanban', board=board, task_id=task.id, run_id=task.current_run_id)
@@ -112,7 +124,14 @@ async def run_task(connection, params):
         from gateway.session_local_recovery import restore_local_session
         ref = restore_local_session(authority, sid)
     else:
-        policy, private = build_kanban_policy(connection, params, _load_gateway_config())
+        source_home = getattr(authority, 'source_profile_home', None)
+        if source_home:
+            from agent.runtime_scope import bind_profile_scope
+            with bind_profile_scope(source_home):
+                cfg = _load_gateway_config(Path(source_home) / 'config.yaml')
+                policy, private = build_kanban_policy(connection, params, cfg)
+        else:
+            policy, private = build_kanban_policy(connection, params, _load_gateway_config())
         ref = create_local_session(authority, connection.actor, {'request_id': request_id},
                                    trusted_policy=policy, trusted_secrets=private)
     from hermes_cli.kanban_db_connect import connect_closing
@@ -121,6 +140,7 @@ async def run_task(connection, params):
     import psutil
     from hermes_cli.process_identity import worker_birth
     context = json.loads(policy.kanban_json)
+    worker_plane_meta = getattr(authority, 'kanban_worker_plane_meta', None)
 
     def admit_claim():
         # The Kanban DB is the cross-profile dispatch bus (busy_timeout up to 120 s): the claim
@@ -138,10 +158,13 @@ async def run_task(connection, params):
                 task = kb.get_task(conn, params['task_id'])
                 if not (task and task.status == 'running' and task.current_run_id == params['run_id'] and task.claim_lock == params['claim_lock']):
                     raise AuthorityRefusal('stale_kanban_claim')
-                kb._append_event(conn, task.id, 'owner_admitted',
-                    {'db': owner_db, 'session_id': ref.session_id,
-                     'request_id': request_id, 'pid': os.getpid(), 'birth': worker_birth(psutil.Process())},
-                    run_id=task.current_run_id)
+                admitted_payload = {
+                    'db': owner_db, 'session_id': ref.session_id,
+                    'request_id': request_id, 'pid': os.getpid(), 'birth': worker_birth(psutil.Process()),
+                }
+                if isinstance(worker_plane_meta, dict) and worker_plane_meta:
+                    admitted_payload.update(worker_plane_meta)
+                kb._append_event(conn, task.id, 'owner_admitted', admitted_payload, run_id=task.current_run_id)
     from gateway.session_runtime_workers import tracked_write
     await tracked_write(authority, admit_claim)
     await connection.resume(ref, {})
@@ -200,9 +223,18 @@ def bind_worker_context(frame):
             # kills target it; ``_watch_submitter`` ties this interpreter's life to it). The bound
             # interpreter is recorded beside it so a sweep can tell when the attempt is truly gone.
             from hermes_cli.kanban_db_dispatch import UNVERIFIED_WORKER_FINGERPRINT, _process_fingerprint
+            from hermes_cli.kanban_worker_plane import read_current_cgroup_path
             fingerprint = _process_fingerprint(os.getpid()) or UNVERIFIED_WORKER_FINGERPRINT
-            kb._append_event(conn, task.id, 'worker_bound', {'pid': os.getpid(), 'claim_lock': context['claim_lock'],
-                             'started_at': fingerprint}, run_id=context['run_id'])
+            bound_payload = {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'started_at': fingerprint}
+            plane_meta = context.get('worker_plane_meta')
+            if isinstance(plane_meta, dict) and plane_meta:
+                for key in ('worker_plane', 'systemd_unit', 'invocation_id', 'boot_id', 'attempt_home', 'profile_home'):
+                    if plane_meta.get(key):
+                        bound_payload[key] = plane_meta[key]
+            cgroup = read_current_cgroup_path()
+            if cgroup:
+                bound_payload['cgroup'] = cgroup
+            kb._append_event(conn, task.id, 'worker_bound', bound_payload, run_id=context['run_id'])
             claimed = conn.execute("SELECT payload, created_at FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",
                                    (task.id, context['run_id'])).fetchone()
     # Heartbeats extend the claim by the TTL the dispatcher claimed it with (a spawned worker

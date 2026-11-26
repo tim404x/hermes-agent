@@ -2,12 +2,14 @@
 Import-light by design: no tool registry, CLI config, or provider resolution."""
 
 import ast
+import contextvars
 import hashlib
 import logging
 import os
 import re
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path, PurePath
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -18,6 +20,41 @@ from hermes_constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+_poll_realpath: contextvars.ContextVar[Optional[Callable[[Any], str]]] = contextvars.ContextVar(
+    "skill_utils_poll_realpath", default=None
+)
+
+
+def _cached_realpath() -> Callable[[Any], str]:
+    """Per-poll realpath memo; canonical outputs map to themselves so repeated resolves hit."""
+    seen: dict[str, str] = {}
+
+    def resolve(path: Any) -> str:
+        key = os.fspath(path)
+        hit = seen.get(key)
+        if hit is None:
+            hit = os.path.realpath(key)
+            seen[key] = seen[hit] = hit
+        return hit
+
+    return resolve
+
+
+@contextmanager
+def bind_poll_realpath(resolver: Optional[Callable[[Any], str]] = None):
+    """Share *resolver* (default: a fresh per-poll realpath memo) across root discovery."""
+    active = _cached_realpath() if resolver is None else resolver
+    token = _poll_realpath.set(active)
+    try:
+        yield active
+    finally:
+        _poll_realpath.reset(token)
+
+
+def _resolve_path(path: Path) -> Path:
+    resolver = _poll_realpath.get()
+    return Path(resolver(path)) if resolver is not None else path.resolve()
 
 PLATFORM_MAP = {"macos": "darwin", "linux": "linux", "windows": "win32"}
 
@@ -352,10 +389,10 @@ def get_external_skills_dirs() -> list[Path]:
     skills_cfg = _skills_cfg()
     if skills_cfg is None:
         return []
-    local_skills = get_skills_dir().resolve()
+    local_skills = _resolve_path(get_skills_dir())
     result: list[Path] = []
     for entry in _config_str_list(skills_cfg.get("external_dirs")):
-        p = _home_relative(_expand_path(entry)).resolve()
+        p = _resolve_path(_home_relative(_expand_path(entry)))
         if p == local_skills or p in result:
             continue
         if p.is_dir():
@@ -376,11 +413,11 @@ def get_skill_create_dir() -> Optional[Path]:
         return None
     p = _home_relative(_expand_path(entry))
     try:
-        resolved = p.resolve()
+        resolved = _resolve_path(p)
     except OSError:
         resolved = p
     try:
-        if resolved == get_skills_dir().resolve():
+        if resolved == _resolve_path(get_skills_dir()):
             return None
     except OSError:
         pass
@@ -535,10 +572,10 @@ def find_project_root(start: Optional[Path] = None) -> Optional[Path]:
         if start is None:
             from agent.runtime_cwd import resolve_agent_cwd
             start = resolve_agent_cwd()
-        cur = Path(start).resolve()
+        cur = _resolve_path(Path(start))
     except OSError:
         return None
-    home = Path.home().resolve()
+    home = _resolve_path(Path.home())
     try:
         for _ in range(_PROJECT_ROOT_MAX_DEPTH):
             if (cur / ".git").exists():
@@ -558,7 +595,7 @@ def _project_trusted_dirs_from_config() -> set[Path]:
     result: set[Path] = set()
     for entry in _config_str_list(_skills_cfg_get("trusted_project_dirs")):
         try:
-            result.add(_expand_path(entry).resolve())
+            result.add(_resolve_path(_expand_path(entry)))
         except OSError:
             continue
     return result
@@ -567,7 +604,7 @@ def _project_trusted_dirs_from_config() -> set[Path]:
 def is_project_root_trusted(root: Path) -> bool:
     """True when *root* is listed in ``skills.trusted_project_dirs``."""
     try:
-        return Path(root).resolve() in _project_trusted_dirs_from_config()
+        return _resolve_path(Path(root)) in _project_trusted_dirs_from_config()
     except OSError:
         return False
 
@@ -575,12 +612,14 @@ def is_project_root_trusted(root: Path) -> bool:
 def _candidate_project_skills_dirs(root: Path) -> list[Path]:
     """Existing skill dirs under *root*, excluding the profile's own skills dir
     (HERMES_HOME itself may live inside a git checkout)."""
-    local_skills = get_skills_dir().resolve()
+    local_skills = _resolve_path(get_skills_dir())
     dirs: list[Path] = []
     for cand in (root / sub for sub in PROJECT_SKILLS_SUBDIRS):
         try:
-            if cand.is_dir() and cand.resolve() != local_skills:
-                dirs.append(cand.resolve())
+            if cand.is_dir():
+                resolved = _resolve_path(cand)
+                if resolved != local_skills:
+                    dirs.append(resolved)
         except OSError:
             continue
     return dirs

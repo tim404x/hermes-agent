@@ -321,6 +321,10 @@ up on the next tick (60s by default).
 # config.yaml
 kanban:
   dispatch_in_gateway: true        # default
+  worker_plane: profile_owner      # default: shared profile gateway execution.
+                                   # Set `isolated_systemd` for opt-in per-card
+                                   # transient systemd user services that survive
+                                   # gateway restarts.
   dispatch_interval_seconds: 60    # default
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
@@ -367,6 +371,64 @@ install give the user one with `sudo loginctl enable-linger <user>`.
   scope can be created, or set `KillMode=process` on that unit so its exit
   only kills the dispatcher itself.
 
+#### Isolated systemd worker plane (`kanban.worker_plane: isolated_systemd`)
+
+By default (`kanban.worker_plane: profile_owner`), the scoped worker client submits
+each claimed card to the assignee profile's shared gateway, which forks
+`agent.managed_worker` inside the gateway unit's cgroup. Restarting that gateway
+stops in-flight Kanban attempts.
+
+Setting `kanban.worker_plane: isolated_systemd` opts into restart-independent
+execution for Kanban cards (all other sources remain untouched):
+
+- **Per-card supervised unit:** each claimed run spawns its own transient systemd
+  user service (`hermes-kanban-w-<board_hash>-<task_id>-r<run_id>.service`,
+  `KillMode=control-group`) with an attempt-private `HERMES_HOME` and card-local
+  `SessionAuthority` + `agent.managed_worker`. It never opens the profile's shared
+  `state.db` for writing.
+- **Restart survival & live identity:** restarting the gateway leaves active worker
+  units running untouched. Dispatcher reclaim, timeout, stale-run, and crash sweeps
+  verify `(board, task_id, run_id, pid, birth/started_at, systemd_unit, invocation_id,
+  boot_id)` rather than bare PIDs, preventing duplicate dispatches or replayed tool
+  effects.
+- **Fail closed:** if Linux user systemd (`systemd-run --user` / user D-Bus) is
+  unavailable, spawns fail closed with an infrastructure deferral
+  (`RestartSafeScopeUnavailable`) without burning card retry budgets.
+  A missing or mismatched unit identity is not proof of exit: reclaim, timeout and
+  subsequent claims wait for a verified stop or an empty, inactive/absent unit.
+- **Profile inputs:** reusable shared asset trees (`skills`, `plugins`) are projected
+  read-only into the unit's mount namespace via `BindReadOnlyPaths=` (never copied per
+  attempt, and verified read-only inside the started unit; fails closed if mount
+  namespacing is unavailable). Tiny mutable inputs (`config.yaml`, `.env`, `auth.json`,
+  `memories`, `SOUL.md`, `hooks`, `locales`, `skins`, `models_dev_cache.json`) are
+  privately copied so attempt writes never mutate the owning profile or shared fleet
+  root. Standard named profiles (`<fleet-root>/profiles/<name>`) may use explicit
+  top-level relative aliases (`../../<asset>`) for `skills`, `plugins`, `memories`, and
+  `SOUL.md`; inside `skills`/`plugins`, only relative symlinks resolving within that
+  same asset root are allowed. Arbitrary aliases, escaping links, and special files are
+  refused. Supply credentials through the assignee's secret sources, not the systemd
+  manager; approval grants are read from the assignee's current policy.
+- **Session visibility:** the canonical board's `owner_admitted`, `worker_bound`,
+  and `worker_result` events plus the task worker log record the attempt's
+  `session_id`, `systemd_unit`, `cgroup`, and attempt-private `state.db` path
+  (readable with `open_persistence_reader`).
+
+**Operator enable & rollback:**
+
+1. Verify user systemd works for the gateway user (`systemctl --user is-system-running`
+   or `loginctl enable-linger <user>`).
+2. Enable in `config.yaml`: set `kanban.worker_plane: isolated_systemd` and reload/restart
+   the dispatching gateway. In-flight `profile_owner` attempts finish or reclaim normally;
+   new claims launch on `isolated_systemd`.
+3. Roll back at any time by setting `kanban.worker_plane: profile_owner` (or removing the key).
+   Already-running `isolated_systemd` units continue to be tracked and stopped/reclaimed by
+   their recorded unit identity until they finish; new claims return to `profile_owner`.
+
+To verify privately on Linux, use the installed test environment's interpreter to run
+`scripts/kanban_worker_plane_staging.py --receipt /path/to/private/receipt.json`.
+The harness uses a scratch home and board under the user's runtime directory, a
+loopback model and a transient gateway. No service installation or daemon reload is required.
+
 Running `hermes kanban daemon` as a separate process is **deprecated**;
 use the gateway. If you truly cannot run the gateway (headless host
 policy forbids long-lived services, etc.) a `--force` escape hatch keeps
@@ -387,6 +449,97 @@ or set `kanban.dispatch_profiles` per home to declare exactly which assignees
 that home may claim — anything else lands in the dispatcher's
 `skipped_nonspawnable` bucket instead of spawning, and no longer counts as
 spawnable work for the gateway's wake-up probe.
+
+### Admission for ranked projects (opt-in)
+
+A project owner can require an exact ranked card ID, a resource lane, and a
+non-conflicting write declaration **before a ready or review claim opens a run**.
+Nothing is enabled by default. No project is inferred from a title, prompt,
+assignee, tenant, or a `PRIORITIES.md` found by searching the checkout.
+
+**Prepare first, without enabling admission.** Choose one authoritative board
+for the project. Inventory every board/home that can dispatch into the workspace.
+Drain existing off-board work and reconcile running/review cards on the authority;
+publishing a mapping does not stop a worker. All claimers must run the admission-aware
+version and share the fleet registry and the same filesystem paths. Do not use
+independent board copies, hard links, DB-only bind mounts, or independently
+configured fleets to coordinate one guarded project.
+
+Create cards parked so that a dispatcher cannot start them before they are ranked:
+
+```bash
+hermes kanban --board research create 'Evaluate candidate' --assignee researcher \
+  --workspace dir:/srv/projects/example --initial-status blocked \
+  --resource-class gpu --write-scope evaluation/results
+
+hermes kanban --board research edit t_abcdef01 --resource-class cpu --read-only
+```
+
+Use the **returned ID**, not the example ID. `kanban_create` and the Python
+`create_task` API also accept `resource_class` (`gpu`, `data` for data/label work,
+or `cpu` for other work) and `write_scopes` (a list of literal paths). An explicit
+`[]` means read-only; omitting the field does not. `edit` can populate queued
+cards in place; `--write-scope` is repeatable and replaces the entire list on edit.
+Requeue an active card before changing its declaration. For worktree tasks,
+specify an explicit workspace path or use a project-linked worktree.
+
+Put the exact ID in the **Card** cell of a positive-numbered row in the table
+immediately under `## Ranked`. The heading may have a parenthesized caption,
+and a single `---` divider may separate it from the table:
+
+```markdown
+## Ranked
+| # | Task | Card |
+|---|------|------|
+| 1 | Compare candidates | t_abcdef01, t_0123abcd |
+```
+
+Only bare IDs or comma-separated lists consisting entirely of IDs count. A
+`later` row, an ID in another column, a stopped/history table, or “team cards”
+does not authorize a claim. Paths may be absolute or relative to the configured
+**project root**, not the card's working directory. `.` reserves the whole root;
+`..`, globs and symlinks escaping it are refused. A writer of `models` excludes
+`models/run1`, not `models-extra`. Explicit readers hold no write scope. This
+arbitrates **declared work**; it is not a filesystem sandbox for worker code.
+
+**Validate on an isolated fleet first.** The example below is a template, not a
+shipped configuration. Only after validation, publish the operator-owned JSON
+file `kanban/guarded-projects.json` under the **shared Kanban home** (not a worker's
+profile). Use an atomic file replacement for it and the ranked file. No restart
+is needed. Example for `/srv/hermes` as the shared home:
+
+```json
+{
+  "example": {
+    "workspace_root": "/srv/projects/example",
+    "priorities_file": "/srv/projects/example/PRIORITIES.md",
+    "board_db": "/srv/hermes/kanban/boards/research/kanban.db"
+  }
+}
+```
+
+The key is a stable reservation name. A workspace at or below the root matches,
+including aliases and shared `dir` tasks with **no project slug**. Optionally add
+`"project_id": "p_0123abcd"` to match the canonical stored project ID as well;
+that is not permission to use a workspace outside the root. Use disjoint mappings.
+`board_db` must name the actual default (`<home>/kanban.db`) or named board DB.
+A matching card on another board is refused, regardless of its board argument.
+The connected DB's fleet registry is also consulted when a different home opens it.
+A missing registry means opt-out; an unreadable/malformed registry fails closed
+because the fleet cannot establish which projects are guarded. A missing ranked
+file holds only the matching project. Keep both files local, regular, and ≤1 MiB.
+
+After activation, unblock the prepared cards. Limits are **three GPU, one data,
+six total per project** across all assignees. `running` and `review` both occupy
+a slot, including human review; moving from one to the other doesn't count twice.
+Pre-existing active cards count even without a managed run: an unknown class
+counts against each limited pool and undeclared writes reserve the project root.
+Leaving both active statuses releases the reservation in the same DB transaction.
+`hermes kanban show ID` reports the bounded rejection reason (e.g. `not_ranked`,
+`write_scope_busy`, `gpu_lane_cap`). No automatic merge, preemption or new run
+occurs. Fix the declaration/ranking, release a slot, or make an explicit human
+decision. Do not retarget project roots or aliases while work is active. To roll
+back, park/drain guarded work first, then remove the mapping.
 
 ### Idempotent create (for automation / webhooks)
 
@@ -1247,6 +1400,14 @@ The Desktop app's Kanban plugin surfaces the same terminal events natively — n
 Coverage window: desktop notifications ride the live event stream, so they fire only while the app is running with the Kanban plugin enabled. Events that land while the app is closed are not replayed as notifications on next launch — use a gateway subscription (below) for delivery that must survive the app being closed.
 
 ## Gateway notifications
+
+A successful completion commits the result receipt, closed run, completed event, and notification destinations in one board transaction. `metadata.artifacts` (or the `artifacts` tool argument) declares **required files**, not informational path references. Every declared file must be readable, allowed for delivery, and within the attachment size limit. Each is copied, not linked, into board storage before scratch cleanup. The receipt URI identifies the immutable SQLite manifest; its SHA-256 covers the manifest. Each file entry has its own pinned URI, byte count, and SHA-256. A summary-only result has a manifest too.
+
+The run records the logical brief at claim, including assignee, task inputs and parent handoffs. A later change to these inputs or an explicit reopen invalidates the old work. A running attempt from a board upgraded before claim snapshots existed must be reclaimed and claimed again: its original brief cannot be inferred. Replaying the winning run verifies the existing receipt rather than submitting a second completion.
+
+Receipt-backed delivery is **at least once**, not exactly once. Gateway and TUI/desktop session subscriptions use the same completed event. Each destination has a five-minute claim lease independent of its event cursor. A fresh collector retries expired leases; a recorded text ping need not be sent again for a file or wake retry. A crash after transport acceptance but before the local checkpoint can duplicate a message, file, or wake. TUI session delivery acknowledges a successful status-frame write, not that someone read it. This is separate from the desktop plugin's live toasts.
+
+`kanban_result_outbox.status` is `no_targets` when nobody was subscribed at commit, `pending` while any destination lacks an acknowledgment, and `delivered` only after all have acknowledged. A failed upload or invalid pin stays pending. Unsubscribing stops delivery; the unacknowledged destination stays queryable in `kanban_result_deliveries` and can resume if the route is subscribed again. A new subscription does not replay historical completions.
 
 When you run `/kanban create …` from the gateway (Telegram, Discord, Slack, etc.), the originating chat is automatically subscribed to the new task. The gateway's background notifier polls `task_events` every few seconds and delivers one message per terminal event (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`) to that chat. Completed tasks also send the first line of the worker's `--result` so you see the outcome without having to `/kanban show`.
 

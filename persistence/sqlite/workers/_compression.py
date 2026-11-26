@@ -124,6 +124,9 @@ class _ReceiptView:
     def _read_ctx(self):
         return nullcontext(self.conn)
 
+    def _read_retrying_ioerr(self, read):
+        return read(self.conn)
+
     def _read_one(self, sql, params=()):
         return self.conn.execute(sql, params).fetchone()
 
