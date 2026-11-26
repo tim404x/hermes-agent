@@ -3233,8 +3233,9 @@ def _apply_agent_failure_marker(job: dict, success: bool, error, final_response)
 
 
 def _create_job_execution(job: dict, source: str) -> dict:
+    report = job.get("_catch_up_report")
     return create_execution(job["id"], source=source, scheduled_instant=job.get("_scheduled_instant"),
-                            catch_up_report=job.get("_catch_up_report"))
+                            **({"catch_up_report": report} if report else {}))
 
 
 def _run_one_job_body(
