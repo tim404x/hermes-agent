@@ -335,6 +335,12 @@ def discover_gateway_endpoint(profile_home: str | Path, *, timeout: float = 2.0)
         return _missing_owner_verdict(home)
     except TimeoutError:
         return GatewayDiscovery("inaccessible", reason_code="control_timeout")
+    except BlockingIOError:
+        # EAGAIN from connect(): the owner's listen backlog is full because its loop stopped
+        # accepting (an owner-loop stall). The owner is alive but slow, exactly like a timeout;
+        # reporting ``invalid_control_peer`` made managed workers give up mid-stall with
+        # ``owner_unavailable`` instead of waiting it out (26 Nov 2026, 10 Kanban workers lost).
+        return GatewayDiscovery("inaccessible", reason_code="control_timeout")
     except DiscoveryError as exc:
         # The code stays bounded; the detail names the local node, its owner or mode, and the fix.
         return GatewayDiscovery("inaccessible", reason_code=exc.reason, detail=exc.bounded_detail(500))
