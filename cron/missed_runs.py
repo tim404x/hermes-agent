@@ -75,7 +75,7 @@ def _book_missed(
         logger.warning("Job '%s': could not book its missed occurrences", job.get("id"), exc_info=True)
 
 
-def fast_forward_missed_recurring(d: Any, grace: int) -> bool:
+def fast_forward_missed_recurring(d: Any, grace: int, *, worker_books: bool = False) -> bool:
     """Re-anchor accumulated misses; return whether catch-up is off for this job (skip the fire).
 
     The fast-forward is persisted immediately — NOT redundant with advance_next_run/mark_job_run:
@@ -93,8 +93,12 @@ def fast_forward_missed_recurring(d: Any, grace: int) -> bool:
     d.scan.persist(d.job["id"], next_run_at=new_next)
     missed = count_missed_slots(d.schedule, d.next_run, d.scan.now, timezone=d.job)
     capped = missed >= _MAX_COUNTED_SLOTS
+    from cron.dispatch_hold import TICK_SLACK_SECONDS, held_update_slot
     if (_instant_after(_ensure_aware(datetime.fromisoformat(new_next)), d.scan.now)
-            and not job_catches_up(d.job)):
+            and not job_catches_up(d.job)
+            and not held_update_slot(d.job, d.scan.now.timestamp(), 2 * TICK_SLACK_SECONDS)):
+        # An already-selected recurring slot, continuously witnessed through a refusal,
+        # is delayed work, not a new miss. A genuine outage still gets the normal policy.
         logger.info(
             "Job '%s' missed its scheduled time (%s, grace=%ds). "
             "Skipping %d missed occurrence(s) because catch-up is off for this job; next run: %s",
@@ -107,12 +111,24 @@ def fast_forward_missed_recurring(d: Any, grace: int) -> bool:
         "Job '%s' missed its scheduled time (%s, grace=%ds). "
         "Running now; next run provisionally set to: %s (re-anchored on completion)",
         d.label, d.next_run, grace, new_next)
-    from cron.occurrences import record_catch_up_occurrence
-    d.scan.on_saved.append(record_catch_up_occurrence)
-    if missed > 1:
-        d.scan.on_saved.append(lambda job=d.job, first=d.next_run: _book_missed(
-            job, missed - 1, first, "collapsed into one catch-up run", capped=capped))
+    report = (missed, d.next_run, capped)
+    if worker_books:
+        # Only after a durable scan; carried with the built-in worker, never on the stored job.
+        # A worker turned away before submit has no catch-up to count or misses to collapse.
+        d.scan.on_saved.append(lambda: d.job.update(_catch_up_report=report))
+    else:
+        d.scan.on_saved.append(lambda: book_catch_up(d.job, report))
     return False
+
+
+def book_catch_up(job, report) -> None:
+    from cron.jobs import _jobs_lock
+    from cron.occurrences import record_catch_up_occurrence
+    missed, first, capped = report
+    with _jobs_lock():
+        record_catch_up_occurrence()
+        if missed > 1:
+            _book_missed(job, missed - 1, first, "collapsed into one catch-up run", capped=capped)
 
 
 def retire_expired_oneshot(d: Any) -> bool:
@@ -126,7 +142,7 @@ def retire_expired_oneshot(d: Any) -> bool:
     from cron import store_health
     from cron.jobs import (
         ONESHOT_GRACE_SECONDS, _current_cron_store, _elapsed_seconds, record_cron_missed)
-    from cron.dispatch_hold import grace_starts_at
+    from cron.dispatch_hold import TICK_SLACK_SECONDS, grace_starts_at, held_update_slot
     from cron.jobs_oneshot_diagnostics import write_missed
 
     if _elapsed_seconds(d.scan.now, d.next_run_dt) <= ONESHOT_GRACE_SECONDS:
@@ -134,6 +150,8 @@ def retire_expired_oneshot(d: Any) -> bool:
     # Due while a gateway drain held dispatch: its grace counts from the end of the hold. A claimed
     # one-shot already fired once, so it never gets the extension (that would re-dispatch it).
     claimed = d.job.get("run_claim") or d.job.get("fire_claim")
+    if not claimed and held_update_slot(d.job, d.scan.now.timestamp(), ONESHOT_GRACE_SECONDS + TICK_SLACK_SECONDS):
+        return False
     grace_start = d.next_run_dt.timestamp() if claimed else grace_starts_at(
         _current_cron_store().cron_dir, d.next_run_dt.timestamp(), ONESHOT_GRACE_SECONDS)
     if d.scan.now.timestamp() - grace_start <= ONESHOT_GRACE_SECONDS:

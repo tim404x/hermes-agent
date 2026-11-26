@@ -20,6 +20,14 @@ def record_unknown_worker_outcome(
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     if not owner:
         return False
+    from cron.update_refusal import load_verified_refusal, settle_refusal
+
+    refusal = load_verified_refusal(
+        str(job["id"]), str(job["execution_id"]), expected_owner=owner
+    )
+    if refusal is not None:
+        settle_refusal(refusal, recovered=True)
+        return True
     with scheduler.fire_claim_fence(job["id"], expected_owner=owner) as owns_claim:
         if not owns_claim:
             return True

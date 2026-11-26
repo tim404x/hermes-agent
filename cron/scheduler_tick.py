@@ -147,10 +147,10 @@ def _tick_admitted(
         with agent_dispatch_held(update_fenced):
             due_jobs = _sched.get_due_jobs()
         _sched._sweep_stale_inflight_for_tick(due_jobs)
+        due_jobs = hold_agent_jobs_while_update_fenced(due_jobs, fenced=update_fenced)
         if headless:
             from cron.scheduler_gateway_gate import refuse_agent_jobs_without_gateway
             due_jobs = refuse_agent_jobs_without_gateway(due_jobs)
-        due_jobs = hold_agent_jobs_while_update_fenced(due_jobs, fenced=update_fenced)
 
         if not due_jobs:
             # Idle tick: skip config load + pool setup, but still reap crashed jobs' MCP orphans.
