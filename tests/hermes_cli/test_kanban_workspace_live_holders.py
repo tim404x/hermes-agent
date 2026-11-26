@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import uuid
+from importlib import import_module
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_ops
+from hermes_cli import kanban_transfer
 from tests.waiting import wait_until
 
 
@@ -442,9 +444,14 @@ def test_parent_deferred_cleanup_defers_for_live_holder(board, holder_spawner):
     assert not parent_ws.exists()
 
 
-@pytest.mark.platforms("linux")
-def test_worktree_cleanup_defers_for_live_holder_and_retries(board, tmp_path, holder_spawner):
-    spawn_foreign, _ = holder_spawner
+@pytest.fixture
+def worktree_ops():
+    """Patch the module that teardown imports at call time, including after suite module reloads."""
+    return import_module("hermes_cli.worktree_ops")
+
+
+@pytest.fixture
+def worktree_task(board, tmp_path):
     origin = tmp_path / "origin.git"
     repo = tmp_path / "repo"
     subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True, timeout=30)
@@ -466,6 +473,14 @@ def test_worktree_cleanup_defers_for_live_holder_and_retries(board, tmp_path, ho
         )
         wt = kbw.resolve_workspace(kb.get_task(conn, tid))
         kbw.set_workspace_path(conn, tid, wt)
+    return tid, wt
+
+
+@pytest.mark.platforms("linux")
+def test_worktree_cleanup_defers_for_live_holder_and_retries(worktree_task, holder_spawner):
+    spawn_foreign, _ = holder_spawner
+    tid, wt = worktree_task
+    with kbc.connect_closing() as conn:
         proc, unit = spawn_foreign(wt, use_systemd=True)
         assert kb.complete_task(conn, tid, summary="done") is True
 
@@ -667,7 +682,244 @@ def test_retry_does_not_remove_a_workspace_that_was_reopened_during_scan(board, 
         monkeypatch.setattr(kbw, "_foreign_workspace_holders", reopen)
         assert kb.retry_deferred_workspace_cleanups(conn) == []
         assert workspace.is_dir()
-        assert _events_of_kind("workspace_cleanup_retried", task_id) == [{"result": "task_changed"}]
+        assert _events_of_kind("workspace_cleanup_retried", task_id) == []
+
+
+def _queue_cleanup(conn, task_id, path):
+    conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+    kb._append_event(conn, task_id, "workspace_cleanup_deferred_live", {"path": str(path), "holders": []})
+
+
+def test_import_retires_source_workspace_cleanup(board, monkeypatch):
+    with kbc.connect_closing() as source:
+        task_id, path = _make_scratch_task(source)
+        _queue_cleanup(source, task_id, path)
+    archive = kanban_transfer.export_board(kb.DEFAULT_BOARD, str(board / "copy"))["archive"]
+    publish = kb.write_board_metadata
+    first_tick = []
+
+    def publish_and_retry(slug, **metadata):
+        result = publish(slug, **metadata)
+        with kbc.connect_closing(board=slug) as imported:
+            first_tick.extend(kb.retry_deferred_workspace_cleanups(imported))
+        return result
+
+    monkeypatch.setattr(kb, "write_board_metadata", publish_and_retry)
+    slug = kanban_transfer.import_board(archive, "imported")["board"]
+    assert first_tick == [] and (path / "keep.txt").is_file()
+    with kbc.connect_closing(board=slug) as imported:
+        assert kb.get_task(imported, task_id).workspace_path is None
+        assert kb.retry_deferred_workspace_cleanups(imported) == []
+        assert (path / "keep.txt").is_file()
+        assert imported.execute("SELECT 1 FROM task_events WHERE kind='workspace_cleanup_retried'").fetchone()
+    with kbc.connect_closing() as source:
+        assert kb.retry_deferred_workspace_cleanups(source) == [task_id]
+
+
+def test_null_scratch_path_belongs_to_connected_board_not_event(board):
+    kb.create_board("other")
+    with kbc.connect_closing(board="other") as conn:
+        task_id = kb.create_task(conn, title="other board scratch")
+        own = kb.workspaces_root(board="other") / task_id
+        foreign = kb.workspaces_root() / task_id
+        for path in (own, foreign):
+            path.mkdir(parents=True)
+        _queue_cleanup(conn, task_id, foreign)
+        assert kb.retry_deferred_workspace_cleanups(conn) == []
+        assert own.is_dir() and foreign.is_dir()
+        _queue_cleanup(conn, task_id, own)
+        assert kb.retry_deferred_workspace_cleanups(conn) == [task_id]
+        assert not own.exists() and foreign.is_dir()
+
+
+def test_proc_enumeration_failure_defers_and_stays_queued(board, monkeypatch):
+    proc = board / "proc"
+    (proc / "self").mkdir(parents=True)
+    monkeypatch.setattr(kbw, "_PROC_ROOT", proc)
+    monkeypatch.setattr(kbw, "_LIVE_CLEANUP_RETRY_INTERVAL_SECONDS", 0)
+    scandir = os.scandir
+
+    def unreadable(path):
+        if path == proc:
+            raise PermissionError("cannot enumerate procfs")
+        return scandir(path)
+
+    with kbc.connect_closing() as conn:
+        tasks = [_make_scratch_task(conn) for _ in range(2)]
+        with monkeypatch.context() as failure:
+            failure.setattr(os, "scandir", unreadable)
+            for task_id, path in tasks:
+                assert kb.complete_task(conn, task_id, summary="done")
+                assert (path / "keep.txt").is_file()
+                assert len(_events_of_kind("workspace_cleanup_deferred_live", task_id)) == 1
+            assert kb.retry_deferred_workspace_cleanups(conn) == []
+            for task_id, path in tasks:
+                assert path.is_dir() and not _events_of_kind("workspace_cleanup_retried", task_id)
+        assert kb.retry_deferred_workspace_cleanups(conn) == [task_id for task_id, _ in tasks]
+
+
+@pytest.mark.parametrize(("entry", "mutation"), [
+    pytest.param("completion", "UPDATE tasks SET workspace_kind='dir' WHERE id=:task", id="completion"),
+    pytest.param("parent", "UPDATE tasks SET workspace_path=:moved WHERE id=:task", id="parent"),
+    pytest.param("archive", "UPDATE tasks SET workspace_path=:path WHERE id=:child", id="archive"),
+    pytest.param("gc", "UPDATE tasks SET status='ready' WHERE id=:task", id="gc"),
+    pytest.param("retry", "INSERT INTO task_links (parent_id, child_id) VALUES (:task, :child)", id="retry"),
+])
+def test_cleanup_revalidates_ownership_after_scan(board, monkeypatch, entry, mutation):
+    with kbc.connect_closing() as conn:
+        task_id, path = _make_scratch_task(conn)
+        child = kb.create_task(conn, title="child", workspace_kind="dir")
+        if entry == "parent":
+            kb.link_tasks(conn, task_id, child)
+            assert kb.complete_task(conn, task_id, summary="parent done")
+
+        changed = []
+
+        def change_owner(scanned_id, scanned_path):
+            with kbc.connect_closing() as writer:
+                writer.execute(mutation, dict(task=task_id, child=child, path=str(path), moved=str(path.parent / "moved")))
+            changed.append((scanned_id, scanned_path))
+            return []
+
+        monkeypatch.setattr(kbw, "_foreign_workspace_holders", change_owner)
+        if entry == "gc":
+            conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (task_id,))
+            assert kbw.gc_archived_workspaces(conn) == 0
+        elif entry == "retry":
+            _queue_cleanup(conn, task_id, path)
+            assert kb.retry_deferred_workspace_cleanups(conn) == []
+            assert _events_of_kind("workspace_cleanup_retried", task_id) == [{"result": "active_children"}]
+        elif entry == "archive":
+            assert kb.archive_task(conn, task_id)
+        else:
+            assert kb.complete_task(conn, child if entry == "parent" else task_id, summary="done")
+        assert changed == [(task_id, path)]
+        assert (path / "keep.txt").is_file()
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("arrival", ["preflight", "revalidation", "between_attempts"])
+def test_worktree_rechecks_holder_before_each_remove(worktree_task, worktree_ops, holder_spawner, monkeypatch, arrival):
+    task_id, path = worktree_task
+    spawn, _ = holder_spawner
+    git = kbw._git
+    unpushed = worktree_ops._worktree_has_unpushed_commits
+    sharing = kbw._workspace_in_use_by_other
+    preflight_done = False
+    spawned = []
+
+    def preflight(*args, **kwargs):
+        nonlocal preflight_done
+        result = unpushed(*args, **kwargs)
+        preflight_done = True
+        if arrival == "preflight":
+            spawned.append(spawn(path, use_systemd=False))
+        return result
+
+    def check_sharing(*args):
+        result = sharing(*args)
+        if arrival == "revalidation" and preflight_done and not spawned:
+            spawned.append(spawn(path, use_systemd=False))
+        return result
+
+    def remove(repo, *args, timeout):
+        if arrival == "between_attempts" and args[:2] == ("worktree", "remove") and not spawned:
+            spawned.append(spawn(path, use_systemd=False))
+            return subprocess.CompletedProcess(args, 1, stderr="handle busy")
+        return git(repo, *args, timeout=timeout)
+
+    with kbc.connect_closing() as conn:
+        with monkeypatch.context() as hooks:
+            hooks.setattr(worktree_ops, "_worktree_has_unpushed_commits", preflight)
+            hooks.setattr(kbw, "_workspace_in_use_by_other", check_sharing)
+            hooks.setattr(kbw, "_git", remove)
+            assert kb.complete_task(conn, task_id, summary="done")
+        assert path.is_dir()
+        deferred, = _events_of_kind("workspace_cleanup_deferred_live", task_id)
+        proc, unit = spawned[0]
+        assert proc.pid in [holder["pid"] for holder in deferred["holders"]]
+        _stop_holder(proc, unit)
+        assert kb.retry_deferred_workspace_cleanups(conn) == [task_id]
+
+
+def test_worktree_reopened_during_final_probe_is_not_removed(worktree_task, worktree_ops, monkeypatch):
+    task_id, path = worktree_task
+    with kbc.connect_closing() as conn, kbc.connect_closing() as writer:
+        _queue_cleanup(conn, task_id, path)
+        preflight = worktree_ops._worktree_has_unpushed_commits
+
+        def reopen(*args):
+            writer.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+            return []
+
+        def arm_final_probe(*args, **kwargs):
+            result = preflight(*args, **kwargs)
+            monkeypatch.setattr(kbw, "_foreign_workspace_holders", reopen)
+            return result
+
+        monkeypatch.setattr(worktree_ops, "_worktree_has_unpushed_commits", arm_final_probe)
+        assert kb.retry_deferred_workspace_cleanups(conn) == []
+        assert kb.get_task(conn, task_id).status == "ready" and path.is_dir()
+        assert not _events_of_kind("workspace_cleanup_retried", task_id)
+
+
+def test_retry_survives_unreadable_sibling_board(board, monkeypatch):
+    kb.create_board("sibling")
+    sibling = kb.kanban_db_path(board="sibling")
+    with kbc.connect_closing() as conn:
+        task_id, path = _make_scratch_task(conn)
+        _queue_cleanup(conn, task_id, path)
+        monkeypatch.setattr(kbw, "_LIVE_CLEANUP_RETRY_INTERVAL_SECONDS", 0)
+        sibling.rename(sibling.with_suffix(".original"))
+        sibling.write_bytes(b"temporarily not a database")
+        assert kb.retry_deferred_workspace_cleanups(conn) == []
+        assert path.is_dir() and not _events_of_kind("workspace_cleanup_retried", task_id)
+        sibling.with_suffix(".original").replace(sibling)
+        assert kb.retry_deferred_workspace_cleanups(conn) == [task_id]
+        assert not path.exists()
+
+
+@pytest.mark.parametrize("failure", ["locked", "preflight", "dirty"])
+def test_retry_distinguishes_failed_git_from_preserved_work(worktree_task, worktree_ops, monkeypatch, failure):
+    task_id, path = worktree_task
+    monkeypatch.setattr(kbw, "_LIVE_CLEANUP_RETRY_INTERVAL_SECONDS", 0)
+    with kbc.connect_closing() as conn:
+        _queue_cleanup(conn, task_id, path)
+        with monkeypatch.context() as hooks:
+            if failure == "locked":
+                subprocess.run(["git", "-C", str(path), "worktree", "lock", str(path)], check=True)
+            elif failure == "preflight":
+                hooks.setattr(worktree_ops, "_git_out", lambda *args, **kwargs: None)
+            else:
+                (path / "new.txt").write_text("unfinished")
+            assert kb.retry_deferred_workspace_cleanups(conn) == []
+        assert path.is_dir()
+        if failure == "dirty":
+            assert _events_of_kind("workspace_cleanup_retried", task_id) == [{"result": "preserved"}]
+            return
+        assert not _events_of_kind("workspace_cleanup_retried", task_id)
+        if failure == "locked":
+            subprocess.run(["git", "-C", str(path), "worktree", "unlock", str(path)], check=True)
+        assert kb.retry_deferred_workspace_cleanups(conn) == [task_id]
+        assert not path.exists()
+
+
+def test_retry_throttles_by_database_and_task(board, monkeypatch):
+    with kbc.connect_closing() as source:
+        task_id, held = _make_scratch_task(source)
+        _queue_cleanup(source, task_id, held)
+        archive = kanban_transfer.export_board(kb.DEFAULT_BOARD, str(board / "copy"))["archive"]
+        slug = kanban_transfer.import_board(archive, "second")["board"]
+        with kbc.connect_closing(board=slug) as other:
+            free = kb.workspaces_root(board=slug) / task_id
+            free.mkdir(parents=True)
+            kbw.set_workspace_path(other, task_id, free)
+            _queue_cleanup(other, task_id, free)
+            holder = dict(pid=1, comm="job", unit="job.scope", cgroup="/job.scope", via="cwd")
+            monkeypatch.setattr(kbw, "_foreign_workspace_holders", lambda task, path: [holder] if path == held else [])
+            assert kb.retry_deferred_workspace_cleanups(source) == []
+            assert kb.retry_deferred_workspace_cleanups(other) == [task_id]
+            assert held.is_dir() and not free.exists()
 
 
 def test_dispatcher_reclaim_calls_retry_and_survives_exception(board, monkeypatch):
