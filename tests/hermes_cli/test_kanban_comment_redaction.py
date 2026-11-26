@@ -17,6 +17,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli.kanban_swarm import (
+    BLACKBOARD_PREFIX,
     SwarmWorkerSpec,
     create_swarm,
     latest_blackboard,
@@ -200,6 +201,140 @@ def test_swarm_blackboard_ordinary_json_round_trips_unchanged(kanban_home):
         updated = latest_blackboard(conn, created.root_id)
         assert updated["credentials"] == {"secret": "***", "status": "checked"}
         assert leaked not in json.dumps(updated)
+
+
+def test_swarm_blackboard_env_password_keeps_valid_json_and_siblings(kanban_home):
+    secret = _synthetic_secret()
+    with kbc.connect_closing() as conn:
+        created = create_swarm(
+            conn,
+            goal="Verify DB_PASSWORD inside blackboard JSON does not truncate siblings.",
+            workers=[SwarmWorkerSpec(profile="researcher", title="Scan", body="Collect notes")],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+        )
+        post_blackboard_update(
+            conn,
+            created.root_id,
+            author="researcher",
+            key="findings",
+            value={"note": f"DB_PASSWORD={secret}", "status": "checked"},
+        )
+
+        stored = kb.list_comments(conn, created.root_id)[-1].body
+        assert stored.startswith(BLACKBOARD_PREFIX)
+        parsed = json.loads(stored[len(BLACKBOARD_PREFIX):])
+        assert parsed["key"] == "findings"
+        for fragment in (secret, secret[:6], secret[-4:]):
+            assert fragment not in stored
+        assert _latest_commented_len(conn, created.root_id) == len(stored)
+
+        board = latest_blackboard(conn, created.root_id)
+        assert board["findings"]["status"] == "checked"
+        assert board["findings"]["note"] != f"DB_PASSWORD={secret}"
+        assert "***" in board["findings"]["note"]
+        assert secret not in board["findings"]["note"]
+
+
+def test_swarm_blackboard_bearer_link_masked_with_trailing_param_and_valid_json(kanban_home):
+    token = _synthetic_secret()
+    with kbc.connect_closing() as conn:
+        created = create_swarm(
+            conn,
+            goal="Verify bearer URL inside blackboard JSON stays valid and keeps non-secret params.",
+            workers=[SwarmWorkerSpec(profile="researcher", title="Scan", body="Collect notes")],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+        )
+        post_blackboard_update(
+            conn,
+            created.root_id,
+            author="researcher",
+            key="findings",
+            value={"url": f"https://eye.example.net/?t={token}&r=x", "status": "checked"},
+        )
+
+        stored = kb.list_comments(conn, created.root_id)[-1].body
+        assert stored.startswith(BLACKBOARD_PREFIX)
+        parsed = json.loads(stored[len(BLACKBOARD_PREFIX):])
+        assert parsed["key"] == "findings"
+        for fragment in (token, token[:6], token[-4:]):
+            assert fragment not in stored
+
+        board = latest_blackboard(conn, created.root_id)
+        assert board["findings"] == {
+            "url": "https://eye.example.net/?t=***&r=x",
+            "status": "checked",
+        }
+
+
+def test_comment_with_blackboard_prefix_and_invalid_json_falls_back_to_text_redaction(kanban_home):
+    env_secret = _synthetic_secret()
+    bearer = _synthetic_secret()
+    body = f"{BLACKBOARD_PREFIX}not valid json: DB_PASSWORD={env_secret} https://eye.example.net/?t={bearer}&r=x"
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="invalid blackboard json comment")
+        kb.add_comment(conn, tid, author="worker", body=body)
+
+        stored = kb.list_comments(conn, tid)[0].body
+        assert stored == f"{BLACKBOARD_PREFIX}not valid json: DB_PASSWORD=*** https://eye.example.net/?t=***&r=x"
+        for fragment in (env_secret, env_secret[:6], env_secret[-4:], bearer, bearer[:6], bearer[-4:]):
+            assert fragment not in stored
+        assert _latest_commented_len(conn, tid) == len(stored)
+
+
+def test_kanban_comment_tool_handler_redacts_plain_and_preserves_blackboard_json(
+    kanban_home, monkeypatch
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+    plain_secret = _synthetic_secret()
+    bearer = _synthetic_secret()
+    bb_secret = _synthetic_secret()
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="tool handler comment redaction", assignee="test-worker")
+        kb.claim_task(conn, tid)
+        run_id = kb._current_run_id(conn, tid)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    plain_res = json.loads(
+        kt._handle_comment({
+            "task_id": tid,
+            "body": f"DB_PASSWORD={plain_secret} https://eye.example.net/?t={bearer}&r=x",
+        })
+    )
+    assert plain_res["ok"] is True
+
+    bb_payload = json.dumps(
+        {"key": "findings", "value": {"note": f"DB_PASSWORD={bb_secret}", "status": "checked"}},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    bb_res = json.loads(
+        kt._handle_comment({"task_id": tid, "body": BLACKBOARD_PREFIX + bb_payload})
+    )
+    assert bb_res["ok"] is True
+
+    with kbc.connect_closing() as conn:
+        comments = kb.list_comments(conn, tid)
+        assert len(comments) == 2
+        assert comments[0].body == "DB_PASSWORD=*** https://eye.example.net/?t=***&r=x"
+        assert comments[1].body.startswith(BLACKBOARD_PREFIX)
+        json.loads(comments[1].body[len(BLACKBOARD_PREFIX):])
+        for secret in (plain_secret, bearer, bb_secret):
+            for fragment in (secret, secret[:6], secret[-4:]):
+                assert fragment not in comments[0].body
+                assert fragment not in comments[1].body
+
+        board = latest_blackboard(conn, tid)
+        assert board["findings"]["status"] == "checked"
+        assert "***" in board["findings"]["note"]
+        assert bb_secret not in board["findings"]["note"]
 
 
 def test_kanban_comment_tool_end_to_end_redacts_before_show_replay(kanban_home):
