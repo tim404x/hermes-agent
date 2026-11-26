@@ -26,8 +26,8 @@ def _notices(monkeypatch, errors=()):
     sent = []
     errors = list(errors)
 
-    def deliver(job, err_text, *, adapters, loop):
-        sent.append((job['id'], err_text))
+    def deliver(job, err_text, *, adapters, loop, suffix=None, nudge=True):
+        sent.append((job['id'], err_text + (f'\n{suffix}' if suffix else '')))
         return (errors.pop(0) if errors else None), 'delivered'
     monkeypatch.setattr(scheduler, '_deliver_crash_failure', deliver)
     return sent
@@ -125,6 +125,7 @@ def test_a_parked_notice_survives_recovery_rewriting_the_journal(tmp_path, monke
     sent = _notices(monkeypatch)
     with jobs.use_cron_store(tmp_path / 'cron'):
         job = jobs.create_job(prompt='brief', schedule='every 1h', deliver='local')
+        jobs.update_job(job['id'], {'pause_on_unknown': True})
         fire = executions.create_execution(job['id'], source='test')['id']
         journal = _unknown_fire(monkeypatch, job, fire)
         record = json.loads(journal.read_text())
@@ -136,6 +137,7 @@ def test_a_parked_notice_survives_recovery_rewriting_the_journal(tmp_path, monke
             return {'status': 'unknown', 'result': None}
         _peer(monkeypatch, answer)
         scheduler_authority.reconcile_pending()
+        assert json.loads(journal.read_text())['pause_recorded']
         _peer(monkeypatch, lambda method: {'status': 'unknown', 'result': None})
         scheduler_authority.reconcile_pending()
         assert len(sent) == 1
@@ -229,8 +231,9 @@ def test_an_unknown_recovery_keeps_the_provisional_mark_as_the_only_count(tmp_pa
         _peer(monkeypatch, lambda method: {'status': 'unknown', 'result': None})
         scheduler_authority.reconcile_pending()
         after = jobs.get_job(job['id'])
-        assert after['repeat']['completed'] == 1 and after['last_status'] == 'error'
-        assert fire in after['provisional_runs']  # still replaceable while the journal exists
+        assert after['repeat']['completed'] == 1 and after['last_status'] == 'unknown'
+        assert after['state'] == 'scheduled' and after['failure_streak'] == 0
+        assert fire in after['canonical_completions'] and 'provisional_runs' not in after
 
 
 def test_a_newer_run_keeps_its_outcome_when_an_older_fire_is_recovered(tmp_path, monkeypatch):

@@ -52,7 +52,9 @@ def test_lost_ack_reconciles_frozen_delivery_once(tmp_path, monkeypatch):
                 unknown_journal.write_text(json.dumps({'params': unknown, 'receipt': None}))
                 await asyncio.to_thread(scheduler_authority.reconcile_pending)
                 assert unknown_journal.exists()
-                assert jobs.get_job(job['id'])['state'] == 'paused'
+                saved = jobs.get_job(job['id'])
+                assert saved['state'] == 'scheduled' and saved['last_status'] == 'unknown'
+                assert saved['repeat']['completed'] == completed + 1
                 assert delivery_queue.claim_next() is None
             finally:
                 session_cron.unbind_owner(authority)

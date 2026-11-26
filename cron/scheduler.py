@@ -3125,7 +3125,7 @@ def _save_compose_deliver(
 
 
 def _deliver_crash_failure(
-    job: dict, err_text: str, *, adapters, loop,
+    job: dict, err_text: str, *, adapters, loop, suffix: Optional[str] = None, nudge: bool = True,
 ) -> tuple[Optional[str], str]:
     """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
@@ -3137,9 +3137,8 @@ def _deliver_crash_failure(
     try:
         delivery_error = _deliver_result(
             job,
-            # Same text as the normal failure delivery: this run also counts toward
-            # failure_streak, so the nudge must leave through here too.
-            _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job),
+            _summarize_cron_failure_for_delivery(job, err_text) + (_failure_streak_nudge(job) if nudge else "")
+            + (f"\n{suffix}" if suffix else ""),
             adapters=adapters,
             loop=loop,
             for_failure=True,
@@ -3397,7 +3396,7 @@ def _run_one_job_body(
             reason = sanitize_persisted_error(str(e)) or "unverified admission"
             pause_for_unknown(job["id"], execution_id, reason)
             give_up_execution(execution_id, reason=reason)
-            logger.error("Cron %s paused with unverified admission: %s", job["id"], e)
+            logger.error("Cron %s: unverified admission: %s", job["id"], e)
             return False
         # BaseException, not Exception: CancelledError/KeyboardInterrupt/SystemExit propagate here.
         # Without mark_job_run(False) a finite one-shot is wedged: claim_dispatch consumed
