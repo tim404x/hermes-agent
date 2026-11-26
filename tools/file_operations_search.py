@@ -499,15 +499,13 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
             continue
         m = _MATCH_LINE_RE.match(line)
         if m:
-            matches.append(SearchMatch(
-                path=(m.group(1) or '') + m.group(2), line_number=int(m.group(3)), content=m.group(4)[:500],
-            ))
+            matches.append(SearchMatch.from_line((m[1] or '') + m[2], int(m[3]), m[4]))
             continue
         # Context lines only when requested, to avoid false positives on dashy paths.
         if context > 0:
             parsed = _parse_search_context_line(line)
             if parsed:
-                matches.append(SearchMatch(path=parsed[0], line_number=parsed[1], content=parsed[2][:500]))
+                matches.append(SearchMatch.from_line(*parsed))
     total = len(matches)
     return SearchResult(
         matches=matches[offset:offset + limit], total_count=total,
