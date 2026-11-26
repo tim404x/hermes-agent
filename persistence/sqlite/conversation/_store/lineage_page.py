@@ -91,16 +91,18 @@ class _Projection(NamedTuple):
 _projections: OrderedDict[tuple, _Projection] = OrderedDict()
 # (store file identity, lineage ids) -> Event set when the active full-rebuild flight finishes
 _inflight: dict[tuple, threading.Event] = {}
-_lock = threading.Lock()
+_lock = threading.RLock()
 _rebuild_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_REBUILDS)
 
 
 class _PageHit(NamedTuple):
+    initial_kept: Optional[_Projection]
     grown: Optional[_Projection]
     page: list[Any]
 
 
 class _RebuildInput(NamedTuple):
+    initial_kept: Optional[_Projection]
     stamp: tuple
     revisions: tuple[int, ...]
     digest_cols: tuple[str, ...]
@@ -295,6 +297,21 @@ def _has_identity_collision(kept: _Projection, new) -> bool:
     return False
 
 
+def _appended_within_limit(conn, old: tuple, stamp: tuple, ids: tuple) -> bool:
+    """Cheap pre-check before materializing appended bodies: stamp deltas + covering-index id probe."""
+    live_delta = stamp[1] - old[1]
+    if live_delta <= 0 or live_delta > _MAX_APPENDED_ROWS or stamp[5] - old[5] != live_delta:
+        return False
+    new_ids = [
+        row[0]
+        for row in conn.execute(
+            f"SELECT id FROM messages WHERE session_id IN ({_marks(ids)}) AND id > ? ORDER BY id ASC LIMIT ?",
+            (*ids, old[_TOP], _MAX_APPENDED_ROWS + 1),
+        )
+    ]
+    return len(new_ids) == live_delta and len(new_ids) <= _MAX_APPENDED_ROWS and sum(new_ids) == stamp[2] - old[2]
+
+
 def _extended(holder: StoreHolder, conn, kept: _Projection, stamp: tuple, ids: tuple) -> Optional[_Projection]:
     """*kept* brought to *stamp* when the lineage only grew (or only rewrote non-projection columns of the
     tip segment), else None (rebuild). Every display key carries its row's timestamp, and every other
@@ -304,18 +321,23 @@ def _extended(holder: StoreHolder, conn, kept: _Projection, stamp: tuple, ids: t
     old = kept.stamp
     if stamp[_TOP] < old[_TOP] or stamp[_INACTIVE] != old[_INACTIVE]:
         return None  # shrank/deleted top, or a row went inactive
+    if stamp[_TOP] == old[_TOP]:
+        # Nothing appended: valid only when every non-revision stamp part holds and the tip digest matched.
+        if stamp[:_REVISION] != old[:_REVISION] or stamp[_REVISION] == old[_REVISION]:
+            return None
+        revisions = _verify_tip_rewrite(holder, conn, kept, stamp, ids)
+        if revisions is None:
+            return None
+        return _Projection(
+            stamp, kept.order, kept.timestamps, kept.uids, kept.tip, revisions, kept.digest_cols, kept.digest
+        )
+    if not _appended_within_limit(conn, old, stamp, ids):
+        return None
     revisions: Optional[tuple[int, ...]] = None
     if stamp[_REVISION] != old[_REVISION]:
         revisions = _verify_tip_rewrite(holder, conn, kept, stamp, ids)
         if revisions is None:
             return None
-    if stamp[_TOP] == old[_TOP]:
-        # Nothing appended: valid only when every non-revision stamp part holds and the tip digest matched.
-        if revisions is None or stamp[:_REVISION] != old[:_REVISION]:
-            return None
-        return _Projection(
-            stamp, kept.order, kept.timestamps, kept.uids, kept.tip, revisions, kept.digest_cols, kept.digest
-        )
     new = conn.execute(
         f"SELECT * FROM messages WHERE session_id IN ({_marks(ids)}) AND id > ? ORDER BY id ASC",
         (*ids, old[_TOP]),
@@ -357,6 +379,25 @@ def _publish(key: tuple, projection: _Projection) -> None:
             _projections.popitem(last=False)
 
 
+def _publish_for_flight(key: tuple, projection: _Projection, flight: threading.Event) -> bool:
+    """Publish *projection* and clear *flight* only if *flight* is still the active builder for *key*."""
+    with _lock:
+        if _inflight.get(key) is not flight:
+            return False
+        _publish(key, projection)
+        del _inflight[key]
+        return True
+
+
+def _publish_if_unchanged(key: tuple, projection: _Projection, expected: Optional[_Projection]) -> bool:
+    """Publish *projection* only if the cached entry is still *expected* (possibly None)."""
+    with _lock:
+        if _projections.get(key) is not expected:
+            return False
+        _publish(key, projection)
+        return True
+
+
 def _fetch_page_rows(conn, wanted: list[int]) -> Optional[list[Any]]:
     found: dict[int, Any] = {}
     for start in range(0, len(wanted), 900):  # SQLite's bound-variable ceiling
@@ -386,20 +427,33 @@ def _try_fast_page(
     return initial_kept, grown, _fetch_page_rows(conn, list(_page(kept.order, limit, offset, latest)))
 
 
-def _claim_or_wait_flight(
-    key: tuple, initial_kept: Optional[_Projection], bypass_flight: bool
+def _ensure_flight(
+    key: tuple, initial_kept: Optional[_Projection], own_flight: Optional[threading.Event]
 ) -> tuple[Optional[threading.Event], Any]:
-    """Return ``(own_flight, None)`` when this caller becomes the builder, else ``(None, action)``."""
+    """Keep *own_flight* if still registered, else claim a new flight or return a retry/wait action."""
     with _lock:
+        if own_flight is not None and _inflight.get(key) is own_flight:
+            return own_flight, None
         fresh = _projections.get(key)
         if fresh is not None and fresh is not initial_kept:
             return None, _RETRY_READ
         existing = _inflight.get(key)
-        if existing is not None and not bypass_flight:
+        if existing is not None:
             return None, _WaitFlight(existing)
         flight = threading.Event()
         _inflight[key] = flight
         return flight, None
+
+
+def _takeover_flight(key: tuple, timed_out: threading.Event) -> Optional[threading.Event]:
+    """Replace *timed_out* with a new flight owned by this thread and wake displaced waiters."""
+    with _lock:
+        if _inflight.get(key) is not timed_out:
+            return None
+        replacement = threading.Event()
+        _inflight[key] = replacement
+    timed_out.set()
+    return replacement
 
 
 def _release_flight(key: tuple, flight: Optional[threading.Event]) -> None:
@@ -425,13 +479,12 @@ def lineage_display_page(holder: StoreHolder, sql: str, session_ids: list[str], 
 
     own_flight: Optional[threading.Event] = None
     has_slot = False
-    bypass_flight = False
 
     def read(conn):
         nonlocal own_flight, has_slot
         if not _stampable(holder, conn):
             return None
-        began = not conn.in_transaction  # inside a transcript_read_snapshot: its transaction
+        began = not conn.in_transaction  # inside a transcript_read_snapshot: caller owns the transaction
         if began:
             conn.execute("BEGIN")
         try:
@@ -441,22 +494,24 @@ def lineage_display_page(holder: StoreHolder, sql: str, session_ids: list[str], 
                 holder, conn, key, stamp, ids, limit=limit, offset=offset, latest=latest,
             )
             if page is not None:
-                return _PageHit(grown, page)
-            # Register our flight BEFORE waiting for a rebuild slot so same-key callers queue on us.
-            if own_flight is None:
-                flight, wait_action = _claim_or_wait_flight(key, initial_kept, bypass_flight)
-                if flight is None:
+                return _PageHit(initial_kept, grown, page)
+            if began:
+                # Register our flight BEFORE waiting for a rebuild slot so same-key callers queue on us.
+                own_flight, wait_action = _ensure_flight(key, initial_kept, own_flight)
+                if own_flight is None:
                     return wait_action
-                own_flight = flight
-            if not has_slot:
-                has_slot = _rebuild_slots.acquire(blocking=False)
                 if not has_slot:
-                    return _NEED_SLOT
+                    has_slot = _rebuild_slots.acquire(blocking=False)
+                    if not has_slot:
+                        return _NEED_SLOT
+            elif not has_slot:
+                # Caller owns the transaction (cannot end it to wait): build inline, taking a slot only if free.
+                has_slot = _rebuild_slots.acquire(blocking=False)
             revisions = _session_revisions(conn, ids)
             digest_cols = _digest_columns(holder, conn)
             digest = _tip_digest(conn, ids[-1], stamp[_TOP], digest_cols)
             rows = _messages._with_removed_identities(holder, conn.execute(sql, ids).fetchall(), list(ids), conn)
-            return _RebuildInput(stamp, revisions, digest_cols, digest, rows)
+            return _RebuildInput(initial_kept, stamp, revisions, digest_cols, digest, rows)
         finally:
             if began and conn.in_transaction:
                 conn.execute("ROLLBACK")
@@ -468,24 +523,25 @@ def lineage_display_page(holder: StoreHolder, sql: str, session_ids: list[str], 
                 return None
             if isinstance(result, _PageHit):
                 if result.grown is not None:
-                    _publish(key, result.grown)
+                    _publish_if_unchanged(key, result.grown, result.initial_kept)
                 return result.page
             if isinstance(result, _RebuildInput):
                 shown = _messages._dedupe_display_generations(holder, result.rows, drop_removed=True)
-                _publish(
-                    key,
-                    _Projection(
-                        result.stamp, array("q", (row["id"] for row in shown)), *_identities(result.rows),
-                        ids[-1], result.revisions, result.digest_cols, result.digest,
-                    ),
+                projection = _Projection(
+                    result.stamp, array("q", (row["id"] for row in shown)), *_identities(result.rows),
+                    ids[-1], result.revisions, result.digest_cols, result.digest,
                 )
+                if own_flight is not None:
+                    _publish_for_flight(key, projection, own_flight)
+                else:
+                    _publish_if_unchanged(key, projection, result.initial_kept)
                 return _page(shown, limit, offset, latest)
             if isinstance(result, _WaitFlight):
                 if has_slot:
                     has_slot = False
                     _rebuild_slots.release()
                 if not result.event.wait(_REBUILD_WAIT_TIMEOUT_S):
-                    bypass_flight = True
+                    own_flight = _takeover_flight(key, result.event)
             elif result is _NEED_SLOT:
                 has_slot = _rebuild_slots.acquire()
     finally:

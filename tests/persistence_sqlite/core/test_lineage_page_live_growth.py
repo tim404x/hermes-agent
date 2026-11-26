@@ -14,6 +14,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
 from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import Any
@@ -25,7 +26,6 @@ from persistence.sqlite.conversation._store import lineage_page
 from persistence.sqlite.conversation._store import messages as store_messages
 from persistence.sqlite.conversation._store.api_content import set_message_api_content
 from persistence.sqlite.conversation._store.messages import (
-    _REMOVED_IDENTITIES_SQL,
     _resume_lineage_ids,
     append_messages_batch,
     get_messages,
@@ -712,13 +712,19 @@ def test_max_verify_rows_exceeded_rebuilds_cleanly(tmp_path, full_reads, monkeyp
 
 
 class _RecordingRow(Mapping):
-    """Mapping wrapper around a sqlite3.Row that records every column name accessed."""
+    """Mapping wrapper around a SQLite result row that records every column name accessed."""
 
-    def __init__(self, row, accessed: set[str]) -> None:
-        self._data = dict(row)
+    def __init__(self, cols: tuple[str, ...], values: tuple[Any, ...], accessed: set[str]) -> None:
+        self._cols = cols
+        self._values = values
+        self._data = dict(zip(cols, values))
         self._accessed = accessed
 
-    def __getitem__(self, key: str):
+    def __getitem__(self, key: str | int):
+        if isinstance(key, int):
+            col = self._cols[key]
+            self._accessed.add(col)
+            return self._values[key]
         self._accessed.add(key)
         return self._data[key]
 
@@ -737,7 +743,7 @@ class _RecordingRow(Mapping):
 
 
 def test_projection_column_guard_covers_all_read_columns(tmp_path):
-    """Every column read by _dedupe_display_generations, _with_removed_identities, and _identities
+    """Every column read by _with_removed_identities, _dedupe_display_generations, and _identities
     must live in lineage_page._DIGEST_COLUMNS | {'id'} so no projection input can be omitted."""
     path = tmp_path / "state.db"
     with StoreHolder(path) as db:
@@ -808,22 +814,39 @@ def test_projection_column_guard_covers_all_read_columns(tmp_path):
         ids = _resume_lineage_ids(db, tip)
         marks = ",".join("?" * len(ids))
         sql = f"SELECT * FROM messages WHERE session_id IN ({marks}) AND (active = 1 OR compacted = 1) ORDER BY id ASC"
-        with db._read_ctx() as conn:
-            display_rows = conn.execute(sql, ids).fetchall()
-            removed_rows = conn.execute(_REMOVED_IDENTITIES_SQL.format(ids=marks), ids).fetchall()
-            merged = store_messages._with_removed_identities(db, display_rows, ids, conn)
-
-        assert removed_rows, "representative lineage must include removed rows"
-        # Every column projected by _REMOVED_IDENTITIES_SQL must be covered.
-        removed_cols = set(removed_rows[0].keys())
-        allowed = lineage_page._DIGEST_COLUMNS | {"id"}
-        assert removed_cols <= allowed, f"uncovered _REMOVED_IDENTITIES_SQL columns: {removed_cols - allowed}"
-
         accessed: set[str] = set()
-        wrapped = [_RecordingRow(row, accessed) for row in merged]
-        shown = store_messages._dedupe_display_generations(db, wrapped, drop_removed=True)
+        merge_accessed: set[str] = set()
+
+        def recording_factory(cursor, values):
+            cols = tuple(desc[0] for desc in cursor.description)
+            return _RecordingRow(cols, values, accessed)
+
+        with db._read_ctx() as conn:
+            prev_factory = conn.row_factory
+            conn.row_factory = recording_factory
+            try:
+                display_rows = conn.execute(sql, ids).fetchall()
+                # Both display_rows and the removed rows queried inside _with_removed_identities are
+                # _RecordingRow instances so any column read during the merge itself is recorded.
+                merged = store_messages._with_removed_identities(db, display_rows, ids, conn)
+                merge_accessed.update(accessed)
+            finally:
+                conn.row_factory = prev_factory
+
+        assert all(isinstance(row, _RecordingRow) for row in merged)
+        assert len(merged) > len(display_rows), "removed rows must be merged by _with_removed_identities"
+        removed_in_merged = [row for row in merged if row._data["active"] == 0 and row._data["compacted"] == 0]
+        assert removed_in_merged, "representative lineage must include removed rows"
+        assert "id" in merge_accessed, "_with_removed_identities must have read recording rows during merge"
+
+        allowed = lineage_page._DIGEST_COLUMNS | {"id"}
+        removed_cols = set(removed_in_merged[0].keys())
+        assert removed_cols <= allowed, f"uncovered _REMOVED_IDENTITIES_SQL columns: {removed_cols - allowed}"
+        assert merge_accessed <= allowed, f"_with_removed_identities read uncovered columns: {merge_accessed - allowed}"
+
+        shown = store_messages._dedupe_display_generations(db, merged, drop_removed=True)
         assert shown
-        lineage_page._identities(wrapped)
+        lineage_page._identities(merged)
 
         # Confirm the fixture actually exercised the subtle branches (slots, summary carrier, tool calls, uids).
         expected_exercised = {
@@ -845,3 +868,537 @@ def test_projection_column_guard_covers_all_read_columns(tmp_path):
             "finish_reason",
         }
         assert not (lineage_page._DIGEST_COLUMNS & non_projection)
+
+
+# ── 7. Single-flight edge cases (caller snapshots, CAS publish, takeover, oversized growth) ──
+
+
+def _assert_all_rebuild_slots_free() -> None:
+    acquired = 0
+    try:
+        for _ in range(lineage_page._MAX_CONCURRENT_REBUILDS):
+            assert lineage_page._rebuild_slots.acquire(blocking=False)
+            acquired += 1
+    finally:
+        for _ in range(acquired):
+            lineage_page._rebuild_slots.release()
+
+
+class _SqlRecordingConn:
+    """Proxy over sqlite3.Connection that records every SQL string passed to execute()."""
+
+    def __init__(self, conn, queries: list[str]) -> None:
+        self._conn = conn
+        self._queries = queries
+
+    def execute(self, sql: str, *args, **kwargs):
+        self._queries.append(sql)
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+
+def test_snapshot_read_does_not_block_when_all_rebuild_slots_held(tmp_path):
+    """Inside transcript_read_snapshot (caller owns the transaction), never block on rebuild slots."""
+    path = tmp_path / "state.db"
+    with StoreHolder(path) as db:
+        tip = _lineage(db)
+        expected = _sliced(_full(db, tip), 4, 0, True)
+        lineage_page._projections.clear()
+
+        slot_count = lineage_page._MAX_CONCURRENT_REBUILDS
+        held_barrier = threading.Barrier(slot_count + 1)
+        release_slots = threading.Event()
+
+        def hold_slot() -> None:
+            assert lineage_page._rebuild_slots.acquire(timeout=5.0)
+            try:
+                held_barrier.wait(timeout=5.0)
+                release_slots.wait(timeout=10.0)
+            finally:
+                lineage_page._rebuild_slots.release()
+
+        holders = [threading.Thread(target=hold_slot) for _ in range(slot_count)]
+        for t in holders:
+            t.start()
+
+        snap_result: list[Any] = []
+        snap_errors: list[BaseException] = []
+        snap_elapsed: list[float] = []
+        snap_consistent: list[bool] = []
+
+        def run_snapshot_read() -> None:
+            try:
+                with db.transcript_read_snapshot() as snap:
+                    assert snap.pinned
+                    t0 = time.monotonic()
+                    page = _page(db, tip, 4, 0, True)
+                    snap_elapsed.append(time.monotonic() - t0)
+                    snap_consistent.append(snap())
+                    snap_result.append(page)
+            except BaseException as exc:
+                snap_errors.append(exc)
+
+        snap_thread = threading.Thread(target=run_snapshot_read)
+        try:
+            held_barrier.wait(timeout=5.0)
+            assert not lineage_page._rebuild_slots.acquire(blocking=False)
+            snap_thread.start()
+            # Must finish promptly BEFORE the slot holders are released.
+            snap_thread.join(timeout=1.5)
+            finished_while_slots_held = not snap_thread.is_alive()
+        finally:
+            release_slots.set()
+            for t in holders:
+                t.join(timeout=5.0)
+            snap_thread.join(timeout=5.0)
+
+        assert finished_while_slots_held, "snapshot read blocked on rebuild slots while holding caller txn"
+        assert snap_errors == []
+        assert snap_consistent == [True]
+        assert snap_elapsed and snap_elapsed[0] < 0.5
+        assert snap_result == [expected]
+        assert not lineage_page._inflight
+        _assert_all_rebuild_slots_free()
+
+
+def test_snapshot_read_does_not_wait_on_inflight_builder(tmp_path, monkeypatch):
+    """Inside transcript_read_snapshot (caller owns the transaction), never wait on or register a flight."""
+    path = tmp_path / "state.db"
+    with StoreHolder(path) as db:
+        tip = _lineage(db)
+        expected = _sliced(_full(db, tip), 4, 0, True)
+        lineage_page._projections.clear()
+        key = (lineage_page._store_identity(db), tuple(_resume_lineage_ids(db, tip)))
+
+        real_dedupe = store_messages._dedupe_display_generations
+        builder_started = threading.Event()
+        release_builder = threading.Event()
+        call_lock = threading.Lock()
+        calls = 0
+
+        def stall_first_dedupe(holder, rows, **kwargs):
+            nonlocal calls
+            with call_lock:
+                calls += 1
+                is_first = calls == 1
+            if is_first:
+                builder_started.set()
+                release_builder.wait(timeout=5.0)
+            return real_dedupe(holder, rows, **kwargs)
+
+        monkeypatch.setattr(store_messages, "_dedupe_display_generations", stall_first_dedupe)
+        monkeypatch.setattr(lineage_page, "_REBUILD_WAIT_TIMEOUT_S", 2.0)
+
+        first_res: list[Any] = []
+        first_err: list[BaseException] = []
+
+        def first_builder() -> None:
+            try:
+                with StoreHolder(path, read_only=True) as reader:
+                    first_res.append(_page(reader, tip, 4, 0, True))
+            except BaseException as exc:
+                first_err.append(exc)
+
+        t1 = threading.Thread(target=first_builder)
+        t1.start()
+        try:
+            assert builder_started.wait(timeout=5.0)
+            orig_flight = lineage_page._inflight.get(key)
+            assert orig_flight is not None
+
+            wait_called = threading.Event()
+            orig_wait = orig_flight.wait
+
+            def spy_wait(*args, **kwargs):
+                wait_called.set()
+                return orig_wait(*args, **kwargs)
+
+            orig_flight.wait = spy_wait  # type: ignore[method-assign]
+
+            with db.transcript_read_snapshot() as snap:
+                assert snap.pinned
+                t0 = time.monotonic()
+                snap_page = _page(db, tip, 4, 0, True)
+                elapsed = time.monotonic() - t0
+                assert snap()
+                inflight_after_snap = lineage_page._inflight.get(key)
+        finally:
+            release_builder.set()
+            t1.join(timeout=5.0)
+
+        assert not t1.is_alive()
+        assert not wait_called.is_set(), "snapshot read waited on another thread's flight inside caller txn"
+        assert elapsed < 0.5, f"snapshot read took {elapsed:.3f}s (expected prompt inline build)"
+        # Snapshot read must not have replaced or cleared the active flight.
+        assert inflight_after_snap is orig_flight
+        assert snap_page == expected
+        assert first_err == []
+        assert first_res == [expected]
+        assert not lineage_page._inflight
+        _assert_all_rebuild_slots_free()
+
+
+def test_superseded_builder_never_overwrites_newer_projection(tmp_path, full_reads, monkeypatch):
+    """A timed-out builder finishing after its replacement published must not overwrite the cache."""
+    path = tmp_path / "state.db"
+    with StoreHolder(path) as db:
+        tip = _lineage(db)
+        with full_reads.oracle():
+            expected_old = _sliced(_full(db, tip), 4, 0, True)
+        lineage_page._projections.clear()
+        full_reads.reset()
+        key = (lineage_page._store_identity(db), tuple(_resume_lineage_ids(db, tip)))
+
+        real_dedupe = store_messages._dedupe_display_generations
+        builder_started = threading.Event()
+        release_builder = threading.Event()
+        call_lock = threading.Lock()
+        calls = 0
+
+        def stall_first_dedupe(holder, rows, **kwargs):
+            nonlocal calls
+            with call_lock:
+                calls += 1
+                is_first = calls == 1
+            if is_first:
+                builder_started.set()
+                release_builder.wait(timeout=5.0)
+            return real_dedupe(holder, rows, **kwargs)
+
+        monkeypatch.setattr(store_messages, "_dedupe_display_generations", stall_first_dedupe)
+        monkeypatch.setattr(lineage_page, "_REBUILD_WAIT_TIMEOUT_S", 0.15)
+
+        t1_res: list[Any] = []
+        t1_err: list[BaseException] = []
+
+        def stalled_builder() -> None:
+            try:
+                with StoreHolder(path, read_only=True) as reader:
+                    t1_res.append(_page(reader, tip, 4, 0, True))
+            except BaseException as exc:
+                t1_err.append(exc)
+
+        t1 = threading.Thread(target=stalled_builder)
+        t1.start()
+        try:
+            assert builder_started.wait(timeout=5.0)
+
+            # Advance the transcript AND bump transcript_revision while t1 is stalled on the older snapshot.
+            append_messages_batch(db, tip, [{"role": "user", "content": "newer turn"}])
+            new_user_id = get_messages(db, tip)[-1]["id"]
+            assert set_user_message_content(db, tip, new_user_id, "newer turn revised") == 1
+            with full_reads.oracle():
+                expected_new = _sliced(_full(db, tip), 4, 0, True)
+
+            # Replacement reader times out on t1's flight, takes over, and publishes the newer projection.
+            replacement_page = _fresh_page(path, tip, 4, 0, True)
+            assert replacement_page == expected_new
+            kept_after_replacement = lineage_page._projections[key]
+            assert kept_after_replacement.revisions[-1] >= 1
+        finally:
+            release_builder.set()
+            t1.join(timeout=5.0)
+
+        assert not t1.is_alive()
+        assert t1_err == []
+        # The superseded builder still returns its own snapshot's exact page.
+        assert t1_res == [expected_old]
+        # Cache must still hold the replacement's newer projection (revisions and stamp intact).
+        assert lineage_page._projections[key] is kept_after_replacement
+        assert lineage_page._projections[key].revisions == kept_after_replacement.revisions
+        assert lineage_page._projections[key].stamp == kept_after_replacement.stamp
+
+        # Next unchanged poll hits the kept replacement projection with 0 full reads.
+        full_reads.reset()
+        assert _fresh_page(path, tip, 4, 0, True) == expected_new
+        assert full_reads.count == 0
+        assert not lineage_page._inflight
+        _assert_all_rebuild_slots_free()
+
+
+def test_inline_snapshot_and_growth_publish_respect_cas(tmp_path, full_reads, monkeypatch):
+    """Inline snapshot rebuilds and growth extensions publish only if the cached entry is unchanged."""
+    path = tmp_path / "state.db"
+    with StoreHolder(path) as db:
+        tip = _lineage(db)
+        with full_reads.oracle():
+            expected_v0 = _sliced(_full(db, tip), 4, 0, True)
+        lineage_page._projections.clear()
+        full_reads.reset()
+        key = (lineage_page._store_identity(db), tuple(_resume_lineage_ids(db, tip)))
+
+        # 1. Inline snapshot rebuild (no flight) started from None must not overwrite a newer published entry.
+        real_dedupe = store_messages._dedupe_display_generations
+        snap_in_dedupe = threading.Event()
+        release_snap = threading.Event()
+        stall_next = [True]
+
+        def stall_snap_dedupe(holder, rows, **kwargs):
+            if stall_next[0]:
+                stall_next[0] = False
+                snap_in_dedupe.set()
+                release_snap.wait(timeout=5.0)
+            return real_dedupe(holder, rows, **kwargs)
+
+        monkeypatch.setattr(store_messages, "_dedupe_display_generations", stall_snap_dedupe)
+        snap_res: list[Any] = []
+        snap_err: list[BaseException] = []
+
+        def inline_worker() -> None:
+            try:
+                with db.transcript_read_snapshot() as snap:
+                    assert snap.pinned
+                    snap_res.append(_page(db, tip, 4, 0, True))
+            except BaseException as exc:
+                snap_err.append(exc)
+
+        t_snap = threading.Thread(target=inline_worker)
+        t_snap.start()
+        try:
+            assert snap_in_dedupe.wait(timeout=5.0)
+            append_messages_batch(db, tip, [{"role": "user", "content": "v1 while inline stalled"}])
+            with full_reads.oracle():
+                expected_v1 = _sliced(_full(db, tip), 4, 0, True)
+            assert _fresh_page(path, tip, 4, 0, True) == expected_v1
+            assert t_snap.is_alive(), "newer publish must land while inline snapshot builder is still stalled"
+            kept_v1 = lineage_page._projections[key]
+        finally:
+            release_snap.set()
+            t_snap.join(timeout=5.0)
+
+        assert snap_err == []
+        assert snap_res == [expected_v0]
+        assert lineage_page._projections[key] is kept_v1
+
+        # 2. Growth extension from kept_v1 -> v2 must not overwrite a newer v3 entry published mid-flight.
+        monkeypatch.setattr(store_messages, "_dedupe_display_generations", real_dedupe)
+        append_messages_batch(db, tip, [{"role": "user", "content": "v2 append"}])
+        with full_reads.oracle():
+            expected_v2 = _sliced(_full(db, tip), 4, 0, True)
+
+        real_extended = lineage_page._extended
+        injected_v3 = [False]
+        kept_v3_holder: list[Any] = []
+
+        def racing_extended(holder, conn, kept, stamp, ids):
+            grown = real_extended(holder, conn, kept, stamp, ids)
+            if not injected_v3[0] and grown is not None:
+                injected_v3[0] = True
+                # Publish a newer v3 projection before this growth call publishes its v2 projection.
+                append_messages_batch(db, tip, [{"role": "assistant", "content": "v3 race winner"}])
+                _fresh_page(path, tip, 4, 0, True)
+                kept_v3_holder.append(lineage_page._projections[key])
+            return grown
+
+        monkeypatch.setattr(lineage_page, "_extended", racing_extended)
+        v2_page = _fresh_page(path, tip, 4, 0, True)
+        assert v2_page == expected_v2
+        assert len(kept_v3_holder) == 1
+        assert lineage_page._projections[key] is kept_v3_holder[0]
+        full_reads.reset()
+        _assert_pages_match(db, tip, full_reads)
+        assert full_reads.count == 0
+
+
+def test_staggered_three_readers_takeover_wakes_displaced_waiter(tmp_path, full_reads, monkeypatch):
+    """When reader 2 times out and takes over flight E, reader 3 waiting on E wakes and finishes right
+    after reader 2 publishes (not another timeout later), with 2 full reads total and no stale overwrite."""
+    path = tmp_path / "state.db"
+    with StoreHolder(path) as db:
+        tip = _lineage(db)
+        with full_reads.oracle():
+            expected_old = _sliced(_full(db, tip), 4, 0, True)
+        lineage_page._projections.clear()
+        full_reads.reset()
+        key = (lineage_page._store_identity(db), tuple(_resume_lineage_ids(db, tip)))
+
+        real_dedupe = store_messages._dedupe_display_generations
+        builder_started = threading.Event()
+        release_builder = threading.Event()
+        call_lock = threading.Lock()
+        calls = 0
+
+        def stall_first_dedupe(holder, rows, **kwargs):
+            nonlocal calls
+            with call_lock:
+                calls += 1
+                is_first = calls == 1
+            if is_first:
+                builder_started.set()
+                release_builder.wait(timeout=5.0)
+            return real_dedupe(holder, rows, **kwargs)
+
+        monkeypatch.setattr(store_messages, "_dedupe_display_generations", stall_first_dedupe)
+        monkeypatch.setattr(lineage_page, "_REBUILD_WAIT_TIMEOUT_S", 0.6)
+
+        t1_res: list[Any] = []
+        t1_err: list[BaseException] = []
+
+        def reader1() -> None:
+            try:
+                t1_res.append(_fresh_page(path, tip, 4, 0, True))
+            except BaseException as exc:
+                t1_err.append(exc)
+
+        t1 = threading.Thread(target=reader1)
+        t1.start()
+
+        r2_res: list[Any] = []
+        r2_err: list[BaseException] = []
+        r2_done_at: list[float] = []
+        r3_res: list[Any] = []
+        r3_err: list[BaseException] = []
+        r3_done_at: list[float] = []
+
+        def reader2() -> None:
+            try:
+                page = _fresh_page(path, tip, 4, 0, True)
+                r2_done_at.append(time.monotonic())
+                r2_res.append(page)
+            except BaseException as exc:
+                r2_err.append(exc)
+
+        def reader3() -> None:
+            try:
+                page = _fresh_page(path, tip, 4, 0, True)
+                r3_done_at.append(time.monotonic())
+                r3_res.append(page)
+            except BaseException as exc:
+                r3_err.append(exc)
+
+        t2 = threading.Thread(target=reader2)
+        t3 = threading.Thread(target=reader3)
+        try:
+            assert builder_started.wait(timeout=5.0)
+            orig_flight = lineage_page._inflight.get(key)
+            assert orig_flight is not None
+
+            # Advance DB while reader 1 is stalled so replacement publishes a newer projection.
+            append_messages_batch(db, tip, [{"role": "user", "content": "takeover newer turn"}])
+            new_uid = get_messages(db, tip)[-1]["id"]
+            assert set_user_message_content(db, tip, new_uid, "takeover newer turn edited") == 1
+            with full_reads.oracle():
+                expected_new = _sliced(_full(db, tip), 4, 0, True)
+
+            waiter_lock = threading.Lock()
+            waiter_count = 0
+            r2_waiting = threading.Event()
+            r3_waiting = threading.Event()
+            r3_saw_unset_event = [False]
+            orig_wait = orig_flight.wait
+
+            def tracked_wait(*args, **kwargs):
+                nonlocal waiter_count
+                with waiter_lock:
+                    waiter_count += 1
+                    idx = waiter_count
+                if idx == 1:
+                    r2_waiting.set()
+                elif idx == 2:
+                    r3_saw_unset_event[0] = not orig_flight.is_set()
+                    r3_waiting.set()
+                return orig_wait(*args, **kwargs)
+
+            orig_flight.wait = tracked_wait  # type: ignore[method-assign]
+
+            t2.start()
+            assert r2_waiting.wait(timeout=5.0)
+            # Stagger reader 3 partway through reader 2's wait timeout so reader 3 enters E.wait before takeover
+            # and still has ~0.35s of its own timeout left when reader 2 takes over.
+            stagger = threading.Event()
+            stagger.wait(0.25)  # health: allow HX013 -- stagger reader 3 within reader 2's wait timeout
+            t3.start()
+            assert r3_waiting.wait(timeout=5.0)
+            assert r3_saw_unset_event[0], "reader 3 must have queued on E before takeover"
+
+            t2.join(timeout=5.0)
+            t3.join(timeout=5.0)
+            assert not t2.is_alive() and not t3.is_alive()
+
+            kept_after_r2 = lineage_page._projections[key]
+        finally:
+            release_builder.set()
+            t1.join(timeout=5.0)
+            t2.join(timeout=5.0)
+            t3.join(timeout=5.0)
+
+        assert not t1.is_alive()
+        assert r2_err == [] and r3_err == [] and t1_err == []
+        assert r2_res == [expected_new]
+        assert r3_res == [expected_new]
+        assert t1_res == [expected_old]
+        # Reader 3 must have been woken by takeover and finished right after reader 2 (not ~0.25s later).
+        lag = r3_done_at[0] - r2_done_at[0]
+        assert lag < 0.15, f"displaced waiter reader 3 lagged {lag:.3f}s behind replacement reader 2"
+        # Exactly 2 full reads total: stalled reader 1 + replacement reader 2.
+        assert full_reads.count == 2
+        # Stalled builder must not have overwritten reader 2's cached projection.
+        assert lineage_page._projections[key] is kept_after_r2
+        full_reads.reset()
+        assert _fresh_page(path, tip, 4, 0, True) == expected_new
+        assert full_reads.count == 0
+        assert not lineage_page._inflight
+        _assert_all_rebuild_slots_free()
+
+
+def test_oversized_growth_skips_select_star_and_rebuilds(tmp_path, full_reads, monkeypatch):
+    """Appending more than _MAX_APPENDED_ROWS rows rejects growth before SELECT * of new rows."""
+    path = tmp_path / "state.db"
+    with StoreHolder(path) as db:
+        tip = _lineage(db)
+        _assert_pages_match(db, tip, full_reads)
+        full_reads.reset()
+
+        monkeypatch.setattr(lineage_page, "_MAX_APPENDED_ROWS", 5)
+
+        def read_and_record_sql() -> tuple[list[Any], list[str]]:
+            queries: list[str] = []
+            page_rows: list[Any] = []
+            with StoreHolder(path, read_only=True) as reader:
+                real_read_ctx = reader._read_ctx
+
+                @contextmanager
+                def recording_read_ctx(*args, **kwargs):
+                    with real_read_ctx(*args, **kwargs) as conn:
+                        yield _SqlRecordingConn(conn, queries)
+
+                monkeypatch.setattr(reader, "_read_ctx", recording_read_ctx)
+                page_rows = _page(reader, tip, 4, 0, True)
+            return page_rows, queries
+
+        # Case 1: plain append of _MAX_APPENDED_ROWS + 1 rows (rejected cheaply via stamp delta).
+        append_messages_batch(db, tip, [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"bulk {i}"}
+            for i in range(6)
+        ])
+        page, queries = read_and_record_sql()
+        appended_star = [q for q in queries if "SELECT *" in q.upper() and "ID > ?" in q.upper()]
+        assert appended_star == [], f"oversized growth materialized new rows: {appended_star}"
+        assert full_reads.count == 1
+        full = _assert_pages_match(db, tip, full_reads)
+        assert page == _sliced(full, 4, 0, True)
+        assert full_reads.count == 1
+
+        # Case 2: delete old rows + append > _MAX_APPENDED_ROWS rows so live_delta <= limit
+        # (caught by the id-only LIMIT probe before SELECT *).
+        full_reads.reset()
+        tip_ids = [m["id"] for m in get_messages(db, tip)]
+        delete_ids = tip_ids[:6]
+        db._execute_write(
+            lambda conn: conn.execute(
+                f"DELETE FROM messages WHERE id IN ({','.join('?' * len(delete_ids))})", delete_ids
+            )
+        )
+        append_messages_batch(db, tip, [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"churn {i}"}
+            for i in range(8)
+        ])
+        page2, queries2 = read_and_record_sql()
+        appended_star2 = [q for q in queries2 if "SELECT *" in q.upper() and "ID > ?" in q.upper()]
+        assert appended_star2 == [], f"delete+append oversized growth materialized new rows: {appended_star2}"
+        assert full_reads.count == 1
+        full2 = _assert_pages_match(db, tip, full_reads)
+        assert page2 == _sliced(full2, 4, 0, True)
+        assert full_reads.count == 1
