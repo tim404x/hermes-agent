@@ -22,58 +22,10 @@ class UpdateRefusedBeforeSubmit(RuntimeError):
     """Raised only at the pre-submit transport boundary (not from an agent's result text)."""
 
 
-def attach_tick_slot(claimed, scanned):
-    """The claim normally sees a future slot: the built-in tick already advanced it. Bind
-    the original raw instant to the worker only if it claimed the same scan and plan."""
-    from cron.jobs import _plan_fingerprint
-
-    manual = scanned.get("manual_run_at") == scanned.get("next_run_at")
-    same_scan = claimed.get("run_claim") == scanned.get("run_claim") and claimed.get(
-        "last_dispatch"
-    ) == scanned.get("last_dispatch")
-    same_dispatch = claimed.get("manual_run_at") == scanned.get("manual_run_at") and (
-        same_scan or manual
-    )
-    expected_pending = scanned.get("_scan_pending_slot")
-    if expected_pending is None:
-        expected_pending = scanned.get("pending_slot")
-    same_pending = (
-        expected_pending is None
-        or (
-            "_claimed_pending_slot" in claimed
-            and claimed["_claimed_pending_slot"] == expected_pending
-        )
-    )
-    expected_seq = max(
-        int(scanned.get("fire_seq") or 0),
-        int(scanned.get("booked_fire_seq") or 0),
-    )
-    if "_claimed_fire_seq" in claimed:
-        same_seq = claimed["_claimed_fire_seq"] == expected_seq
-    else:
-        claimed_seq = (claimed.get("fire_claim") or {}).get("seq")
-        same_seq = claimed_seq is None or claimed_seq == expected_seq + 1
-    matched = (
-        claimed.get("_scan_claim_matched") is not False
-        and same_pending
-        and same_seq
-        and same_dispatch
-        and _plan_fingerprint(claimed) == _plan_fingerprint(scanned)
-    )
-    if matched:
-        claimed["_refused_slot"] = scanned.get("next_run_at")
-        if manual and "_refused_manual_restore" not in claimed and "manual_run_restore_at" in scanned:
-            claimed["_refused_manual_restore"] = scanned["manual_run_restore_at"]
-    else:
-        claimed["_refused_slot"] = None
-        claimed.pop("_refused_manual_restore", None)
-
-
 def restore_refused_slot(fire, *, observed_at: str | None = None):
     from cron import extra_fire
     from cron.jobs import (
         _fire_job_lock,
-        _hermes_now,
         _plan_fingerprint,
         _with_job,
         save_jobs,
@@ -121,7 +73,7 @@ def restore_refused_slot(fire, *, observed_at: str | None = None):
             if "_refused_manual_restore" in fire:
                 job[extra_fire.RESTORE_KEY] = fire["_refused_manual_restore"]
             detail = prefix + "Original slot remains due."
-            witness_at = observed_at or fire.get("_refused_at") or _hermes_now().isoformat()
+            witness_at = observed_at or (fire.get("fire_claim") or {}).get("at")
             job["last_fire_error"] = {
                 "at": witness_at,
                 "detail": detail,
@@ -203,7 +155,7 @@ def reconcile_refusal_record(record: dict, job_id: str, request_id: str) -> None
 def reconcile_pending_refusals() -> None:
     """Replay refusal fallbacks persisted in executions.db when the admissions journal could not be written."""
     import logging
-    from cron.executions import execution_owner_live, list_pending_refusals
+    from cron.executions import list_pending_refusals
 
     log = logging.getLogger(__name__)
     try:
@@ -213,12 +165,7 @@ def reconcile_pending_refusals() -> None:
         return
     for eid, jid, envelope in pending_refusals:
         try:
-            if execution_owner_live(eid, jid):
-                continue
-            fire = verified_refusal_fire(envelope, jid, eid)
-            if fire is None:
-                raise ValueError("cron pending refusal identity conflict")
-            settle_refusal(fire, recovered=True)
+            reconcile_refusal_record(envelope, jid, eid)
         except Exception:  # health: allow BLE001 -- deferred to next tick like journal recovery
             log.warning(
                 "Cron pending refusal recovery deferred: %s/%s", jid, eid, exc_info=True
@@ -276,28 +223,14 @@ def settle_refusal(fire, *, recovered: bool = False):
         log.exception("Cron %s: refused slot rollback pending", jid)
         detail = None
     reason = detail or "Update refused before cron.submit; slot restoration pending."
-    if recovered:
+    args = dict(success=False, cancelled=True, error=reason, delivery_outcome="suppressed")
+    if not executions.finish_execution(eid, **args):
+        if not recovered:
+            return reason
         row = executions.get_execution(eid)
         if row and row["status"] not in executions.FIRER_FINISHED_STATES:
-            if not executions.recover_receipted_execution(
-                eid,
-                jid,
-                success=False,
-                error=reason,
-                cancelled=True,
-                delivery_outcome="suppressed",
-            ):
-                return reason  # the ledger still has an owner; keep the journal
-    else:
-        try:
-            settled = executions.finish_execution(
-                eid, success=False, cancelled=True, error=reason, delivery_outcome="suppressed"
-            )
-        except (sqlite3.Error, OSError):
-            log.exception("Cron %s: failed to cancel execution %s after refusal", jid, eid)
-            return reason
-        if not settled:
-            return reason
+            if not executions.recover_receipted_execution(eid, jid, **args):
+                return reason  # a foreign live owner must settle the ledger itself
     if detail is not None:
         try:
             path.unlink(missing_ok=True)

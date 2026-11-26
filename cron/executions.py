@@ -105,9 +105,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
     add_column_if_missing(conn, "executions", "progress_at", "progress_at TEXT")
     add_column_if_missing(conn, "executions", "catch_up_report", "catch_up_report TEXT")
-    add_column_if_missing(
-        conn, "executions", "catch_up_booked", "catch_up_booked INTEGER NOT NULL DEFAULT 0"
-    )
+    conn.execute("CREATE TABLE IF NOT EXISTS catch_up_total (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
@@ -262,28 +260,9 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     )
 
 
-def _serialize_catch_up_report(report: Any) -> Optional[str]:
-    if not report:
-        return None
-    missed, first, capped = report
-    return json.dumps([int(missed), first, bool(capped)])
-
-
-def _parse_catch_up_report(raw: Any) -> Optional[tuple[int, Optional[str], bool]]:
-    if raw is None:
-        return None
-    try:
-        parsed = json.loads(raw) if isinstance(raw, str) else list(raw)
-        if isinstance(parsed, list) and len(parsed) == 3:
-            return int(parsed[0]), parsed[1], bool(parsed[2])
-    except (ValueError, TypeError):
-        pass
-    return None
-
-
 def create_execution(
     job_id: str, *, source: str, scheduled_instant: Optional[str] = None,
-    catch_up_report: Optional[Any] = None,
+    catch_up_report: Optional[tuple] = None,
 ) -> dict[str, Any]:
     """Persist a claimed attempt before executor/provider dispatch."""
     from cron.occurrences import scheduled_instant as canonical_instant
@@ -291,7 +270,7 @@ def create_execution(
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
-    encoded_report = _serialize_catch_up_report(catch_up_report)
+    encoded_report = json.dumps(catch_up_report) if catch_up_report is not None else None
     with _transaction() as conn:
         conn.execute(
             """INSERT INTO executions
@@ -461,67 +440,39 @@ def record_missed_occurrences(
     return record
 
 
-def book_execution_catch_up(
-    execution_id: str, job_id: str, *, fallback_report: Optional[Any] = None,
-) -> Optional[tuple[int, Optional[str], bool]]:
-    """Atomically book an execution's persisted catch-up report (at-most-once) and insert its
-    collapsed ``missed`` row in the same transaction. Returns ``(missed, first, capped)`` iff
-    THIS call won the transition, else ``None``."""
+def book_execution_catch_up(execution_id: str, job_id: str) -> None:
+    """Consume the report, count one fire, and book its collapsed slots in ONE transaction.
+    A replay or a pruned execution has no report left to consume."""
     from cron.missed_runs import _MAX_COUNTED_SLOTS
 
-    if not fallback_report and not _executions_db_path().exists():
-        return None
-    missed_record: Optional[dict[str, Any]] = None
-    booked: Optional[tuple[int, Optional[str], bool]] = None
+    record = None
     with _transaction() as conn:
         row = conn.execute(
-            "SELECT catch_up_report, catch_up_booked FROM executions WHERE id=?",
-            (str(execution_id),),
+            "SELECT catch_up_report FROM executions WHERE id=? AND job_id=? AND catch_up_report IS NOT NULL",
+            (execution_id, job_id),
         ).fetchone()
-        if row is None:
-            parsed = _parse_catch_up_report(fallback_report)
-            if parsed is None:
-                return None
-            booked = parsed
-        else:
-            if row["catch_up_booked"]:
-                return None
-            raw = row["catch_up_report"]
-            if raw is None:
-                if not fallback_report:
-                    return None
-                raw = _serialize_catch_up_report(fallback_report)
-                parsed = _parse_catch_up_report(raw)
-                if parsed is None:
-                    return None
-                cur = conn.execute(
-                    "UPDATE executions SET catch_up_report=?, catch_up_booked=1 "
-                    "WHERE id=? AND catch_up_booked=0",
-                    (raw, str(execution_id)),
-                )
-            else:
-                parsed = _parse_catch_up_report(raw)
-                if parsed is None:
-                    return None
-                cur = conn.execute(
-                    "UPDATE executions SET catch_up_booked=1 "
-                    "WHERE id=? AND catch_up_booked=0",
-                    (str(execution_id),),
-                )
-            if cur.rowcount != 1:
-                return None
-            booked = parsed
-        missed, first, capped = booked
+        if not row or not conn.execute(
+            "UPDATE executions SET catch_up_report=NULL WHERE id=? AND job_id=? AND catch_up_report=?",
+            (execution_id, job_id, row[0]),
+        ).rowcount:
+            return
+        missed, first, capped = json.loads(row[0])
+        conn.execute("INSERT INTO catch_up_total VALUES (1,1) ON CONFLICT(id) DO UPDATE SET value=value+1")
         if missed > 1:
             detail = "collapsed into one catch-up run"
             if capped:
-                detail = f"{detail}; counting stopped at {_MAX_COUNTED_SLOTS}"
-            missed_record = _insert_missed_unlocked(
-                conn, str(job_id), count=missed - 1, first_instant=first, detail=detail,
-            )
-    if missed_record is not None:
-        _emit_execution_state(missed_record)
-    return booked
+                detail += f"; counting stopped at {_MAX_COUNTED_SLOTS}"
+            record = _insert_missed_unlocked(conn, job_id, count=missed - 1, first_instant=first, detail=detail)
+    if record:
+        _emit_execution_state(record)
+
+
+def booked_catch_up_count() -> int:
+    if not _executions_db_path().exists():
+        return 0
+    with _transaction() as conn:
+        row = conn.execute("SELECT value FROM catch_up_total WHERE id=1").fetchone()
+        return row[0] if row else 0
 
 
 def record_pending_refusal(execution_id: str, job_id: str, payload: dict[str, Any]) -> None:

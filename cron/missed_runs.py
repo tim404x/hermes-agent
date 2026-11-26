@@ -121,40 +121,14 @@ def fast_forward_missed_recurring(d: Any, grace: int, *, worker_books: bool = Fa
     return False
 
 
-def book_catch_up(job, report, *, execution_id: Optional[str] = None) -> bool:
-    """Book catch-up count + collapsed missed row. With *execution_id*, binds the report to the
-    execution row so ordinary and recovered completions book idempotently at most once."""
+def book_catch_up(job, report) -> None:
     from cron.jobs import _jobs_lock
     from cron.occurrences import record_catch_up_occurrence
-
-    # Parallel tick workers no longer share the scan's lock for this read/modify/write metric.
+    missed, first, capped = report
     with _jobs_lock():
-        if execution_id is not None:
-            from cron.executions import book_execution_catch_up
-
-            booked = book_execution_catch_up(
-                execution_id, str(job.get("id")), fallback_report=report
-            )
-            if booked is None:
-                return False
-            job.pop("_catch_up_report", None)
-            record_catch_up_occurrence()
-            return True
-        if not report:
-            return False
-        missed, first, capped = report
         record_catch_up_occurrence()
         if missed > 1:
             _book_missed(job, missed - 1, first, "collapsed into one catch-up run", capped=capped)
-        return True
-
-
-def book_completion_catch_up(job, execution_id: Optional[str], *, recovered: bool = False) -> bool:
-    """Book catch-up accounting on ordinary or recovered completion when a report is present."""
-    report = job.get("_catch_up_report")
-    if not recovered and not report:
-        return False
-    return book_catch_up(job, report, execution_id=execution_id)
 
 
 def retire_expired_oneshot(d: Any) -> bool:

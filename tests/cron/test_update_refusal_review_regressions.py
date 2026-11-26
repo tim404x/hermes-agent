@@ -11,70 +11,15 @@ from cron import scheduler_authority
 from cron.occurrences import get_catch_up_occurrence_count
 from cron.scheduler_authority import reconcile_pending as _real_reconcile
 from cron.scheduler_provider import CronScheduler
-from cron.update_refusal import attach_tick_slot, restore_refused_slot
+from cron.update_refusal import restore_refused_slot
 from hermes_cli import gateway_client as client, gateway_runtime as runtime
-from tests.cron.test_postcheck import ERROR, make_due
+from tests.cron import test_postcheck as postcheck
 from tests.cron.test_tick_holds_agent_jobs_during_update import _fence
-from tests.cron.test_xcron_fence_delays_never_changes import _bind_cron_home
 
-
-@pytest.fixture
-def cron_home(tmp_path, monkeypatch):
-    home = _bind_cron_home(tmp_path / "home", monkeypatch)
-    yield home
-    S._shutdown_parallel_pool()
-
-
-@pytest.fixture
-def transport(cron_home, monkeypatch):
-    from gateway import session_cron
-
-    real = client.connect_gateway
-    evidence = {"refuse": True, "errors": [], "submitted": [], "markers": []}
-    side_effect = cron_home / "work"
-    monkeypatch.setattr(session_cron, "owner_for_home", lambda home: None)
-    monkeypatch.setattr(S, "_maybe_run_worktree_maintenance", lambda: None)
-    monkeypatch.setattr(S, "_launch_external_cron_worker", lambda job: False)
-    monkeypatch.setattr(
-        runtime,
-        "discover_gateway_endpoint",
-        lambda *a, **kw: runtime.GatewayDiscovery("absent"),
-    )
-    monkeypatch.setattr(
-        runtime, "_observe_replacing_stale", lambda *a: pytest.fail("unfenced ensure")
-    )
-
-    class Owner:
-        async def rpc(self, op, **params):
-            if op == "cron.submit":
-                evidence["submitted"].append(params["job_id"])
-                with side_effect.open("a", encoding="utf-8") as f:
-                    f.write(params["job_id"] + "\n")
-                return {"session_id": "s", "admission_id": "a"}
-            assert op == "cron.status"
-            return {
-                "status": "terminal",
-                "result": [True, "# report\n", "observation made", None],
-            }
-
-    @asynccontextmanager
-    async def connect():
-        if not evidence["refuse"]:
-            yield Owner()
-            return
-        assert any(j.get("fire_claim") for j in J.load_jobs())
-        evidence["markers"].append(_fence(cron_home))
-        if "after_claim" in evidence:
-            evidence["after_claim"]()
-        try:
-            async with real():
-                pytest.fail("fenced connection must not reach submit")
-        except client.GatewayUnavailableError as exc:
-            evidence["errors"].append(f"{type(exc).__name__}: {exc}")
-            raise
-
-    monkeypatch.setattr(client, "connect_gateway", connect)
-    return evidence, side_effect
+cron_home = postcheck.cron_home
+transport = postcheck.transport
+make_due = postcheck.make_due
+ERROR = postcheck.ERROR
 
 
 def test_intervening_fire_between_scan_and_claim_blocks_old_slot_restore(
@@ -104,7 +49,7 @@ def test_intervening_fire_between_scan_and_claim_blocks_old_slot_restore(
     assert newer_next != old_due
     assert after_intervening["last_dispatch"] == scanned["last_dispatch"]
 
-    # Queued worker now starts and hits the update fence before cron.submit.
+    # The stale scan must not even reach the transport, or advance the newer schedule.
     execution = E.create_execution(
         jid, source="builtin", scheduled_instant=scanned.get("_scheduled_instant")
     )
@@ -112,14 +57,15 @@ def test_intervening_fire_between_scan_and_claim_blocks_old_slot_restore(
     assert S._process_due_job(queued_job, adapters=None, loop=None, verbose=False) is True
 
     row = J.get_job(jid)
-    assert not work.exists() and ev["errors"] == [ERROR]
+    assert row["fire_seq"] == after_intervening["fire_seq"]
+    assert not work.exists() and not ev["errors"]
     assert row["next_run_at"] == newer_next, (
         f"queued worker restored older scan's slot {old_due} over newer fire's {newer_next}"
     )
     assert not row.get("fire_claim")
     assert row["repeat"]["completed"] == 1
     assert (row.get("last_fire_error") or {}).get("update_slot") != old_due
-    assert E.get_execution(execution["id"])["status"] == "cancelled"
+    assert "not started" in E.get_execution(execution["id"])["error"]
 
 
 @pytest.mark.parametrize("reason", ["rescheduled", "run_claim_changed", "unprecharged"])
@@ -133,10 +79,8 @@ def test_oneshot_repeat_decrement_gated_on_plan_and_actual_precharge(
 
     due_jobs = J.get_due_jobs()
     assert [j["id"] for j in due_jobs] == [jid]
-    scanned = due_jobs[0]
     claimed = J.claim_job_for_fire(jid, return_job=True)
     assert isinstance(claimed, dict)
-    attach_tick_slot(claimed, scanned)
 
     if reason == "rescheduled":
         assert J.claim_dispatch(jid) is True
@@ -386,7 +330,7 @@ def test_record_unknown_worker_outcome_honors_verified_refusal_journal(cron_home
     scanned = due_jobs[0]
     J.advance_next_runs([jid])
     claimed = J.claim_job_for_fire(jid, return_job=True)
-    attach_tick_slot(claimed, scanned)
+    claimed["_refused_slot"] = scanned["next_run_at"]  # legacy journal after a built-in tick
     row = E.create_execution(jid, source="builtin")
     eid = row["id"]
     claimed["execution_id"] = eid
@@ -616,8 +560,6 @@ def test_recovered_catchup_completion_books_count_and_missed_rows_idempotently(
 
     # Verify idempotency: re-booking the same execution does not double-count.
     completed_row = next(r for r in E.list_executions(job_id=jid) if r["status"] == "completed")
-    from cron.missed_runs import book_catch_up
-
-    book_catch_up(J.get_job(jid), (4, due, False), execution_id=completed_row["id"])
+    E.book_execution_catch_up(completed_row["id"], jid)
     assert get_catch_up_occurrence_count() == 1
     assert len([r for r in E.list_executions(job_id=jid) if r["status"] == "missed"]) == 1

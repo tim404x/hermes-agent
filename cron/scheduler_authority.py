@@ -511,13 +511,13 @@ def reconcile_pending(*, allow_connect=True):
             params = record['params']
             if journal != journal_path(params['job_id'], params['request_id']):
                 raise ValueError('cron journal identity conflict')
-            if execution_owner_live(params['request_id'], params['job_id']):
-                # Its firer (this process included) still owns the row and its tail: re-saving the
-                # output or re-marking the job on every tick would duplicate its side effects.
-                continue
             if 'update_refused' in record:
                 from cron.update_refusal import reconcile_refusal_record
                 reconcile_refusal_record(record, params['job_id'], params['request_id'])
+                continue
+            if execution_owner_live(params['request_id'], params['job_id']):
+                # Its firer (this process included) still owns the row and its tail: re-saving the
+                # output or re-marking the job on every tick would duplicate its side effects.
                 continue
             row = get_execution(params['request_id'])
             if row is not None and row['job_id'] == params['job_id'] and row['status'] in FIRER_FINISHED_STATES:

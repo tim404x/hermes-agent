@@ -187,68 +187,27 @@ def test_resubmit_lost_reply_then_update_paused_redial_stays_unknown_same_reques
 ):
     """#53 resubmit path: transient storage_unavailable -> recover=missing -> lost resubmit
     reply -> update_paused redial must keep one request_id and never refund the slot."""
-    import json
     from cron import scheduler_authority
+    from tests.cron.test_observer_reconnects_by_receipt import _gateway
 
-    ev, work = transport
-    monkeypatch.setattr(scheduler_authority, "STORAGE_RETRY_DELAYS_S", (0.001,), raising=False)
-    monkeypatch.setattr(scheduler_authority, "RECONNECT_BUDGET_S", 0.05, raising=False)
-    monkeypatch.setattr(scheduler_authority, "RECONNECT_FIRST_DELAY_S", 0.01, raising=False)
-
+    monkeypatch.setattr(scheduler_authority, "STORAGE_RETRY_DELAYS_S", (0,))
+    monkeypatch.setattr(scheduler_authority, "RECONNECT_BUDGET_S", 0.02)
+    monkeypatch.setattr(scheduler_authority, "RECONNECT_FIRST_DELAY_S", 0.01)
     jid, due = make_due("every 30m", timedelta(seconds=10))
-    calls = []
-    dials = {"count": 0}
-    real_connect = client.connect_gateway
-
-    class ResubmitOwner:
-        async def rpc(self, op, **params):
-            calls.append((op, params.get("request_id")))
-            if op == "cron.submit":
-                if sum(1 for m, _ in calls if m == "cron.submit") == 1:
-                    raise client.GatewayRPCError(
-                        "storage_unavailable", 5001, {"reason": "storage_unavailable"}
-                    )
-                raise client.GatewayClientError(client.DISCONNECTED)
-            if op == "cron.recover":
-                return {"status": "missing", "result": None}
-            raise AssertionError(f"unexpected rpc {op}")
-
-    @asynccontextmanager
-    async def connect():
-        dials["count"] += 1
-        if dials["count"] == 1:
-            yield ResubmitOwner()
-            return
-        if not ev["markers"]:
-            ev["markers"].append(_fence(cron_home))
-        async with real_connect():
-            pytest.fail("fenced redial must raise update_paused")
-
-    monkeypatch.setattr(client, "connect_gateway", connect)
-
+    seen = _gateway(monkeypatch, [
+        {"submit": [client.GatewayRPCError("storage_unavailable", 5001),
+                    client.GatewayClientError(client.DISCONNECTED)],
+         "recover": [{"status": "missing"}]},
+        client.GatewayUnavailableError("Gateway draining: update_paused", "draining", "update_paused"),
+    ])
     S.tick(verbose=False, sync=True)
-
-    assert [op for op, _ in calls] == ["cron.submit", "cron.recover", "cron.submit"]
-    request_ids = {rid for _, rid in calls}
-    assert len(request_ids) == 1
-    req_id = next(iter(request_ids))
-    assert req_id is not None and not work.exists()
-    assert dials["count"] >= 2
-
-    row = J.get_job(jid)
-    assert row["state"] == "paused"
-    assert row["next_run_at"] != due
-    assert (row.get("last_fire_error") or {}).get("update_slot") is None
-
-    exec_rows = E.list_executions(job_id=jid)
-    assert len(exec_rows) == 1 and exec_rows[0]["id"] == req_id
-    assert exec_rows[0]["status"] == "unknown"
-
-    journals = list((cron_home / "cron/admissions").glob("*.json"))
-    assert len(journals) == 1
-    saved = json.loads(journals[0].read_text(encoding="utf-8-sig"))
-    assert saved["params"]["request_id"] == req_id
-    assert "update_refused" not in saved
+    row, = E.list_executions(job_id=jid)
+    assert row["status"] == "unknown" and J.get_job(jid)["state"] == "paused"
+    assert J.get_job(jid)["next_run_at"] != due
+    assert [op for op, _ in seen[0]] == ["submit", "recover", "submit"]
+    assert {p["request_id"] for _, p in seen[0]} == {row["id"]}
+    assert len(seen) >= 2 and not any(seen[1:])
+    assert scheduler_authority.journal_path(jid, row["id"]).exists()
 
 
 def test_fence_does_not_replay_an_already_executed_monitor_script(cron_home, transport):

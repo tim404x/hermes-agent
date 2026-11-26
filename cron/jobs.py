@@ -2842,8 +2842,7 @@ def _machine_id() -> str:
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False,
     manual: bool = False, return_job: bool = False,
-    expected_pending_slot: Optional[dict[str, Any]] = None,
-    expected_fire_seq: Optional[int] = None,
+    scanned: Optional[dict[str, Any]] = None,
 ) -> bool | dict[str, Any]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
@@ -2873,18 +2872,15 @@ def claim_job_for_fire(
         # stamping it would make completed_occurrence() skip that slot when it arrives.
         manual_fire = force or manual or job.get("manual_run_at") == job.get("next_run_at")
         raw_slot = job.get("next_run_at")
-        queued_manual = raw_slot is not None and raw_slot == job.get("manual_run_at")
-        has_manual_restore = queued_manual and extra_fire.RESTORE_KEY in job
-        manual_restore = job.get(extra_fire.RESTORE_KEY) if has_manual_restore else None
-        pre_pending_slot = copy.deepcopy(job.get("pending_slot"))
-        pre_fire_seq = max(
-            int(job.get(jobs_newer_fire.SEQ_KEY) or 0),
-            int(job.get(jobs_newer_fire.BOOKED_KEY) or 0),
-        )
-        scan_matched = (
-            (expected_pending_slot is None or pre_pending_slot == expected_pending_slot)
-            and (expected_fire_seq is None or pre_fire_seq == expected_fire_seq)
-        )
+        if scanned is not None and (
+            job.get(jobs_newer_fire.SEQ_KEY) != scanned.get(jobs_newer_fire.SEQ_KEY)
+            or job.get("pending_slot") != scanned.get("pending_slot")
+            or _plan_fingerprint(job) != _plan_fingerprint(scanned)
+            or job.get("manual_run_at") != scanned.get("manual_run_at")
+            or (not scanned.get("pending_slot") and raw_slot != scanned.get("next_run_at"))
+        ):
+            return False  # A newer fire/edit superseded this scan. Do not advance or clear its slot.
+        manual_restore = job.get(extra_fire.RESTORE_KEY, _MISSING) if extra_fire.queued(job) else _MISSING
         instant = None if manual_fire else scheduled_instant(raw_slot)
         # A scheduled tick only ever fires when now >= next_run_at
         # (_evaluate_due_job returns False while the stored occurrence is still
@@ -2927,17 +2923,11 @@ def claim_job_for_fire(
         save_jobs(jobs)
         if not return_job:
             return True
-        refused_slot = raw_slot if (instant or queued_manual) and scan_matched else None
-        snapshot = dict(
-            copy.deepcopy(job),
-            _scheduled_instant=instant,
-            _refused_slot=refused_slot,
-            _claimed_pending_slot=pre_pending_slot,
-            _claimed_fire_seq=pre_fire_seq,
-        )
-        if expected_pending_slot is not None or expected_fire_seq is not None:
-            snapshot["_scan_claim_matched"] = scan_matched
-        if refused_slot is not None and has_manual_restore:
+        refused_slot = raw_slot if instant or raw_slot == job.get("manual_run_at") else None
+        if scanned is not None:
+            refused_slot = scanned.get("next_run_at") if job.get("run_claim") == scanned.get("run_claim") else None
+        snapshot = dict(copy.deepcopy(job), _scheduled_instant=instant, _refused_slot=refused_slot)
+        if manual_restore is not _MISSING:
             snapshot["_refused_manual_restore"] = manual_restore
         return snapshot
 
@@ -3419,10 +3409,6 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     # Missed-run visibility: persist scheduled-vs-actual timing so separate CLI processes can show a
     # late catch-up. Recurring only — expired one-shots were retired above; manual triggers aren't
     # late.
-    job["_scan_fire_seq"] = max(
-        int(job.get("fire_seq") or 0),
-        int(job.get("booked_fire_seq") or 0),
-    )
     if not manual_run and recurring:
         lateness = max(0.0, _elapsed_seconds(now, d.next_run_dt))
         # See #99879.
@@ -3438,7 +3424,7 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         from cron.occurrences import pending_slot_stamp
 
         pending = pending_slot_stamp(next_run, now)
-        job["_scan_pending_slot"] = pending
+        job["pending_slot"] = pending
         scan.persist(
             job["id"], last_dispatch=dispatch_stamp,
             pending_slot=pending)
