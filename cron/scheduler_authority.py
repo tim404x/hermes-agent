@@ -3,8 +3,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import random
 import time
 import uuid
+
+from hermes_cli.gateway_client import GatewayRPCError
+from storage_errors import is_transient_store_failure
+
+logger = logging.getLogger(__name__)
 
 
 class CronExecutionUnknown(RuntimeError):
@@ -16,6 +22,37 @@ class CronExecutionUnknown(RuntimeError):
 # unknown. Covers a stalled owner loop and a gateway restart; a gateway down longer fails closed.
 RECONNECT_BUDGET_S = 600.0
 RECONNECT_FIRST_DELAY_S, RECONNECT_MAX_DELAY_S = 0.5, 30.0
+STORAGE_RETRY_DELAYS_S = (1.0, 3.0, 8.0, 15.0)
+STATUS_STORAGE_BUDGET_S = 120.0
+
+
+def _transient_storage_refusal(exc: BaseException) -> bool:
+    """Older gateways sent only the reason; newer ones can explicitly rule out a retry. Only the
+    store-failure code (5001, or no code from an older owner) is retryable: a 4001 policy refusal
+    that names ``storage_unavailable`` is permanent, as it is owner-locally (AuthorityRefusal)."""
+    if isinstance(exc, GatewayRPCError):
+        return exc.code in (5001, None) and exc.data.get('transient') is not False and (
+            str(exc) == 'storage_unavailable' or exc.data.get('reason') == 'storage_unavailable')
+    return is_transient_store_failure(exc)
+
+
+class _StorageRetryStopped(Exception):
+    """Cancellation while waiting to resubmit a fire ``recover`` proved missing: nothing is admitted,
+    so the stop is booked like a refusal. A cancel during a RECOVER backoff is not this: the
+    admission is unproven there, so it fails closed (CronExecutionUnknown, receipt recovery)."""
+
+
+async def _wait_storage_retry(delay, cancel_event):
+    if cancel_event is None:
+        await asyncio.sleep(delay)
+        return
+    while not cancel_event.is_set():
+        if delay <= 0:
+            return
+        step = min(delay, 0.5)
+        await asyncio.sleep(step)
+        delay -= step
+    raise _StorageRetryStopped
 
 
 class _ConnectionLost(Exception):
@@ -229,9 +266,19 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
         # write (file and directory) waits in a worker, and still completes before the next step.
         await asyncio.to_thread(write_journal)
 
-    async def refuse(exc):
+    delays = iter(STORAGE_RETRY_DELAYS_S)
+    resubmits = 0
+
+    def retry_delay(exc):
+        delay = next(delays, None) if _transient_storage_refusal(exc) else None
+        return delay * (1 + random.uniform(0, 0.25)) if delay is not None else None
+
+    async def refuse(exc, unreachable=False):
         """The owner answered the submit with an error and holds no admission: the booked failure."""
         error = f'{error_type_name(exc)}: {exc}'
+        if unreachable:
+            job['_model_unreachable'] = True
+            error += f' (transient storage contention persisted through {resubmits} resubmits)'
         result = [False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error]
         record['refusal'] = result
         record['job'] = dict(job)
@@ -243,26 +290,49 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
     # nor re-stamp a wedged run's unchanged progress as fresh).
     answered = progress = None
 
+    async def recover(call):
+        while True:
+            try:
+                return await call('recover', params)
+            except Exception as exc:
+                delay = retry_delay(exc)
+                if delay is None:
+                    raise
+                logger.info('Cron %s: recover read refused by transient storage contention (%s); retrying in %.1fs',
+                            job['id'], error_type_name(exc), delay)
+                try:
+                    await _wait_storage_retry(delay, cancel_event)
+                except _StorageRetryStopped:
+                    # The submit may have committed before its error came back: never book this.
+                    raise CronExecutionUnknown(
+                        f'cron admission unverified: stopped while recover was refused ({error_type_name(exc)})'
+                    ) from exc
+
     async def submit(call):
-        nonlocal attempted, answered
+        nonlocal attempted, answered, resubmits
         attempted = True
         await save()
-        try:
-            return await call('submit', params)
-        except Exception as exc:
-            from hermes_cli.gateway_client import GatewayRPCError
-            # A returned owner exception is definite; a transport disconnect is not. Even an
-            # owner error after commit must retain the admitted identity, so verify its absence.
-            if owner is not None or isinstance(exc, GatewayRPCError):
-                answered = exc  # the owner finished handling this submit: none of it is in flight
-                state = await call('recover', params)
-                if state['status'] == 'missing':
-                    return await refuse(exc)
-                if state['status'] not in {'queued', 'started', 'terminal'}:
+        while True:
+            answered = None  # a dropped resubmit is ambiguous regardless of the previous answer
+            try:
+                return await call('submit', params)
+            except Exception as exc:
+                if owner is None and not isinstance(exc, GatewayRPCError):
                     raise
-                # Admitted before the answer was lost: observe it through the recovered receipt.
-                return {'session_id': state['session_id'], 'admission_id': state['admission_id']}
-            raise
+                answered = exc
+                state = await recover(call)
+                if state['status'] in {'queued', 'started', 'terminal'}:
+                    return {'session_id': state['session_id'], 'admission_id': state['admission_id']}
+                if state['status'] != 'missing':
+                    raise
+                delay = retry_delay(exc)
+                if delay is None:
+                    return await refuse(exc, unreachable=_transient_storage_refusal(exc))
+                resubmits += 1
+                logger.info('Cron %s: submit refused by transient storage contention (%s); resubmitting '
+                            'execution %s in %.1fs (attempt %d/%d)', job['id'], error_type_name(exc),
+                            request_id, delay, resubmits, len(STORAGE_RETRY_DELAYS_S))
+                await _wait_storage_retry(delay, cancel_event)
 
     async def readmit(call):
         """A reconnect's receipt for a fire whose submit answer went down with the socket: read
@@ -276,22 +346,53 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
             raise CronExecutionUnknown(f'cron admission {state["status"]} after the gateway connection dropped')
         return {'session_id': state['session_id'], 'admission_id': state['admission_id']}
 
+    status_refused_at = None
+
+    async def poll(call, receipt):
+        nonlocal status_refused_at
+        delay = .1
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                try:
+                    await call('cancel', receipt)
+                except Exception as exc:
+                    if not _transient_storage_refusal(exc):
+                        raise
+            try:
+                state = await call('status', receipt)
+            except Exception as exc:
+                if not _transient_storage_refusal(exc):
+                    raise
+                now = time.monotonic()
+                if status_refused_at is None:
+                    status_refused_at = now
+                    logger.info('Cron %s: status read refused by transient storage contention (%s); retrying',
+                                job['id'], error_type_name(exc))
+                elif now - status_refused_at >= STATUS_STORAGE_BUDGET_S:
+                    raise
+            else:
+                status_refused_at = None
+                yield state
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 2.0)
+
     async def observe(call, *, resumed=False):
         """Admit the fire (``resumed``: on a fresh connection after a drop, from the saved receipt
         or ``recover``) and poll its receipt to the outcome."""
         nonlocal progress
         receipt = record['receipt'] if resumed else None
         if receipt is None:
-            receipt = await (readmit if resumed else submit)(call)
+            try:
+                receipt = await (readmit if resumed else submit)(call)
+            except _StorageRetryStopped:
+                from cron.cancellation import cancel_reason
+                return await refuse(RuntimeError(f"Cron job '{job.get('name') or job['id']}' was stopped: "
+                                                 f"{cancel_reason(cancel_event)}"))
             if isinstance(receipt, tuple):
                 return receipt  # the owner refused the submit: the booked failure
             record['receipt'] = receipt
             await save()
-        delay = .1
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
-                await call('cancel', receipt)
-            state = await call('status', receipt)
+        async for state in poll(call, receipt):
             if state.get('progress_at') not in (None, progress):
                 # The owner's agent is still working: refresh OUR ledger row (the owner's stamp is
                 # fenced to the row's owner), once per owner stamp, so the stale-claim sweep measures
@@ -306,8 +407,6 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                 return tuple(state['result'])
             if state['status'] == 'unknown':
                 raise CronExecutionUnknown('unknown_execution: cron admission was not replayed')
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 2.0)
 
     async def remote():
         """Observe over the gateway socket. The one socket lives for the whole agent turn (30+ min);
@@ -315,7 +414,7 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
         failed a ``cron.status`` reply, 24 Nov 2026): redial with backoff and resume from the saved
         receipt, never submitting again. Only a gateway unreachable for ``RECONNECT_BUDGET_S``
         gives the fire up as unknown."""
-        from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError
+        from hermes_cli.gateway_client import GatewayClientError
         resumed, lost_at, backoff = False, None, RECONNECT_FIRST_DELAY_S
         while True:
             dialed = False
