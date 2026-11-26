@@ -1684,6 +1684,29 @@ def _resumed_next_run(job: dict[str, Any]) -> Optional[str]:
     return compute_next_run(job["schedule"], timezone=job.get("timezone"))
 
 
+def unknown_fire_pauses(job: dict) -> bool:
+    """Only known recurring schedules keep firing by default after an unknown outcome."""
+    return bool(job.get("pause_on_unknown")) or (job.get("schedule") or {}).get("kind") not in ("cron", "interval")
+
+
+def settle_unknown_fire(job_id: str, execution_id: str, reason: str, *, lift_pause=None):
+    """Hold a one-shot or opted-in job; otherwise book the fire without re-executing it.
+
+    next_run_at stays as booked: the natural next slot from _advance_after_run or the
+    provisional mark's booking, never "now". No retry rung or quota hold is planned and
+    failure_streak is unchanged. An operator pause is never adopted or lifted:
+    _lift_recovery_pause only lifts the exact pause recorded for this fire.
+    """
+    job = get_job(job_id)
+    if job is None:
+        return "missing", None
+    if unknown_fire_pauses(job):
+        return "held", hold_for_unknown(job_id, reason)
+    booked = mark_job_run(job_id, False, error=reason, status="unknown",
+                          execution_id=execution_id, lift_pause=lift_pause)
+    return ("booked" if booked else "refused"), None
+
+
 def hold_for_unknown(job_id: str, reason: str) -> Optional[dict[str, Any]]:
     """Pause *job_id* for a fire whose outcome is unknown, unless it is already paused: one locked
     check-and-pause, so receipt recovery can never adopt (and later lift) an operator's pause or
@@ -1691,6 +1714,8 @@ def hold_for_unknown(job_id: str, reason: str) -> Optional[dict[str, Any]]:
     with _jobs_lock():
         job = get_job(job_id)
         if job is None or job.get("state") == "paused" or job.get("paused_at"):
+            return None
+        if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return None
         return pause_job(job_id, reason=reason)
 
@@ -2450,7 +2475,8 @@ def _record_run_outcome(
     elif not cancelled:
         # Consecutive agent-failure streak; delivery failures do NOT count
         # (scheduler._failure_streak_nudge).
-        job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
+        if status != "unknown":
+            job["failure_streak"] = int(job.get("failure_streak") or 0) + 1
         # Sticky last-failure stamp (#118354): the next success resets last_status and
         # failure_streak, which erases the only job-level trace that a run ever failed —
         # a monitor sampling jobs.json then sees a permanently green job. last_failure

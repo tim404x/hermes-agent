@@ -138,12 +138,18 @@ def _from_booking_stamp(stamp):
 
 
 def pause_for_unknown(job_id, execution_id, reason):
-    """The firer pauses the job for this fire's unverified admission and records that exact pause
-    on the fire's journal, so the receipt that later proves the run terminal can lift it."""
-    from cron.jobs import hold_for_unknown
+    """Hold the schedule until receipt recovery, or indefinitely only when the job requires it."""
+    from cron.jobs import get_job, hold_for_unknown, unknown_fire_pauses
     from utils import atomic_json_write
-    paused = hold_for_unknown(job_id, reason)  # an operator's pause is never adopted
     journal = journal_path(job_id, execution_id)
+    if not journal.exists() or not _builtin_ticker():
+        job = get_job(job_id)
+        if job is None:
+            return
+        if not unknown_fire_pauses(job):
+            logger.warning('Cron %s: outcome unknown, schedule kept (no receipt recovery for this fire)', job_id)
+            return
+    paused = hold_for_unknown(job_id, reason)  # an operator's pause is never adopted
     if paused and journal.exists():
         record = json.loads(journal.read_text(encoding='utf-8-sig'))
         record['pause_recorded'] = _pause_identity(paused)
@@ -198,7 +204,7 @@ def park_unknown_notice(job, execution_id, notice):
     return True
 
 
-def _send_parked_notice(journal):
+def _send_parked_notice(journal, suffix=None):
     """Deliver a parked unknown-outcome notice once recovery proved the outcome is really unknown.
     Sent first and cleared after, so a crash can repeat it but never lose it; a failing delivery is
     retried on later ticks, ``_PARKED_NOTICE_ATTEMPTS`` times at most."""
@@ -216,7 +222,8 @@ def _send_parked_notice(journal):
     job = dict(current or job, execution_id=job.get('execution_id'))  # a removed one-shot keeps its snapshot
     tokens = scheduler._install_fire_secret_scope()
     try:
-        delivery_error, _ = scheduler._deliver_crash_failure(job, parked.get('notice') or '', adapters=None, loop=None)
+        delivery_error, _ = scheduler._deliver_crash_failure(job, parked.get('notice') or '', adapters=None,
+                                                              loop=None, suffix=suffix)
     except Exception as exc:  # health: allow BLE001 -- retried on the next tick
         delivery_error = str(exc)
     finally:
@@ -484,6 +491,28 @@ def _clean_orphan_notices(root):
             parked.unlink(missing_ok=True)  # its fire was settled: the real outcome went out instead
 
 
+def _settle_unknown_receipt(journal, record):
+    from cron.jobs import get_job, settle_unknown_fire
+    from utils import atomic_json_write
+
+    if not record.get('unknown_settled'):
+        params = record['params']
+        verdict, paused = settle_unknown_fire(params['job_id'], params['request_id'],
+                                              'Canonical cron unknown; no automatic re-execution',
+                                              lift_pause=record.get('pause_recorded'))
+        if verdict == 'booked':
+            next_run = (get_job(params['job_id']) or {}).get('next_run_at')
+            record['unknown_notice_suffix'] = 'Outcome unknown (no automatic re-run); schedule kept' + (
+                f', next run {next_run}' if next_run else '')
+        elif verdict == 'held' and not record.get('pause_recorded'):
+            record['pause_recorded'] = _pause_identity(paused)
+        if verdict != 'refused':
+            record['unknown_settled'] = True
+            atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
+    if _notice_path(journal).exists():
+        _send_parked_notice(journal, suffix=record.get('unknown_notice_suffix'))
+
+
 def reconcile_pending(*, allow_connect=True):
     """Observe prepared fires; never submit missing or interrupted work.
 
@@ -495,7 +524,7 @@ def reconcile_pending(*, allow_connect=True):
     from hermes_cli.gateway_client import connect_gateway
     from cron.executions import FIRER_FINISHED_STATES, execution_owner_live, get_execution
     from cron import jobs_newer_fire
-    from cron.jobs import get_job, hold_for_unknown
+    from cron.jobs import get_job
     from hermes_time import now as _hermes_now
     from cron.scheduler import (_RunDelivery, _FireOwnership, _apply_agent_failure_marker,
                                 _save_compose_deliver)
@@ -562,14 +591,8 @@ def reconcile_pending(*, allow_connect=True):
                 state = {'status': 'terminal', 'job': current,
                          'result': [False, f'# Cron Job: {params["job_id"]} (FAILED)\n\n{error}\n', '', error]}
             if state['status'] != 'terminal':
-                if state['status'] == 'unknown' and _notice_path(journal).exists():
-                    # Recovery confirmed the outcome is unknown: the parked notice is true now. Sent
-                    # before the pause below, which a finished one-shot refuses.
-                    _send_parked_notice(journal)
-                if state['status'] == 'unknown' and not record.get('pause_recorded'):
-                    reason = 'Canonical cron unknown; no automatic re-execution'
-                    record['pause_recorded'] = _pause_identity(hold_for_unknown(params['job_id'], reason))
-                    atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
+                if state['status'] == 'unknown':
+                    _settle_unknown_receipt(journal, record)
                 continue
             success, output, answer, error = state['result']
             job = dict(state['job'], **(state.get('job_flags') or {}))

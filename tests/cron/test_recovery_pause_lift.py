@@ -188,6 +188,7 @@ def test_an_operator_pause_is_never_adopted_by_the_unknown_pass(clock, tmp_path,
     (and later lift it, arming a five-minute retry on a paused daily job)."""
     with jobs.use_cron_store(tmp_path / 'cron'):
         job = jobs.create_job(prompt='daily', schedule='every 1d', deliver='local')
+        jobs.update_job(job['id'], {'pause_on_unknown': True})
         fire = executions.create_execution(job['id'], source='test')['id']
         journal = _dead_firer_journal(job['id'], fire)
         jobs.pause_job(job['id'], reason='operator maintenance')
@@ -207,6 +208,7 @@ def test_an_operator_pause_is_never_adopted_by_the_unknown_pass(clock, tmp_path,
 def test_the_firer_never_adopts_an_operator_pause_made_mid_run(tmp_path, monkeypatch):
     with jobs.use_cron_store(tmp_path / 'cron'):
         job = jobs.create_job(prompt='brief', schedule='every 1h', deliver='local')
+        jobs.update_job(job['id'], {'pause_on_unknown': True})
         jobs.pause_job(job['id'], reason='operator hold')
         fire = executions.create_execution(job['id'], source='test')['id']
         scheduler_authority.pause_for_unknown(job['id'], fire, 'unverified')
