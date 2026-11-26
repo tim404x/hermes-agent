@@ -40,6 +40,7 @@ from agent.model_metadata import (
 from agent.image_token_cost import bind_image_token_cost
 from agent.usage_anchor import anchored_context_tokens, restore_usage_anchor
 from agent.turn_author import parse_turn_author
+from agent.turn_empty_response import NoticeWork
 
 logger = logging.getLogger(__name__)
 
@@ -1278,6 +1279,7 @@ def build_turn_context(
     _bot_chain_turn_start(agent, turn_author, persist_user_display_kind, persist_user_message or user_message)
     # Set every turn so a cached agent never carries a wake turn's kind into the human turn after it.
     agent._turn_display_kind = persist_user_display_kind
+    agent._notice_work = NoticeWork.for_turn(persist_user_display_kind, persist_user_display_metadata)
 
     # Tag log records on this thread with the session ID for ``hermes logs``; bind the
     # skill write-origin ContextVar; restore the primary runtime after a fallback turn.

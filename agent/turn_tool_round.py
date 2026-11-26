@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from agent.message_metadata import append_message
 from agent.message_sanitization import normalize_provider_tool_call_ids
+from agent.turn_empty_response import NoticeWork
 from session_rules.turns import coalesce_tool_call_id
 from agent.turn_preflight import compress_after_tool_results
 from agent.turn_tool_validation import validate_tool_calls
@@ -47,6 +48,26 @@ class ToolRoundVerdict:
     result: Optional[dict[str, Any]] = None
 
 
+def _prepare_dispatch(agent: Any, assistant_message: Any, notice: NoticeWork | None) -> None:
+    """Track the calls which will need results, in the same ID space as the durable tool rows."""
+    from agent.tool_call_batches import expand_local_tool_batches, prune_native_tool_blocks
+
+    provider_data = getattr(assistant_message, "provider_data", None)
+    emitted = expand_local_tool_batches(assistant_message.tool_calls, provider_data=provider_data)
+    capped = agent._cap_delegate_task_calls(emitted)
+    calls = agent._deduplicate_tool_calls(capped)
+    if provider_data and len(calls) < len(emitted):
+        prune_native_tool_blocks(provider_data, emitted, calls)
+    normalize_provider_tool_call_ids(calls)
+    assistant_message.tool_calls = calls
+    if notice is None:
+        return
+    if len(capped) < len(emitted) and len(agent._deduplicate_tool_calls(emitted)) > len(calls):
+        return
+    notice.pending.update(coalesce_tool_call_id(call) for call in calls)
+    agent._notice_work = notice
+
+
 def run_tool_round(
     agent: Any, *, assistant_message: Any, finish_reason: Any, messages: Any,
     conversation_history: Any, api_call_count: Any, effective_task_id: Any, user_message: Any,
@@ -78,6 +99,8 @@ def run_tool_round(
             args_preview = raw_args[:200] if isinstance(raw_args, str) else repr(raw_args)[:200]
             logging.debug("Tool call: %s with args: %s...", tc.function.name, args_preview)
 
+    notice = getattr(agent, "_notice_work", None)
+    agent._notice_work = None
     _tvv = validate_tool_calls(
         agent, assistant_message, finish_reason, messages=messages,
         conversation_history=conversation_history, api_call_count=api_call_count,
@@ -88,21 +111,7 @@ def run_tool_round(
     if _tvv.action == "continue":
         return _verdict("continue")
 
-    # Normalize only this unpersisted turn. Each local bridge entry must pass
-    # through the same scope, approvals, state and scheduling as a singleton.
-    from agent.tool_call_batches import expand_local_tool_batches, prune_native_tool_blocks
-    provider_data = getattr(assistant_message, "provider_data", None)
-    assistant_message.tool_calls = expand_local_tool_batches(assistant_message.tool_calls, provider_data=provider_data)
-
-    # Post-call guardrails. A dropped call gets no result, so it must leave the native
-    # replay sidecars too (before id normalization, while their ids still match).
-    emitted = assistant_message.tool_calls
-    assistant_message.tool_calls = agent._deduplicate_tool_calls(agent._cap_delegate_task_calls(emitted))
-    if provider_data and len(assistant_message.tool_calls) < len(emitted):
-        prune_native_tool_blocks(provider_data, emitted, assistant_message.tool_calls)
-    # Filtering can turn a mixed batch into an all-provider one; re-check the final batch
-    # before it is staged (idempotent for already-normalized ids).
-    normalize_provider_tool_call_ids(assistant_message.tool_calls)
+    _prepare_dispatch(agent, assistant_message, notice)
 
     # Mixed batch: the assistant message keeps EVERY emitted call (each tool_call needs a
     # matching result) while only valid ones dispatch.
