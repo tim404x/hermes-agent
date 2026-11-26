@@ -1014,7 +1014,9 @@ def _record_stale_release(job: dict, job_id: str, age: float, allowance: float, 
     _record_forced_release(job_id, name, age, allowance)
     # Ledger already records how the run ended: mark_job_run here would clobber an honest
     # ok status with a synthetic failure or double-write a failure.
-    if reason == "ledger-terminal":
+    if reason == "ledger-terminal" or job.get("pending_slot"):
+        # The scan already reserved a new occurrence. The release above is recorded;
+        # booking a synthetic run here would erase that occurrence's unclaimed stamp.
         return
     # Age release may lack a ledger row, so last_error is how it surfaces. But a forced release
     # is NOT a real run: never consume a finite repeat budget or let mark_job_run auto-delete.
