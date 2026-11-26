@@ -398,6 +398,65 @@ def tool_frame(call_id, name, args, *result):
     return json.loads(json.dumps(frame, default=str))
 
 
+_SAFE_LINK_REASONS = frozenset({'owner_unresponsive'})
+
+
+def _safe_link_reason(exc):
+    """A loggable reason for a lost owner link: a known reason code, else only exception TYPE
+    names. ``WorkerRPC`` wraps raw transport text (socket paths, profile ids) into the message."""
+    reason = exc.args[0] if exc.args else ''
+    if reason in _SAFE_LINK_REASONS:
+        return reason
+    cause = exc.__cause__ or exc.__context__
+    return type(exc).__name__ + (f' from {type(cause).__name__}' if cause is not None else '')
+
+
+def adopt_with_redial(rpc, scope, *, budget=None):
+    """Send ``worker.adopt`` until the owner answers it, waiting out a stalled owner loop.
+
+    ``worker.adopt`` is idempotent within the same owner epoch (a restarted owner with a new epoch
+    refuses with ``stale_epoch``, a ``WorkerOwnerRefusal`` that stays final at once). Only
+    ``WorkerLinkLost`` (control timeout, dropped socket, late receipt) is retried, bounded by
+    ``RECONNECT_BUDGET_S`` (the owner's ``HELLO_SECONDS`` timeout guards only ``hello``; after
+    bootstrap it waits on ``next_frame(None, ack=STOP_ACK_SECONDS)`` with no adopt deadline).
+    ``WorkerOwnerRefusal`` and plain ``WorkerPersistenceError`` fail immediately; past the budget
+    the last ``WorkerLinkLost`` re-raises (fail closed).
+    """
+    from agent.retry_utils import jittered_backoff
+    from agent.runtime_session_store import (
+        RECONNECT_BASE_DELAY_S,
+        RECONNECT_BUDGET_S,
+        RECONNECT_JITTER_RATIO,
+        RECONNECT_MAX_DELAY_S,
+        WorkerLinkLost,
+    )
+
+    if budget is None:
+        budget = RECONNECT_BUDGET_S
+    params = {k: v for k, v in scope.items() if k != 'epoch'}
+    lost_at, attempt = None, 0
+    while True:
+        try:
+            return rpc('worker.adopt', **params)
+        except WorkerLinkLost as exc:
+            now = time.monotonic()
+            lost_at = now if lost_at is None else lost_at
+            left = budget - (now - lost_at)
+            attempt += 1
+            delay = jittered_backoff(attempt, base_delay=RECONNECT_BASE_DELAY_S,
+                                     max_delay=RECONNECT_MAX_DELAY_S, jitter_ratio=RECONNECT_JITTER_RATIO)
+            # Never start an attempt at (or past) the deadline: the budget must cover the wait
+            # before it. One started attempt can still run its own bounded I/O (connect 5 s +
+            # RECEIPT_WAIT_S) past the budget; the owner has no adopt deadline, so that is safe.
+            if delay >= left:
+                logger.warning('worker.adopt: owner unanswered for %.0fs, giving up (%s)',
+                               now - lost_at, _safe_link_reason(exc))
+                raise
+            logger.warning('worker.adopt got no answer (%s); retrying in %.1fs (%.0fs of reconnect budget left)',
+                           _safe_link_reason(exc), delay, left)
+            time.sleep(delay)
+
+
 def execute(frame, channel):
     # The owner RPC below imports gateway/config modules (hermes_cli.config, providers,
     # hermes_cli.plugins) transitively; the policy must already be frozen when they load.
@@ -410,7 +469,7 @@ def execute(frame, channel):
     push_state(scope=Scope(LOCAL_TENANT, frame['home'], LOCAL_OWNER).for_turn(
         scope['session_id'], scope['execution_id'], Fence(scope['epoch'], scope['generation'])))
     rpc = WorkerRPC(frame['home'])
-    adopted = rpc('worker.adopt', **{k: v for k, v in scope.items() if k != 'epoch'})
+    adopted = adopt_with_redial(rpc, scope)
     if adopted['owner_epoch'] != scope['epoch']:
         raise RuntimeError('stale_epoch')
     store = RuntimeSessionStore(rpc, scope, outbox_dir(frame['home'], scope['execution_id']), adopted)
