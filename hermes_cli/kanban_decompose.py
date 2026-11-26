@@ -181,13 +181,23 @@ def _format_roster(roster: list[dict]) -> str:
     )
 
 
+def _resolve_valid_assignee(assignee: object, valid_names: set[str]) -> Optional[str]:
+    """Return a profile id in ``valid_names`` (accepting direct hits and Bot-Mode aliases), or None."""
+    if not isinstance(assignee, str) or not assignee.strip():
+        return None
+    chosen = assignee.strip()
+    if chosen in valid_names:
+        return chosen
+    resolved, _ = kb.resolve_assignee(chosen)
+    if resolved and resolved in valid_names:
+        return resolved
+    return None
+
+
 def _normalize_assignee_choice(assignee: object, *, default_assignee: str, valid_names: set[str]) -> str:
     """A valid assignee, else ``default_assignee`` — promoted work is never
     left unassigned."""
-    if not isinstance(assignee, str) or not assignee.strip():
-        return default_assignee
-    chosen = assignee.strip()
-    return chosen if chosen in valid_names else default_assignee
+    return _resolve_valid_assignee(assignee, valid_names) or default_assignee
 
 
 @dataclass
@@ -249,10 +259,9 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
             return [], f"tasks[{idx}].title is missing or empty"
         body = entry.get("body")
         assignee = entry.get("assignee")
-        chosen = _normalize_assignee_choice(
-            assignee, default_assignee=routing.default_assignee, valid_names=routing.valid_names,
-        )
-        if isinstance(assignee, str) and assignee.strip() and assignee.strip() not in routing.valid_names:
+        matched = _resolve_valid_assignee(assignee, routing.valid_names)
+        chosen = matched or routing.default_assignee
+        if isinstance(assignee, str) and assignee.strip() and matched is None:
             logger.info(
                 "decompose: task %s child %d picked unknown assignee %r — "
                 "routing to default_assignee %r",

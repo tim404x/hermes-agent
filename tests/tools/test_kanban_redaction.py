@@ -21,6 +21,8 @@ def worker_env(monkeypatch, tmp_path):
     """Isolated HERMES_HOME with a running task; returns the task id."""
     home = tmp_path / ".hermes"
     home.mkdir()
+    (home / "profiles" / "test-worker").mkdir(parents=True)
+    (home / "profiles" / "test-worker" / "config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
