@@ -1,7 +1,7 @@
 """Empty / thinking-only final-response recovery ladder for the conversation turn loop.
 
 Runs when the model returned no visible text after ``<think>`` blocks. Ladder order is
-load-bearing: partial-stream recovery → machinery-turn quiet exit → reuse prior
+load-bearing: partial-stream recovery → reuse prior
 turn content (housekeeping tools only) → one post-tool-call nudge → thinking-only
 completion reminder (×2) → empty-response retries (budgeted, deterministic-empty
 short-circuit) → fallback provider → terminal ``(empty)`` sentinel. Nothing here imports
@@ -12,24 +12,20 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from agent import empty_response_guard as _empty_guard
 from agent.message_metadata import append_message
 from agent.message_sanitization import _sanitize_surrogates
+from agent.tool_result_classification import is_guardrail_refusal
 from agent.turn_context_compaction import _refund_api_call
 from agent.turn_recovery import interruptible_backoff_sleep
+from session_rules.silence import is_intentional_silence_response, is_machinery_display_kind
 
 logger = logging.getLogger("agent.conversation_loop")
 
 _INLINE_THINK_RE = re.compile(r'<think>|<thinking>|<reasoning>', re.IGNORECASE)
-
-# The persisted user-row display kinds the gateway types as machinery: the self-injected
-# internal_notification turn plus the producer-notice cards (background-process completions,
-# async delegation results). Mirrors gateway.response_filters.MACHINERY_DISPLAY_KINDS;
-# agent/ cannot import gateway/.
-_MACHINERY_DISPLAY_KINDS = frozenset({"internal_notification", "process_complete", "async_delegation_complete"})
 
 # Loop exit stamped when a machinery turn ends with the model adding nothing.
 NOTIFICATION_NO_REPLY_EXIT = "notification_no_reply"
@@ -39,28 +35,75 @@ NOTIFICATION_NO_REPLY_EXIT = "notification_no_reply"
 MACHINERY_NO_REPLY_ROW = "[SILENT]"
 
 
-def _latest_user_display_kind(messages: list[dict[str, Any]]) -> str | None:
-    for msg in reversed(messages):
-        if isinstance(msg, dict) and msg.get("role") == "user":
-            return msg.get("display_kind")
-    return None
+@dataclass
+class NoticeWork:
+    """Turn-local receipts for an unaddressed host wake; never reconstructed from replay."""
+
+    pending: set[str] = field(default_factory=set)
+    stop_withheld: bool = False
+
+    @classmethod
+    def for_turn(cls, display_kind: str | None, metadata: dict | None) -> NoticeWork | None:
+        if is_machinery_display_kind(display_kind) and (metadata or {}).get("reply_expected") is not True:
+            return cls()
+        return None
+
+    def record_result(self, call_id: str, result: Any, *, executed: bool) -> None:
+        if executed and call_id in self.pending and result is not None and not is_guardrail_refusal(result):
+            self.pending.remove(call_id)
+            self.stop_withheld = False
 
 
-def _notification_turn_without_tool_round(messages: list[dict[str, Any]]) -> bool:
-    """True when the latest user row is a machinery turn no tool has followed.
+def _settled_notice(agent: Any) -> bool:
+    notice = getattr(agent, "_notice_work", None)
+    return (notice is not None and not notice.pending and not notice.stop_withheld
+            and not getattr(agent, "_turn_user_intervened", False)
+            and not getattr(agent, "_interrupt_requested", False))
 
-    Scans back to the turn's user row: a ``tool`` row first means the model already
-    acted on the notice (mid-task, keeps the full empty-response ladder), and any
-    other user row (a steer, a recovery nudge) is the message the model is answering.
-    """
-    for msg in reversed(messages):
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") == "tool":
-            return False
-        if msg.get("role") == "user":
-            return msg.get("display_kind") in _MACHINERY_DISPLAY_KINDS
-    return False
+
+def notice_silence_marker(agent: Any, visible: str) -> bool:
+    return (is_machinery_display_kind(getattr(agent, "_turn_display_kind", None))
+            and is_intentional_silence_response(visible))
+
+
+def _confirmed_notice_stop(response: Any, finish_reason: str) -> bool:
+    """Transport normalizers can default missing or unknown reasons to 'stop'."""
+    status = getattr(response, "status", None)
+    choices = getattr(response, "choices", None)
+    if (finish_reason != "stop" or status not in (None, "completed")
+            or (choices and not getattr(choices[0], "finish_reason", None))):
+        return False
+    if isinstance(response, dict):
+        return response.get("stopReason") in {"end_turn", "stop_sequence"}
+    if hasattr(response, "stop_reason"):
+        return response.stop_reason in {"end_turn", "stop_sequence"}
+    return bool(choices) or status == "completed"
+
+
+def notice_final_text(agent: Any, message: Any, text: str, response: Any, finish_reason: str, *,
+                      unfinished: bool) -> tuple[str, bool]:
+    """Normalize a proven blank to the ordinary marker before any stop gate or durable write."""
+    if not is_machinery_display_kind(getattr(agent, "_turn_display_kind", None)):
+        return text, False
+    if unfinished or not _confirmed_notice_stop(response, finish_reason):
+        agent._notice_work = None
+    if not _settled_notice(agent):
+        return ("" if is_intentional_silence_response(agent._strip_think_blocks(text)) else text), False
+    if text.strip():
+        return text, False
+    streamed = (agent._current_streamed_assistant_text or "").strip()
+    if streamed:
+        visible = agent._strip_think_blocks(streamed).strip()
+        if is_intentional_silence_response(visible):
+            message.content = visible
+            return visible, False
+        return text, False
+    reasoning_fields = ("reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items")
+    if (agent._last_content_with_tools or agent._post_tool_empty_retried or agent._thinking_prefill_retries
+            or any(getattr(message, key, None) for key in reasoning_fields)):
+        return text, False
+    message.content = MACHINERY_NO_REPLY_ROW
+    return message.content, True
 
 
 @dataclass
@@ -213,7 +256,7 @@ def housekeeping_reply_line(agent: Any) -> Optional[str]:
 def take_housekeeping_reply_line(agent: Any) -> Optional[str]:
     """Consume ``housekeeping_reply_line`` as the turn's final response."""
     final_response = housekeeping_reply_line(agent)
-    if final_response is None:
+    if final_response is None or notice_silence_marker(agent, final_response):
         return None
     agent._last_content_with_tools = None
     agent._last_content_tools_all_housekeeping = False
@@ -230,42 +273,15 @@ def take_housekeeping_reply_line(agent: Any) -> Optional[str]:
 def _partial_stream_reply(agent: Any) -> Optional[str]:
     """The visible text streamed before the connection died, as the turn's reply; None if none."""
     partial = getattr(agent, "_current_streamed_assistant_text", "") or ""
-    if not agent._has_content_after_think_block(partial):
+    recovered = agent._strip_think_blocks(partial).strip() if partial else ""
+    if not recovered or notice_silence_marker(agent, recovered):
         return None
-    recovered = agent._strip_think_blocks(partial).strip()
     logger.info("Partial stream content delivered (%d chars) — using as final response", len(recovered))
     agent._emit_diagnostic_status("↻ Stream interrupted — using delivered content " "as final response")
     # A streamed fragment isn't a confirmed preview: gateway fallback delivery
     # sends the text plus the abnormal-turn explanation.
     agent._response_was_previewed = False
     return recovered
-
-
-def _machinery_quiet_exit(agent: Any, assistant_message: Any, finish_reason: str, messages: Any) -> bool:
-    """End a machinery turn's empty reply quietly; True when it did.
-
-    A machinery turn (a self-injected internal_notification or a background-process /
-    delegation completion the gateway staged as its own user row) answered empty means
-    "nothing to add": no nudge, no paid retries, no provider switch, no sentinel row. Only
-    when no tool ran this turn (a model that acted on the notice is mid-task) and the reply
-    did not announce a tool call: ``finish_reason="tool_calls"`` with no payload is a dropped
-    action, so it keeps the ladder below, whose re-prompt recovers it.
-    """
-    if finish_reason == "tool_calls" or not _notification_turn_without_tool_round(messages):
-        return False
-    logger.info(
-        "Empty response on a machinery turn (%s): ending the turn without a reply",
-        _latest_user_display_kind(messages),
-    )
-    # Close the turn in the transcript. The finalizer appends an assistant row only for a
-    # non-empty final, and a user row left unanswered makes the next pre-call repair merge
-    # the following human prompt into the notice (text and display_kind both lost). The
-    # row carries the marker a deliberate no-reply already persists on human turns, so the
-    # gateway keeps treating it as silence and the wire keeps alternating.
-    assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
-    assistant_msg["content"] = MACHINERY_NO_REPLY_ROW
-    append_message(messages, assistant_msg)
-    return True
 
 
 def recover_empty_response(
@@ -295,11 +311,6 @@ def recover_empty_response(
     if (_recovered := _partial_stream_reply(agent)) is not None:
         _turn_exit_reason = "partial_stream_recovery"
         final_response = _recovered
-        return _verdict("break")
-
-    if _machinery_quiet_exit(agent, assistant_message, finish_reason, messages):
-        _turn_exit_reason = NOTIFICATION_NO_REPLY_EXIT
-        final_response = ""
         return _verdict("break")
 
     # Prior turn had real content + ONLY housekeeping tools: model is done, reuse it.
