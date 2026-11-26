@@ -27,15 +27,19 @@ STATUS_STORAGE_BUDGET_S = 120.0
 
 
 def _transient_storage_refusal(exc: BaseException) -> bool:
-    """Older gateways sent only the reason; newer ones can explicitly rule out a retry."""
+    """Older gateways sent only the reason; newer ones can explicitly rule out a retry. Only the
+    store-failure code (5001, or no code from an older owner) is retryable: a 4001 policy refusal
+    that names ``storage_unavailable`` is permanent, as it is owner-locally (AuthorityRefusal)."""
     if isinstance(exc, GatewayRPCError):
-        return exc.data.get('transient') is not False and (
+        return exc.code in (5001, None) and exc.data.get('transient') is not False and (
             str(exc) == 'storage_unavailable' or exc.data.get('reason') == 'storage_unavailable')
     return is_transient_store_failure(exc)
 
 
 class _StorageRetryStopped(Exception):
-    """Cancellation while waiting to retry a refused admission or its recovery read."""
+    """Cancellation while waiting to resubmit a fire ``recover`` proved missing: nothing is admitted,
+    so the stop is booked like a refusal. A cancel during a RECOVER backoff is not this: the
+    admission is unproven there, so it fails closed (CronExecutionUnknown, receipt recovery)."""
 
 
 async def _wait_storage_retry(delay, cancel_event):
@@ -296,7 +300,13 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                     raise
                 logger.info('Cron %s: recover read refused by transient storage contention (%s); retrying in %.1fs',
                             job['id'], error_type_name(exc), delay)
-                await _wait_storage_retry(delay, cancel_event)
+                try:
+                    await _wait_storage_retry(delay, cancel_event)
+                except _StorageRetryStopped:
+                    # The submit may have committed before its error came back: never book this.
+                    raise CronExecutionUnknown(
+                        f'cron admission unverified: stopped while recover was refused ({error_type_name(exc)})'
+                    ) from exc
 
     async def submit(call):
         nonlocal attempted, answered, resubmits

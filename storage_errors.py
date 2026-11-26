@@ -65,7 +65,7 @@ def is_sqlite_lock_error(exc_or_str) -> bool:
 def is_transient_store_failure(exc: BaseException) -> bool:
     """Retry a typed transient failure or a raw SQLite operational refusal naming contention."""
     return isinstance(exc, TransientStoreError) or (
-        isinstance(exc, sqlite3.OperationalError) and is_sqlite_lock_error(str(exc))
+        isinstance(exc, sqlite3.OperationalError) and is_sqlite_lock_error(exc)
     )
 
 

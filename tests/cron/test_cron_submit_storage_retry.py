@@ -171,12 +171,9 @@ def test_refused_recover_retries_until_admission_is_known_or_budget_expires(monk
         assert [op for op, _ in seen[0]] == ['submit', 'recover', 'recover', 'submit', 'status']
 
 
-@pytest.mark.parametrize('read', [MISSING, _refusal()], ids=['resubmit-backoff', 'recover-backoff'])
-def test_cancel_during_backoff_books_stop_without_resubmitting(monkeypatch, read):
-    job = {'id': 'hourly', 'name': 'report', 'execution_id': 'fire'}
+def _cancel_on_first_sleep(monkeypatch):
     cancel = threading.Event()
     cancel.reason = 'operator cancelled'
-    seen = _gateway(monkeypatch, [{'submit': [_refusal()], 'recover': [read]}])
     monkeypatch.setattr(scheduler_authority, 'STORAGE_RETRY_DELAYS_S', (8.0,))
 
     async def cancel_during_sleep(delay):
@@ -184,10 +181,58 @@ def test_cancel_during_backoff_books_stop_without_resubmitting(monkeypatch, read
         cancel.set()
 
     monkeypatch.setattr(asyncio, 'sleep', cancel_during_sleep)
+    return cancel
+
+
+def test_cancel_during_resubmit_backoff_books_stop_without_resubmitting(monkeypatch):
+    job = {'id': 'hourly', 'name': 'report', 'execution_id': 'fire'}
+    seen = _gateway(monkeypatch, [{'submit': [_refusal()], 'recover': [MISSING]}])
+    cancel = _cancel_on_first_sleep(monkeypatch)
     result = scheduler_authority.run_canonical_job(job, cancel_event=cancel)
     assert not result[0] and result[3] == "RuntimeError: Cron job 'report' was stopped: operator cancelled"
     assert [op for op, _ in seen[0]] == ['submit', 'recover']
     assert '_model_unreachable' not in job and '_model_unreachable' not in _record(job)['job']
+
+
+def test_cancel_during_recover_backoff_fails_closed_never_books(monkeypatch):
+    """recover never answered, so the refused submit may still have committed: a stop here must
+    leave the journal to receipt recovery (CronExecutionUnknown), never write a refusal."""
+    job = {'id': 'hourly', 'name': 'report', 'execution_id': 'fire'}
+    seen = _gateway(monkeypatch, [{'submit': [_refusal()], 'recover': [_refusal()]}])
+    cancel = _cancel_on_first_sleep(monkeypatch)
+    with pytest.raises(scheduler_authority.CronExecutionUnknown, match='stopped while recover was refused'):
+        scheduler_authority.run_canonical_job(job, cancel_event=cancel)
+    assert [op for op, _ in seen[0]] == ['submit', 'recover']
+    record = _record(job)
+    # No refusal and no receipt: reconcile_pending takes the recover path and books the real outcome.
+    assert 'refusal' not in record and record['receipt'] is None and '_model_unreachable' not in job
+
+
+def _sqlite_error(message, code):
+    exc = sqlite3.OperationalError(message)
+    exc.sqlite_errorcode = code
+    return exc
+
+
+@pytest.mark.parametrize(('exc', 'transient'), [
+    (_sqlite_error('vtable constructor failed: messages_fts', sqlite3.SQLITE_BUSY), True),
+    (_sqlite_error('database table is locked', sqlite3.SQLITE_LOCKED), True),
+    (_sqlite_error('no such table: busy_jobs', sqlite3.SQLITE_ERROR), False),
+    (sqlite3.OperationalError('database is locked'), True),
+])
+def test_sqlite_refusal_classified_by_result_code_before_text(exc, transient):
+    assert scheduler_authority._transient_storage_refusal(exc) is transient
+
+
+def test_policy_refusal_naming_storage_is_permanent_over_rpc(monkeypatch):
+    """A 4001 refusal whose reason is ``storage_unavailable`` is an AuthorityRefusal on the owner:
+    permanent locally, so permanent over the wire too (local/remote parity)."""
+    refusal = GatewayRPCError('storage_unavailable', 4001, {'reason': 'storage_unavailable'})
+    seen = _gateway(monkeypatch, [{'submit': [refusal], 'recover': [MISSING]}])
+    job = {'id': 'hourly', 'execution_id': 'fire'}
+    result = scheduler_authority.run_canonical_job(job)
+    assert not result[0] and [op for op, _ in seen[0]] == ['submit', 'recover']
+    assert '_model_unreachable' not in job
 
 
 def test_a_disconnected_resubmit_is_not_a_definite_refusal(monkeypatch):
