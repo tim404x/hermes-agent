@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import re
 import signal
@@ -2263,17 +2264,16 @@ def _dispatch_lane_task(
 
 
 def _run_reclaim_phase(
-    conn: sqlite3.Connection,
-    result: DispatchResult,
-    *,
-    stale_timeout_seconds: int,
-    failure_limit: int,
-    reconcile_orphans: bool,
-    board: Optional[str] = None,
+    conn: sqlite3.Connection, result: DispatchResult, *, stale_timeout_seconds: int,
+    failure_limit: int, reconcile_orphans: bool, board: Optional[str] = None,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
+    try:
+        result.retried_workspace_cleanups = _kbw.retry_deferred_workspace_cleanups(conn)
+    except Exception:
+        logging.getLogger(__name__).exception("Cannot retry deferred kanban workspace cleanups")
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)

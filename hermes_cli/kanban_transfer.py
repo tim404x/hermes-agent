@@ -267,6 +267,8 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
             ).fetchall()
         ]
         conn.execute("UPDATE tasks SET workspace_path = NULL, branch_name = NULL")
+        for pending in conn.execute(kb._PENDING_LIVE_EVENTS_SQL).fetchall():
+            kb._append_event(conn, pending["task_id"], "workspace_cleanup_retried", {"result": "unmanaged"})
         if parked:
             conn.execute(f"UPDATE tasks SET status = 'triage' WHERE id IN ({_placeholders(parked)})", parked)
             warnings.append(
@@ -323,11 +325,15 @@ def import_board(
 
         board_root = kb.board_dir(target)
         board_root.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staged_db), str(board_root / "kanban.db"))
         for tree in ("attachments", "logs"):
             src = extracted / tree
             if src.is_dir():
                 shutil.move(str(src), str(board_root / tree))
+
+        with kbc.connect_closing(db_path=staged_db) as conn:
+            stats, warnings = _relocate_imported_rows(conn, target)
+            counts = _count_rows(conn)
+        shutil.move(str(staged_db), str(board_root / "kanban.db"))
 
     # Rewritten rather than moved across: the archive's copy names a slug
     # and a workdir that belong to the exporting machine.
@@ -340,14 +346,6 @@ def import_board(
         color=str(staged_meta.get("color") or ""),
         archived=False,
     )
-    # Bring the imported schema up to this install's version before the
-    # relocation pass writes to it.
-    kb.init_db(board=target)
-
-    with kbc.connect_closing(board=target) as conn:
-        stats, warnings = _relocate_imported_rows(conn, target)
-        counts = _count_rows(conn)
-
     if activate:
         kb.set_current_board(target)
 

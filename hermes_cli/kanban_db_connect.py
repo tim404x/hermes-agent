@@ -1000,6 +1000,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE task_events SET kind = ? WHERE kind = ?", (new, old))
 
     _rebuild_drifted_tables(conn)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_workspace_cleanup ON task_events(task_id, id, kind) "
+        "WHERE kind IN ('workspace_cleanup_deferred_live', 'workspace_cleanup_retried')"
+    )
 
     from hermes_cli import kanban_result_receipts as _kbrr
 
