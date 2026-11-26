@@ -10,7 +10,7 @@ import os
 import re
 import shlex
 import threading
-from urllib.parse import unquote_plus
+from urllib.parse import unquote, unquote_plus
 
 # Shared with agent/file_safety's read-block list so the two defenses can't
 # drift: a blocked file_tools read that falls back to ``cat`` is still caught.
@@ -216,12 +216,10 @@ _PREFIX_PATTERNS = [
 # tolerate spaces around "=" and allow the keyword embedded anywhere
 # (``MYTOKEN=…``) — an all-caps key is almost never prose. Bare ``KEY``/``PASS``/
 # ``PW`` suffixes are included; _key_has_secret_keyword rejects ``KEYBOARD=``.
-# The regex is IGNORECASE so lowercase env names (``openai_key=…``) are caught here too. The secret name
-# must sit at a word boundary (``_``-delimited or whole-word) so generic prose words (``password=``,
-# ``token=``, ``KEYBOARD=``, ``PASSAGE=``) do not match — those are handled by the config/form/URL paths,
-# and a bare ``password=…`` in a form body must not be swallowed greedily by ``\S+``. See #77484.
 _SECRET_ENV_NAMES = r"(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PW|CREDENTIAL|AUTH)"
-_ENV_ASSIGN_RE = re.compile(rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2")
+_QUOTED_ASSIGN_VALUE = r'''(?P<quote>["'])(?P<quoted>(?:\\[^\r\n]|(?!(?P=quote))[^\\\r\n])*+)(?:(?P=quote)|(?=[\r\n]|$))'''
+_ENV_VALUE = rf'''(?:{_QUOTED_ASSIGN_VALUE}|(?P<bare>[^\s"']\S*+))'''
+_ENV_ASSIGN_RE = re.compile(rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*{_ENV_VALUE}")
 # Command-line credentials. ``--password=…``, ``--token …`` and ``docker login -p …`` reach
 # the approval card and the chat egress verbatim because the ENV passes only look at
 # ``NAME=value`` (issue #143982). The flag name is kept so the reader still knows what was
@@ -275,7 +273,7 @@ _CONNSTR_GATE = re.compile(r"(?:AccountKey|SharedAccessKey|SharedAccessSignature
 # it re.sub retries the greedy prefix at every byte of a long opaque payload.
 # See #77484.
 _ENV_ASSIGN_LOWER_RE = re.compile(
-    r"(?<![a-z0-9_])([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*(['\"]?)(\S+)\2",
+    rf"(?<![a-z0-9_])([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*{_ENV_VALUE}",
     re.IGNORECASE,
 )
 
@@ -293,7 +291,7 @@ _ENV_ASSIGN_LOWER_RE = re.compile(
 # (contains a dot), which is unambiguously a config key — never a prose word. 3. _CFG_ANCHORED_RE matches a
 # bare secret-word key only at line start (optionally after ``export``), so conversational ``I have
 # password=foo`` mid-sentence is left alone.
-_CFG_VALUE = r"(['\"]?)([^\s&]+?)\2(?=[\s&]|$)"
+_CFG_VALUE = rf'''(?:{_QUOTED_ASSIGN_VALUE}|(?P<bare>[^\s&"'][^\s&]*+))'''
 # Linear pre-gate for the _CFG_*_RE subs: no secret keyword => neither can match.
 _CFG_SECRET_WORD_RE = re.compile(_SECRET_CFG_NAMES, re.IGNORECASE)
 
@@ -322,7 +320,7 @@ _CFG_ANCHORED_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
-# YAML / colon config: bare-key quoted scalars cannot match _JSON_FIELD_RE.
+# YAML / colon config: bare-key quoted scalars cannot match the JSON field grammar.
 # Match escaped double quotes, doubled single quotes, or an unquoted token.
 # An unterminated quote masks to end-of-line; no branch crosses LF or CRLF.
 # NOTE(perf): possessive where the successor is disjoint; the leading class
@@ -390,6 +388,11 @@ _PATH_OR_VAR_VALUE_RE = re.compile(rf"^(?:{_SHELL_VAR_REF}|\$\(|~|/)(?:[\w./:-]|
 # (``/wJalrXUtnFEMIK7MDENG/bPxRf…``) is a secret that happens to start with a path character,
 # whereas ``/home/u/.docker`` / ``~/.ssh/id_rsa`` / ``S.gpg-agent.ssh`` never clear that bar.
 _OPAQUE_PATH_SEGMENT_RE = re.compile(r"(?=[^.]*[a-z])(?=[^.]*[A-Z])(?=[^.]*[0-9])[^.]{16,}")
+
+
+def _is_assignment_reference(value: str) -> bool:
+    return bool(_PATH_OR_VAR_VALUE_RE.fullmatch(value)) and (
+        value.startswith("$") or not any(_OPAQUE_PATH_SEGMENT_RE.fullmatch(seg) for seg in value.split("/")))
 
 
 def _is_word_start(s: str, i: int) -> bool:
@@ -464,12 +467,6 @@ def _should_redact_assignment(key: str, value: str, *, check_keyword: bool) -> b
     """Shared gate for the ENV / JSON / YAML assignment passes: skip programmatic env
     lookups used as values, optionally require a word-bounded keyword in the key,
     then redact when the key is unambiguously credential-bearing or the value looks opaque."""
-    # Programmatic env lookups reference variable *names*, not secret values — masking them corrupts code
-    # snippets in prose/log contexts (issue #2852): ``KEY=os.getenv('X')``.
-    # Same programmatic-env-lookup exception as _redact_env above (issue #2852): "apiKey": "os.getenv('X')"
-    # is a code snippet, not a leaked secret value.
-    # Same programmatic-env-lookup exception as _redact_env above (issue #2852): api_key: os.getenv('X') is
-    # a code snippet, not a leaked secret value.
     if _ENV_LOOKUP_VALUE_RE.match(value):
         return False
     # An earlier pass already masked this value (``***`` or the ``«redacted:…»`` sentinel). Masking it
@@ -486,13 +483,8 @@ def _should_redact_assignment(key: str, value: str, *, check_keyword: bool) -> b
     # A shell rc's ``SSH_AUTH_SOCK=$HOME/.ssh/agent.sock`` is configuration the agent must keep
     # readable; only password-class keys mask a path/variable reference.
     password_key = _has_word_bounded_keyword(key, _PASSWORD_KEY_RE) or _has_password_keyword(key)
-    if _PATH_OR_VAR_VALUE_RE.match(value) and not password_key:
-        # ``$VAR`` is an unambiguous reference. A bare ``/...`` or ``~...`` is not:
-        # ``/home/u/.docker`` and ``/8f3kd9sKd0als...`` have the same shape, so every
-        # segment has to look like a path (see _OPAQUE_PATH_SEGMENT_RE) before the
-        # value is treated as configuration.
-        if value[0] == "$" or not any(_OPAQUE_PATH_SEGMENT_RE.fullmatch(seg) for seg in value.split("/")):
-            return False
+    if not password_key and _is_assignment_reference(value):
+        return False
     # ``signing_key`` / ``privateKey`` are credentials at any length, the same policy
     # is_secret_field_name applies to mappings, so JSON text and dicts agree.
     return (password_key or _has_word_bounded_keyword(key, _STRONG_KEY_KEYWORD_RE)
@@ -515,20 +507,10 @@ _JSON_KEY_NAMES = (
     r"|secret_value|raw_secret|secret_input|key_material|client[_.\-]?key[_.\-]?data"
     rf"|{_KEY_QUALIFIED_NAME})"
 )
-_JSON_FIELD_RE = re.compile(rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"', re.IGNORECASE)
-# The same field inside a JSON-encoded string (``{"output": "{\\"api_key\\": \\"…\\"}"}``): every tool result
-# that wraps a config dump in JSON escapes the quotes, so the rule above never saw the value (#115104).
-# The backreference keeps the key's and value's escape depth equal.
-_JSON_FIELD_ESCAPED_RE = re.compile(rf'((\\+)"{_JSON_KEY_NAMES}\2")\s*:\s*\2"([^"\\]+)\2"', re.IGNORECASE)
-# Any other identifier-shaped key (``"API_TOKEN"``, ``"DB_PASSWORD"``, ``"client_secret"``): the closed
-# list above misses affixed names that the ENV and YAML passes already accept (#147240). The callback
-# applies the YAML pass's word set at a word boundary, then the shared assignment gate.
-# The value may carry JSON escapes (``"s3cret\\value"``): ``\\.`` consumes each escape pair whole.
-_JSON_ANY_KEY_FIELD_RE = re.compile(r'("([A-Za-z0-9_.\-]{1,128}+)")\s*+:\s*+"((?:[^"\\\n]|\\.)++)"')
-# The same field inside a JSON-encoded string (``{"output": "{\\"DB_PASSWORD\\": \\"…\\"}"}``),
-# like _JSON_FIELD_ESCAPED_RE does for the closed key list: group 2 is the escape run.
-_JSON_ANY_KEY_FIELD_ESCAPED_RE = re.compile(
-    r'((\\++)"([A-Za-z0-9_.\-]{1,128}+)\2")\s*+:\s*+\2"([^"\\\n]++)\2"')
+_JSON_FIELD_RE = re.compile(
+    r'(?<!\\)(?P<esc>\\++|)"(?P<key>[\w.-]++)(?P=esc)"\s*+:\s*+(?P=esc)"'
+    r'(?=(?P<value>(?:[^"\\\r\n]++|(?P=esc)\\(?:(?P=esc)"|(?P=esc)\\|[^"\\\r\n]))++)'
+    r'(?P<close>(?P=esc)"|(?=\r?$)))', re.MULTILINE)
 _JSON_KEY_NAMES_FULL_RE = re.compile(_JSON_KEY_NAMES, re.IGNORECASE)
 
 # Python ``repr`` uses single-quoted mapping fields, so opaque credentials in
@@ -581,11 +563,9 @@ _PYTHON_REPR_CREDENTIAL_SUFFIXES = (
     "credentials",
 )
 _PYTHON_REPR_FIELD_RE = re.compile(
-    r"'(?P<key>[A-Za-z_][A-Za-z0-9_]*)'(?P<sep>\s*:\s*)"
-    r"(?:"
-    r"(?P<single_prefix>[bB]?)'(?P<single_value>(?:\\.|[^'\\])+)'"
-    r"|(?P<double_prefix>[bB]?)\"(?P<double_value>(?:\\.|[^\"\\])+)\""
-    r")"
+    r"'(?P<key>[A-Za-z0-9_.-]{1,128}+)'\s*+:\s*+[bB]?"
+    r'''(?:'(?P<single_value>(?:\\[^\r\n]|[^'\\\r\n])++)(?:'|(?=\r?$))'''
+    r'''|"(?P<double_value>(?:\\[^\r\n]|[^"\\\r\n])++)(?:"|(?=\r?$)))''', re.MULTILINE,
 )
 
 # Terminal/process output normally uses ``code_file=True`` to preserve source.
@@ -770,7 +750,8 @@ _URL_USERINFO_RE = re.compile(r"(https?|wss?|ftp)://([^/\s:@]+):([^/\s@]+)@")
 _STRICT_URL_PARAM_RE = re.compile(r"([?#&;])([A-Za-z0-9_.~+%\-]+)=([^#&;\s\"'<>]*(?:'[A-Za-z0-9_~+%\-][^#&;\s\"'<>]*)*)")
 _BEARER_SHORT_NAMES = frozenset({"t", "tk", "tok"})
 _BEARER_SHORT_PARAM_RE = re.compile(
-    r'''(?<=[?#&;])([tT%][A-Za-z0-9%]{0,80}+)=([A-Za-z0-9_=-]++)(?=$|[#&;\s"'<>\\])''')
+    r'(?:[?#&;]|\\u00(?:26|3[fF]))([tT%][A-Za-z0-9%]{0,80}+)='
+    r'((?:[A-Za-z0-9_-]++|%[A-Fa-f0-9]{2})++=*+)')
 
 # Userinfo in absolute and network-path (``//user:pass@host``) references; the
 # authority stops at path/query/fragment delimiters. Anchored on the mandatory
@@ -953,9 +934,19 @@ def _mask_token(token: str) -> str:
     return mask_secret(token, head=6, tail=4, floor=18)
 
 
+def _hide_token(value: str) -> str:
+    return "***"
+
+
 def _mask_assignment_value(value: str, mask=_mask_token) -> str:
     """Keep a display hint only for a known vendor prefix; file reads always use their sentinel."""
-    return mask(value) if mask is _mask_token_nonreusable or value.startswith(_PREFIX_SUBSTRINGS) else "***"
+    if _PREFIX_RE.fullmatch(value):
+        return mask(value)
+    if mask is _mask_token_nonreusable:
+        return "«redacted-secret»"
+    if mask is _mask_token and len(value) == 13 and value[6:9] == "..." and _VENDOR_HINT_HEAD_RE.match(value):
+        return value
+    return "***"
 
 
 # Output of an earlier pass: masking it again would erase the kind it keeps visible. Only a
@@ -990,7 +981,7 @@ def _mask_flag_value(match: "re.Match[str]", mask=None) -> str:
             return match.group(0)
         if _is_flag_path_reference(match.group("flag"), stripped):
             return match.group(0)
-    masked = (mask or _mask_token)(stripped)
+    masked = _mask_assignment_value(stripped, mask or _mask_token)
     start = match.start("value") - match.start(0)
     end = match.end("value") - match.start(0)
     return match.group(0)[:start] + masked + match.group(0)[end:]
@@ -1066,7 +1057,7 @@ def _redact_private_key_blocks(text: str) -> str:
 
 def _is_python_repr_secret_key(key: str) -> bool:
     """Return True for exact secret keys or credential-suffixed key names."""
-    folded = key.casefold()
+    folded = key.casefold().replace("-", "_").replace(".", "_")
     if folded in _PYTHON_REPR_SECRET_KEYS:
         return True
     if key.isupper() and key.endswith(_PYTHON_REPR_ENV_SUFFIXES):
@@ -1128,18 +1119,10 @@ def _redact_python_repr_fields(text: str) -> str:
     """Fully mask credential fields in Python mapping ``repr`` output."""
     def _sub(match: re.Match) -> str:
         key = match.group("key")
-        if not _is_python_repr_secret_key(key):
-            return match.group(0)
-
-        single_value = match.group("single_value")
-        if single_value is not None:
-            prefix = match.group("single_prefix") or ""
-            quote = "'"
-            value = single_value
-        else:
-            prefix = match.group("double_prefix") or ""
-            quote = '"'
-            value = match.group("double_value")
+        group = "single_value" if match["single_value"] is not None else "double_value"
+        value = match[group]
+        if not (_is_python_repr_secret_key(key) or _structured_field_is_secret(key, value)):
+            return match[0]
 
         # Mapping repr can contain code-shaped fixture values too. Preserve
         # programmatic env lookups just like the ENV/JSON/YAML passes do.
@@ -1153,7 +1136,7 @@ def _redact_python_repr_fields(text: str) -> str:
         # Do not retain head/tail characters here: escaped repr atoms can cross
         # a slicing boundary and leave an unescaped quote behind. A full mask is
         # parseable for both str and bytes values and leaks no opaque bytes.
-        return f"'{key}'{match.group('sep')}{prefix}{quote}***{quote}"
+        return _replace_field(match, group, "***")
 
     return _PYTHON_REPR_FIELD_RE.sub(_sub, text)
 
@@ -1202,20 +1185,31 @@ def _has_mixed_classes(value: str) -> bool:
 
 
 def _is_bearer_shaped(value: str) -> bool:
+    if "%" in value:
+        value = unquote(value)
     return (len(value) >= 24 and re.fullmatch(r"[A-Za-z0-9_-]++=*+", value) is not None
             and _has_mixed_classes(value))
 
 
 def _redact_bearer_short_params(text: str) -> str:
     """Three rounds of percent-encoding can expand a three-letter name to 81 characters."""
-    if "=" not in text or not any(sep in text for sep in "?#&;"):
+    if "=" not in text or not any(sep in text for sep in ("?", "#", "&", ";", r"\u00")):
         return text
-    folded = text.lower()
-    if "%" not in text and not any(name + "=" in folded for name in _BEARER_SHORT_NAMES):
-        return text
-    return _BEARER_SHORT_PARAM_RE.sub(
-        lambda match: match[1] + "=***" if _decode_url_param_name(match[1]).casefold() in _BEARER_SHORT_NAMES
-        and _is_bearer_shaped(match[2]) else match[0], text)
+    if "%" not in text:
+        folded = text.lower()
+        if not any(name + "=" in folded for name in _BEARER_SHORT_NAMES):
+            return text
+    def replace(match):
+        if _decode_url_param_name(match[1]).casefold() not in _BEARER_SHORT_NAMES or not _is_bearer_shaped(match[2]):
+            return match[0]
+        if text.startswith(":", match.end()) and re.fullmatch(r"[a-fA-F0-9]+", unquote(match[2])):
+            return match[0]
+        return match[0][:-len(match[2])] + "***"
+    form = text[:1] in "tT" and "&" in text and _FORM_BODY_RE.fullmatch(text)
+    if form:
+        text = "?" + text
+    masked = _BEARER_SHORT_PARAM_RE.sub(replace, text)
+    return masked[1:] if form else masked
 
 
 def _canonical_url_param_name(name: str) -> str:
@@ -1234,7 +1228,7 @@ def _is_sensitive_url_param(name: str, value: str) -> bool:
     if canonical in _SENSITIVE_QUERY_PARAMS:
         return True
     decoded = _decode_url_param_name(name).replace("-", "_")  # camelCase kept: _key_name_words splits on it
-    # Same suffix drop as _json_affixed_key_secret: ``api_key_value`` / ``passwordValue`` hold the credential.
+    # ``api_key_value`` / ``passwordValue`` hold the credential.
     return (bool(_JSON_KEY_NAMES_FULL_RE.fullmatch(decoded))
             or _is_python_repr_secret_key(_JSON_VALUE_SUFFIX_RE.sub("", decoded)))
 
@@ -1282,11 +1276,11 @@ def _redact_form_body(text: str) -> str:
 
 def _mask_token_nonreusable(token: str) -> str:
     """Keep only the vendor label, never a reusable or truncated-looking credential (#35519)."""
-    label = next((sub for sub in _PREFIX_SUBSTRINGS if token.startswith(sub)), "") if token else ""
+    label = next((sub for sub in _PREFIX_SUBSTRINGS if token.startswith(sub)), "") if _PREFIX_RE.fullmatch(token) else ""
     return f"«redacted:{label}…»" if label else "«redacted-secret»"
 
 
-def _redact_json_string_value(m: re.Match, *, mask=_mask_token) -> str:
+def _redact_json_string_value(m: re.Match, *, mask=_mask_token, opaque=False) -> str:
     """Mask a captured JSON string value without breaking its escapes."""
     encoded_value = m.group(2)
     try:
@@ -1297,6 +1291,10 @@ def _redact_json_string_value(m: re.Match, *, mask=_mask_token) -> str:
         value = encoded_value
     if not json_header_value_is_credential(m.group(1), value):
         return m.group(0)
+    if opaque:
+        candidate = value.split(None, 1)[-1] if "authorization" in m[1].lower() else value
+        if not _is_high_entropy_credential(candidate) and not ("cookie" in m[1].lower() and "=" in value):
+            return m[0]
     masked = json.dumps(mask(value), ensure_ascii=False)[1:-1]
     return m.group(1) + masked + m.group(3)
 
@@ -1312,51 +1310,59 @@ def _redact_unterminated_json_string_value(m: re.Match, *, mask=_mask_token) -> 
     return m.group(1) + masked
 
 
-def _assignment_sub(render, *, check_keyword: bool):
-    """re.sub callback: keep the match unless the key/value pair (groups[0], groups[-1]) needs redaction."""
-    def _sub(m):
-        groups = m.groups()
-        if not _should_redact_assignment(groups[0], groups[-1], check_keyword=check_keyword):
-            return m.group(0)
-        return render(groups)
-    return _sub
+def _replace_field(match, group, value):
+    start, end = match.span(group)
+    return match[0][:start - match.start()] + value + match[0][end - match.start():]
+
+
+def _redact_env_value(match, mask):
+    group = "quoted" if match["quote"] else "bare"
+    value = match[group]
+    return (_replace_field(match, group, mask(value)) if _should_redact_assignment(match[1], value, check_keyword=True)
+            else match[0])
 
 
 _JSON_VALUE_SUFFIX_RE = re.compile(r"[_.\-]?(?:value|Value|VALUE)$")
 
 
-def _json_affixed_key_secret(key: str, value: str) -> bool:
-    """Whether ``"key": "value"`` holds a credential under an affixed secret-word key (#147240)."""
-    if _JSON_KEY_NAMES_FULL_RE.fullmatch(key):  # the closed-list pass already decided this field
+def _structured_field_is_secret(key: str, value: str) -> bool:
+    """Shared JSON/repr field policy, including metadata exclusions (#149435)."""
+    if _JSON_KEY_NAMES_FULL_RE.fullmatch(key):
+        return _should_redact_assignment(key, value, check_keyword=False)
+    if len(key) > 128 or not key.isascii():
         return False
     if not (_has_word_bounded_keyword(key, _YAML_CFG_WORD_RE) or _has_password_keyword(key)):
         return False
     if _DSN_PW_PLACEHOLDER_RE.fullmatch(value) or not _should_redact_assignment(key, value, check_keyword=True):
         return False
-    # A key that does not END in the credential word is metadata about one: ``passwordChanged``,
-    # ``password_expires_at``, ``tokenUrl``, ``secret_id``, ``secret_arn``, ``PASSWORD_STORE_DIR``
-    # carry timestamps, URLs and ids that look opaque, so the value shape cannot decide (#149435
-    # review).
-    # ``api_key_value`` / ``passwordValue`` hold the credential itself: drop that one suffix first.
     return _is_python_repr_secret_key(_JSON_VALUE_SUFFIX_RE.sub("", key))
 
 
-def _redact_json_affixed_key(m: "re.Match[str]", mask) -> str:
-    if not _json_affixed_key_secret(m.group(2), m.group(3)):
-        return m.group(0)
-    return f'{m.group(1)}: "{mask(m.group(3))}"'
+def _redact_json_fields(text, mask, *, opaque=False):
+    """Inspect values by lookahead: a public outer string can contain another serialized field."""
+    for pattern in (_SECRET_HEADER_JSON_RE, _COOKIE_HEADER_JSON_RE):
+        text = pattern.sub(lambda match: _redact_json_string_value(match, mask=mask, opaque=opaque), text)
+    if not opaque:
+        for pattern in (_SECRET_HEADER_JSON_UNTERMINATED_RE, _COOKIE_HEADER_JSON_UNTERMINATED_RE):
+            text = pattern.sub(lambda match: _redact_unterminated_json_string_value(match, mask=mask), text)
+    pieces, cursor = [], 0
+    for match in _JSON_FIELD_RE.finditer(text):
+        start, end = match.span("value")
+        if start < cursor:
+            continue
+        value = match["value"]
+        if opaque and "\\/" in value:
+            value = value.replace(match["esc"] + "\\/", "/")
+        if (opaque or not match["close"]) and not _is_high_entropy_credential(value):
+            continue
+        if _structured_field_is_secret(match["key"], value):
+            pieces.extend((text[cursor:start], mask(value)))
+            cursor = end
+    return "".join((*pieces, text[cursor:])) if pieces else text
 
 
-def _redact_json_affixed_key_escaped(m: "re.Match[str]", mask) -> str:
-    if not _json_affixed_key_secret(m.group(3), m.group(4)):
-        return m.group(0)
-    return f'{m.group(1)}: {m.group(2)}"{mask(m.group(4))}{m.group(2)}"'
-
-
-def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
+def _redact_assignments(text: str, token_mask) -> str:
     """Mask ENV/config/JSON/YAML assignments; file reads get a non-reusable sentinel (#35519)."""
-    token_mask = _mask_token_nonreusable if mask_nonreusable else _mask_token
-
     def mask(value):
         return _mask_assignment_value(value, token_mask)
 
@@ -1364,31 +1370,18 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
         text = redact_cookie_assignments(text, mask)
         if "://" not in text and _CFG_SECRET_WORD_RE.search(text):  # before the ENV passes: their ``\S+``
             text = redact_spaced_cfg_assignments(text, mask)        # value stops at a quoted value's space
-        _redact_env = _assignment_sub(lambda g: f"{g[0]}={g[1]}{mask(g[2])}{g[1]}", check_keyword=True)
-        text = _ENV_ASSIGN_RE.sub(_redact_env, text)
+        text = _ENV_ASSIGN_RE.sub(lambda match: _redact_env_value(match, mask), text)
         if "://" not in text:  # lowercase names would match URL params
-            text = _ENV_ASSIGN_LOWER_RE.sub(_redact_env, text)
+            text = _ENV_ASSIGN_LOWER_RE.sub(lambda match: _redact_env_value(match, mask), text)
         # The keyword pre-gate is exact and matters: _CFG_DOTTED_RE backtracks
         # quadratically on long unbroken [A-Za-z0-9_.\-] runs.
         if "://" not in text and _CFG_SECRET_WORD_RE.search(text):
-            text = _CFG_DOTTED_RE.sub(_redact_env, text)
-            text = _CFG_ANCHORED_RE.sub(_redact_env, text)
+            text = _CFG_DOTTED_RE.sub(lambda match: _redact_env_value(match, mask), text)
+            text = _CFG_ANCHORED_RE.sub(lambda match: _redact_env_value(match, mask), text)
             text = redact_spaced_cfg_assignments(text, mask)
 
     if ":" in text and '"' in text:
-        for pattern in (_SECRET_HEADER_JSON_RE, _COOKIE_HEADER_JSON_RE):
-            text = pattern.sub(lambda m: _redact_json_string_value(m, mask=mask), text)
-        for pattern in (_SECRET_HEADER_JSON_UNTERMINATED_RE, _COOKIE_HEADER_JSON_UNTERMINATED_RE):
-            text = pattern.sub(lambda m: _redact_unterminated_json_string_value(m, mask=mask), text)
-        redact_json = _assignment_sub(lambda g: f'{g[0]}: "{mask(g[1])}"', check_keyword=False)
-        text = _JSON_FIELD_RE.sub(
-            lambda m: m.group(0) if m.group(1)[1:-1].lower() == "apikey" else redact_json(m), text)
-        if '\\"' in text:
-            text = _JSON_FIELD_ESCAPED_RE.sub(
-                _assignment_sub(lambda g: f'{g[0]}: {g[1]}"{mask(g[2])}{g[1]}"', check_keyword=False), text)
-        text = _JSON_ANY_KEY_FIELD_RE.sub(lambda m: _redact_json_affixed_key(m, mask), text)
-        if '\\"' in text:
-            text = _JSON_ANY_KEY_FIELD_ESCAPED_RE.sub(lambda m: _redact_json_affixed_key_escaped(m, mask), text)
+        text = _redact_json_fields(text, mask)
 
     # Python mapping repr fields ({'API_KEY': '…'}): single-quoted, so the JSON rule
     # above never sees them — the traceback / pytest-introspection leak shape.
@@ -1433,10 +1426,10 @@ def _redact_userinfo_passwords(text: str) -> str:
     return _URL_USERINFO_PAIR_RE.sub(_sub, text)
 
 
-def _redact_credential_store_lines(text: str, *, mask_nonreusable: bool) -> str:
+def _redact_credential_store_lines(text: str, token_mask) -> str:
     """``secret_file``-only credential-store pass (agent/redact_credential_stores.py)."""
-    mask = _mask_token_nonreusable if mask_nonreusable else _mask_token
-    return redact_credential_store_lines(text, mask, lambda k, v: _should_redact_assignment(k, v, check_keyword=True))
+    return redact_credential_store_lines(text, lambda value: _mask_assignment_value(value, token_mask),
+                                         lambda key, value: _should_redact_assignment(key, value, check_keyword=True))
 
 
 def _redact_url_credentials(text: str, code_file: bool, *, file_read: bool = False) -> str:
@@ -1484,40 +1477,37 @@ def _redact_phone(m):
 
 def _is_high_entropy_credential(value: str) -> bool:
     return (len(value) >= 20 and not value.lower().startswith(("your", "example", "changeme", "xxx", "fixture-value-"))
-            and not _ENV_LOOKUP_VALUE_RE.match(value)
+            and not _ENV_LOOKUP_VALUE_RE.match(value) and not _is_assignment_reference(value)
             and re.fullmatch(r"[A-Za-z0-9_+/=.~-]++", value) is not None and _has_mixed_classes(value))
 
 
 def _redact_opaque_fields(text: str, code_file: bool, opaque_fields: bool, file_read: bool) -> str:
     if not (code_file and opaque_fields and ":" in text):
         return text
-
-    def field(match, group, key=None):
-        if key is not None and not (_JSON_KEY_NAMES_FULL_RE.fullmatch(key) or _is_python_repr_secret_key(key)
-                or (_key_has_secret_keyword(key) and {"password", "secret", "token"}.intersection(_key_name_words(key)))):
-            return match[0]
+    folded = text.lower()
+    if not any(word in folded for word in ("key", "token", "secret", "pass", "pwd", "credential", "auth", "bearer", "cookie")):
+        return text
+    mask = _mask_token_nonreusable if file_read else _hide_token
+    def field(match):
+        group = "single_value" if match["single_value"] is not None else "double_value"
         value = match[group]
-        if not _is_high_entropy_credential(value):
+        if not _is_high_entropy_credential(value) or not _structured_field_is_secret(match["key"], value):
             return match[0]
-        start, end = match.span(group)
-        mask = _mask_token_nonreusable(value) if file_read else "***"
-        return match[0][:start - match.start()] + mask + match[0][end - match.start():]
+        return _replace_field(match, group, mask(value))
 
     if '"' in text:
-        text = _JSON_FIELD_RE.sub(lambda match: field(match, 2), text)
-        text = _JSON_ANY_KEY_FIELD_RE.sub(lambda match: field(match, 3, match[2]), text)
-        if '\\"' in text:
-            text = _JSON_FIELD_ESCAPED_RE.sub(lambda match: field(match, 3), text)
-            text = _JSON_ANY_KEY_FIELD_ESCAPED_RE.sub(lambda match: field(match, 4, match[3]), text)
-    if "'" in text:
-        text = _PYTHON_REPR_FIELD_RE.sub(
-            lambda match: field(match, "single_value" if match["single_value"] else "double_value", match["key"]), text)
-    return text
+        text = _redact_json_fields(text, mask, opaque=True)
+    return _PYTHON_REPR_FIELD_RE.sub(field, text) if "'" in text else text
+
+
+def redact_file_fields(text: str) -> str:
+    """Mask structured data on the bounded raw page, before tool formatting and clipping."""
+    return _redact_opaque_fields(text, True, True, True) if _redact_enabled() else text
 
 
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False,
                           file_read: bool = False, secret_file: bool = False, opaque_fields: bool = False,
-                          redact_url_credentials: bool = False, keep_phone_numbers: bool = False) -> str:
+                          redact_url_credentials: bool = False, keep_phone_numbers: bool = False, vendor_hints: bool = True) -> str:
     """Apply all redaction patterns to a block of text.
 
     Safe on any string. Enabled by default (``security.redact_secrets: false``
@@ -1545,12 +1535,12 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         return text
     return redact_credential_shapes(text, force=force, code_file=code_file, file_read=file_read,
                                     secret_file=secret_file, redact_url_credentials=redact_url_credentials,
-                                    keep_phone_numbers=keep_phone_numbers, opaque_fields=opaque_fields)
+                                    keep_phone_numbers=keep_phone_numbers, opaque_fields=opaque_fields, vendor_hints=vendor_hints)
 
 
 def redact_credential_shapes(text: str, *, force: bool = False, code_file: bool = False,
                              file_read: bool = False, secret_file: bool = False, opaque_fields: bool = False,
-                             redact_url_credentials: bool = False, keep_phone_numbers: bool = False) -> str:
+                             redact_url_credentials: bool = False, keep_phone_numbers: bool = False, vendor_hints: bool = True) -> str:
     """The pattern passes of ``redact_sensitive_text`` alone: no registered exact values, no preference
     gate. A classifier (does this value have a credential shape?) must not read a registry, or another
     profile's values would decide what this one treats as secret."""
@@ -1565,7 +1555,7 @@ def redact_credential_shapes(text: str, *, force: bool = False, code_file: bool 
     text = _redact_opaque_fields(text, code_file=code_file, opaque_fields=opaque_fields, file_read=file_read)
     # Control/zero-width chars can split a token body so _PREFIX_RE alone misses it.
     has_prefix = _has_known_prefix_substring(text)
-    token_mask = _mask_token_nonreusable if file_read else _mask_token
+    token_mask = _mask_token_nonreusable if file_read else (_mask_token if vendor_hints else _hide_token)
     if has_prefix:
         # Control/zero-width chars (\\n, \\r, ESC, U+200B, …) split a token body so _PREFIX_RE cannot match
         # across them — a secret smuggled as ``sk-abc\\x1bdef…`` leaks verbatim (issue #77484). Mask such
@@ -1580,17 +1570,17 @@ def redact_credential_shapes(text: str, *, force: bool = False, code_file: bool 
     # Store lines first: the assignment passes would mask only the first word of ``password=a b``.
     aws_command_lines = []
     if secret_file:
-        text = _redact_credential_store_lines(text, mask_nonreusable=file_read)
+        text = _redact_credential_store_lines(text, token_mask)
         aws_command_lines = aws_credential_process_keys(text)
     if not code_file:
-        text = outside_spans(text, aws_command_lines, lambda t: _redact_assignments(t, mask_nonreusable=file_read))
+        text = outside_spans(text, aws_command_lines, lambda t: _redact_assignments(t, token_mask))
     if has_prefix:
         text = mask_prefix_matches(text, token_mask, _PREFIX_SUB_RE, _is_glued_identifier)
 
     # Flags and connection-string keys carry a credential in command text, so they are not
     # gated on code_file: the shape (``--password=`` / ``;AccountKey=``) is unambiguous, and
     # the surfaces that leaked them (approval cards, chat status) run this pass anyway.
-    text = _redact_cli_secrets(text, _mask_token_nonreusable if file_read else None)
+    text = _redact_cli_secrets(text, token_mask)
 
     if force and "=" in text:
         # ``NAME=user:pass`` under an innocuous name (#125664): shape-only, so force-only — every
@@ -1845,7 +1835,8 @@ def redact_code_output(output: str, *, force: bool = False) -> str:
     redacted = redact_sensitive_text(output, force=force, code_file=True, opaque_fields=True)
     if not redacted or "=" not in redacted or not (force or _redact_enabled()):
         return redacted
-    mask_env = _assignment_sub(lambda g: f"{g[0]}={g[1]}{_mask_assignment_value(g[2])}{g[1]}", check_keyword=True)
+    def mask_env(match):
+        return _redact_env_value(match, _mask_assignment_value)
     return _ENV_DUMP_LINE_RE.sub(lambda m: _mask_env_dump_line(m, mask_env), redacted)
 
 # --- Prefix pre-screen: derived from _PREFIX_PATTERNS so a new prefix can't
@@ -1868,6 +1859,14 @@ def _has_nested_unbounded_repeat(pattern: str) -> bool:
     return _pattern_structure(pattern)[1]
 
 
+def _compile_hint_heads(patterns):
+    """Recognize the mandatory leading atoms still visible in a six-character vendor hint."""
+    atoms = re.compile(r"(?:(?:[a-zA-Z0-9_/-]|\\[.d]|\[[A-Za-z0-9_./+=-]++\])(?![?*]|\{0[,}])){1,6}")
+    return re.compile("|".join(head[0] if (head := atoms.match(pattern)) else re.escape(_extract_literal_prefix(pattern)[:6])
+                               for pattern in patterns))
+
+
+_VENDOR_HINT_HEAD_RE = _compile_hint_heads(_PREFIX_PATTERNS)
 _PREFIX_SUBSTRINGS = tuple(_extract_literal_prefix(p) for p in _PREFIX_PATTERNS)
 
 
@@ -1894,11 +1893,12 @@ def _plugin_patterns() -> list:
 def _rebuild_prefix_matcher() -> None:
     """Recompile the prefix alternation and pre-screen substrings; callers read the
     module globals at call time, so the swap propagates immediately."""
-    global _PREFIX_RE, _PREFIX_SUB_RE, _PREFIX_SUBSTRINGS
+    global _PREFIX_RE, _PREFIX_SUB_RE, _PREFIX_SUBSTRINGS, _VENDOR_HINT_HEAD_RE
     combined = _PREFIX_PATTERNS + _plugin_patterns()
     _PREFIX_RE = _compile_prefix_matcher(combined)
     _PREFIX_SUB_RE = _compile_prefix_sub_matcher(combined)
     _PREFIX_SUBSTRINGS = tuple(_extract_literal_prefix(p) for p in combined)
+    _VENDOR_HINT_HEAD_RE = _compile_hint_heads(combined)
 
 
 # Structural validators for register_redaction_patterns, in check order:

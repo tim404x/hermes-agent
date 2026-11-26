@@ -47,7 +47,7 @@ _SECRET_HEADER_UNQUOTED_CURL_RE = re.compile(
 
 # Same secret headers serialized in JSON form (``"x-api-key": "<value>"``). The
 # bare-header regex above cannot match this shape — the closing quote sits
-# between the name and the colon — and ``_JSON_FIELD_RE``'s key list omits the
+# between the name and the colon — and the closed JSON key list omits the
 # hyphenated header names, so opaque custom/local-backend keys (no vendor prefix
 # for ``_PREFIX_RE`` to catch) leak verbatim from serialized request dumps. This
 # mirrors the JSON-field redaction shape, so it is applied under the same
@@ -56,7 +56,7 @@ _SECRET_HEADER_JSON_RE = re.compile(
     # ``(?:\\.|[^"\\])`` consumes JSON string contents escape-aware, so a value
     # containing an escaped quote (``"ab\"cd"``) is masked whole rather than
     # truncated at the embedded quote (which would leave the tail in cleartext).
-    rf'("{_SECRET_HEADER_NAMES}"\s*:\s*")((?:\\[^\r\n]|[^"\\\r\n])+)(")',
+    rf'("(?:{_SECRET_HEADER_NAMES}|(?:proxy-)?authorization)"\s*:\s*")((?:\\[^\r\n]|[^"\\\r\n])++)(")',
     re.IGNORECASE,
 )
 
@@ -239,6 +239,8 @@ def json_header_value_is_credential(key: str, value: str) -> bool:
     from agent.redact import _ENV_LOOKUP_VALUE_RE, _SHELL_VAR_REF
     if "cookie" in key.lower():
         return cookie_value_is_credential(value)
+    if "authorization" in key.lower():
+        return re.fullmatch(r"(?:Bearer|Basic|Bot|Token|Digest|Negotiate|NTLM|OAuth)\s+\S.*", value, re.IGNORECASE) is not None
     # An earlier pass's marker keeps its vendor label (``«redacted:ghp_…»``), as main's field pass does.
     return not (value == "***" or value.startswith("«redacted") or _ENV_LOOKUP_VALUE_RE.match(value)
                 or re.fullmatch(_SHELL_VAR_REF, value))
