@@ -160,8 +160,7 @@ def decompose_triage_task(
         for idx, child in enumerate(children):
             for p_idx in child.get("parents") or []:
                 parent_id, child_id = child_ids[p_idx], child_ids[idx]
-                _link(conn, parent_id, child_id)
-                _append_event(conn, child_id, "linked", {"parent": parent_id, "child": child_id})
+                _link(conn, parent_id, child_id, emit_event=True)
         # Root waits for the whole graph: link it under EVERY child (simpler
         # than computing leaves; cycle-free since the root is only ever a child).
         for cid in child_ids:
