@@ -26,7 +26,7 @@ def _notices(monkeypatch, errors=()):
     sent = []
     errors = list(errors)
 
-    def deliver(job, err_text, *, adapters, loop, suffix=None):
+    def deliver(job, err_text, *, adapters, loop, suffix=None, nudge=True):
         sent.append((job['id'], err_text + (f'\n{suffix}' if suffix else '')))
         return (errors.pop(0) if errors else None), 'delivered'
     monkeypatch.setattr(scheduler, '_deliver_crash_failure', deliver)

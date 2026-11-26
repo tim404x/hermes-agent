@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from cron import executions, jobs, scheduler, scheduler_authority as authority
+from cron import executions, jobs, scheduler, scheduler_authority as authority, unreachable_retry
 from cron.scheduler_worker_failure import record_unknown_worker_outcome
 from hermes_cli import gateway_client
 from tests.cron.test_observer_reconnects_by_receipt import RECEIPT
@@ -245,3 +245,197 @@ def test_retired_one_shot_still_sends_its_parked_notice(monkeypatch, removed):
     authority.reconcile_pending()
     assert notices == [(job['id'], 'worker died')]
     assert json.loads(journal.read_text())['unknown_settled'] is True
+
+
+def _give_up(monkeypatch, job):
+    with monkeypatch.context() as peer:
+        _peer(peer, {'cron.submit': RECEIPT, 'cron.status': {'status': 'unknown'}}.__getitem__)
+        with pytest.raises(authority.CronExecutionUnknown) as lost:
+            authority.run_canonical_job(job)
+    execution_id = job['execution_id']
+    authority.pause_for_unknown(job['id'], execution_id, str(lost.value))
+    assert executions.give_up_execution(execution_id, reason='waiter saw lost worker')
+    return authority.journal_path(job['id'], execution_id)
+
+
+@pytest.fixture
+def delivered(monkeypatch):
+    messages = []
+    monkeypatch.setattr(scheduler, '_deliver_result', lambda job, text, **kwargs: messages.append(text))
+    return messages
+
+
+@pytest.mark.parametrize('receipt, status', [('unknown', 'unknown'), ('terminal', 'ok')])
+def test_lost_pause_journal_write_lifts_only_the_firers_pause(monkeypatch, receipt, status):
+    job = _claim()
+    journal = _give_up(monkeypatch, job)
+    record = json.loads(journal.read_text())
+    del record['pause_recorded']
+    journal.write_text(json.dumps(record))
+    assert record_unknown_worker_outcome(job)
+    _peer(monkeypatch, lambda method: {'status': receipt, 'job': job, 'result': [True, 'brief', 'answer', None]})
+    authority.reconcile_pending()
+    saved = jobs.get_job(job['id'])
+    assert saved['state'] == 'scheduled' and saved['enabled'] and not saved['paused_at']
+    assert not saved.get('paused_for_execution')
+    assert saved['last_status'] == status and saved['repeat']['completed'] == 1
+
+
+@pytest.mark.parametrize('lost_write', [True, False])
+def test_operator_repause_is_never_lifted(monkeypatch, lost_write):
+    job = _claim()
+    journal = _give_up(monkeypatch, job)
+    record = json.loads(journal.read_text())
+    reason = record['pause_recorded']['reason']
+    if lost_write:
+        del record['pause_recorded']
+        journal.write_text(json.dumps(record))
+    assert jobs.get_job(job['id']).get('paused_for_execution') == job['execution_id']
+    operator_pause = jobs.pause_job(job['id'], reason=reason)
+    assert not operator_pause.get('paused_for_execution')
+    assert record_unknown_worker_outcome(job)
+    authority.reconcile_pending()
+    saved = jobs.get_job(job['id'])
+    assert saved['state'] == 'paused' and not saved['enabled']
+    assert (saved['paused_at'], saved['paused_reason']) == (operator_pause['paused_at'], reason)
+    assert saved['last_status'] == 'unknown'
+
+
+def test_recovery_waits_for_the_waiter_to_book_and_park(monkeypatch, delivered):
+    job = _claim()
+    journal = _give_up(monkeypatch, job)
+    authority.reconcile_pending()
+    waiting = jobs.get_job(job['id'])
+    assert waiting['fire_claim'] == job['fire_claim'] and waiting['repeat']['completed'] == 0
+    assert not json.loads(journal.read_text()).get('unknown_settled') and not delivered
+    assert record_unknown_worker_outcome(job)
+    assert journal.with_suffix('.notice').exists() and not delivered
+    authority.reconcile_pending()
+    authority.reconcile_pending()
+    saved = jobs.get_job(job['id'])
+    assert saved['state'] == 'scheduled' and saved['repeat']['completed'] == 1
+    assert saved['canonical_completions'] == [job['execution_id']]
+    assert len(delivered) == 1 and 'waiter saw lost worker' in delivered[0]
+
+
+def test_recovery_sends_the_only_notice_if_the_waiter_never_books(monkeypatch, delivered):
+    job = _claim()
+    journal = _give_up(monkeypatch, job)
+    jobs.update_job(job['id'], {'fire_claim': None})
+    authority.reconcile_pending()
+    authority.reconcile_pending()
+    saved = jobs.get_job(job['id'])
+    assert saved['state'] == 'scheduled' and saved['repeat']['completed'] == 1
+    assert saved['canonical_completions'] == [job['execution_id']]
+    assert len(delivered) == 1 and 'Cron execution unverified: the run was lost (outcome unknown).' in delivered[0]
+    assert delivered[0].endswith(f"schedule kept, next run {saved['next_run_at']}") and 'in a row' not in delivered[0]
+    assert json.loads(journal.read_text())['unknown_notice_sent'] is True
+
+
+@pytest.mark.parametrize('booked', [False, True], ids=['live', 'booked'])
+def test_unknown_without_provisional_respects_newer_fire(monkeypatch, clock, booked):
+    job = _claim()
+    _give_up(monkeypatch, job)
+    clock[0] += timedelta(hours=1)
+    newer = jobs.claim_job_for_fire(job['id'], claim_ttl_seconds=0, force=True, return_job=True)
+    owner = newer['fire_claim']['by']
+    if booked:
+        assert jobs.mark_job_run(job['id'], True, expected_fire_owner=owner, execution_id='newer')
+    before = jobs.get_job(job['id'])
+    clock[0] += timedelta(minutes=2)
+    authority.reconcile_pending()
+    saved = jobs.get_job(job['id'])
+    assert saved['repeat']['completed'] == before['repeat']['completed'] + 1
+    if booked:
+        assert saved['canonical_completions'] == [job['execution_id'], 'newer']
+        for key in ('last_status', 'last_run_at', 'failure_streak', 'last_error', 'next_run_at'):
+            assert saved[key] == before[key]
+    else:
+        assert saved['fire_claim'] == newer['fire_claim'] and saved['next_run_at'] == newer['next_run_at']
+        assert jobs.mark_job_run(job['id'], True, expected_fire_owner=owner)
+        assert jobs.get_job(job['id'])['repeat']['completed'] == 2
+
+
+@pytest.mark.parametrize('minutes', [5, 65], ids=['future', 'elapsed'])
+def test_unknown_without_provisional_keeps_claim_booked_interval(monkeypatch, clock, minutes):
+    job = _claim('every 1h')
+    _give_up(monkeypatch, job)
+    jobs.update_job(job['id'], {'fire_claim': None})
+    assert job['next_run_at'] == '2026-11-26T14:00:00+00:00'
+    clock[0] += timedelta(minutes=minutes, seconds=30)
+    authority.reconcile_pending()
+    saved = jobs.get_job(job['id'])
+    assert saved['next_run_at'] == job['next_run_at'] and saved['state'] == 'scheduled'
+    assert not {'unreachable_retry', 'quota_hold_until', 'quota_hold_cron_expr'}.intersection(saved)
+
+
+def test_unknown_retry_without_provisional_does_not_exhaust_repeat(monkeypatch, clock):
+    monkeypatch.setattr(unreachable_retry, '_hermes_now', lambda: clock[0])
+    job = jobs.create_job(prompt='brief', schedule='every 1h', repeat=2, deliver='local')
+    assert jobs.mark_job_run(job['id'], False, error='offline', model_unreachable=True)
+    first = jobs.get_job(job['id'])
+    assert first['repeat']['completed'] == 1
+    clock[0] = datetime.fromisoformat(first['unreachable_retry']['at'])
+    retry = jobs.claim_job_for_fire(job['id'], return_job=True)
+    assert unreachable_retry.is_retry_run(retry)
+    retry['execution_id'] = executions.create_execution(job['id'], source='test')['id']
+    _give_up(monkeypatch, retry)
+    jobs.update_job(job['id'], {'fire_claim': None})
+    authority.reconcile_pending()
+    saved = jobs.get_job(job['id'])
+    assert saved['repeat']['completed'] == 1 and saved['state'] == 'scheduled'
+    assert saved['last_status'] == 'unknown' and saved['next_run_at'] == retry['next_run_at']
+    assert not {'unreachable_retry', 'quota_hold_until', 'quota_hold_cron_expr'}.intersection(saved)
+
+
+def test_opt_in_resume_before_first_reconciliation_is_respected(monkeypatch, delivered):
+    job = _claim()
+    jobs.update_job(job['id'], {'pause_on_unknown': True})
+    journal = _give_up(monkeypatch, job)
+    assert json.loads(journal.read_text())['pause_recorded']
+    assert record_unknown_worker_outcome(job)
+    jobs.resume_job(job['id'])
+    authority.reconcile_pending()
+    authority.reconcile_pending()
+    saved = jobs.get_job(job['id'])
+    assert saved['state'] == 'scheduled' and saved['enabled'] and not saved.get('paused_for_execution')
+    assert len(delivered) == 1 and json.loads(journal.read_text())['unknown_settled'] is True
+
+
+def test_booked_unknown_parked_notice_has_no_failure_streak_nudge(monkeypatch, delivered):
+    job = _claim()
+    _give_up(monkeypatch, job)
+    assert record_unknown_worker_outcome(job)
+    authority.reconcile_pending()
+    saved = jobs.get_job(job['id'])
+    assert saved['failure_streak'] == 2 and len(delivered) == 1
+    assert 'in a row' not in delivered[0]
+    assert delivered[0].splitlines()[-1] == f"Outcome unknown (no automatic re-run); schedule kept, next run {saved['next_run_at']}"
+
+
+def test_restart_that_killed_the_waiter_still_settles_once_its_claim_goes_stale(monkeypatch, clock, delivered):
+    """26 Nov shape where the gateway restart kills the firer AND its in-gateway waiter: nobody gives
+    up, pauses or books the fire, and the dead waiter's claim stays on the job. Recovery defers only
+    while that claim is live, then settles the fire itself: schedule kept, one notice."""
+    job = _claim()
+    fire = job['execution_id']
+    executions.mark_execution_running(fire)
+    with executions._transaction() as conn:
+        conn.execute('UPDATE executions SET process_id=?,pid=? WHERE id=?', ('dead-gateway', 999999, fire))
+    journal = authority.journal_path(job['id'], fire)
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    journal.write_text(json.dumps({'params': {'job_id': job['id'], 'request_id': fire, 'extra_prompt': None},
+                                   'receipt': RECEIPT, 'fire_claim': authority._claim_identity(job['fire_claim']),
+                                   'scheduled_instant': job.get('_scheduled_instant')}))
+    authority.reconcile_pending()  # the claim is still within its TTL: the waiter may yet book it
+    assert not json.loads(journal.read_text()).get('unknown_settled') and not delivered
+    clock[0] += timedelta(minutes=6)  # no heartbeat: the claim went stale
+    authority.reconcile_pending()
+    authority.reconcile_pending()
+    saved = jobs.get_job(job['id'])
+    assert (saved['state'], saved['enabled'], saved['paused_at']) == ('scheduled', True, None)
+    assert saved['next_run_at'] == job['next_run_at'] and saved['fire_claim'] is None
+    assert saved['last_status'] == 'unknown' and saved['failure_streak'] == 2
+    assert saved['repeat']['completed'] == 1 and saved['canonical_completions'] == [fire]
+    assert len(delivered) == 1 and 'the run was lost (outcome unknown)' in delivered[0]
+    assert delivered[0].endswith(f"schedule kept, next run {saved['next_run_at']}")

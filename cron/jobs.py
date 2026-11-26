@@ -1652,12 +1652,13 @@ def _with_job(
 
 def _complete_job_record(job: dict[str, Any]) -> None:
     """Retire *job* in place as a terminal completion (record kept for `cronjob list`)."""
+    job.pop("paused_for_execution", None)
     job.update(enabled=False, state="completed", next_run_at=None)
 
 
 def _activate_job_record(job: dict[str, Any]) -> None:
     """Clear pause markers in place so *job* is runnable again."""
-    job.update(enabled=True, state="scheduled", paused_at=None, paused_reason=None)
+    job.update(enabled=True, state="scheduled", paused_at=None, paused_reason=None, paused_for_execution=None)
 
 
 def _plan_fingerprint(job: dict[str, Any]) -> str:
@@ -1689,10 +1690,11 @@ def unknown_fire_pauses(job: dict) -> bool:
     return bool(job.get("pause_on_unknown")) or (job.get("schedule") or {}).get("kind") not in ("cron", "interval")
 
 
-def settle_unknown_fire(job_id: str, execution_id: str, reason: str, *, lift_pause=None):
+def settle_unknown_fire(job_id: str, execution_id: str, reason: str, *, lift_pause=None,
+                        recovered_claim=None, ladder_rung=False):
     """Hold a one-shot or opted-in job; otherwise book the fire without re-executing it.
 
-    next_run_at stays as booked: the natural next slot from _advance_after_run or the
+    next_run_at stays as booked: the natural next slot from the claim or the
     provisional mark's booking, never "now". No retry rung or quota hold is planned and
     failure_streak is unchanged. An operator pause is never adopted or lifted:
     _lift_recovery_pause only lifts the exact pause recorded for this fire.
@@ -1701,13 +1703,14 @@ def settle_unknown_fire(job_id: str, execution_id: str, reason: str, *, lift_pau
     if job is None:
         return "missing", None
     if unknown_fire_pauses(job):
-        return "held", hold_for_unknown(job_id, reason)
+        return "held", None if lift_pause else hold_for_unknown(job_id, reason, execution_id=execution_id)
     booked = mark_job_run(job_id, False, error=reason, status="unknown",
-                          execution_id=execution_id, lift_pause=lift_pause)
+                          execution_id=execution_id, lift_pause=lift_pause, recovered_claim=recovered_claim,
+                          ladder_rung=ladder_rung, keep_next_run=True)
     return ("booked" if booked else "refused"), None
 
 
-def hold_for_unknown(job_id: str, reason: str) -> Optional[dict[str, Any]]:
+def hold_for_unknown(job_id: str, reason: str, *, execution_id: Optional[str] = None) -> Optional[dict[str, Any]]:
     """Pause *job_id* for a fire whose outcome is unknown, unless it is already paused: one locked
     check-and-pause, so receipt recovery can never adopt (and later lift) an operator's pause or
     another fire's. The paused record, or None when nothing was paused."""
@@ -1717,7 +1720,7 @@ def hold_for_unknown(job_id: str, reason: str) -> Optional[dict[str, Any]]:
             return None
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return None
-        return pause_job(job_id, reason=reason)
+        return pause_job(job_id, reason=reason, execution_id=execution_id)
 
 
 def _lift_recovery_pause(job: dict[str, Any], pause: Any) -> bool:
@@ -1732,6 +1735,7 @@ def _lift_recovery_pause(job: dict[str, Any], pause: Any) -> bool:
     recompute to the resume) takes its next instant, and a one-shot with nothing left to fire stays
     paused for the operator."""
     if not (isinstance(pause, dict) and job.get("state") == "paused"
+            and (not pause.get("execution_id") or job.get("paused_for_execution") == pause["execution_id"])
             and (job.get("paused_at"), job.get("paused_reason")) == (pause.get("paused_at"), pause.get("reason"))):
         return False
     schedule = job.get("schedule") or {}
@@ -2245,7 +2249,7 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
     return _with_job(job_id, apply)
 
 
-def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[dict[str, Any]]:
+def pause_job(job_id: str, reason: Optional[str] = None, *, execution_id: Optional[str] = None) -> Optional[dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)
     if not job:
@@ -2255,6 +2259,7 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[dict[str, A
         "state": "paused",
         "paused_at": _hermes_now().isoformat(),
         "paused_reason": reason,
+        "paused_for_execution": execution_id,
     })
 
 
@@ -2276,13 +2281,9 @@ def resume_job(job_id: str) -> Optional[dict[str, Any]]:
         raise ValueError(
             f"Cannot resume: one-shot time {run_at} is in the past "
             f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire.")
-    return update_job(job["id"], {
-        "enabled": True,
-        "state": "scheduled",
-        "paused_at": None,
-        "paused_reason": None,
-        "next_run_at": next_run_at,
-    })
+    updates = {"next_run_at": next_run_at}
+    _activate_job_record(updates)
+    return update_job(job["id"], updates)
 
 
 def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[dict[str, Any]]:
@@ -2298,17 +2299,15 @@ def trigger_job(job_id: str, extra_prompt: Optional[str] = None) -> Optional[dic
             f"Create a new occurrence with 'hermes cron resume {name} "
             "--run-now' or '--at <ISO-8601>'.")
     manual_run_at = _hermes_now().isoformat()
-    return update_job(job["id"], {
-        "enabled": True,
-        "state": "scheduled",
-        "paused_at": None,
-        "paused_reason": None,
+    updates = {
         "next_run_at": manual_run_at,
         # Run-now intent, so cron expression/TZ repair guards don't treat it as stale state; the
         # overwritten slot comes back at claim time (an extra fire, cron/extra_fire.py).
         "manual_run_at": manual_run_at, extra_fire.RESTORE_KEY: extra_fire.restore_target(job),
         "manual_run_prompt": (extra_prompt or None),
-    })
+    }
+    _activate_job_record(updates)
+    return update_job(job["id"], updates)
 
 
 def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
@@ -2559,6 +2558,7 @@ def mark_job_run(
     provisional: bool = False,
     lift_pause: Optional[dict[str, Any]] = None,
     recovered_claim: Optional[dict[str, Any]] = None,
+    keep_next_run: bool = False,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached. A manual run
@@ -2597,6 +2597,9 @@ def mark_job_run(
     stored claim held by anyone else, or a queued run-now, belongs to a newer fire: its claim,
     markers, slot and schedule stay; if a fire acquired after this one is already booked (claim
     ``seq`` vs ``booked_fire_seq``) this outcome is historical (``cron/jobs_newer_fire.py``).
+
+    ``keep_next_run``: on a plain nonterminal booking, keep the slot already advanced by the
+    claim instead of advancing again from recovery time. An elapsed slot stays due for catch-up.
     """
     from cron import jobs_newer_fire, jobs_provisional
 
@@ -2663,7 +2666,10 @@ def mark_job_run(
             if extra:  # a manual run: repeat budget and pending occurrence untouched
                 extra_fire.settle(job, now)
             else:
+                next_run = job.get("next_run_at")
                 _advance_after_run(job, now, ladder_rung=ladder_rung)
+                if keep_next_run and next_run is not None and not is_terminal_job(job):
+                    job["next_run_at"] = next_run
             jobs_newer_fire.note_booked(job, recovered_claim or booked_claim)
         if newer_pending and not replacing:
             jobs_newer_fire.note_booked(job, recovered_claim)

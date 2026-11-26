@@ -76,6 +76,7 @@ def _pause_identity(paused):
         return True
     from cron.jobs import _plan_fingerprint
     return {'paused_at': paused.get('paused_at'), 'reason': paused.get('paused_reason'),
+            'execution_id': paused.get('paused_for_execution'),
             'plan': _plan_fingerprint(paused)}
 
 
@@ -149,7 +150,7 @@ def pause_for_unknown(job_id, execution_id, reason):
         if not unknown_fire_pauses(job):
             logger.warning('Cron %s: outcome unknown, schedule kept (no receipt recovery for this fire)', job_id)
             return
-    paused = hold_for_unknown(job_id, reason)  # an operator's pause is never adopted
+    paused = hold_for_unknown(job_id, reason, execution_id=execution_id)
     if paused and journal.exists():
         record = json.loads(journal.read_text(encoding='utf-8-sig'))
         record['pause_recorded'] = _pause_identity(paused)
@@ -194,17 +195,21 @@ def park_unknown_notice(job, execution_id, notice):
     receipt recovery (``reconcile_pending``) books and delivers the real outcome. The notice goes out
     only if recovery settles the fire ``unknown``. False (send it now) when there is no journal or no
     built-in ticker to run that recovery."""
-    from utils import atomic_json_write
     journal = journal_path(job['id'], execution_id)
     if not journal.exists() or not _builtin_ticker():
         return False
-    snapshot = json.loads(json.dumps(dict(job), default=str))
-    atomic_json_write(_notice_path(journal), {'notice': str(notice or ''), 'job': snapshot, 'attempts': 0},
-                      mode=0o600, fsync_dir=True)
+    _write_parked_notice(journal, job, notice)
     return True
 
 
-def _send_parked_notice(journal, suffix=None):
+def _write_parked_notice(journal, job, notice):
+    from utils import atomic_json_write
+    snapshot = json.loads(json.dumps(dict(job), default=str))
+    atomic_json_write(_notice_path(journal), {'notice': str(notice or ''), 'job': snapshot, 'attempts': 0},
+                      mode=0o600, fsync_dir=True)
+
+
+def _send_parked_notice(journal, record):
     """Deliver a parked unknown-outcome notice once recovery proved the outcome is really unknown.
     Sent first and cleared after, so a crash can repeat it but never lose it; a failing delivery is
     retried on later ticks, ``_PARKED_NOTICE_ATTEMPTS`` times at most."""
@@ -213,6 +218,9 @@ def _send_parked_notice(journal, suffix=None):
     from cron.jobs import get_job
     from utils import atomic_json_write
     path = _notice_path(journal)
+    if record.get('unknown_notice_sent'):
+        path.unlink(missing_ok=True)
+        return
     try:
         parked = json.loads(path.read_text(encoding='utf-8-sig'))
     except (OSError, ValueError):
@@ -220,17 +228,21 @@ def _send_parked_notice(journal, suffix=None):
     job = dict(parked.get('job') or {})
     current = get_job(job.get('id')) if job.get('id') else None
     job = dict(current or job, execution_id=job.get('execution_id'))  # a removed one-shot keeps its snapshot
+    suffix = record.get('unknown_notice_suffix')
     tokens = scheduler._install_fire_secret_scope()
     try:
         delivery_error, _ = scheduler._deliver_crash_failure(job, parked.get('notice') or '', adapters=None,
-                                                              loop=None, suffix=suffix)
+                                                              loop=None, suffix=suffix, nudge=suffix is None)
     except Exception as exc:  # health: allow BLE001 -- retried on the next tick
         delivery_error = str(exc)
     finally:
         scheduler._reset_fire_secret_scope(tokens)
     attempts = int(parked.get('attempts') or 0) + 1
     if not delivery_error or attempts >= _PARKED_NOTICE_ATTEMPTS:
-        if delivery_error:
+        if not delivery_error:
+            record['unknown_notice_sent'] = True
+            atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
+        else:
             logging.getLogger(__name__).warning(
                 'Cron %s unknown-outcome notice not delivered after %d attempts: %s', job.get('id'), attempts, delivery_error)
         path.unlink(missing_ok=True)
@@ -491,26 +503,48 @@ def _clean_orphan_notices(root):
             parked.unlink(missing_ok=True)  # its fire was settled: the real outcome went out instead
 
 
-def _settle_unknown_receipt(journal, record):
+def _fire_claim_live(claim):
+    from cron.constants import FIRE_CLAIM_TTL_SECONDS
+    from cron.jobs import _claim_is_live, _hermes_now
+    return _claim_is_live(claim, _hermes_now(), FIRE_CLAIM_TTL_SECONDS)
+
+
+def _settle_unknown_receipt(journal, record, frozen):
     from cron.jobs import get_job, settle_unknown_fire
+    from cron.unreachable_retry import is_retry_run
     from utils import atomic_json_write
 
     if not record.get('unknown_settled'):
         params = record['params']
-        verdict, paused = settle_unknown_fire(params['job_id'], params['request_id'],
-                                              'Canonical cron unknown; no automatic re-execution',
-                                              lift_pause=record.get('pause_recorded'))
+        job_id, execution_id = params['job_id'], params['request_id']
+        current = get_job(job_id) or {}
+        if (record.get('fire_claim') and record['fire_claim'] == _claim_identity(current.get('fire_claim'))
+                and _fire_claim_live(current.get('fire_claim'))):
+            # The firer's waiter still holds (and heartbeats) this fire's claim: it books the fire
+            # and parks the notice; settling first would retire the claim and its alert. A claim
+            # its dead waiter left behind (a restart killed it) never defers: nobody else books it.
+            logger.info('Cron %s: deferring unknown receipt %s until the waiter books its fire', job_id, execution_id)
+            return
+        provisional = execution_id in (current.get('provisional_runs') or {})
+        instant = record.get('scheduled_instant')
+        verdict, paused = settle_unknown_fire(
+            job_id, execution_id, 'Canonical cron unknown; no automatic re-execution',
+            lift_pause=record.get('pause_recorded'), recovered_claim=_recovered_claim(record, frozen),
+            ladder_rung=bool(instant) and is_retry_run(dict(current, _scheduled_instant=instant)))
         if verdict == 'booked':
-            next_run = (get_job(params['job_id']) or {}).get('next_run_at')
+            next_run = (get_job(job_id) or {}).get('next_run_at')
             record['unknown_notice_suffix'] = 'Outcome unknown (no automatic re-run); schedule kept' + (
                 f', next run {next_run}' if next_run else '')
+            if not provisional and not record.get('unknown_notice_sent') and not _notice_path(journal).exists():
+                _write_parked_notice(journal, dict(current, execution_id=execution_id),
+                                     'Cron execution unverified: the run was lost (outcome unknown).')
         elif verdict == 'held' and not record.get('pause_recorded'):
             record['pause_recorded'] = _pause_identity(paused)
         if verdict != 'refused':
             record['unknown_settled'] = True
             atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
     if _notice_path(journal).exists():
-        _send_parked_notice(journal, suffix=record.get('unknown_notice_suffix'))
+        _send_parked_notice(journal, record)
 
 
 def reconcile_pending(*, allow_connect=True):
@@ -540,6 +574,10 @@ def reconcile_pending(*, allow_connect=True):
             params = record['params']
             if journal != journal_path(params['job_id'], params['request_id']):
                 raise ValueError('cron journal identity conflict')
+            if not record.get('pause_recorded'):
+                held = get_job(params['job_id'])
+                if held and held.get('state') == 'paused' and held.get('paused_for_execution') == params['request_id']:
+                    record['pause_recorded'] = _pause_identity(held)
             if 'update_refused' in record:
                 from cron.update_refusal import reconcile_refusal_record
                 reconcile_refusal_record(record, params['job_id'], params['request_id'])
@@ -592,7 +630,7 @@ def reconcile_pending(*, allow_connect=True):
                          'result': [False, f'# Cron Job: {params["job_id"]} (FAILED)\n\n{error}\n', '', error]}
             if state['status'] != 'terminal':
                 if state['status'] == 'unknown':
-                    _settle_unknown_receipt(journal, record)
+                    _settle_unknown_receipt(journal, record, frozen)
                 continue
             success, output, answer, error = state['result']
             job = dict(state['job'], **(state.get('job_flags') or {}))
