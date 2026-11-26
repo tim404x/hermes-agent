@@ -30,6 +30,8 @@ from gateway.control_dispatch import ControlRequestDispatcher
 logger = logging.getLogger(__name__)
 
 CONTROL_PROTOCOL_VERSION = 1
+# Listen backlog of the POSIX control socket (the kernel caps it at net.core.somaxconn).
+CONTROL_SOCKET_BACKLOG = 1024
 _SOCKET_FILENAME = "gateway.sock"
 _POINTER_FILENAME = "gateway.sock.path"
 _IS_WINDOWS = sys.platform == "win32"
@@ -293,7 +295,10 @@ class GatewayControlServer:
         # Restrictive umask so the socket is never world-connectable, even for the instant before chmod.
         old_umask = os.umask(0o177)
         try:
-            self._server = await asyncio.start_unix_server(self._handle_connection, path=str(bind_path))
+            # A deep backlog: every worker, cron firer and probe dials here, and a short owner-loop
+            # stall must queue them, not refuse them with EAGAIN (asyncio's default is 100).
+            self._server = await asyncio.start_unix_server(self._handle_connection, path=str(bind_path),
+                                                           backlog=CONTROL_SOCKET_BACKLOG)
         finally:
             os.umask(old_umask)
         with contextlib.suppress(OSError):
