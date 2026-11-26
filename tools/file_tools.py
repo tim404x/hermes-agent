@@ -224,7 +224,7 @@ def _is_source_code_path(path: str | Path) -> bool:
 
 
 def _redact_data_page(text, path):
-    return text if _is_source_code_path(path) else redact_file_fields(text)
+    return redact_file_fields(text, opaque_fields=not _is_source_code_path(path))
 
 
 def _render_read_content(file_ops, result, result_dict, path, offset) -> bool:

@@ -3,6 +3,7 @@
 import json
 import logging
 import secrets
+import shlex
 from functools import partial
 from pathlib import Path
 from time import perf_counter
@@ -207,6 +208,21 @@ def test_search_masks_secret_straddling_match_cap(tmp_path, visible):
     assert not hit["content"][len(prefix):].startswith(value[:visible])
 
 
+@pytest.mark.parametrize("suffix", [".txt", ".py"])
+@pytest.mark.parametrize("producer", ["read", "search"])
+def test_bearer_is_masked_before_read_and_search_clip_to_twenty_chars(tmp_path, monkeypatch, suffix, producer):
+    value = "aZ" + secrets.token_urlsafe(24)
+    prefix = " /link?t=".rjust(480, ".")
+    path = tmp_path / ("preview" + suffix)
+    path.write_text(prefix + value + "&r=ok")
+    monkeypatch.setattr("tools.tool_output_limits.get_max_line_length", lambda: 500)
+    if producer == "read":
+        assert json.loads(read_file_tool(str(path)))["content"] == "1|" + prefix + "***&r=ok"
+    else:
+        hit, = json.loads(search_tool("link", path=str(path)))["matches"]
+        assert hit["content"] == prefix + "***&r=ok"
+
+
 def test_complete_quoted_assignment_is_masked_and_still_parseable():
     words = [secrets.token_hex(6) for _ in range(3)]
     for encode in (json.dumps, lambda fields: json.dumps(json.dumps(fields))):
@@ -218,7 +234,18 @@ def test_complete_quoted_assignment_is_masked_and_still_parseable():
             assert redact_sensitive_text(f"{name}={quote}{' '.join(words)}{quote} NEXT=1") == f"{name}={quote}***{quote} NEXT=1"
 
 
-@pytest.mark.parametrize("prefix", ["SG", "AQ", "xox", "ya29", "sk-proj-"])
+def test_env_assignment_masks_one_complete_shell_word():
+    value = "aZ" + secrets.token_urlsafe(24)
+    for word in (shlex.quote("first'" + value), r"'first'\ " + value, "bare'with spaces'" + value):
+        for key in ("DB_PASSWORD", "db_password", "db.password", "password"):
+            output = redact_sensitive_text(f"{key}={word} NEXT=public")
+            assert shlex.split(output) == [key + "=***", "NEXT=public"]
+        assert shlex.split(redact_code_output(f"INFO=env DB_PASSWORD={word} NEXT=public")) == [
+            "INFO=env", "DB_PASSWORD=***", "NEXT=public"]
+    assert redact_sensitive_text("DB_PASSWORD=first&" + value) == "DB_PASSWORD=***"
+
+
+@pytest.mark.parametrize("prefix", ["SG", "AQ", "xox_", "ya29", "sk-proj-"])
 def test_only_complete_vendor_tokens_retain_assignment_hints(prefix):
     value = prefix + secrets.token_urlsafe(32)
     expected = value[:6] + "..." + value[-4:] if prefix == "sk-proj-" else "***"
@@ -240,6 +267,14 @@ def test_runtime_json_and_repr_agree_on_dotted_and_hyphenated_keys(sink):
     for encode in (repr, json.dumps, lambda fields: json.dumps(json.dumps(fields))):
         fields = dict.fromkeys(keys, value)
         assert sink(encode(fields)) == encode(dict.fromkeys(keys, "***"))
+
+
+@pytest.mark.parametrize("sink", [redact_terminal_output, redact_code_output])
+@pytest.mark.parametrize("encode", [json.dumps, repr])
+def test_runtime_masks_glued_credential_names_and_bare_authorization(sink, encode):
+    fields = dict.fromkeys(("accesstoken", "clientsecret", "Authorization"), "aZ" + secrets.token_urlsafe(24))
+    public = {"accesstoken_path": fields["accesstoken"], "ClientSecret": "/home/user/.config/gcloud2/adc.json"}
+    assert sink(encode(fields | public)) == encode(dict.fromkeys(fields, "***") | public)
 
 
 def test_json_keeps_qualified_secret_names_outside_the_affixed_key_grammar():
@@ -264,9 +299,11 @@ def test_config_metadata_and_paths_round_trip_through_read_and_write(tmp_path):
     assert path.read_text() == original + "\n"
 
 
-@pytest.mark.parametrize("flood", [True, False], ids=["backslashes", "benign-json"])
-def test_opaque_scan_completes_within_budget(flood):
-    text = r'\"secret\" :' + "\\" * 100_000 + "x" if flood else json.dumps({f"label{idx}": "plain" for idx in range(6000)})
+@pytest.mark.parametrize("text", [r'\"secret\" :' + "\\" * 100_000 + "x",
+                                  json.dumps({f"label{idx}": "plain" for idx in range(6000)}),
+                                  json.dumps({"secret_id": "public", "label": "$" + "a" * 8192 + "!", "pad": "x" * 100_000})],
+                         ids=["backslashes", "benign-json", "invalid-variable-reference"])
+def test_opaque_scan_completes_within_budget(text):
     assert len(text) >= 100_000
     started = perf_counter()
     assert _redact_opaque_fields(text, True, True, True) == text
@@ -288,6 +325,25 @@ def test_runtime_structured_auth_and_cookie_headers_are_masked():
     fields = {"Authorization": "Bearer " + value, "Cookie": "sid=" + value, "label": value}
     for sink in (redact_terminal_output, redact_code_output):
         assert json.loads(sink(json.dumps(fields))) == {**fields, "Authorization": "***", "Cookie": "***"}
+
+
+def test_benign_cookie_json_round_trips_through_read_and_write(tmp_path):
+    path = tmp_path / "cookies.json"
+    original = json.dumps({"Cookie": "theme=dark", "Set-Cookie": "ThemePreferenceWithLongName="})
+    path.write_text(original)
+    content = json.loads(read_file_tool(str(path)))["content"].removeprefix("1|")
+    assert content == original
+    assert "error" not in json.loads(write_file_tool(str(path), content + "\n"))
+    assert path.read_text() == original + "\n"
+
+
+def test_nested_headers_mask_decoded_credentials_only():
+    value = "aZ" + secrets.token_urlsafe(24)
+    fields = {"Authorization": "Bearer " + value, "Cookie": 'theme=dark; sid="' + value + '"', "label": value}
+    expected = json.dumps(json.dumps({**fields, "Authorization": "***", "Cookie": "***"}))
+    for inner in (json.dumps(fields), json.dumps(fields).replace("Bearer ", r"Bearer\u0020")):
+        for sink in (redact_terminal_output, redact_code_output):
+            assert sink(json.dumps(inner)) == expected
 
 
 @pytest.mark.parametrize("quote", ['"', "'"])

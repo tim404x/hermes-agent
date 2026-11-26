@@ -5,12 +5,14 @@ curl ``-H`` arguments, mid-line log text and JSON-serialized request dumps. Auth
 headers stay in agent/redact.py (they carry a scheme word).
 """
 
+import json
 import re
 
 
 # API-key style headers (single opaque value, no scheme word): non-vendor-prefix
 # values would otherwise leak when a curl command is echoed into tool output.
 SECRET_HEADER_NAME_LIST = ("x-api-key", "x-goog-api-key", "api-key", "apikey", "x-api-token", "x-auth-token", "x-access-token")
+JSON_HEADER_NAMES = frozenset((*SECRET_HEADER_NAME_LIST, "authorization", "proxy-authorization", "cookie", "set-cookie"))
 _SECRET_HEADER_NAMES = rf"(?:{'|'.join(SECRET_HEADER_NAME_LIST)})"
 _SECRET_HEADER_LINE_RE = re.compile(
     rf"(^[ \t]*(?:[<>][ \t]+)?{_SECRET_HEADER_NAMES}[ \t]*:[ \t]*)([^\r\n]+)",
@@ -45,23 +47,8 @@ _SECRET_HEADER_UNQUOTED_CURL_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
-# Same secret headers serialized in JSON form (``"x-api-key": "<value>"``). The
-# bare-header regex above cannot match this shape — the closing quote sits
-# between the name and the colon — and the closed JSON key list omits the
-# hyphenated header names, so opaque custom/local-backend keys (no vendor prefix
-# for ``_PREFIX_RE`` to catch) leak verbatim from serialized request dumps. This
-# mirrors the JSON-field redaction shape, so it is applied under the same
-# ``code_file`` gate.
-_SECRET_HEADER_JSON_RE = re.compile(
-    # ``(?:\\.|[^"\\])`` consumes JSON string contents escape-aware, so a value
-    # containing an escaped quote (``"ab\"cd"``) is masked whole rather than
-    # truncated at the embedded quote (which would leave the tail in cleartext).
-    rf'("(?:{_SECRET_HEADER_NAMES}|(?:proxy-)?authorization)"\s*:\s*")((?:\\[^\r\n]|[^"\\\r\n])++)(")',
-    re.IGNORECASE,
-)
-
 # Fail closed for a recognized JSON header whose string value is truncated at
-# a line boundary. The primary regex above handles all valid JSON strings; this
+# a line boundary. The field scanner handles well-formed JSON strings; this
 # fallback is deliberately line-bounded and its alternatives are disjoint so
 # malformed diagnostic output cannot trigger unbounded backtracking.
 _SECRET_HEADER_JSON_UNTERMINATED_RE = re.compile(
@@ -107,20 +94,6 @@ _COOKIE_HEADER_UNQUOTED_CURL_RE = re.compile(
     r"([!#$%&'*+\-.^_`|~0-9A-Za-z]+="
     r"(?:\\[^\r\n]|[^ \t\r\n;&|<>()$`\\])*)",
     re.IGNORECASE | re.MULTILINE,
-)
-
-# The on-disk request/response dump sink serializes headers as JSON, so cookies
-# also appear as ``"Cookie": "<name=value…>"`` — the bare regex above cannot see
-# that shape. A ``name=value`` pair is required so non-header ``"Cookie"`` values
-# are left untouched. JSON-shaped, so applied under the ``code_file`` gate.
-_COOKIE_HEADER_JSON_RE = re.compile(
-    # Escape-aware single-group value match (see _SECRET_HEADER_JSON_RE): the
-    # whole JSON string value of a "Cookie"/"Set-Cookie" key is masked. A single
-    # unambiguous group (no internal "=" split) avoids superlinear backtracking
-    # on malformed/unterminated JSON. A JSON key literally named Cookie is a
-    # strong-enough header signal that the "name=value" requirement is dropped.
-    r'("(?:Set-)?Cookie"\s*:\s*")((?:\\[^\r\n]|[^"\\\r\n])*)(")',
-    re.IGNORECASE,
 )
 
 _COOKIE_HEADER_JSON_UNTERMINATED_RE = re.compile(
@@ -230,6 +203,18 @@ def cookie_value_is_credential(value: str, *, qualified: bool = False) -> bool:
         return False
     key = "session_token" if qualified else "cookie"
     return ("=" in value and not value.startswith("$")) or _should_redact_assignment(key, value, check_keyword=False)
+
+
+def decode_json_header_value(value: str, escapes: str = "") -> str:
+    """Each enclosing JSON string doubles the backslashes before a field quote and adds one."""
+    for _ in range(len(escapes).bit_length() + 1):
+        if "\\" not in value:
+            break
+        try:
+            value = json.loads(f'"{value}"')
+        except json.JSONDecodeError:
+            break
+    return value
 
 
 def json_header_value_is_credential(key: str, value: str) -> bool:

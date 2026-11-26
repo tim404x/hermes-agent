@@ -26,8 +26,8 @@ from agent.redact_credential_stores import (
     redact_credential_store_lines,
 )
 from agent.redact_headers import (
-    _COOKIE_HEADER_JSON_RE, _COOKIE_HEADER_JSON_UNTERMINATED_RE, _SECRET_HEADER_JSON_RE,
-    _SECRET_HEADER_JSON_UNTERMINATED_RE, _SECRET_HEADER_LINE_RE, json_header_value_is_credential, redact_cookie_assignments,
+    JSON_HEADER_NAMES, _COOKIE_HEADER_JSON_UNTERMINATED_RE, _SECRET_HEADER_JSON_UNTERMINATED_RE,
+    _SECRET_HEADER_LINE_RE, decode_json_header_value, json_header_value_is_credential, redact_cookie_assignments,
     redact_header_credentials,
 )
 from agent.redact_partial_keys import _redact_partial_private_keys
@@ -217,8 +217,15 @@ _PREFIX_PATTERNS = [
 # (``MYTOKEN=…``) — an all-caps key is almost never prose. Bare ``KEY``/``PASS``/
 # ``PW`` suffixes are included; _key_has_secret_keyword rejects ``KEYBOARD=``.
 _SECRET_ENV_NAMES = r"(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PW|CREDENTIAL|AUTH)"
-_QUOTED_ASSIGN_VALUE = r'''(?P<quote>["'])(?P<quoted>(?:\\[^\r\n]|(?!(?P=quote))[^\\\r\n])*+)(?:(?P=quote)|(?=[\r\n]|$))'''
-_ENV_VALUE = rf'''(?:{_QUOTED_ASSIGN_VALUE}|(?P<bare>[^\s"']\S*+))'''
+
+
+def _assignment_word(bare: str) -> str:
+    """Keep the format's bare-value bounds; a shell quote or escape can join more segments."""
+    segment = r'''(?:\\[^\r\n]?+|'[^'\r\n]*+'?+|"(?:[^"\\\r\n]++|\\[^\r\n]?+)*+"?+)'''
+    return rf'''(?P<word>(?:{bare}|{segment})(?:{segment}|[^\s'"\\;&|<>]++)*+)'''
+
+
+_ENV_VALUE = _assignment_word(r'''[^\s'"\\]++''')
 _ENV_ASSIGN_RE = re.compile(rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*{_ENV_VALUE}")
 # Command-line credentials. ``--password=…``, ``--token …`` and ``docker login -p …`` reach
 # the approval card and the chat egress verbatim because the ENV passes only look at
@@ -291,7 +298,7 @@ _ENV_ASSIGN_LOWER_RE = re.compile(
 # (contains a dot), which is unambiguously a config key — never a prose word. 3. _CFG_ANCHORED_RE matches a
 # bare secret-word key only at line start (optionally after ``export``), so conversational ``I have
 # password=foo`` mid-sentence is left alone.
-_CFG_VALUE = rf'''(?:{_QUOTED_ASSIGN_VALUE}|(?P<bare>[^\s&"'][^\s&]*+))'''
+_CFG_VALUE = _assignment_word(r'''[^\s&'"\\]++''')
 # Linear pre-gate for the _CFG_*_RE subs: no secret keyword => neither can match.
 _CFG_SECRET_WORD_RE = re.compile(_SECRET_CFG_NAMES, re.IGNORECASE)
 
@@ -1280,32 +1287,17 @@ def _mask_token_nonreusable(token: str) -> str:
     return f"«redacted:{label}…»" if label else "«redacted-secret»"
 
 
-def _redact_json_string_value(m: re.Match, *, mask=_mask_token, opaque=False) -> str:
-    """Mask a captured JSON string value without breaking its escapes."""
-    encoded_value = m.group(2)
-    try:
-        value = json.loads(f'"{encoded_value}"')
-    except json.JSONDecodeError:
-        # The regex also accepts malformed escape pairs. Keep redaction
-        # fail-safe while emitting a syntactically valid replacement value.
-        value = encoded_value
-    if not json_header_value_is_credential(m.group(1), value):
-        return m.group(0)
-    if opaque:
-        candidate = value.split(None, 1)[-1] if "authorization" in m[1].lower() else value
-        if not _is_high_entropy_credential(candidate) and not ("cookie" in m[1].lower() and "=" in value):
-            return m[0]
-    masked = json.dumps(mask(value), ensure_ascii=False)[1:-1]
-    return m.group(1) + masked + m.group(3)
+def _opaque_header_credential(key: str, value: str) -> bool:
+    if key.endswith("cookie") and "=" in value:
+        return any(_is_high_entropy_credential(pair.partition("=")[2].strip().strip('"')) for pair in value.split(";"))
+    if key.endswith("authorization") and (parts := value.split(None, 1)):
+        value = parts[-1]
+    return _is_high_entropy_credential(value)
 
 
 def _redact_unterminated_json_string_value(m: re.Match, *, mask=_mask_token) -> str:
     """Fail closed on a truncated JSON header value through end-of-line."""
-    encoded_value = m.group(2)
-    try:
-        value = json.loads(f'"{encoded_value}"')
-    except json.JSONDecodeError:
-        value = encoded_value
+    value = decode_json_header_value(m[2])
     masked = json.dumps(mask(value), ensure_ascii=False)[1:-1]
     return m.group(1) + masked
 
@@ -1316,10 +1308,12 @@ def _replace_field(match, group, value):
 
 
 def _redact_env_value(match, mask):
-    group = "quoted" if match["quote"] else "bare"
-    value = match[group]
-    return (_replace_field(match, group, mask(value)) if _should_redact_assignment(match[1], value, check_keyword=True)
-            else match[0])
+    word = match["word"]
+    quote = word[0] if len(word) > 1 and word[0] in "\"'" and word[-1] == word[0] else ""
+    value = word[1:-1] if quote else word
+    if not _should_redact_assignment(match[1], value, check_keyword=True):
+        return match[0]
+    return _replace_field(match, "word", quote + mask(value) + quote)
 
 
 _JSON_VALUE_SUFFIX_RE = re.compile(r"[_.\-]?(?:value|Value|VALUE)$")
@@ -1327,7 +1321,7 @@ _JSON_VALUE_SUFFIX_RE = re.compile(r"[_.\-]?(?:value|Value|VALUE)$")
 
 def _structured_field_is_secret(key: str, value: str) -> bool:
     """Shared JSON/repr field policy, including metadata exclusions (#149435)."""
-    if _JSON_KEY_NAMES_FULL_RE.fullmatch(key):
+    if _JSON_KEY_NAMES_FULL_RE.fullmatch(key) or key.casefold() in ("accesstoken", "clientsecret", "authorization"):
         return _should_redact_assignment(key, value, check_keyword=False)
     if len(key) > 128 or not key.isascii():
         return False
@@ -1338,10 +1332,22 @@ def _structured_field_is_secret(key: str, value: str) -> bool:
     return _is_python_repr_secret_key(_JSON_VALUE_SUFFIX_RE.sub("", key))
 
 
+def _json_credential_value(match, opaque):
+    key, value = match["key"], match["value"]
+    folded = key.casefold()
+    if folded in JSON_HEADER_NAMES:
+        value = decode_json_header_value(value, match["esc"])
+        if (not opaque or _opaque_header_credential(folded, value)) and json_header_value_is_credential(key, value):
+            return value
+    elif opaque and "\\/" in value:
+        value = value.replace(match["esc"] + "\\/", "/")
+    if (opaque or not match["close"]) and not _is_high_entropy_credential(value):
+        return None
+    return value if _structured_field_is_secret(key, value) else None
+
+
 def _redact_json_fields(text, mask, *, opaque=False):
     """Inspect values by lookahead: a public outer string can contain another serialized field."""
-    for pattern in (_SECRET_HEADER_JSON_RE, _COOKIE_HEADER_JSON_RE):
-        text = pattern.sub(lambda match: _redact_json_string_value(match, mask=mask, opaque=opaque), text)
     if not opaque:
         for pattern in (_SECRET_HEADER_JSON_UNTERMINATED_RE, _COOKIE_HEADER_JSON_UNTERMINATED_RE):
             text = pattern.sub(lambda match: _redact_unterminated_json_string_value(match, mask=mask), text)
@@ -1350,12 +1356,8 @@ def _redact_json_fields(text, mask, *, opaque=False):
         start, end = match.span("value")
         if start < cursor:
             continue
-        value = match["value"]
-        if opaque and "\\/" in value:
-            value = value.replace(match["esc"] + "\\/", "/")
-        if (opaque or not match["close"]) and not _is_high_entropy_credential(value):
-            continue
-        if _structured_field_is_secret(match["key"], value):
+        value = _json_credential_value(match, opaque)
+        if value is not None:
             pieces.extend((text[cursor:start], mask(value)))
             cursor = end
     return "".join((*pieces, text[cursor:])) if pieces else text
@@ -1477,8 +1479,8 @@ def _redact_phone(m):
 
 def _is_high_entropy_credential(value: str) -> bool:
     return (len(value) >= 20 and not value.lower().startswith(("your", "example", "changeme", "xxx", "fixture-value-"))
-            and not _ENV_LOOKUP_VALUE_RE.match(value) and not _is_assignment_reference(value)
-            and re.fullmatch(r"[A-Za-z0-9_+/=.~-]++", value) is not None and _has_mixed_classes(value))
+            and re.fullmatch(r"[A-Za-z0-9_+/=.~-]++", value) is not None
+            and not _ENV_LOOKUP_VALUE_RE.match(value) and not _is_assignment_reference(value) and _has_mixed_classes(value))
 
 
 def _redact_opaque_fields(text: str, code_file: bool, opaque_fields: bool, file_read: bool) -> str:
@@ -1500,9 +1502,11 @@ def _redact_opaque_fields(text: str, code_file: bool, opaque_fields: bool, file_
     return _PYTHON_REPR_FIELD_RE.sub(field, text) if "'" in text else text
 
 
-def redact_file_fields(text: str) -> str:
-    """Mask structured data on the bounded raw page, before tool formatting and clipping."""
-    return _redact_opaque_fields(text, True, True, True) if _redact_enabled() else text
+def redact_file_fields(text: str, *, opaque_fields: bool = True) -> str:
+    """Mask bearers and eligible structured fields before tool formatting and clipping."""
+    if not _redact_enabled():
+        return text
+    return _redact_opaque_fields(_redact_bearer_short_params(text), True, opaque_fields, True)
 
 
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False,
