@@ -17,7 +17,8 @@ from agent.repetition_guard import STOP_PATH_MIN_CHARS, is_runaway_repetition
 from agent.stream_delivery import publish_held_final_row
 from agent.turn_failure_copy import stamp_failure
 from agent.turn_empty_response import (
-    housekeeping_reply_line, recover_empty_response, take_housekeeping_reply_line,
+    MACHINERY_NO_REPLY_ROW, NOTIFICATION_NO_REPLY_EXIT, housekeeping_reply_line, notice_final_text,
+    notice_silence_marker, recover_empty_response, take_housekeeping_reply_line,
 )
 from agent.turn_stop_gates import apply_stop_gates
 from agent.turn_truncation import partial_result, repetition_copy
@@ -171,7 +172,10 @@ def finish_text_response(
                 len(_promoted), agent.model, agent.provider, api_call_count,
                 sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")),
             )
-    final_response = _promoted or assistant_message.content or ""
+    final_response, inferred_silence = notice_final_text(
+        agent, assistant_message, _promoted or _content or "", response, finish_reason,
+        unfinished=bool(truncated_response_parts or length_continue_retries or _pending_verification_response),
+    )
     # Unmute: _mute_post_response from a housekeeping tool turn must not silence
     # empty-response warnings on the final response path.
     agent._mute_post_response = False
@@ -378,9 +382,25 @@ def finish_text_response(
     _pending_verification_response = _sg.pending_verification_response
     _pending_verification_response_previewed = _sg.pending_verification_response_previewed
     if _sg.continue_turn:
+        if (notice := getattr(agent, "_notice_work", None)) is not None and notice_silence_marker(agent, final_response):
+            notice.stop_withheld = True
+            _pending_verification_response = None
         final_response = None
         return _verdict("continue")
 
+    final_response = _commit_final_text(agent, final_msg, final_response, messages, conversation_history,
+                                       promoted=_promoted, joined=_joined)
+    _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
+    if inferred_silence and final_response == MACHINERY_NO_REPLY_ROW:
+        final_response, _turn_exit_reason = "", NOTIFICATION_NO_REPLY_EXIT
+    if not agent.quiet_mode:
+        agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
+    return _verdict("break")
+
+
+def _commit_final_text(agent: Any, final_msg: dict, final_response: str, messages: list, conversation_history: Any,
+                       *, promoted: Any, joined: bool) -> str:
+    """Transform and persist the stop candidate that actually passed the gates."""
     # Plugins rewrite the reply BEFORE it is appended and flushed: SQLite treats a non-blank
     # assistant row as settled, so a transform after this write would reach the user but never
     # the stored/replayed transcript (#44239). finalize_turn reads the recorded outcome; like
@@ -392,11 +412,11 @@ def finish_text_response(
             agent, final_response, turn_id=getattr(agent, "_current_turn_id", "") or "", logger=logger,
         )
     if _transformed:
-        if _promoted:
+        if promoted:
             final_msg["api_content"] = final_response
         else:
             final_msg["content"] = final_response
-    publish_held_final_row(agent, final_msg, final_response, _joined)
+    publish_held_final_row(agent, final_msg, final_response, joined)
 
     append_message(messages, final_msg)
     # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER keeps
@@ -411,7 +431,4 @@ def finish_text_response(
             exc_info=True,
         )
 
-    _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
-    if not agent.quiet_mode:
-        agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
-    return _verdict("break")
+    return final_response

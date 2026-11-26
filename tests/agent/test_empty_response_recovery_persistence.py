@@ -182,7 +182,7 @@ def _write_file_call(path):
 
 
 @pytest.fixture
-def real_loop(tmp_path, monkeypatch):
+def real_loop(tmp_path, monkeypatch, request):
     """A real AIAgent on the real ``file`` toolset and a real store; only the provider is scripted.
     Any request that would still leave the process dies on a dead local address."""
     for var in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "ALL_PROXY", "all_proxy"):
@@ -197,7 +197,8 @@ def real_loop(tmp_path, monkeypatch):
     with patch("agent.process_bootstrap.OpenAI"), patch("agent.model_metadata.fetch_model_metadata", return_value={}):
         agent = AIAgent(
             api_key="test-key", base_url=f"{_DEAD_LOCAL}/v1", model="test/model", quiet_mode=True,
-            skip_context_files=True, skip_memory=True, enabled_toolsets=["file"], persistence=db, session_id=sid,
+            skip_context_files=True, skip_memory=True, enabled_toolsets=getattr(request, "param", ["file"]),
+            persistence=db, session_id=sid,
         )
 
     def _no_real_client(*_a, **_k):
