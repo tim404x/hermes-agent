@@ -837,7 +837,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         max_line_length = get_max_line_length()
         truncated_lines = any(len(line) > max_line_length for line in content.split('\n'))
         return ReadResult(
-            content=self._add_line_numbers(content, offset), total_lines=total_lines,
+            content=self._add_line_numbers(content, offset), _raw_page=content, total_lines=total_lines,
             file_size=file_size, truncated=truncated, hint=" ".join(hint_parts),
             truncated_lines=True if truncated_lines else None)
 
@@ -1194,7 +1194,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         max_line_length = get_max_line_length()
         truncated_lines = any(len(line) > max_line_length for line in read_output.split('\n'))
         return ReadResult(
-            content=self._add_line_numbers(read_output, offset), total_lines=total_lines,
+            content=self._add_line_numbers(read_output, offset), _raw_page=read_output, total_lines=total_lines,
             file_size=file_size, truncated=truncated, hint=hint,
             truncated_lines=True if truncated_lines else None)
 
