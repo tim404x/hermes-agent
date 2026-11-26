@@ -15,6 +15,8 @@ from typing import Any, Callable, Iterable, Optional
 import json
 import time
 
+from hermes_cli import kanban_db as kb
+
 
 # Least → most urgent; sorted outputs put critical first.
 SEVERITY_ORDER = ("warning", "error", "critical")
@@ -98,7 +100,7 @@ def _event_kind(ev) -> str:
 
 
 def _event_ts(ev) -> int:
-    return int(_task_field(ev, "created_at", 0) or 0)
+    return kb._to_epoch(_task_field(ev, "created_at")) or 0
 
 
 def _first_field(task, primary: str, legacy: str, default=None):
@@ -557,11 +559,55 @@ def _rule_review_dependency_deadlock(task, events, runs, now, cfg) -> list[Diagn
     )]
 
 
+def _link_from_run(event, run_id, started_at, *, after_claim: bool) -> bool:
+    """Run and event row adapters use zero for unreadable timestamps."""
+    link_run_id = _task_field(event, "run_id")
+    if link_run_id is not None:
+        return link_run_id == run_id
+    linked_at = _event_ts(event)
+    if not started_at or not linked_at:
+        return False
+    return after_claim and linked_at >= started_at
+
+
+def _handoff_parent_ids(task, events, runs) -> set[str]:
+    """Use insertion evidence when available; replay older links in arrival order."""
+    run_id = _task_field(task, "current_run_id")
+    if run_id is None:
+        return set()
+    current_run = next((run for run in runs if _task_field(run, "id") == run_id), None)
+    started_at = kb._to_epoch(_task_field(current_run, "started_at"))
+    child_id = _task_field(task, "id")
+    ordered = sorted(events, key=lambda event: _task_field(event, "id", 0))
+    claim_index = next((index for index, event in enumerate(ordered)
+                        if _event_kind(event) == "claimed" and _task_field(event, "run_id") == run_id), -1)
+    handoff_by_parent: dict[str, bool] = {}
+    for index, event in enumerate(ordered):
+        kind = _event_kind(event)
+        if kind in ("created", "decomposed"):
+            key = "parents" if kind == "created" else "child_ids"
+            handoff_by_parent.update(dict.fromkeys(_parse_payload(event).get(key) or [], False))
+        elif kind in ("linked", "unlinked"):
+            edge = _parse_payload(event)
+            if edge.get("child") != child_id or not (parent_id := edge.get("parent")):
+                continue
+            if kind == "unlinked":
+                handoff_by_parent.pop(parent_id, None)
+            elif edge.get("inserted", parent_id not in handoff_by_parent):
+                handoff_by_parent[parent_id] = _link_from_run(
+                    event, run_id, started_at, after_claim=index > claim_index,
+                )
+            else:
+                handoff_by_parent.setdefault(parent_id, False)
+    return {parent_id for parent_id, is_handoff in handoff_by_parent.items() if is_handoff}
+
+
 def _rule_running_with_open_parents(task, events, runs, now, cfg) -> list[Diagnostic]:
     """A ``running`` card with a direct parent that is not ``done``/``archived``:
     the dependency gate is not holding it (the parent reopened mid-run, or the
     edge predates the running-child refusal) and ``kanban_complete`` will be
-    refused until the parents finish. Graph-aware; mutates nothing."""
+    refused until the parents finish. Excludes the active worker's own handoff
+    edges, which intentionally gate completion but not the start of this run."""
     if _task_field(task, "status") != "running":
         return []
     graph = cfg.get("_graph")
@@ -572,11 +618,14 @@ def _rule_running_with_open_parents(task, events, runs, now, cfg) -> list[Diagno
         if isinstance(parent, dict) and parent.get("id")
         and parent.get("status") not in ("done", "archived")
     ]
+    if open_parents:
+        handoffs = _handoff_parent_ids(task, events, runs)
+        open_parents = [parent for parent in open_parents if parent["id"] not in handoffs]
     if not open_parents:
         return []
     task_id = str(_task_field(task, "id") or "")
     parent_ids = [str(parent["id"]) for parent in open_parents]
-    seen_at = int(_task_field(task, "started_at", default=0) or 0) or now
+    seen_at = kb._to_epoch(_task_field(task, "started_at")) or now
     return [Diagnostic(
         kind="running_with_open_parents", severity="warning",
         title=f"Running while {len(parent_ids)} parent(s) are not done",
@@ -750,7 +799,6 @@ def _rule_stale_running(task, events, runs, now, cfg) -> list[Diagnostic]:
     grace_seconds = float(cfg.get("stale_running_grace_seconds", 60 * 60))
     if _task_field(task, "status") != "running":
         return []
-    from hermes_cli import kanban_db as kb
     expires = kb._to_epoch(_task_field(task, "claim_expires", None))
     if expires is None or (now - expires) < grace_seconds:
         return []
