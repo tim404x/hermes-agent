@@ -18,6 +18,7 @@ import threading
 import time
 from typing import Any, NamedTuple
 
+from hermes_dir_acl import make_user_dir
 from session_rules.media import PRUNED_SUBDIR, SPILLOVER_SUBDIR, archive_refs_in_text
 from tools.budget_config import DEFAULT_PREVIEW_SIZE_CHARS, BudgetConfig, DEFAULT_BUDGET
 
@@ -44,6 +45,7 @@ _spillover_prune_lock = threading.Lock()
 _spillover_pruned_homes: set = set()  # profile home keys already swept this process
 _private_dir_lock = threading.Lock()
 _tightened_archive_dirs: set[str] = set()  # resolved archive dirs already chmod'd 0o700 this process
+_warned_private_archive_dirs: set[str] = set()
 
 
 def get_spillover_dir():
@@ -166,7 +168,7 @@ def _ensure_archive_dir(spill_dir, *, private: bool) -> None:
         spill_dir.mkdir(parents=True, exist_ok=True)
         return
     existed = spill_dir.exists()
-    spill_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    make_user_dir(spill_dir, mode=0o700, parents=True, exist_ok=True)
     if os.name != "posix":
         return
     try:
@@ -177,14 +179,28 @@ def _ensure_archive_dir(spill_dir, *, private: bool) -> None:
         logger.debug("Could not resolve archive dir %s for chmod: %s", spill_dir, exc)
         return
     with _private_dir_lock:
-        already_tightened = key in _tightened_archive_dirs
-        if existed and already_tightened:
+        if existed and key in _tightened_archive_dirs:
             return
+        try:
+            os.chmod(spill_dir, 0o700)
+        except OSError as exc:
+            logger.debug("Could not chmod archive dir %s to 0700: %s", spill_dir, exc)
         _tightened_archive_dirs.add(key)
-    try:
-        os.chmod(spill_dir, 0o700)
-    except OSError as exc:
-        logger.debug("Could not chmod archive dir %s to 0700: %s", spill_dir, exc)
+
+
+def _docker_can_read_archive_dir(spill_dir) -> bool:
+    if os.stat(spill_dir).st_mode & 0o005 == 0o005:
+        return True
+    key = str(spill_dir.resolve())
+    with _private_dir_lock:
+        if key in _warned_private_archive_dirs:
+            return False
+        _warned_private_archive_dirs.add(key)
+    logger.warning(
+        "Archive dir %s is private, so a non-root container user could not read it. "
+        "Set terminal.docker_run_as_host_user: true or loosen the dir to re-enable archives.", key,
+    )
+    return False
 
 
 def _tighten_archive_file(path) -> None:
@@ -239,15 +255,16 @@ def _sweep_archive_dir(archive_dir, cutoff: float) -> int:
     if expired:
         referenced = referenced_spillover_names(archive_dir)
         for f, st in expired:
-            if referenced is None or f.name in referenced:  # unknown set: fail closed, keep
-                if private and (st.st_mode & 0o077):
-                    kept_loose.append(f)
-                continue
-            try:
-                f.unlink()
-                removed += 1
-            except OSError as exc:
-                logger.debug("Could not unlink expired archive %s: %s", f, exc)
+            if referenced is not None and f.name not in referenced:
+                try:
+                    f.unlink()
+                except OSError as exc:
+                    logger.debug("Could not unlink expired archive %s: %s", f, exc)
+                else:
+                    removed += 1
+                    continue
+            if private and (st.st_mode & 0o077):
+                kept_loose.append(f)
     for f in kept_loose:
         _tighten_archive_file(f)
     return removed
@@ -287,7 +304,8 @@ def _write_to_spillover(content: str, filename: str, subdir: str = SPILLOVER_SUB
     output saved": a partially-flushed or corrupted file (quota, ENOSPC race) fails closed to the
     bounded inline truncation instead of referencing an archive that silently lost bytes.
     Writes use private permissions (0700 dir, 0600 file, O_NOFOLLOW) regardless of umask except on
-    the docker backend without ``docker_run_as_host_user``, where bind-mounted files follow umask.
+    the docker backend without ``docker_run_as_host_user``, where bind-mounted files follow umask
+    and a private archive dir is left untouched.
     """
     data = content.encode("utf-8", errors="replace")
     private = _archive_files_private()
@@ -297,12 +315,17 @@ def _write_to_spillover(content: str, filename: str, subdir: str = SPILLOVER_SUB
         from hermes_constants import get_hermes_home
         spill_dir = get_hermes_home() / subdir
         _ensure_archive_dir(spill_dir, private=private)
+        if not private and not _docker_can_read_archive_dir(spill_dir):
+            return None
         path = spill_dir / filename
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if not nofollow and os.path.islink(path):
+            raise OSError(f"Refusing to write through archive symlink: {path}")
         flags = (
             os.O_WRONLY
             | os.O_CREAT
-            | (os.O_EXCL if exclusive else os.O_TRUNC)
-            | getattr(os, "O_NOFOLLOW", 0)
+            | (os.O_EXCL if exclusive else 0)
+            | nofollow
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_BINARY", 0)
         )
@@ -311,6 +334,10 @@ def _write_to_spillover(content: str, filename: str, subdir: str = SPILLOVER_SUB
         try:
             if private and hasattr(os, "fchmod"):
                 os.fchmod(fd, 0o600)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(f"Not a regular archive file: {path}")
+            if not exclusive:
+                os.ftruncate(fd, 0)
             handle_cm = open(fd, "wb")
         except BaseException:
             os.close(fd)

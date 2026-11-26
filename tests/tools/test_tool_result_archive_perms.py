@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import stat
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -60,7 +62,7 @@ def test_spillover_non_exclusive_overwrite_tightens_preexisting_file(tmp_path):
     spill_dir.mkdir(parents=True)
     os.chmod(spill_dir, 0o755)
     target = spill_dir / "tc_overwrite.txt"
-    target.write_bytes(b"old loose content")
+    target.write_bytes(b"old loose content with a longer tail")
     os.chmod(target, 0o644)
     assert _mode(target) == 0o644
 
@@ -69,6 +71,16 @@ def test_spillover_non_exclusive_overwrite_tightens_preexisting_file(tmp_path):
     assert _mode(spill_dir) == 0o700
     assert _mode(target) == 0o600
     assert target.read_bytes() == b"new private bytes"
+
+
+def test_spillover_failed_fchmod_preserves_existing_bytes(tmp_path):
+    target = tmp_path / SPILLOVER_SUBDIR / "tc_overwrite.txt"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"original bytes")
+
+    with patch("tools.tool_result_storage.os.fchmod", side_effect=OSError("chmod failed")):
+        assert _write_to_spillover("replacement", target.name) is None
+    assert target.read_bytes() == b"original bytes"
 
 
 def test_preexisting_loose_dir_and_kept_file_migrated_by_write_and_sweep(tmp_path, monkeypatch):
@@ -112,6 +124,25 @@ def test_preexisting_loose_dir_and_kept_file_migrated_by_write_and_sweep(tmp_pat
     assert _mode(old_file) == 0o600
     # Symlink target outside archive dir must never be chmod'd.
     assert _mode(outside) == 0o644
+
+
+def test_expired_loose_archive_tightened_when_unlink_fails(tmp_path):
+    target = tmp_path / SPILLOVER_SUBDIR / "expired.txt"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"expired archive")
+    target.chmod(0o644)
+    cutoff = target.stat().st_mtime + 1
+    unlink = Path.unlink
+
+    def deny_target_unlink(path, *args, **kwargs):
+        if path == target:
+            raise PermissionError(errno.EACCES, "Cannot unlink", str(path))
+        return unlink(path, *args, **kwargs)
+
+    with patch.object(Path, "unlink", deny_target_unlink):
+        assert _sweep_archive_dir(target.parent, cutoff) == 0
+    assert target.read_bytes() == b"expired archive"
+    assert _mode(target) == 0o600
 
 
 @pytest.mark.parametrize(
@@ -168,6 +199,28 @@ def test_docker_with_host_user_writes_private_archives(tmp_path, monkeypatch):
     host_path, _ = archived
     assert _mode(tmp_path / PRUNED_SUBDIR) == 0o700
     assert _mode(host_path) == 0o600
+
+
+def test_docker_without_host_user_skips_private_archive_dir(tmp_path, monkeypatch, caplog):
+    archived = write_pruned_original("local body", "s1", "terminal", "local_call")
+    assert archived is not None
+    archive_dir = tmp_path / PRUNED_SUBDIR
+    assert _mode(archive_dir) == 0o700
+    (tmp_path / SPILLOVER_SUBDIR).symlink_to(archive_dir, target_is_directory=True)
+
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false")
+    with caplog.at_level(logging.WARNING, logger=trs.__name__):
+        assert write_pruned_original("docker prune", "s1", "terminal", "docker_call") is None
+        assert _write_to_spillover("docker spill", "docker.txt") is None
+
+    assert _mode(archive_dir) == 0o700
+    assert list(archive_dir.iterdir()) == [Path(archived[0])]
+    warnings = [rec.getMessage() for rec in caplog.records
+                if rec.name == trs.__name__ and rec.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert str(archive_dir) in warnings[0]
+    assert "terminal.docker_run_as_host_user: true" in warnings[0]
 
 
 @pytest.mark.parametrize("backend", ["ssh", "modal", "daytona", "vercel_sandbox"])
