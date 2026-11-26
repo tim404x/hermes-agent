@@ -16,6 +16,7 @@ import stat
 import threading
 import time
 from contextlib import ExitStack
+from itertools import groupby
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_nt_namespace_error, get_read_block_error, is_blocked_device_path
@@ -27,7 +28,7 @@ from tools.file_operations import (
 from tools.file_operations_common import DEFAULT_READ_LIMIT, count_conflict_blocks
 from tools import file_state
 from hermes_platform.host import facts
-from agent.redact import _is_secret_file_arg, redact_sensitive_text
+from agent.redact import _is_secret_file_arg, redact_file_fields, redact_sensitive_text
 from tools.file_tools_paths import (
     _expand_tilde, _hosted_tilde, _path_resolution_warning, _resolve_base_dir, _resolve_entry_for_task,
     _resolve_path_for_task)
@@ -209,6 +210,57 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     except (OSError, ValueError):
         return False
     return is_blocked_device_path(resolved)
+
+
+_SOURCE_CODE_SUFFIXES = frozenset({
+    ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".c",
+    ".cc", ".cpp", ".h", ".hpp", ".cs", ".swift", ".scala", ".sh", ".bash", ".zsh", ".lua", ".dart", ".m", ".mm",
+    ".mjs", ".cjs", ".mts", ".cts", ".vue", ".svelte", ".kts", ".ps1", ".ex", ".exs", ".r", ".jl", ".hs", ".zig", ".tf", ".hcl",
+})
+
+
+def _is_source_code_path(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in _SOURCE_CODE_SUFFIXES
+
+
+def _redact_data_page(text, path):
+    return redact_file_fields(text, opaque_fields=not _is_source_code_path(path))
+
+
+def _render_read_content(file_ops, result, result_dict, path, offset) -> bool:
+    """Render safe content; return whether masking invalidates a whole-file write baseline."""
+    raw_page = getattr(result, "_raw_page", None)
+    content = result.content or ""
+    fields_masked = False
+    if isinstance(raw_page, str):
+        masked_page = _redact_data_page(raw_page, path)
+        if masked_page != raw_page:
+            fields_masked = True
+            content = file_ops._add_line_numbers(masked_page, offset)
+    max_chars = _get_max_read_chars()
+    if len(content) > max_chars:
+        content = _apply_char_budget(result_dict, content, offset, result_dict.get("total_lines", "unknown"), max_chars)
+    if not content:
+        return fields_masked
+    result.content = redact_sensitive_text(content, file_read=True, secret_file=_is_secret_file_arg(path),
+                                          opaque_fields=raw_page is None and not _is_source_code_path(path))
+    result_dict["content"] = result.content
+    return fields_masked or result.content != content
+
+
+def _redact_search_match_pages(matches, task_id):
+    """Join consecutive lines of one file; hits without coordinates stay independent."""
+    def page_key(item):
+        index, hit = item
+        number = getattr(hit, "line_number", None)
+        return hit.path, number - index if number is not None else (index,)
+    for (path, _), group in groupby(enumerate(matches), key=page_key):
+        resolved = _resolved_match_path(path, task_id)
+        hits = [hit for _, hit in group]
+        page = "\n".join(getattr(hit, "_unclipped", None) or hit.content for hit in hits)
+        lines = _redact_data_page(page, resolved).split("\n")
+        for hit, line in zip(hits, lines, strict=True):
+            hit.content = redact_sensitive_text(line[:500], file_read=True, secret_file=_is_secret_file_arg(resolved))
 
 
 def _resolved_match_path(path: str, task_id: str) -> str:
@@ -486,8 +538,9 @@ def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task
     page_text = "\n".join(lines[offset - 1:end_line])
     max_line_length = get_max_line_length()
     truncated_lines = any(len(line) > max_line_length for line in page_text.split('\n'))
+    masked_page = _redact_data_page(page_text, _resolved)
     result_dict = {
-        "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
+        "content": file_ops._add_line_numbers(masked_page, offset) if masked_page else "",
         "total_lines": total_lines,
         "file_size": binary.file_size,
         "truncated": total_lines > end_line,
@@ -506,7 +559,7 @@ def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task
         result_dict["content"] = redact_sensitive_text(
             rendered, file_read=True,
             secret_file=_is_secret_file_arg(str(_resolved)))
-        redacted = result_dict["content"] != rendered
+        redacted = masked_page != page_text or result_dict["content"] != rendered
     else:
         redacted = False
     if (offset == 1 and not result_dict["truncated"] and not redacted
@@ -723,22 +776,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         if _err or result_dict.get("is_binary"):
             return json.dumps(result_dict, ensure_ascii=False)
 
-        # Char budget on the FORMATTED content (what enters context), BEFORE
-        # redaction (skip the regex pass on huge content); truncate gracefully
-        # with a next_offset instead of rejecting.
+        redacted = _render_read_content(file_ops, result, result_dict, resolved_str, offset)
         file_size = result_dict.get("file_size", 0)
-        max_chars = _get_max_read_chars()
-        if len(result.content or "") > max_chars:
-            result.content = _apply_char_budget(
-                result_dict, result.content or "", offset,
-                result_dict.get("total_lines", "unknown"), max_chars)
-        redacted = False
-        if result.content:
-            unredacted = result.content
-            result.content = redact_sensitive_text(
-                unredacted, file_read=True, secret_file=_is_secret_file_arg(resolved_str))
-            redacted = result.content != unredacted
-            result_dict["content"] = result.content
 
         if result.content:
             conflicts = count_conflict_blocks(result.content)
@@ -1133,11 +1172,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             pattern=pattern, path=path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context, order=order)
         omitted = _filter_read_blocked_search_results(result, task_id)
-        for m in getattr(result, "matches", None) or ():
-            if getattr(m, "content", None):
-                m.content = redact_sensitive_text(
-                    m.content, file_read=True,
-                    secret_file=_is_secret_file_arg(_resolved_match_path(m.path, task_id)))
+        _redact_search_match_pages(getattr(result, "matches", None) or (), task_id)
         result_dict = result.to_dict(densify=True)
 
         if omitted:

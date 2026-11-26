@@ -36,7 +36,7 @@ def _redact_terminal_error_text(value: Any) -> str:
     """Force-redact text before serializing a terminal error envelope."""
     from agent.redact import redact_sensitive_text
 
-    return redact_sensitive_text("" if value is None else str(value), force=True)
+    return redact_sensitive_text("" if value is None else str(value), force=True, vendor_hints=False)
 
 
 from tools.registry import tool_error

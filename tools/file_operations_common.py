@@ -33,6 +33,7 @@ class ReadResult:
     _snapshot: Optional[tuple] = None
     # sha256 of the exact on-disk bytes ``read_file_raw`` decoded (BOM included).
     _content_sha256: Optional[str] = None
+    _raw_page: Optional[str] = field(default=None, repr=False)
     # read_file_raw refused the file for exceeding its size cap: it exists, but no content came back.
     _too_large: bool = False
 
@@ -105,6 +106,12 @@ class SearchMatch:
     line_number: int
     content: str
     mtime: float = 0.0  # Modification time for sorting
+    _unclipped: Optional[str] = field(default=None, repr=False)
+
+    @classmethod
+    def from_line(cls, path: str, number: int, line: str) -> "SearchMatch":
+        raw = line.removesuffix(" [... omitted end of long line]") if len(line) > 500 else None
+        return cls(path, number, line[:500], _unclipped=raw)
 
 
 @dataclass
