@@ -15,6 +15,8 @@ from typing import Any, Callable, Iterable, Optional
 import json
 import time
 
+from hermes_cli import kanban_db as kb
+
 
 # Least → most urgent; sorted outputs put critical first.
 SEVERITY_ORDER = ("warning", "error", "critical")
@@ -98,7 +100,7 @@ def _event_kind(ev) -> str:
 
 
 def _event_ts(ev) -> int:
-    return int(_task_field(ev, "created_at", 0) or 0)
+    return kb._to_epoch(_task_field(ev, "created_at")) or 0
 
 
 def _first_field(task, primary: str, legacy: str, default=None):
@@ -557,17 +559,30 @@ def _rule_review_dependency_deadlock(task, events, runs, now, cfg) -> list[Diagn
     )]
 
 
+def _link_from_run(event, run_id, started_at, *, after_claim: bool) -> bool:
+    """Run and event row adapters use zero for unreadable timestamps."""
+    link_run_id = _task_field(event, "run_id")
+    if link_run_id is not None:
+        return link_run_id == run_id
+    linked_at = _event_ts(event)
+    if not started_at or not linked_at:
+        return False
+    return after_claim and linked_at >= started_at
+
+
 def _handoff_parent_ids(task, events, runs) -> set[str]:
-    """A repeated link is a no-op. Date untagged links from the current run,
-    not the task's first-ever start."""
+    """Use insertion evidence when available; replay older links in arrival order."""
     run_id = _task_field(task, "current_run_id")
     if run_id is None:
         return set()
     current_run = next((run for run in runs if _task_field(run, "id") == run_id), None)
-    started_at = _task_field(current_run, "started_at")
+    started_at = kb._to_epoch(_task_field(current_run, "started_at"))
     child_id = _task_field(task, "id")
+    ordered = sorted(events, key=lambda event: _task_field(event, "id", 0))
+    claim_index = next((index for index, event in enumerate(ordered)
+                        if _event_kind(event) == "claimed" and _task_field(event, "run_id") == run_id), -1)
     handoff_by_parent: dict[str, bool] = {}
-    for event in events:
+    for index, event in enumerate(ordered):
         kind = _event_kind(event)
         if kind in ("created", "decomposed"):
             key = "parents" if kind == "created" else "child_ids"
@@ -578,12 +593,12 @@ def _handoff_parent_ids(task, events, runs) -> set[str]:
                 continue
             if kind == "unlinked":
                 handoff_by_parent.pop(parent_id, None)
-            elif parent_id not in handoff_by_parent:
-                link_run_id = _task_field(event, "run_id")
-                handoff_by_parent[parent_id] = (
-                    link_run_id == run_id if link_run_id is not None
-                    else started_at is not None and _event_ts(event) >= started_at
+            elif edge.get("inserted", parent_id not in handoff_by_parent):
+                handoff_by_parent[parent_id] = _link_from_run(
+                    event, run_id, started_at, after_claim=index > claim_index,
                 )
+            else:
+                handoff_by_parent.setdefault(parent_id, False)
     return {parent_id for parent_id, is_handoff in handoff_by_parent.items() if is_handoff}
 
 
@@ -610,7 +625,7 @@ def _rule_running_with_open_parents(task, events, runs, now, cfg) -> list[Diagno
         return []
     task_id = str(_task_field(task, "id") or "")
     parent_ids = [str(parent["id"]) for parent in open_parents]
-    seen_at = int(_task_field(task, "started_at", default=0) or 0) or now
+    seen_at = kb._to_epoch(_task_field(task, "started_at")) or now
     return [Diagnostic(
         kind="running_with_open_parents", severity="warning",
         title=f"Running while {len(parent_ids)} parent(s) are not done",
@@ -784,7 +799,6 @@ def _rule_stale_running(task, events, runs, now, cfg) -> list[Diagnostic]:
     grace_seconds = float(cfg.get("stale_running_grace_seconds", 60 * 60))
     if _task_field(task, "status") != "running":
         return []
-    from hermes_cli import kanban_db as kb
     expires = kb._to_epoch(_task_field(task, "claim_expires", None))
     if expires is None or (now - expires) < grace_seconds:
         return []
