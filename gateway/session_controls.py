@@ -14,6 +14,7 @@ from gateway.session_llm_oneshot import DeferredReply
 from gateway.session_persistence import authority_persistence
 from hermes_constants import profile_name_for_home
 from persistence.core.errors import STORE_FAILURES, AuthorityRefusal, PersistenceError
+from storage_errors import is_transient_store_failure
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +95,7 @@ _STORAGE_TRACEBACKS = set()
 
 
 def _log_storage_failure(profile, method, session_id, exc: sqlite3.Error | PersistenceError) -> None:
-    """Keep SQLite's diagnostic at the gateway while its wire error stays retryable.
+    """Keep SQLite's diagnostic at the gateway; only retryability goes on the wire.
 
     Clients retry on ``storage_unavailable``, so, like ``_log_refusal``, a retrying client must not
     flood the log: every failure keeps one line with its cause, the traceback comes once per method
@@ -421,7 +422,8 @@ class AuthorityConnection:
             _log_storage_failure(getattr(self.actor, 'profile_id', None), method,
                                  params.get('session_id'), exc)
             return {'jsonrpc': '2.0', 'id': rid, 'error': {
-                'code': 5001, 'message': 'storage_unavailable', 'data': {'reason': 'storage_unavailable'}}}
+                'code': 5001, 'message': 'storage_unavailable',
+                'data': {'reason': 'storage_unavailable', 'transient': is_transient_store_failure(exc)}}}
 
     async def a2a_forward(self, ref, params):
         from gateway.session_a2a import forward
