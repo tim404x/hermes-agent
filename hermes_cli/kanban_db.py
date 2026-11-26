@@ -1323,11 +1323,13 @@ def _project_branch_name(project_obj: Any, task_id: str, title: Optional[str]) -
         return None
 
 
-def _link(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
-    conn.execute(
+def _link(conn: sqlite3.Connection, parent_id: str, child_id: str, *, emit_event: bool = False) -> None:
+    inserted = conn.execute(
         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
         (parent_id, child_id),
-    )
+    ).rowcount == 1
+    if emit_event:
+        _append_event(conn, child_id, "linked", {"parent": parent_id, "child": child_id, "inserted": inserted})
 
 
 def _missing_task_ids(conn: sqlite3.Connection, ids: Iterable[str]) -> list[str]:
@@ -1546,7 +1548,6 @@ def link_tasks(
             raise ValueError(f"cannot link {parent_id} -> {child_id}: child is already running")
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
-        _link(conn, parent_id, child_id)
         # If child was ready but parent is not yet terminal, demote child to todo
         # (archived counts as terminal, matching _parents_satisfied/recompute_ready).
         if _task_status(conn, parent_id) not in ("done", "archived"):
@@ -1562,12 +1563,7 @@ def link_tasks(
                     "dependency_wait",
                     {"reason": "parent_not_done", "demoted": True, "parent": parent_id},
                 )
-        _append_event(
-            conn,
-            child_id,
-            "linked",
-            {"parent": parent_id, "child": child_id},
-        )
+        _link(conn, parent_id, child_id, emit_event=True)
         _inherit_notify_subs(conn, child_id, (parent_id,))
     return gated
 
@@ -3911,7 +3907,10 @@ def _to_epoch(val) -> Optional[int]:
     if val is None:
         return None
     if isinstance(val, (int, float)):
-        return int(val)
+        try:
+            return int(val)
+        except (ValueError, OverflowError):
+            return None
     s = str(val).strip()
     if not s:
         return None
