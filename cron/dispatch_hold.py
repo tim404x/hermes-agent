@@ -81,7 +81,7 @@ def held_update_slot(job: dict, now: float, max_age: float) -> bool:
     if not isinstance(stamp, dict) or not stamp.get('update_slot') or stamp['update_slot'] != job.get('next_run_at'):
         return False
     try:
-        when = datetime.fromisoformat(stamp['at'])
+        when = datetime.fromisoformat(stamp.get('update_at') or stamp['at'])
         return when.tzinfo is not None and 0 <= now - when.timestamp() <= max_age
     except (ValueError, TypeError, KeyError, OverflowError):
         return False

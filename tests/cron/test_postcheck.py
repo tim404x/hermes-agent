@@ -182,6 +182,75 @@ def test_same_typed_disconnect_after_submit_is_unknown_not_retried(
     assert list((cron_home / "cron/admissions").glob("*.json"))
 
 
+def test_resubmit_lost_reply_then_update_paused_redial_stays_unknown_same_request_id(
+    cron_home, monkeypatch, transport
+):
+    """#53 resubmit path: transient storage_unavailable -> recover=missing -> lost resubmit
+    reply -> update_paused redial must keep one request_id and never refund the slot."""
+    import json
+    from cron import scheduler_authority
+
+    ev, work = transport
+    monkeypatch.setattr(scheduler_authority, "STORAGE_RETRY_DELAYS_S", (0.001,), raising=False)
+    monkeypatch.setattr(scheduler_authority, "RECONNECT_BUDGET_S", 0.05, raising=False)
+    monkeypatch.setattr(scheduler_authority, "RECONNECT_FIRST_DELAY_S", 0.01, raising=False)
+
+    jid, due = make_due("every 30m", timedelta(seconds=10))
+    calls = []
+    dials = {"count": 0}
+    real_connect = client.connect_gateway
+
+    class ResubmitOwner:
+        async def rpc(self, op, **params):
+            calls.append((op, params.get("request_id")))
+            if op == "cron.submit":
+                if sum(1 for m, _ in calls if m == "cron.submit") == 1:
+                    raise client.GatewayRPCError(
+                        "storage_unavailable", 5001, {"reason": "storage_unavailable"}
+                    )
+                raise client.GatewayClientError(client.DISCONNECTED)
+            if op == "cron.recover":
+                return {"status": "missing", "result": None}
+            raise AssertionError(f"unexpected rpc {op}")
+
+    @asynccontextmanager
+    async def connect():
+        dials["count"] += 1
+        if dials["count"] == 1:
+            yield ResubmitOwner()
+            return
+        if not ev["markers"]:
+            ev["markers"].append(_fence(cron_home))
+        async with real_connect():
+            pytest.fail("fenced redial must raise update_paused")
+
+    monkeypatch.setattr(client, "connect_gateway", connect)
+
+    S.tick(verbose=False, sync=True)
+
+    assert [op for op, _ in calls] == ["cron.submit", "cron.recover", "cron.submit"]
+    request_ids = {rid for _, rid in calls}
+    assert len(request_ids) == 1
+    req_id = next(iter(request_ids))
+    assert req_id is not None and not work.exists()
+    assert dials["count"] >= 2
+
+    row = J.get_job(jid)
+    assert row["state"] == "paused"
+    assert row["next_run_at"] != due
+    assert (row.get("last_fire_error") or {}).get("update_slot") is None
+
+    exec_rows = E.list_executions(job_id=jid)
+    assert len(exec_rows) == 1 and exec_rows[0]["id"] == req_id
+    assert exec_rows[0]["status"] == "unknown"
+
+    journals = list((cron_home / "cron/admissions").glob("*.json"))
+    assert len(journals) == 1
+    saved = json.loads(journals[0].read_text(encoding="utf-8-sig"))
+    assert saved["params"]["request_id"] == req_id
+    assert "update_refused" not in saved
+
+
 def test_fence_does_not_replay_an_already_executed_monitor_script(cron_home, transport):
     ev, work = transport
     counter = cron_home / "monitor-runs"

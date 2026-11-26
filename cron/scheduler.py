@@ -2770,8 +2770,10 @@ def run_one_job(
     # API fires) crosses this seam.  Ensure the detached worker has a durable
     # attempt to adopt before any launch can occur.
     if not job.get("execution_id"):
-        execution = create_execution(
-            job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))
+        exec_kwargs = {"source": "direct", "scheduled_instant": job.get("_scheduled_instant")}
+        if job.get("_catch_up_report"):
+            exec_kwargs["catch_up_report"] = job["_catch_up_report"]
+        execution = create_execution(job["id"], **exec_kwargs)
         job["execution_id"] = execution["id"]
 
     execution_id = str(job["execution_id"])
@@ -3233,16 +3235,31 @@ def _apply_agent_failure_marker(job: dict, success: bool, error, final_response)
     return success, error, False
 
 
+def _ensure_execution_id(job: dict, *, source: str = "direct") -> str:
+    execution_id = job.get("execution_id")
+    if execution_id:
+        return str(execution_id)
+    exec_kwargs = {"source": source, "scheduled_instant": job.get("_scheduled_instant")}
+    if job.get("_catch_up_report"):
+        exec_kwargs["catch_up_report"] = job["_catch_up_report"]
+    return str(create_execution(job["id"], **exec_kwargs)["id"])
+
+
+def _claim_job_dispatch(job_id: str, fire_owner: Optional[str]) -> bool:
+    from cron.jobs import claim_dispatch as _jobs_claim_dispatch
+
+    if fire_owner and claim_dispatch is _jobs_claim_dispatch:
+        return claim_dispatch(job_id, expected_fire_owner=fire_owner)
+    return claim_dispatch(job_id)
+
+
 def _run_one_job_body(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, claim_lost: Optional[_CancelEventLike] = None,
     transport_cancel: Optional[_CancelEventLike] = None,
     execution_token: Optional[object] = None,
 ) -> bool:
-    execution_id = job.get("execution_id")
-    if not execution_id:
-        execution_id = create_execution(
-            job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))["id"]
+    execution_id = _ensure_execution_id(job)
     job = dict(job, execution_id=execution_id)
     # The execution id is resolved BEFORE the fence so ``hermes cron cancel`` can join the same
     # cancel seam: the marker it writes is polled by whichever process owns this attempt.
@@ -3267,7 +3284,7 @@ def _run_one_job_body(
         # re-fire it forever on restart. No-op for recurring/infinite jobs (at-most-times).
         # This lives here in the shared body so BOTH the built-in ticker and the external provider (Chronos
         # fire_due) get at-most-times semantics. See #38758.
-        if not claim_dispatch(job["id"]):
+        if not _claim_job_dispatch(job["id"], fire_owner):
             logger.info(
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]))
@@ -3318,9 +3335,8 @@ def _run_one_job_body(
         if outcome is None:  # an operator cancel stopped it and is already booked
             return True
         success, output, final_response, error = outcome
-        if job.get("_catch_up_report"):
-            from cron.missed_runs import book_catch_up
-            book_catch_up(job, job["_catch_up_report"])
+        from cron.missed_runs import book_completion_catch_up
+        book_completion_catch_up(job, execution_id)
 
         if _fire_claim_ownership_lost():
             _teardown_deferred()
@@ -3511,6 +3527,14 @@ def _wait_for_external_cron_worker_body(
         current = get_execution(execution_id)
         if current and current.get("status") in FIRER_FINISHED_STATES:
             return True
+        if current and current.get("job_id"):
+            from cron.update_refusal import load_verified_refusal, settle_refusal
+
+            refusal = load_verified_refusal(str(current["job_id"]), execution_id)
+            if refusal is not None:
+                detail = settle_refusal(refusal, recovered=True)
+                logger.warning("Cron %s: %s", current["job_id"], detail)
+                return True
         # If the adopted worker died without terminalizing, its owner is
         # now provably gone. Recover to ``unknown`` rather than routing the
         # exception through the pre-handoff dispatch-failure path, which
@@ -4196,7 +4220,12 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
     # Claim only when the worker actually starts, so a queued lease can't expire first.
     try:
-        claimed = claim_job_for_fire(job["id"], return_job=True)
+        claim_kwargs: dict[str, Any] = {"return_job": True}
+        if "_scan_pending_slot" in job:
+            claim_kwargs["expected_pending_slot"] = job["_scan_pending_slot"]
+        if "_scan_fire_seq" in job:
+            claim_kwargs["expected_fire_seq"] = job["_scan_fire_seq"]
+        claimed = claim_job_for_fire(job["id"], **claim_kwargs)
     except OSError as exc:
         store_health.note_unwritable(exc, f"skipped job '{job.get('name') or job['id']}'", "claim", [job])
         settle_unstarted_execution(
@@ -4277,8 +4306,10 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     # Record the attempt before dispatch; recovery marks abandoned rows unknown (no retry).
     execution = None
     try:
-        execution = create_execution(
-            job_id, source="builtin", scheduled_instant=job.get("_scheduled_instant"))
+        exec_kwargs = {"source": "builtin", "scheduled_instant": job.get("_scheduled_instant")}
+        if job.get("_catch_up_report"):
+            exec_kwargs["catch_up_report"] = job["_catch_up_report"]
+        execution = create_execution(job_id, **exec_kwargs)
         dispatched_job = dict(job, execution_id=execution["id"])
         note_cron_execution(dispatched_job)
         _ctx = contextvars.copy_context()

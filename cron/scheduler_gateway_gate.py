@@ -65,15 +65,27 @@ def _note_fire_refused(job_ids, detail: str, *, update_slots=None) -> None:
                 slot = update_slots[job['id']]
                 if not slot or slot != job.get('next_run_at') or job.get('run_claim') or job.get('fire_claim'):
                     continue
-                if held_update_slot(job, now.timestamp(), 2 * TICK_SLACK_SECONDS):
-                    error['update_slot'] = slot  # preserve a worker's proof through subsequent held ticks
-                if (job.get('schedule') or {}).get('kind') == 'once':
+                witnessed = held_update_slot(job, now.timestamp(), 2 * TICK_SLACK_SECONDS)
+                if not witnessed and (job.get('schedule') or {}).get('kind') == 'once':
                     due = _parse_aware(slot)
                     age = now.timestamp() - due.timestamp() if due is not None else float('inf')
-                    if 0 <= age <= ONESHOT_GRACE_SECONDS or held_update_slot(job, now.timestamp(), 2 * TICK_SLACK_SECONDS):
-                        error['update_slot'] = slot  # never extend a reminder already stale before the fence
+                    witnessed = 0 <= age <= ONESHOT_GRACE_SECONDS  # never extend a reminder already stale before the fence
+                if witnessed:
+                    error['update_slot'] = slot  # preserve/renew proof only on a tick observing the fence
+                    error['update_at'] = now.isoformat()
                 job['last_fire_error'] = error
                 continue
+            prev = job.get("last_fire_error")
+            if (
+                isinstance(prev, dict)
+                and prev.get("update_slot")
+                and prev["update_slot"] == job.get("next_run_at")
+            ):
+                # Non-fenced readiness skip never renews a witness, only preserves its original stamp.
+                witness_at = prev.get("update_at") or prev.get("at")
+                if witness_at:
+                    error["update_slot"] = prev["update_slot"]
+                    error["update_at"] = witness_at
             job["last_fire_error"] = error
             job.pop("pending_slot", None)
             if job.get("run_claim") is not None:

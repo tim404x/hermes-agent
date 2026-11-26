@@ -478,6 +478,12 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
         error = f'{error_type_name(exc)}: {exc}'
         return False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error
 
+def _clean_orphan_notices(root):
+    for parked in root.glob('*.notice'):
+        if not parked.with_suffix('.json').exists():
+            parked.unlink(missing_ok=True)  # its fire was settled: the real outcome went out instead
+
+
 def reconcile_pending(*, allow_connect=True):
     """Observe prepared fires; never submit missing or interrupted work.
 
@@ -498,9 +504,7 @@ def reconcile_pending(*, allow_connect=True):
     import logging
 
     root = get_hermes_home() / 'cron' / 'admissions'
-    for parked in root.glob('*.notice'):
-        if not parked.with_suffix('.json').exists():
-            parked.unlink(missing_ok=True)  # its fire was settled: the real outcome went out instead
+    _clean_orphan_notices(root)
     for journal in sorted(root.glob('*.json')):
         try:
             record = json.loads(journal.read_text(encoding='utf-8-sig'))
@@ -512,11 +516,8 @@ def reconcile_pending(*, allow_connect=True):
                 # output or re-marking the job on every tick would duplicate its side effects.
                 continue
             if 'update_refused' in record:
-                from cron.update_refusal import settle_refusal
-                fire = record['update_refused']
-                if (fire['id'], fire['execution_id']) != (params['job_id'], params['request_id']):
-                    raise ValueError('cron refusal identity conflict')
-                settle_refusal(fire, recovered=True)
+                from cron.update_refusal import reconcile_refusal_record
+                reconcile_refusal_record(record, params['job_id'], params['request_id'])
                 continue
             row = get_execution(params['request_id'])
             if row is not None and row['job_id'] == params['job_id'] and row['status'] in FIRER_FINISHED_STATES:
@@ -609,3 +610,5 @@ def reconcile_pending(*, allow_connect=True):
                 _lift_pause(params['job_id'], record.get('pause_recorded'))
         except Exception:
             logging.getLogger(__name__).warning('Cron receipt recovery deferred: %s', journal, exc_info=True)
+    from cron.update_refusal import reconcile_pending_refusals
+    reconcile_pending_refusals()
