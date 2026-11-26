@@ -95,6 +95,47 @@ def test_running_with_open_parents_fires_only_while_running():
     assert kd.compute_task_diagnostics(_task(status="running"), [], [], graph=done_graph) == []
 
 
+@pytest.mark.parametrize("run_id, linked_at", [(468, 575), (None, 100)], ids=["owned", "untagged-at-start"])
+def test_dependency_handoff_link_by_current_run_does_not_warn(run_id, linked_at):
+    task = _task(id="t_8689c05d", status="running", current_run_id=468)
+    parent = {"id": "t_a5f76f8b", "status": "todo"}
+    link = _event("linked", linked_at, parent=parent["id"], child=task["id"]) | {"run_id": run_id}
+    diags = kd.compute_task_diagnostics(task, [link], [{"id": 468, "started_at": 100}], graph={"parents": [parent]})
+    assert not any(diag.kind == "running_with_open_parents" for diag in diags)
+
+
+@pytest.mark.parametrize("other_link", [
+    _event("linked", 99, parent="t_gate", child="t_demo00"),
+    _event("linked", 110, parent="t_gate", child="t_demo00") | {"run_id": 467},
+    _event("linked", 110, parent="t_gate", child="t_other") | {"run_id": 468},
+], ids=["before-retry", "foreign-run", "other-child"])
+def test_running_with_open_parents_reports_only_non_handoff_edge(other_link):
+    task = _task(status="running", started_at=10, current_run_id=468)
+    runs = [{"id": 467, "started_at": 10}, {"id": 468, "started_at": 100}]
+    gate = {"id": "t_gate", "status": "ready"}
+    handoff = {"id": "t_handoff", "status": "todo"}
+    link = _event("linked", 120, parent=handoff["id"], child=task["id"]) | {"run_id": 468}
+    diags = kd.compute_task_diagnostics(task, [other_link, link], runs, graph={"parents": [handoff, gate]})
+    warning, = (diag for diag in diags if diag.kind == "running_with_open_parents")
+    assert warning.count == 1
+    assert warning.data["open_parents"] == [gate]
+    assert warning.actions[0].payload["command"] == "hermes kanban unlink t_gate t_demo00"
+
+
+def test_repeating_a_link_to_a_reopened_parent_is_not_a_new_handoff():
+    task = _task(status="running", current_run_id=468)
+    parent = {"id": "t_reopened", "status": "ready"}
+    graph = {"parents": [parent]}
+    edge = {"parent": parent["id"], "child": task["id"]}
+    link = _event("linked", 110, **edge) | {"run_id": 468}
+    events = [_event("created", 50, parents=[parent["id"]]), link]
+    warning, = kd.compute_task_diagnostics(task, events, [], graph=graph)
+    assert warning.data["open_parents"] == [parent]
+
+    events.extend([_event("unlinked", 115, **edge), link | {"created_at": 120}])
+    assert not kd.compute_task_diagnostics(task, events, [], graph=graph)
+
+
 def test_stuck_in_blocked_fires_past_threshold():
     now = int(time.time())
     task = _task(status="blocked")

@@ -557,11 +557,42 @@ def _rule_review_dependency_deadlock(task, events, runs, now, cfg) -> list[Diagn
     )]
 
 
+def _handoff_parent_ids(task, events, runs) -> set[str]:
+    """A repeated link is a no-op. Date untagged links from the current run,
+    not the task's first-ever start."""
+    run_id = _task_field(task, "current_run_id")
+    if run_id is None:
+        return set()
+    current_run = next((run for run in runs if _task_field(run, "id") == run_id), None)
+    started_at = _task_field(current_run, "started_at")
+    child_id = _task_field(task, "id")
+    handoff_by_parent: dict[str, bool] = {}
+    for event in events:
+        kind = _event_kind(event)
+        if kind in ("created", "decomposed"):
+            key = "parents" if kind == "created" else "child_ids"
+            handoff_by_parent.update(dict.fromkeys(_parse_payload(event).get(key) or [], False))
+        elif kind in ("linked", "unlinked"):
+            edge = _parse_payload(event)
+            if edge.get("child") != child_id or not (parent_id := edge.get("parent")):
+                continue
+            if kind == "unlinked":
+                handoff_by_parent.pop(parent_id, None)
+            elif parent_id not in handoff_by_parent:
+                link_run_id = _task_field(event, "run_id")
+                handoff_by_parent[parent_id] = (
+                    link_run_id == run_id if link_run_id is not None
+                    else started_at is not None and _event_ts(event) >= started_at
+                )
+    return {parent_id for parent_id, is_handoff in handoff_by_parent.items() if is_handoff}
+
+
 def _rule_running_with_open_parents(task, events, runs, now, cfg) -> list[Diagnostic]:
     """A ``running`` card with a direct parent that is not ``done``/``archived``:
     the dependency gate is not holding it (the parent reopened mid-run, or the
     edge predates the running-child refusal) and ``kanban_complete`` will be
-    refused until the parents finish. Graph-aware; mutates nothing."""
+    refused until the parents finish. Excludes the active worker's own handoff
+    edges, which intentionally gate completion but not the start of this run."""
     if _task_field(task, "status") != "running":
         return []
     graph = cfg.get("_graph")
@@ -572,6 +603,9 @@ def _rule_running_with_open_parents(task, events, runs, now, cfg) -> list[Diagno
         if isinstance(parent, dict) and parent.get("id")
         and parent.get("status") not in ("done", "archived")
     ]
+    if open_parents:
+        handoffs = _handoff_parent_ids(task, events, runs)
+        open_parents = [parent for parent in open_parents if parent["id"] not in handoffs]
     if not open_parents:
         return []
     task_id = str(_task_field(task, "id") or "")
