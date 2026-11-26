@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_admission import claims as admission
+from hermes_cli.kanban_assignee import assignee_sql_filter, resolve_assignee
 from hermes_cli.kanban_db_graph import _parents_satisfied, unsatisfied_parents
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from hermes_cli.kanban_admission.declarations import _normalize_task_skills, _validate_model_override
@@ -1040,12 +1041,8 @@ def _host_prefix() -> str:
 # --- Task creation / mutation ---
 
 def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
-    """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
-    if assignee is None:
-        return None
-    from hermes_cli.profiles import normalize_profile_name
-
-    return normalize_profile_name(assignee)
+    """Canonical profile folder id (or lowercase name) for Kanban rows."""
+    return resolve_assignee(assignee)[0]
 
 
 def _resolve_project_link(
@@ -1412,10 +1409,12 @@ def list_tasks(
         raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
     query = "SELECT * FROM tasks WHERE 1=1"
     params: list[Any] = []
+    assignee_clause, assignee_params = assignee_sql_filter(assignee)
+    query += assignee_clause
+    params.extend(assignee_params)
     for col, val in (
-        ("assignee", _canonical_assignee(assignee)), ("status", status), ("tenant", tenant),
-        ("session_id", session_id), ("workflow_template_id", workflow_template_id),
-        ("current_step_key", current_step_key),
+        ("status", status), ("tenant", tenant), ("session_id", session_id),
+        ("workflow_template_id", workflow_template_id), ("current_step_key", current_step_key),
     ):
         if val is not None:
             query += f" AND {col} = ?"

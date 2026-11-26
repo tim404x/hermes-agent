@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 import shlex
 import sys
@@ -33,6 +34,8 @@ from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
 from hermes_cli.kanban_parser import build_parser
+
+logger = logging.getLogger(__name__)
 
 
 # --- Flag parsing helpers ---
@@ -341,6 +344,46 @@ def _declared_writes(args: argparse.Namespace) -> list[str] | None:
     return []
 
 
+def _is_installed_profile_best_effort(name: Optional[str]) -> bool:
+    """Return True if *name* is in the installed profile roster; never raises."""
+    if not name:
+        return False
+    try:
+        from hermes_cli.profiles import list_profile_names
+
+        return name in list_profile_names()
+    except Exception:
+        logger.debug("kanban: failed to list installed profiles", exc_info=True)
+        return False
+
+
+def _warn_assignee_resolution(
+    raw_assignee: Optional[str], stored_assignee: Optional[str], is_installed: bool,
+) -> None:
+    """Emit a stderr note on alias resolution or a warning when not an installed profile."""
+    if not stored_assignee:
+        return
+    if not is_installed:
+        try:
+            from hermes_cli.profiles import list_profile_names
+
+            installed = ", ".join(list_profile_names())
+        except Exception:
+            logger.debug("kanban: failed to list installed profiles for warning", exc_info=True)
+            installed = ""
+        roster_suffix = f" (installed: {installed})" if installed else ""
+        print(
+            f"warning: assignee {stored_assignee!r} is not an installed profile"
+            f"{roster_suffix}; the dispatcher will not spawn this card.",
+            file=sys.stderr,
+        )
+    elif raw_assignee and raw_assignee.strip().lower() != stored_assignee:
+        print(
+            f"note: assignee {raw_assignee!r} resolved to profile {stored_assignee!r}",
+            file=sys.stderr,
+        )
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
@@ -369,9 +412,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    raw_assignee = args.assignee
+    resolved_assignee, assignee_installed = kb.resolve_assignee(raw_assignee)
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
-            conn, title=args.title, body=body, assignee=args.assignee,
+            conn, title=args.title, body=body, assignee=resolved_assignee,
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
             project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
@@ -399,6 +444,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    stored_assignee = task.assignee if task is not None else resolved_assignee
+    # An idempotent retry returns the existing card: describe ITS assignee, not the request's.
+    if stored_assignee != resolved_assignee:
+        _warn_assignee_resolution(
+            None, stored_assignee, _is_installed_profile_best_effort(stored_assignee),
+        )
+    else:
+        _warn_assignee_resolution(raw_assignee, stored_assignee, assignee_installed)
     return 0
 
 
@@ -592,10 +645,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
+    resolved_profile, is_installed = kb.resolve_assignee(profile)
     with kbc.connect_closing() as conn:
-        ok = kb.assign_task(conn, args.task_id, profile)
-    return _ok_or_err(ok, f"no such task: {args.task_id}",
-                      f"Assigned {args.task_id} to {profile or '(unassigned)'}")
+        ok = kb.assign_task(conn, args.task_id, resolved_profile)
+    rc = _ok_or_err(ok, f"no such task: {args.task_id}",
+                    f"Assigned {args.task_id} to {resolved_profile or '(unassigned)'}")
+    if ok:
+        _warn_assignee_resolution(profile, resolved_profile, is_installed)
+    return rc
 
 
 def _cmd_set_model(args: argparse.Namespace) -> int:
@@ -627,14 +684,20 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
+    resolved_profile, is_installed = kb.resolve_assignee(profile)
     reclaim = bool(getattr(args, "reclaim", False))
     with kbc.connect_closing() as conn:
-        ok = kb.reassign_task(conn, args.task_id, profile, reclaim_first=reclaim, reason=getattr(args, "reason", None))
-    return _ok_or_err(
+        ok = kb.reassign_task(
+            conn, args.task_id, resolved_profile, reclaim_first=reclaim, reason=getattr(args, "reason", None),
+        )
+    rc = _ok_or_err(
         ok,
         f"cannot reassign {args.task_id} (unknown id, or still running — pass --reclaim to release first)",
-        f"Reassigned {args.task_id} to {profile or '(unassigned)'}" + (" (claim reclaimed)" if reclaim else ""),
+        f"Reassigned {args.task_id} to {resolved_profile or '(unassigned)'}" + (" (claim reclaimed)" if reclaim else ""),
     )
+    if ok:
+        _warn_assignee_resolution(profile, resolved_profile, is_installed)
+    return rc
 
 
 def _rows_by_task(conn, table: str, ids: list[str]) -> dict[str, list]:

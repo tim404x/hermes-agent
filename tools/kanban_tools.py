@@ -904,15 +904,28 @@ def _handle_request_review(args: dict, **kw) -> str:
         metadata = _merge_artifacts(metadata, artifacts)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     # Reviewer is model-supplied free text stored durably on the event payload.
-    reviewer = _redact_opt(args.get("reviewer") or None)
+    raw_reviewer = args.get("reviewer")
+    if raw_reviewer is not None and not isinstance(raw_reviewer, str):
+        raise _Reject(
+            f"reviewer must be a string profile name, got {type(raw_reviewer).__name__}: {raw_reviewer!r}"
+        )
+    reviewer = _redact_opt((raw_reviewer.strip() or None) if isinstance(raw_reviewer, str) else None)
     if reviewer:
-        from hermes_cli.profiles import list_profile_names, profile_exists
+        from hermes_cli.kanban_assignee import resolve_assignee
+        from hermes_cli.profiles import profile_exists
 
-        # A non-profile reviewer would park the card in `review` on an assignee
-        # the dispatcher can never spawn (#106163).
-        _check(profile_exists(reviewer),
-               f"reviewer profile {reviewer!r} is not installed. "
-               f"Installed profiles: {', '.join(list_profile_names())}")
+        # Resolve aliases (e.g. 'hermes', 'neo' -> 'default') before checking
+        # existence so a non-profile reviewer still cannot park the card in
+        # `review` on an assignee the dispatcher can never spawn (#106163).
+        resolved_reviewer, _ = resolve_assignee(reviewer)
+        if not (resolved_reviewer is not None and profile_exists(resolved_reviewer)):
+            from hermes_cli.profiles import list_profile_names
+
+            raise _Reject(
+                f"reviewer profile {reviewer!r} is not installed. "
+                f"Installed profiles: {', '.join(list_profile_names())}"
+            )
+        reviewer = resolved_reviewer
     with _board(args.get("board")) as (kb, conn):
         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary)
         try:
@@ -1114,8 +1127,26 @@ def _handle_create(args: dict, **kw) -> str:
     _reject_delegated_child_mutation("kanban_create")
     title = _require_text(args, "title")
     assignee = args.get("assignee")
-    _check(assignee, "assignee is required — name the profile that should execute this "
-                     "task (the dispatcher will only spawn tasks with an assignee)")
+    if assignee is None or (isinstance(assignee, str) and not assignee.strip()):
+        raise _Reject(
+            "assignee is required — name the profile that should execute this "
+            "task (the dispatcher will only spawn tasks with an assignee)"
+        )
+    if not isinstance(assignee, str):
+        raise _Reject(
+            f"assignee must be a string profile name, got {type(assignee).__name__}: {assignee!r}"
+        )
+    from hermes_cli.kanban_assignee import resolve_assignee
+
+    resolved_assignee, is_installed = resolve_assignee(assignee)
+    if not (is_installed and resolved_assignee is not None):
+        from hermes_cli.profiles import list_profile_names
+
+        raise _Reject(
+            f"assignee {assignee!r} is not an installed profile. "
+            f"Installed profiles: {', '.join(list_profile_names())} "
+            f"(aliases like 'hermes'/'neo' resolve to 'default')."
+        )
     # Workspace sharing is always explicit: omitted fields mean a fresh scratch workspace
     # even for a dispatcher-spawned creator (reusing the parent's path would let a child
     # mutate review evidence or race its checkout). Project identity is the one safe thing
@@ -1149,7 +1180,7 @@ def _handle_create(args: dict, **kw) -> str:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
         new_tid = kb.create_task(
             conn, title=_redact(str(title).strip()), body=_redact_opt(args.get("body")),
-            assignee=str(assignee),
+            assignee=resolved_assignee,
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority"), 0),
             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
