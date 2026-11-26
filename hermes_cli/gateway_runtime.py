@@ -244,7 +244,16 @@ def _served_by_multiplexer(home: Path, *, timeout: float) -> GatewayDiscovery | 
         if host_serves_named_profile(root, home) is False:
             return None
         return named
-    except (FileNotFoundError, ConnectionRefusedError, TimeoutError, DiscoveryError,
+    except (TimeoutError, BlockingIOError):
+        # The multiplexer's listener is alive but not answering: its loop is stalled (a full
+        # backlog refuses with EAGAIN at once). For a secondary it serves that is a slow owner, not
+        # a missing one, so its managed workers wait the stall out instead of failing with
+        # ``owner_unavailable`` (26 Nov 2026). A standalone secondary is never served: unchanged.
+        from hermes_cli.gateway_multiplex_mode import host_serves_named_profile
+        if host_serves_named_profile(root, home) is False:
+            return None
+        return GatewayDiscovery("inaccessible", reason_code="control_timeout")
+    except (FileNotFoundError, ConnectionRefusedError, DiscoveryError,
             OSError, ValueError, TypeError):
         return None
     result = _endpoint(payload, home, control_home=root)
@@ -334,6 +343,12 @@ def discover_gateway_endpoint(profile_home: str | Path, *, timeout: float = 2.0)
             return served
         return _missing_owner_verdict(home)
     except TimeoutError:
+        return GatewayDiscovery("inaccessible", reason_code="control_timeout")
+    except BlockingIOError:
+        # EAGAIN from connect(): the owner's listen backlog is full because its loop stopped
+        # accepting (an owner-loop stall). The owner is alive but slow, exactly like a timeout;
+        # reporting ``invalid_control_peer`` made managed workers give up mid-stall with
+        # ``owner_unavailable`` instead of waiting it out (26 Nov 2026, 10 Kanban workers lost).
         return GatewayDiscovery("inaccessible", reason_code="control_timeout")
     except DiscoveryError as exc:
         # The code stays bounded; the detail names the local node, its owner or mode, and the fix.
@@ -484,8 +499,14 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float | None = 
             # published its owner a moment later. A winning racer shows up as starting/ready instead.
             status = child.poll() if child is not None else None
             # The home as given too: resolving a link can lead out of the root, past its marker.
+            probed_at = time.monotonic()
             observed = run_elsewhere_verdict(profile_home) or _observe_replacing_stale(home, deadline, replaced)
             if observed.reason_code == "control_timeout":
+                # Usually the probe used its whole budget. A full backlog's EAGAIN answers at once
+                # instead: pause then (never past the deadline, never via ``remaining``, which raises
+                # before the runway can extend) so an instant refusal cannot spin this loop.
+                if time.monotonic() - probed_at < 0.05:
+                    time.sleep(max(0.0, min(0.1, deadline - time.monotonic())))
                 continue  # the probe used its whole budget; the next one raises unless extended
             if observed.state == "draining" and observed.reason_code in _RETIRING:
                 retiring, requested, child = True, False, None
