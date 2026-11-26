@@ -235,7 +235,7 @@ def notify_task_updated(
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "adopted", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
-    "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
+    "retried_workspace_cleanups", "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
     "skipped_nonspawnable",
 )
@@ -3959,7 +3959,7 @@ def _retention_seconds(older_than_seconds: int) -> int:
 
 
 def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600) -> int:
-    """Prune old done/archived events, retaining decomposition identity until task deletion.
+    """Prune old done/archived events, retaining decomposition identity and pending live cleanups.
 
     ``older_than_seconds=0`` means everything older than now; the CLI maps
     ``--event-retention-days 0`` to "disabled" before calling this.
@@ -3968,7 +3968,8 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
+            "(SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
+            f"AND id NOT IN (SELECT id FROM ({_PENDING_LIVE_EVENTS_SQL}))", (cutoff,),
         )
     return int(cur.rowcount or 0)
 
@@ -4159,10 +4160,8 @@ from hermes_cli.kanban_db_connect import (
     write_txn,
 )
 from hermes_cli.kanban_db_workspace import (
-    _cleanup_workspace,
-    _is_managed_scratch_path,
-    _managed_scratch_path_info,
-    _scratch_workspace,
+    _PENDING_LIVE_EVENTS_SQL, _cleanup_workspace, _is_managed_scratch_path,
+    _managed_scratch_path_info, _scratch_workspace, retry_deferred_workspace_cleanups,
 )
 from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,
