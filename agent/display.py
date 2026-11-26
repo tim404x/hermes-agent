@@ -1047,9 +1047,9 @@ def _detect_tool_failure(tool_name: str, result: Any) -> tuple[bool, str]:
         return True, f" [{_tail_trunc(str(data['user_summary']), _DEGRADED_SUFFIX_MAX_LEN)}]"
 
     # Terminal: non-zero exit code is the canonical failure signal.
-    if tool_name == "terminal":
-        exit_code = data.get("exit_code") if isinstance(data, dict) else None
-        if exit_code is None or exit_code == 0:
+    if tool_name == "terminal" and isinstance(data, dict) and data.get("exit_code") is not None:
+        exit_code = data["exit_code"]
+        if exit_code == 0:
             return False, ""
         if data.get("status") == "degraded":
             return True, _degraded_suffix(data)

@@ -4,8 +4,7 @@ Empty responses on machinery turns (``internal_notification``, ``process_complet
 ``async_delegation_complete`` display kind) end the turn quietly: no nudge, no
 paid retries, no provider switch, no ``(empty)`` sentinel; the turn is closed with
 the ``[SILENT]`` row so the next human prompt is not merged into the notice.
-Ordinary turns and machinery turns where the model already ran a tool keep the
-full ladder.
+Ordinary turns and machinery turns with unfinished work keep the full ladder.
 """
 
 from types import SimpleNamespace
@@ -14,29 +13,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent import turn_empty_response as ter
-
-
-def _agent():
-    a = MagicMock()
-    a.model = "test/model"
-    a.provider = "test"
-    a._current_streamed_assistant_text = ""
-    a._has_content_after_think_block.return_value = False
-    a._strip_think_blocks.side_effect = lambda t: t or ""
-    a._last_content_with_tools = None
-    a._thinking_prefill_retries = 2
-    a._fallback_chain = None
-    a._empty_content_retries = 0
-    a._emit_diagnostic_status = MagicMock()
-    a._buffer_diagnostic_status = MagicMock()
-    a._flush_status_buffer = MagicMock()
-    a._build_assistant_message = MagicMock(return_value={"role": "assistant", "content": ""})
-    # MagicMock.getattr(foo, "bar", False) returns a truthy child mock unless
-    # the attribute is explicitly set to a falsy value.  The real AIAgent
-    # object never auto-creates these attributes.
-    a._post_tool_empty_retried = False
-    a._response_was_previewed = False
-    return a
 
 
 def _assistant_msg():
@@ -87,24 +63,6 @@ def loop_agent(monkeypatch):
     monkeypatch.setattr(agent, "_save_trajectory", MagicMock())
     monkeypatch.setattr(agent, "_cleanup_task_resources", MagicMock())
     return agent
-
-
-def _recover(agent, messages, **kwargs):
-    return ter.recover_empty_response(
-        agent,
-        _assistant_msg(),
-        None,
-        "stop",
-        final_response="",
-        messages=messages,
-        api_messages=[],
-        conversation_history=[],
-        active_system_prompt="sys",
-        api_call_count=1,
-        turn_exit_reason=None,
-        preflight_compression_blocked=False,
-        **kwargs,
-    )
 
 
 def _completed_tool_round():
@@ -206,77 +164,24 @@ class TestNotificationTurnLoop:
         assert rows[-2].get("display_kind") == "process_complete"
 
 
-class TestNotificationTurnDetection:
-    def test_user_row_with_process_complete_no_tool_is_notification_turn(self):
-        messages = [
-            {"role": "user", "content": "hello"},
-            {"role": "assistant", "content": "hi!"},
-            {"role": "user", "content": "[process completed] task done", "display_kind": "process_complete"},
-        ]
-        assert ter._notification_turn_without_tool_round(messages) is True
-
-    def test_user_row_with_async_delegation_complete_no_tool_is_notification_turn(self):
-        messages = [
-            {"role": "user", "content": "hello"},
-            {"role": "assistant", "content": "hi!"},
-            {"role": "user", "content": "[delegate finished]", "display_kind": "async_delegation_complete"},
-        ]
-        assert ter._notification_turn_without_tool_round(messages) is True
-
-    def test_notification_turn_with_tool_is_not_detected(self):
-        messages = [
-            {"role": "user", "content": "[process completed]", "display_kind": "process_complete"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "x", "arguments": "{}"}}],
-            },
-            {"role": "tool", "content": "result", "tool_call_id": "call_1"},
-        ]
-        assert ter._notification_turn_without_tool_round(messages) is False
-
-    def test_ordinary_user_turn_is_not_detected(self):
-        messages = [
-            {"role": "user", "content": "ordinary message"},
-        ]
-        assert ter._notification_turn_without_tool_round(messages) is False
-
-    def test_ordinary_user_turn_with_tools_is_not_detected(self):
-        messages = [
-            {"role": "user", "content": "run task"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "x", "arguments": "{}"}}],
-            },
-            {"role": "tool", "content": "result", "tool_call_id": "call_1"},
-        ]
-        assert ter._notification_turn_without_tool_round(messages) is False
-
-    def test_empty_messages_is_not_detected(self):
-        assert ter._notification_turn_without_tool_round([]) is False
-
-    def test_notification_with_nudge_row_as_user_injection_is_not_detected(self):
-        """The model replied with text, then the user sent a follow-up message:
-        that follow-up is the message the next turn answers, not a notification."""
-        messages = [
-            {"role": "user", "content": "[process completed]", "display_kind": "process_complete"},
-            {"role": "assistant", "content": "got it"},
-            {"role": "user", "content": "now do X"},
-        ]
-        assert ter._notification_turn_without_tool_round(messages) is False
+def test_transcript_cannot_grant_notification_silence(loop_agent):
+    rows = [{"role": "user", "content": "done", "display_kind": "process_complete"},
+            {"role": "assistant", "content": "[SILENT]"}]
+    loop_agent.client.chat.completions.create.side_effect = [_empty_response(), _text_response("Here it is.")]
+    result = loop_agent.run_conversation("What happened?", conversation_history=rows)
+    assert result["final_response"] == "Here it is."
+    assert loop_agent.client.chat.completions.create.call_count == 2
 
 
 class TestNotificationQuietExit:
     @pytest.mark.parametrize(
         "display_kind", ["internal_notification", "process_complete", "async_delegation_complete"]
     )
-    def test_quiet_exit_closes_the_turn_with_the_silence_row(self, display_kind):
-        agent = _agent()
-        messages = [{"role": "user", "content": "[notice]", "display_kind": display_kind}]
-        verdict = _recover(agent, messages)
-        assert verdict.action == "break"
-        assert verdict.turn_exit_reason == ter.NOTIFICATION_NO_REPLY_EXIT
+    def test_quiet_exit_closes_the_turn_with_the_silence_row(self, loop_agent, display_kind):
+        result = loop_agent.run_conversation("[notice]", persist_user_display_kind=display_kind)
+        messages = result["messages"]
+        assert result["final_response"] == ""
+        assert result["turn_exit_reason"] == ter.NOTIFICATION_NO_REPLY_EXIT
         # One closing assistant row, the same marker a deliberate no-reply leaves on a human
         # turn; never the "(empty)" failure sentinel.
         assert [m["role"] for m in messages] == ["user", "assistant"]
@@ -284,52 +189,29 @@ class TestNotificationQuietExit:
         assert not messages[-1].get("_empty_terminal_sentinel")
         assert not messages[-1].get("_empty_recovery_synthetic")
 
-    def test_process_complete_empty_reply_exits_quietly(self):
-        agent = _agent()
-        messages = [
-            {"role": "user", "content": "[process completed]", "display_kind": "process_complete"},
-        ]
-        verdict = _recover(agent, messages)
-        assert verdict.action == "break"
-        assert verdict.final_response == ""
-        assert verdict.turn_exit_reason == ter.NOTIFICATION_NO_REPLY_EXIT
+    @pytest.mark.parametrize("reasoning", ["inline", "structured"])
+    def test_reasoning_only_is_not_a_finished_blank(self, loop_agent, reasoning):
+        private = "unfinished private thought"
+        response = _empty_response()
+        if reasoning == "inline":
+            response.choices[0].message.content = f"<think>{private}</think>"
+        else:
+            response.choices[0].message.reasoning_content = private
+        loop_agent.client.chat.completions.create.side_effect = [response, _text_response("Still working.")]
+        result = loop_agent.run_conversation("[notice]", persist_user_display_kind="async_delegation_complete")
+        assert result["final_response"] == "Still working."
+        assert all(private not in (row.get("content") or "") for row in result["messages"])
 
-    def test_async_delegation_complete_empty_reply_exits_quietly(self):
-        agent = _agent()
-        messages = [
-            {"role": "user", "content": "delegate X returned", "display_kind": "async_delegation_complete"},
-        ]
-        verdict = _recover(agent, messages)
-        assert verdict.action == "break"
-        assert verdict.final_response == ""
-        assert verdict.turn_exit_reason == ter.NOTIFICATION_NO_REPLY_EXIT
+    def test_blank_does_not_replace_a_visible_streamed_update(self, loop_agent):
+        def respond(**_kwargs):
+            loop_agent._current_streamed_assistant_text = "<think>private</think>The job is still running."
+            return _empty_response()
 
-    def test_notification_turn_with_tool_mid_task_not_quiet_exit(self):
-        """A model that acted on a notification with a tool call is mid-task;
-        _notification_turn_without_tool_round is False, so the quiet exit path
-        is skipped. The post-tool nudge fires instead (verdict is 'continue'
-        with the nudge queued as a request-only hint; the transcript is untouched)."""
-        agent = _agent()
-        agent._last_content_with_tools = "mid-task reply"
-        agent._last_content_tools_all_housekeeping = False
-        messages = [
-            {"role": "user", "content": "[process completed]", "display_kind": "process_complete"},
-            {
-                "role": "assistant",
-                "content": "mid-task reply",
-                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "x", "arguments": "{}"}}],
-            },
-            {"role": "tool", "content": "result", "tool_call_id": "call_1"},
-        ]
-        verdict = _recover(agent, messages)
-        # Should not exit via notification_no_reply.
-        assert verdict.turn_exit_reason != ter.NOTIFICATION_NO_REPLY_EXIT
-        # Post-tool nudge fired: verdict is "continue" and the nudge rides the next request only.
-        assert verdict.action == "continue"
-        from agent.conversation_loop import _EMPTY_TOOL_RESPONSE_NUDGE
-
-        assert agent._empty_response_retry_hint == _EMPTY_TOOL_RESPONSE_NUDGE
-        assert len(messages) == 3
+        loop_agent.client.chat.completions.create.side_effect = respond
+        result = loop_agent.run_conversation("[notice]", persist_user_display_kind="process_complete")
+        assert result["turn_exit_reason"] == "partial_stream_recovery"
+        assert "The job is still running." in result["final_response"]
+        assert "private" not in result["final_response"]
 
 
 class TestResponseFiltersNotificationNoReply:

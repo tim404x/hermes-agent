@@ -1117,6 +1117,7 @@ def _commit_tool_result(
     function_name, function_args, tool_call_id, effective_task_id = ref.name, ref.args, ref.call_id, ref.task_id
     from hermes_cli.observability.shared_metrics_harness import observe_tool_outcome
 
+    raw_result = function_result
     observe_tool_outcome(agent, function_name, is_error)
     if not (blocked or is_error):
         function_result = observe_onboarding_result(agent, function_name, function_args, function_result)
@@ -1193,6 +1194,8 @@ def _commit_tool_result(
     messages.append(tool_message)
     if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
         return None
+    if notice := getattr(agent, "_notice_work", None):
+        notice.record_result(tool_call_id, raw_result, executed=observed and not (blocked or is_error or effect_disposition))
 
     if not blocked:
         # ``tool.completed`` projects AFTER the canonical append + flush so resume can

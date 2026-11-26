@@ -1107,7 +1107,7 @@ class _ResponseParts:
             self.reasoning_details.append({"type": "redacted_thinking", "data": encoded})
             block["redactedContentBase64"] = encoded
 
-    def build(self, ordered_blocks: list[dict[str, Any]], usage_data: dict[str, int], stop_reason: str, model: str) -> SimpleNamespace:
+    def build(self, ordered_blocks: list[dict[str, Any]], usage_data: dict[str, int], stop_reason: str | None, model: str) -> SimpleNamespace:
         """Assemble the OpenAI-shaped response. Converse's inputTokens EXCLUDES cache read/write tokens
         (OpenAI's prompt_tokens includes them), so they are added back. ``reasoning_details`` carries every
         reasoning block in Anthropic shape (signed thinking included) because it is the persisted column."""
@@ -1132,6 +1132,7 @@ class _ResponseParts:
             finish_reason = "tool_calls"
         return SimpleNamespace(
             choices=[SimpleNamespace(index=0, message=msg, finish_reason=finish_reason)], usage=usage, model=model,
+            stop_reason=stop_reason,
         )
 
 
@@ -1154,7 +1155,7 @@ def normalize_converse_response(response: dict) -> SimpleNamespace:
             ordered_blocks.append(_tool_use_block(tu.get("toolUseId", ""), tu.get("name", ""), tu.get("input", {})))
             parts.tool_calls.append(_tool_call_ns(tu.get("toolUseId", ""), tu.get("name", ""), tu.get("input", {})))
     return parts.build(
-        ordered_blocks, response.get("usage", {}), response.get("stopReason", "end_turn"), response.get("modelId", ""),
+        ordered_blocks, response.get("usage", {}), response.get("stopReason"), response.get("modelId", ""),
     )
 
 
@@ -1247,14 +1248,14 @@ def stream_converse_with_callbacks(
             else:
                 flush_text()
         elif "messageStop" in event:
-            stop_reason = event["messageStop"].get("stopReason", "end_turn")
+            stop_reason = event["messageStop"].get("stopReason", "")
         elif "metadata" in event:
             meta_usage = event["metadata"].get("usage", {})
             usage_data = {key: meta_usage.get(key, 0) for key in ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheWriteInputTokens")}
     if stop_reason is None and not interrupted:
         raise EmptyStreamError("Bedrock Converse stream ended before messageStop; response is incomplete")
     flush_text()
-    return parts.build([stream_blocks[i] for i in sorted(stream_blocks)], usage_data, stop_reason or "end_turn", "")
+    return parts.build([stream_blocks[i] for i in sorted(stream_blocks)], usage_data, stop_reason, "")
 
 
 # --- High-level API: call Bedrock Converse ---
