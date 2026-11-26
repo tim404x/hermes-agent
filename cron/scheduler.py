@@ -1014,7 +1014,9 @@ def _record_stale_release(job: dict, job_id: str, age: float, allowance: float, 
     _record_forced_release(job_id, name, age, allowance)
     # Ledger already records how the run ended: mark_job_run here would clobber an honest
     # ok status with a synthetic failure or double-write a failure.
-    if reason == "ledger-terminal":
+    if reason == "ledger-terminal" or job.get("pending_slot"):
+        # The scan already reserved a new occurrence. The release above is recorded;
+        # booking a synthetic run here would erase that occurrence's unclaimed stamp.
         return
     # Age release may lack a ledger row, so last_error is how it surfaces. But a forced release
     # is NOT a real run: never consume a finite repeat budget or let mark_job_run auto-delete.
@@ -2770,8 +2772,7 @@ def run_one_job(
     # API fires) crosses this seam.  Ensure the detached worker has a durable
     # attempt to adopt before any launch can occur.
     if not job.get("execution_id"):
-        execution = create_execution(
-            job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))
+        execution = _create_job_execution(job, "direct")
         job["execution_id"] = execution["id"]
 
     execution_id = str(job["execution_id"])
@@ -3233,16 +3234,19 @@ def _apply_agent_failure_marker(job: dict, success: bool, error, final_response)
     return success, error, False
 
 
+def _create_job_execution(job: dict, source: str) -> dict:
+    report = job.get("_catch_up_report")
+    return create_execution(job["id"], source=source, scheduled_instant=job.get("_scheduled_instant"),
+                            **({"catch_up_report": report} if report else {}))
+
+
 def _run_one_job_body(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, claim_lost: Optional[_CancelEventLike] = None,
     transport_cancel: Optional[_CancelEventLike] = None,
     execution_token: Optional[object] = None,
 ) -> bool:
-    execution_id = job.get("execution_id")
-    if not execution_id:
-        execution_id = create_execution(
-            job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))["id"]
+    execution_id = job.get("execution_id") or _create_job_execution(job, "direct")["id"]
     job = dict(job, execution_id=execution_id)
     # The execution id is resolved BEFORE the fence so ``hermes cron cancel`` can join the same
     # cancel seam: the marker it writes is polled by whichever process owns this attempt.
@@ -3267,7 +3271,8 @@ def _run_one_job_body(
         # re-fire it forever on restart. No-op for recurring/infinite jobs (at-most-times).
         # This lives here in the shared body so BOTH the built-in ticker and the external provider (Chronos
         # fire_due) get at-most-times semantics. See #38758.
-        if not claim_dispatch(job["id"]):
+        owner_check = {"expected_fire_owner": fire_owner} if "_refused_slot" in job else {}
+        if not claim_dispatch(job["id"], **owner_check):
             logger.info(
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]))
@@ -3378,6 +3383,12 @@ def _run_one_job_body(
 
     except BaseException as e:
         from cron.scheduler_authority import CronExecutionUnknown
+        from cron.update_refusal import UpdateRefusedBeforeSubmit, settle_refusal
+        if isinstance(e, UpdateRefusedBeforeSubmit):
+            # Cancel the transport attempt, not the job; the waiter must not book it again.
+            detail = settle_refusal(job)
+            logger.warning("Cron %s: %s", job["id"], detail)
+            return True
         if isinstance(e, CronExecutionUnknown):
             from cron.executions import give_up_execution
             from cron.jobs_error_text import sanitize_persisted_error
@@ -3502,6 +3513,14 @@ def _wait_for_external_cron_worker_body(
         current = get_execution(execution_id)
         if current and current.get("status") in FIRER_FINISHED_STATES:
             return True
+        if current and current.get("job_id"):
+            from cron.update_refusal import load_verified_refusal, settle_refusal
+
+            refusal = load_verified_refusal(str(current["job_id"]), execution_id)
+            if refusal is not None:
+                detail = settle_refusal(refusal, recovered=True)
+                logger.warning("Cron %s: %s", current["job_id"], detail)
+                return True
         # If the adopted worker died without terminalizing, its owner is
         # now provably gone. Recover to ``unknown`` rather than routing the
         # exception through the pre-handoff dispatch-failure path, which
@@ -4187,7 +4206,8 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
     # Claim only when the worker actually starts, so a queued lease can't expire first.
     try:
-        claimed = claim_job_for_fire(job["id"], return_job=True)
+        scan = {"scanned": job} if "_scheduled_instant" in job else {}
+        claimed = claim_job_for_fire(job["id"], return_job=True, **scan)
     except OSError as exc:
         store_health.note_unwritable(exc, f"skipped job '{job.get('name') or job['id']}'", "claim", [job])
         settle_unstarted_execution(
@@ -4205,6 +4225,8 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    if job.get("_catch_up_report"):
+        claimed_job["_catch_up_report"] = job["_catch_up_report"]
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
@@ -4264,8 +4286,7 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     # Record the attempt before dispatch; recovery marks abandoned rows unknown (no retry).
     execution = None
     try:
-        execution = create_execution(
-            job_id, source="builtin", scheduled_instant=job.get("_scheduled_instant"))
+        execution = _create_job_execution(job, "builtin")
         dispatched_job = dict(job, execution_id=execution["id"])
         note_cron_execution(dispatched_job)
         _ctx = contextvars.copy_context()

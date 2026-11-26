@@ -7,6 +7,7 @@ to match the claim-time fingerprint is not proof of death. Terminal states are i
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -47,6 +48,10 @@ _PROCESS_ID = uuid.uuid4().hex
 
 # --- executions ledger --------------------------------------------------------------------------
 
+def _executions_db_path() -> Path:
+    return EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
+
+
 def _connect() -> sqlite3.Connection:
     # Late imports: a scheduler daemon that outlives an on-disk upgrade already has the OLD
     # ``hermes_cli.sqlite_util`` / ``cron.jobs`` cached, so new names must be resolved at call time,
@@ -54,7 +59,7 @@ def _connect() -> sqlite3.Connection:
     from cron.jobs import _ensure_cron_dir
     from hermes_cli.sqlite_util import open_db
 
-    path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
+    path = _executions_db_path()
     _ensure_cron_dir(path.parent)
     return open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
 
@@ -99,9 +104,19 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
     add_column_if_missing(conn, "executions", "progress_at", "progress_at TEXT")
+    add_column_if_missing(conn, "executions", "catch_up_report", "catch_up_report TEXT")
+    conn.execute("CREATE TABLE IF NOT EXISTS catch_up_total (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS pending_refusals (
+             execution_id TEXT PRIMARY KEY,
+             job_id TEXT NOT NULL,
+             payload TEXT NOT NULL,
+             created_at TEXT NOT NULL
+           )"""
     )
 
 
@@ -247,6 +262,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
 
 def create_execution(
     job_id: str, *, source: str, scheduled_instant: Optional[str] = None,
+    catch_up_report: Optional[tuple] = None,
 ) -> dict[str, Any]:
     """Persist a claimed attempt before executor/provider dispatch."""
     from cron.occurrences import scheduled_instant as canonical_instant
@@ -254,14 +270,16 @@ def create_execution(
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
+    encoded_report = json.dumps(catch_up_report) if catch_up_report is not None else None
     with _transaction() as conn:
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at, scheduled_instant)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
+                status, claimed_at, scheduled_instant, catch_up_report)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now, canonical_instant(scheduled_instant)),
+             _process_start_time(pid), now, canonical_instant(scheduled_instant),
+             encoded_report),
         )
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
@@ -379,12 +397,14 @@ def finish_execution(
     return record
 
 
-def record_missed_occurrences(
-    job_id: str, *, count: int, first_instant: Optional[str], detail: str,
+def _insert_missed_unlocked(
+    conn: sqlite3.Connection,
+    job_id: str,
+    *,
+    count: int,
+    first_instant: Optional[str],
+    detail: str,
 ) -> Optional[dict[str, Any]]:
-    """Book occurrences the scheduler passed over without running as ONE terminal ``missed`` row
-    (``missed ×N``), so run history shows the gap instead of nothing. Never started, so no
-    owner fencing applies; ``first_instant`` is the earliest skipped slot."""
     from cron.occurrences import scheduled_instant as canonical_instant
 
     if count < 1:
@@ -392,22 +412,141 @@ def record_missed_occurrences(
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
+    conn.execute(
+        """INSERT INTO executions
+           (id, job_id, source, process_id, pid, process_started_at,
+            status, claimed_at, finished_at, error, scheduled_instant)
+           VALUES (?, ?, 'scheduler', ?, ?, ?, 'missed', ?, ?, ?, ?)""",
+        (execution_id, str(job_id), _PROCESS_ID, pid, _process_start_time(pid), now, now,
+         f"missed \u00d7{count} ({detail})", canonical_instant(first_instant)),
+    )
+    _prune_unlocked(conn)
+    return _fetch(conn, execution_id)
+
+
+def record_missed_occurrences(
+    job_id: str, *, count: int, first_instant: Optional[str], detail: str,
+) -> Optional[dict[str, Any]]:
+    """Book occurrences the scheduler passed over without running as ONE terminal ``missed`` row
+    (``missed ×N``), so run history shows the gap instead of nothing. Never started, so no
+    owner fencing applies; ``first_instant`` is the earliest skipped slot."""
+    if count < 1:
+        return None
     with _transaction() as conn:
-        conn.execute(
-            """INSERT INTO executions
-               (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at, finished_at, error, scheduled_instant)
-               VALUES (?, ?, 'scheduler', ?, ?, ?, 'missed', ?, ?, ?, ?)""",
-            (execution_id, str(job_id), _PROCESS_ID, pid, _process_start_time(pid), now, now,
-             f"missed \u00d7{count} ({detail})", canonical_instant(first_instant)),
+        record = _insert_missed_unlocked(
+            conn, job_id, count=count, first_instant=first_instant, detail=detail,
         )
-        _prune_unlocked(conn)
-        record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record
 
 
-def recover_receipted_execution(execution_id, job_id, *, success, error=None, delivery_outcome=None):
+def book_execution_catch_up(execution_id: str, job: dict, *, recovered: bool = False) -> None:
+    """Consume the report, count one fire, and book its collapsed slots in ONE transaction.
+    A replay or a pruned execution has no report left to consume."""
+    from cron.missed_runs import _MAX_COUNTED_SLOTS
+
+    # The recovering owner returns its frozen job, without the scan's ephemeral report.
+    if not recovered and not job.get("_catch_up_report"):
+        return
+    job_id = job["id"]
+    record = None
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT catch_up_report FROM executions WHERE id=? AND job_id=? AND catch_up_report IS NOT NULL",
+            (execution_id, job_id),
+        ).fetchone()
+        if not row or not conn.execute(
+            "UPDATE executions SET catch_up_report=NULL WHERE id=? AND job_id=? AND catch_up_report=?",
+            (execution_id, job_id, row[0]),
+        ).rowcount:
+            return
+        missed, first, capped = json.loads(row[0])
+        conn.execute("INSERT INTO catch_up_total VALUES (1,1) ON CONFLICT(id) DO UPDATE SET value=value+1")
+        if missed > 1:
+            detail = "collapsed into one catch-up run"
+            if capped:
+                detail += f"; counting stopped at {_MAX_COUNTED_SLOTS}"
+            record = _insert_missed_unlocked(conn, job_id, count=missed - 1, first_instant=first, detail=detail)
+    if record:
+        _emit_execution_state(record)
+
+
+def booked_catch_up_count() -> int:
+    if not _executions_db_path().exists():
+        return 0
+    with _transaction() as conn:
+        row = conn.execute("SELECT value FROM catch_up_total WHERE id=1").fetchone()
+        return row[0] if row else 0
+
+
+def record_pending_refusal(execution_id: str, job_id: str, payload: dict[str, Any]) -> None:
+    """Persist a durable refusal fallback when the admissions journal cannot be written."""
+    now = _hermes_now().isoformat()
+    encoded = json.dumps(payload, default=str)
+    with _transaction() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO pending_refusals
+               (execution_id, job_id, payload, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (str(execution_id), str(job_id), encoded, now),
+        )
+
+
+def get_pending_refusal(
+    execution_id: str, *, job_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Return a stored refusal fallback payload for *execution_id*, without creating a DB."""
+    if not _executions_db_path().exists():
+        return None
+    with _transaction() as conn:
+        if job_id is not None:
+            row = conn.execute(
+                "SELECT payload FROM pending_refusals WHERE execution_id=? AND job_id=?",
+                (str(execution_id), str(job_id)),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT payload FROM pending_refusals WHERE execution_id=?",
+                (str(execution_id),),
+            ).fetchone()
+    if row is None:
+        return None
+    try:
+        data = json.loads(row["payload"])
+        return data if isinstance(data, dict) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def list_pending_refusals() -> list[tuple[str, str, dict[str, Any]]]:
+    """Return pending refusal fallback rows ``(execution_id, job_id, payload)``, without creating a DB."""
+    if not _executions_db_path().exists():
+        return []
+    with _transaction() as conn:
+        rows = conn.execute(
+            "SELECT execution_id, job_id, payload FROM pending_refusals "
+            "ORDER BY created_at ASC, execution_id ASC"
+        ).fetchall()
+    out: list[tuple[str, str, dict[str, Any]]] = []
+    for row in rows:
+        try:
+            data = json.loads(row["payload"])
+            if isinstance(data, dict):
+                out.append((str(row["execution_id"]), str(row["job_id"]), data))
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def clear_pending_refusal(execution_id: str) -> None:
+    """Remove a settled refusal fallback row if one exists, without creating a DB."""
+    if not _executions_db_path().exists():
+        return
+    with _transaction() as conn:
+        conn.execute("DELETE FROM pending_refusals WHERE execution_id=?", (str(execution_id),))
+
+
+def recover_receipted_execution(execution_id, job_id, *, success, error=None, delivery_outcome=None, cancelled=False):
     """Settle a verified canonical receipt after owner loss, including its unknown audit row.
 
     Terminal verdicts stay immutable. A live firer still owns its bookkeeping
@@ -424,7 +563,7 @@ def recover_receipted_execution(execution_id, job_id, *, success, error=None, de
         conn.execute(
             """UPDATE executions SET status=?, finished_at=?, error=?, handoff_pending=0,
                handoff_started_at=NULL, delivery_outcome=? WHERE id=?""",
-            ('completed' if success else 'failed', now, detail, delivery_outcome, execution_id))
+            ('cancelled' if cancelled else ('completed' if success else 'failed'), now, detail, delivery_outcome, execution_id))
         _prune_unlocked(conn)
         record = _fetch(conn, execution_id)
     _emit_execution_state(record, delivery_outcome=delivery_outcome)

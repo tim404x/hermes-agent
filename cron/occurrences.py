@@ -103,8 +103,8 @@ def unclaimed_pending_slot(job, now):
     return slot
 
 
-def get_catch_up_occurrence_count() -> int:
-    """Return the profile-local stale-schedule catch-up count."""
+def _scan_catch_up_count() -> int:
+    """Scan-booked count, including the historical marker from before execution booking."""
     from cron.jobs import _current_cron_store
 
     path = _current_cron_store().cron_dir / "catch_up_occurrences"
@@ -114,8 +114,14 @@ def get_catch_up_occurrence_count() -> int:
         return 0
 
 
+def get_catch_up_occurrence_count() -> int:
+    from cron.executions import booked_catch_up_count
+
+    return _scan_catch_up_count() + booked_catch_up_count()
+
+
 def record_catch_up_occurrence() -> None:
     """Increment the profile-local stale-schedule catch-up counter, best effort."""
     from cron.jobs import _write_marker
 
-    _write_marker("catch_up_occurrences", str(get_catch_up_occurrence_count() + 1), ".count_")
+    _write_marker("catch_up_occurrences", str(_scan_catch_up_count() + 1), ".count_")

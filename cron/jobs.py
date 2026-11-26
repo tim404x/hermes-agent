@@ -2677,7 +2677,7 @@ def mark_job_run(
     return _under_fire_fence(job_id, locked)
 
 
-def claim_dispatch(job_id: str) -> bool:
+def claim_dispatch(job_id: str, *, expected_fire_owner: Optional[str] = None) -> bool:
     """Atomically claim a finite one-shot dispatch BEFORE execution: ``repeat.completed`` is bumped
     and persisted under the jobs lock so a tick dying mid-execution cannot lose the dispatch
     (*at-most-times* instead of *at-least-once*). True if the caller may run the job; False when
@@ -2696,6 +2696,10 @@ def claim_dispatch(job_id: str) -> bool:
             return True
         if extra_fire.is_extra(job):  # a manual run leaves the scheduled fire's budget alone
             return True
+        claim = job.get("fire_claim")
+        if expected_fire_owner is not None:
+            if not isinstance(claim, dict) or claim.get("by") != expected_fire_owner:
+                return False
         completed = repeat.get("completed", 0)
         label = job.get("name", job.get("id", "?"))
         if completed >= times:
@@ -2721,6 +2725,8 @@ def claim_dispatch(job_id: str) -> bool:
             return False
         # Claim this dispatch before the side effect runs.
         repeat["completed"] = completed + 1
+        if isinstance(claim, dict):
+            claim["dispatch_precharged"] = repeat["completed"]
         save_jobs(jobs)
         logger.debug("Job '%s': claimed dispatch %d/%d", label, repeat["completed"], times)
         return True
@@ -2836,6 +2842,7 @@ def _machine_id() -> str:
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False,
     manual: bool = False, return_job: bool = False,
+    scanned: Optional[dict[str, Any]] = None,
 ) -> bool | dict[str, Any]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
@@ -2864,7 +2871,17 @@ def claim_job_for_fire(
         # scheduler tick ``next_run_at`` is the NEXT occurrence, not the one being run, so
         # stamping it would make completed_occurrence() skip that slot when it arrives.
         manual_fire = force or manual or job.get("manual_run_at") == job.get("next_run_at")
-        instant = None if manual_fire else scheduled_instant(job.get("next_run_at"))
+        raw_slot = job.get("next_run_at")
+        if scanned is not None and (
+            job.get(jobs_newer_fire.SEQ_KEY) != scanned.get(jobs_newer_fire.SEQ_KEY)
+            or job.get("pending_slot") != scanned.get("pending_slot")
+            or _plan_fingerprint(job) != _plan_fingerprint(scanned)
+            or job.get("manual_run_at") != scanned.get("manual_run_at")
+            or (not scanned.get("pending_slot") and raw_slot != scanned.get("next_run_at"))
+        ):
+            return False  # A newer fire/edit superseded this scan. Do not advance or clear its slot.
+        manual_restore = job.get(extra_fire.RESTORE_KEY, _MISSING) if extra_fire.queued(job) else _MISSING
+        instant = None if manual_fire else scheduled_instant(raw_slot)
         # A scheduled tick only ever fires when now >= next_run_at
         # (_evaluate_due_job returns False while the stored occurrence is still
         # in the future), so a claim arriving BEFORE the stored next occurrence
@@ -2904,7 +2921,15 @@ def claim_job_for_fire(
             if nxt:
                 job["next_run_at"] = nxt
         save_jobs(jobs)
-        return dict(copy.deepcopy(job), _scheduled_instant=instant) if return_job else True
+        if not return_job:
+            return True
+        refused_slot = raw_slot if instant or raw_slot == job.get("manual_run_at") else None
+        if scanned is not None:
+            refused_slot = scanned.get("next_run_at") if job.get("run_claim") == scanned.get("run_claim") else None
+        snapshot = dict(copy.deepcopy(job), _scheduled_instant=instant, _refused_slot=refused_slot)
+        if manual_restore is not _MISSING:
+            snapshot["_refused_manual_restore"] = manual_restore
+        return snapshot
 
     return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
 
@@ -3292,7 +3317,7 @@ def _restore_unclaimed_slot(job: dict[str, Any], scan: _DueScan) -> Optional[str
 
 # The tick read the update fence before this scan and holds every agent job (``no_agent`` scripts
 # still fire): see ``cron.scheduler_gateway_gate.update_fence_holds_agent_jobs``.
-_agent_dispatch_held: ContextVar[bool] = ContextVar("cron_agent_dispatch_held", default=False)
+_agent_dispatch_held: ContextVar[Optional[bool]] = ContextVar("cron_agent_dispatch_held", default=None)
 
 
 @contextlib.contextmanager
@@ -3365,7 +3390,8 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     grace = _compute_grace_seconds(d.schedule, job.get("grace_minutes"))
     from cron.missed_runs import fast_forward_missed_recurring, retire_expired_oneshot
 
-    if not manual_run and recurring and fast_forward_missed_recurring(d, grace):
+    if not manual_run and recurring and fast_forward_missed_recurring(
+            d, grace, worker_books=(_agent_dispatch_held.get() is False and not job.get("no_agent"))):
         return False
     if kind == "once":
         if retire_expired_oneshot(d) or _oneshot_dispatch_limit_reached(job, scan):
@@ -3397,9 +3423,11 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         # stamp survives a process death in that window so the slot is restored, not lost.
         from cron.occurrences import pending_slot_stamp
 
+        pending = pending_slot_stamp(next_run, now)
+        job["pending_slot"] = pending
         scan.persist(
             job["id"], last_dispatch=dispatch_stamp,
-            pending_slot=pending_slot_stamp(next_run, now))
+            pending_slot=pending)
     return True
 
 
