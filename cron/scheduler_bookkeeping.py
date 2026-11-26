@@ -137,9 +137,8 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
                 "Cron %s receipt recovery: booking of %s refused (fire fence busy); retrying next tick",
                 job["id"], execution_id)
             return False
-    if recovered or job.get("_catch_up_report"):
-        from cron.executions import book_execution_catch_up
-        book_execution_catch_up(execution_id, job["id"])
+    from cron.executions import book_execution_catch_up
+    book_execution_catch_up(execution_id, job, recovered=recovered)
     delivery_outcome = _classify_delivery_outcome(
         delivery_error=d.delivery_error,
         delivery_queued=job.get("last_delivery_queued"),

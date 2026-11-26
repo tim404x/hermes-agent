@@ -440,11 +440,15 @@ def record_missed_occurrences(
     return record
 
 
-def book_execution_catch_up(execution_id: str, job_id: str) -> None:
+def book_execution_catch_up(execution_id: str, job: dict, *, recovered: bool = False) -> None:
     """Consume the report, count one fire, and book its collapsed slots in ONE transaction.
     A replay or a pruned execution has no report left to consume."""
     from cron.missed_runs import _MAX_COUNTED_SLOTS
 
+    # The recovering owner returns its frozen job, without the scan's ephemeral report.
+    if not recovered and not job.get("_catch_up_report"):
+        return
+    job_id = job["id"]
     record = None
     with _transaction() as conn:
         row = conn.execute(

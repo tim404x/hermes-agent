@@ -183,7 +183,7 @@ def test_same_typed_disconnect_after_submit_is_unknown_not_retried(
 
 
 def test_resubmit_lost_reply_then_update_paused_redial_stays_unknown_same_request_id(
-    cron_home, monkeypatch, transport
+    monkeypatch, transport
 ):
     """#53 resubmit path: transient storage_unavailable -> recover=missing -> lost resubmit
     reply -> update_paused redial must keep one request_id and never refund the slot."""

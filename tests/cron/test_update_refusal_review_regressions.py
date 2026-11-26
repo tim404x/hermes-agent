@@ -560,6 +560,6 @@ def test_recovered_catchup_completion_books_count_and_missed_rows_idempotently(
 
     # Verify idempotency: re-booking the same execution does not double-count.
     completed_row = next(r for r in E.list_executions(job_id=jid) if r["status"] == "completed")
-    E.book_execution_catch_up(completed_row["id"], jid)
+    E.book_execution_catch_up(completed_row["id"], J.get_job(jid), recovered=True)
     assert get_catch_up_occurrence_count() == 1
     assert len([r for r in E.list_executions(job_id=jid) if r["status"] == "missed"]) == 1
