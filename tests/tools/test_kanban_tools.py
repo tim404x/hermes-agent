@@ -49,6 +49,10 @@ def worker_env(monkeypatch, tmp_path):
     after we've created the task."""
     home = tmp_path / ".hermes"
     home.mkdir()
+    for _pname in ("peer", "qa", "test-worker"):
+        _pdir = home / "profiles" / _pname
+        _pdir.mkdir(parents=True)
+        (_pdir / "config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
@@ -1278,6 +1282,8 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     # home to avoid mkdir() colliding with the worker's directory.
     home = tmp_path / "gate-home" / ".hermes"
     home.mkdir(parents=True)
+    (home / "profiles" / "peer").mkdir(parents=True)
+    (home / "profiles" / "peer" / "config.yaml").write_text("{}\n", encoding="utf-8")
     (home / "config.yaml").write_text(
         "kanban:\n  auto_subscribe_on_create: false\n"
     )
