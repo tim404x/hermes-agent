@@ -7,16 +7,21 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
+import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import time
 import unicodedata
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Optional
-from typing import TYPE_CHECKING
-import contextlib
+from typing import Optional, TYPE_CHECKING
 
 from hermes_cli.worktree_ops import release_lsp_clients
 
@@ -24,6 +29,14 @@ if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
 
 _REMOVABLE_KINDS = ("scratch", "worktree")
+_PROC_ROOT = Path("/proc")
+_AGENT_HOST_UNIT_RE = re.compile(r"^hermes-(?:gateway|dashboard)(?:-[^/]*)?\.service$")
+_DELETED_SUFFIX = " (deleted)"
+_LIVE_CLEANUP_RETRY_INTERVAL_SECONDS = 30.0
+_DatabaseKey = str | sqlite3.Connection
+_LIVE_CLEANUP_LAST_RETRY: dict[tuple[_DatabaseKey, str], float] = {}
+_LIVE_CLEANUP_AFTER: dict[_DatabaseKey, int] = {}
+_FINISHED_CLEANUPS = {"removed", "gone", "preserved", "unmanaged", "shared", "active_children"}
 
 
 def _path_key(path: Path | str | None) -> str:
@@ -49,7 +62,17 @@ _ACTIVE_CHILDREN_SQL = (
     "LIMIT 1"
 )
 
-_WORKSPACE_ROW_SQL = "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?"
+_WORKSPACE_ROW_SQL = (
+    "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ? "
+    f"AND status IN {_TERMINAL_STATUSES_SQL}"
+)
+
+_PENDING_LIVE_EVENTS_SQL = """
+    SELECT task_id, id, payload FROM task_events WHERE kind = 'workspace_cleanup_deferred_live' AND id IN (
+        SELECT MAX(id) FROM task_events WHERE kind IN ('workspace_cleanup_deferred_live', 'workspace_cleanup_retried')
+        GROUP BY task_id
+    )
+"""
 
 
 def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProcess:
@@ -75,15 +98,6 @@ def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProce
 
 def _has_active_children(conn: sqlite3.Connection, task_id: str) -> bool:
     return conn.execute(_ACTIVE_CHILDREN_SQL, (task_id,)).fetchone() is not None
-
-
-_TERMINAL_TASK_SQL = (
-    f"SELECT 1 FROM tasks WHERE id = ? AND status IN {_TERMINAL_STATUSES_SQL}"
-)
-
-
-def _is_terminal_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    return conn.execute(_TERMINAL_TASK_SQL, (task_id,)).fetchone() is not None
 
 
 _OTHER_LIVE_PATHS_SQL = (
@@ -128,8 +142,6 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
     default board at ``<home>/kanban.db`` and named boards at
     ``<home>/kanban/boards/<slug>/kanban.db``.
     """
-    from hermes_cli.kanban_db_connect import _main_db_file  # late: import cycle
-
     current_file = _main_db_file(conn)
     current = Path(current_file).resolve() if current_file else None
     candidates = [_kb.kanban_home() / "kanban.db"]
@@ -209,11 +221,11 @@ def _workspace_in_use_by_other(
 
 def _defer_shared_workspace_cleanup(
     conn: sqlite3.Connection, task_id: str, path: Path | str
-) -> bool:
+) -> Optional[str]:
     """Skip removal and record why, when *path* may still be used by a live task."""
     reason = _workspace_in_use_by_other(conn, task_id, path)
     if reason is None:
-        return False
+        return None
     if reason == "shared":
         _kb._log.warning(
             "Deferring workspace cleanup for task %s: %s is still used by "
@@ -226,35 +238,148 @@ def _defer_shared_workspace_cleanup(
             "another task still uses %s",
             task_id, path,
         )
+    _record_cleanup_event(conn, task_id, "workspace_cleanup_deferred_shared", {"path": str(path), "reason": reason})
+    return reason
+
+
+def _record_cleanup_event(
+    conn: sqlite3.Connection, task_id: str, kind: str, payload: dict
+) -> None:
+    """One INSERT on the board's autocommit connection, outside the task transition."""
     try:
-        _kb._append_event(
-            conn, task_id, "workspace_cleanup_deferred_shared",
-            {"path": str(path), "reason": reason},
+        _kb._append_event(conn, task_id, kind, payload)
+    except sqlite3.Error as exc:
+        _kb._log.debug(
+            "kanban workspace: failed to record %s for task %s: %s", kind, task_id, exc
         )
-    except sqlite3.Error:
-        pass
-    return True
-
-
-def _defer_shared_worktree_cleanup(
-    conn: sqlite3.Connection, task_id: str, path: Path | str
-) -> bool:
-    """Defer removing a linked worktree another live task may still use.
-
-    Only a real linked worktree is ever removed, so the sharing scan runs just
-    for those.
-    """
-    wt = Path(path).expanduser()
-    return (
-        wt.is_dir()
-        and _is_linked_worktree_checkout(wt)
-        and _defer_shared_workspace_cleanup(conn, task_id, path)
-    )
 
 
 def _lexical_path(path: Path | str) -> Path:
     """Absolute, ``..``-collapsed, NFC form of *path* WITHOUT following symlinks."""
     return Path(_path_key(os.path.abspath(path)))
+
+
+def _read_cgroup(pid: int) -> str:
+    path = ""
+    for line in (_PROC_ROOT / str(pid) / "cgroup").read_bytes().splitlines():
+        fields = line.split(b":", 2)
+        if len(fields) == 3:
+            path = os.fsdecode(fields[2])
+            if fields[:2] == [b"0", b""]:
+                break
+    return path
+
+
+def _proc_references(directory: Path, map_filter: re.Pattern[bytes]) -> Iterator[tuple[str, str]]:
+    for via in ("cwd", "root", "exe"):
+        with contextlib.suppress(FileNotFoundError):
+            yield via, os.readlink(directory / via)
+    with contextlib.suppress(FileNotFoundError), os.scandir(directory / "fd") as entries:
+        for entry in entries:
+            with contextlib.suppress(FileNotFoundError):
+                yield "fd", os.readlink(entry.path)
+    maps = (directory / "maps").read_bytes()
+    if map_filter.search(maps):
+        for line in maps.split(b"\n"):
+            fields = line.split(None, 5)
+            if len(fields) == 6:
+                yield "map", os.fsdecode(fields[5])
+
+
+class _WorkspaceProbe:
+    def __init__(self, paths: dict[str, Path | str]) -> None:
+        self.roots: dict[str, set[str]] = {}
+        for task_id, path in paths.items():
+            for root in (os.path.realpath(path), str(_lexical_path(path))):
+                self.roots.setdefault(root, set()).add(task_id)
+        self.prefix = os.path.commonprefix(list(self.roots))
+        self.map_filter = re.compile(b"|".join(re.escape(os.fsencode(root)) for root in self.roots))
+        self.worker_units = {
+            key: re.compile(rf"hermes-worker-kanban-{re.escape(key)}-run-[^/]+\.scope") for key in paths
+        }
+
+    def matches(self, directory: Path, pending: set[str]) -> dict[str, str]:
+        """First reference per workspace: one process can hold several workspaces."""
+        matches = {}
+        with contextlib.suppress(OSError):
+            for via, target in _proc_references(directory, self.map_filter):
+                target = target.removesuffix(_DELETED_SUFFIX)
+                while target and target != "/" and target.startswith(self.prefix):
+                    for task_id in self.roots.get(target, ()):
+                        if task_id in pending:
+                            matches.setdefault(task_id, via)
+                    target = target.rpartition(os.sep)[0]
+                if len(matches) == len(pending):
+                    break
+        return matches
+
+    def foreign(self, pid: int, current_group: str, pending: set[str]) -> Iterator[tuple[str, dict]]:
+        directory = _PROC_ROOT / str(pid)
+        matches = self.matches(directory, pending)
+        if not matches:
+            return
+        cgroup = _read_cgroup(pid)
+        if current_group and cgroup == current_group:
+            return
+        unit = cgroup.rsplit("/", 1)[-1]
+        env = (directory / "environ").read_bytes().split(b"\0") if _AGENT_HOST_UNIT_RE.fullmatch(unit) else ()
+        comm = (directory / "comm").read_bytes().removesuffix(b"\n").decode(errors="replace")
+        for task_id, via in matches.items():
+            if self.worker_units[task_id].fullmatch(unit) or os.fsencode(f"HERMES_KANBAN_TASK={task_id}") in env:
+                continue
+            yield task_id, dict(pid=pid, comm=comm, unit=unit, cgroup=cgroup, via=via)
+
+
+def _foreign_workspace_holders_many(paths: dict[str, Path | str], *, limit: int = 10) -> dict[str, list[dict] | None]:
+    """One procfs snapshot; None means enumeration failed, not that the root is free."""
+    holders: dict[str, list[dict]] = {task_id: [] for task_id in paths}
+    try:
+        if not paths or limit <= 0 or not (_PROC_ROOT / "self").is_dir():
+            return holders
+        probe = _WorkspaceProbe(paths)
+        pending = set(paths)
+        current_pid = os.getpid()
+        current_group = ""
+        with contextlib.suppress(OSError):
+            current_group = _read_cgroup(current_pid)
+        with os.scandir(_PROC_ROOT) as entries:
+            for entry in entries:
+                if not entry.name.isdecimal() or (pid := int(entry.name)) == current_pid:
+                    continue
+                with contextlib.suppress(OSError):
+                    for task_id, holder in probe.foreign(pid, current_group, pending):
+                        holders[task_id].append(holder)
+                        if len(holders[task_id]) == limit:
+                            pending.remove(task_id)
+                if not pending:
+                    break
+    except OSError:
+        return {task_id: found or None for task_id, found in holders.items()}
+    return holders
+
+
+def _foreign_workspace_holders(task_id: str, path: Path | str, *, limit: int = 10) -> list[dict] | None:
+    return _foreign_workspace_holders_many({task_id: path}, limit=limit)[task_id]
+
+
+def _defer_live_workspace_cleanup(
+    conn: sqlite3.Connection, task_id: str, path: Path, *, record: bool, holders: list[dict] | None,
+    unknown_reason: str = "scan_failed",
+) -> bool:
+    if holders == []:
+        return False
+    log = _kb._log.warning if record else _kb._log.debug
+    payload = {"path": str(path), "holders": holders or []}
+    if holders is None:
+        log("Deferring workspace cleanup for task %s: %s (%s)", task_id, path, unknown_reason)
+        payload["reason"] = unknown_reason
+    else:
+        first = holders[0]
+        log("Deferring workspace cleanup for task %s: %s held by pid %s (%s, %s)",
+            task_id, path, first["pid"], first["unit"], first["comm"])
+    if record:
+        _record_cleanup_event(conn, task_id, "workspace_cleanup_deferred_live", payload)
+    return True
 
 
 def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
@@ -359,6 +484,128 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
+def _board_scratch_root(conn: sqlite3.Connection) -> Path | None:
+    """Resolve implicit scratch paths from the open DB, not the caller's selected board."""
+    filename = _main_db_file(conn)
+    if not filename:
+        return None
+    database = Path(filename)
+    if database == _kb.kanban_db_path().resolve() and (
+        not os.environ.get("HERMES_KANBAN_DB") or os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT")
+    ):
+        return _kb.workspaces_root()
+    if database == (_kb.kanban_home() / "kanban.db").resolve():
+        return _kb.kanban_home() / "kanban" / "workspaces"
+    if database.name == "kanban.db" and database.parent.parent == _kb.boards_root().resolve():
+        return _kb.boards_root() / database.parent.name / "workspaces"
+    return None
+
+
+@dataclass(frozen=True)
+class _WorkspaceCleanup:
+    task_id: str
+    kind: str
+    path: Path
+    branch_name: Optional[str]
+    stored_path: str | None
+    real_path: str
+
+    @classmethod
+    def from_row(cls, conn: sqlite3.Connection, row: sqlite3.Row) -> _WorkspaceCleanup | None:
+        stored_path, kind, task_id = row["workspace_path"], row["workspace_kind"], row["id"]
+        if stored_path:
+            path = Path(stored_path).expanduser()
+        elif kind == "scratch" and Path(task_id).name == task_id and task_id not in ("", ".."):
+            root = _board_scratch_root(conn)
+            if root is None:
+                return None
+            path = root / task_id
+        else:
+            return None
+        return cls(task_id, kind, path, row["branch_name"], stored_path, os.path.realpath(path))
+
+    def blocker(self, conn: sqlite3.Connection) -> Optional[str]:
+        try:
+            is_dir = stat.S_ISDIR(self.path.stat().st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            return "gone"
+        except OSError:
+            return "unknown"
+        if not is_dir:
+            return "unmanaged"
+        if _has_active_children(conn, self.task_id):
+            return "active_children"
+        if self.kind == "scratch":
+            if self.path.is_symlink() or not _is_managed_scratch_path(self.path):
+                _kb._log.warning("Refusing to remove out-of-scratch workspace for task %s: %s", self.task_id, self.path)
+                return "unmanaged"
+        elif self.kind != "worktree" or self.path.is_symlink() or not (self.path / ".git").is_file():
+            return "unmanaged"
+        return _defer_shared_workspace_cleanup(conn, self.task_id, self.path)
+
+    def revalidate(self, conn: sqlite3.Connection) -> str | None:
+        row = conn.execute(_WORKSPACE_ROW_SQL, (self.task_id,)).fetchone()
+        if row is None or self != self.from_row(conn, row):
+            return "task_changed"
+        return self.blocker(conn)
+
+    def worktree_guard(self, conn: sqlite3.Connection, record_live: bool) -> str | None:
+        """Check DB ownership first; no sibling DB walks between the final procfs scan and Git."""
+        version = _board_revision(conn)
+        if reason := self.revalidate(conn):
+            return reason
+        holders = _foreign_workspace_holders(self.task_id, self.path)
+        unknown_reason = "scan_failed"
+        if holders == [] and _board_revision(conn) != version:
+            holders, unknown_reason = None, "board_changed_during_scan"
+        if _defer_live_workspace_cleanup(conn, self.task_id, self.path, record=record_live,
+                                         holders=holders, unknown_reason=unknown_reason):
+            return "unknown" if holders is None else "live"
+        return None
+
+
+def _board_revision(conn: sqlite3.Connection) -> tuple[int, int]:
+    """SQLite counts this connection's writes separately from commits on other connections."""
+    return conn.total_changes, conn.execute("PRAGMA data_version").fetchone()[0]
+
+
+def _cleanup_task_workspaces(
+    conn: sqlite3.Connection, rows: list[sqlite3.Row], *, record_live: bool = True,
+) -> dict[str, str]:
+    results: dict[str, str] = {}
+    ready = []
+    for row in rows:
+        ws = _WorkspaceCleanup.from_row(conn, row)
+        if ws is None or (not record_live and str(ws.path) != row["deferred_path"]):
+            results[row["id"]] = "unmanaged"
+            continue
+        reason = ws.blocker(conn)
+        if reason:
+            results[ws.task_id] = reason
+        else:
+            release_lsp_clients(str(ws.path))
+            ready.append(ws)
+    batch = _foreign_workspace_holders_many({ws.task_id: ws.path for ws in ready}) if len(ready) > 1 else {}
+    for ws in ready:
+        holders = batch[ws.task_id] if batch else _foreign_workspace_holders(ws.task_id, ws.path)
+        if _defer_live_workspace_cleanup(conn, ws.task_id, ws.path, record=record_live, holders=holders):
+            results[ws.task_id] = "unknown" if holders is None else "live"
+            continue
+        if ws.kind == "worktree":
+            results[ws.task_id] = _cleanup_worktree_workspace(
+                ws.task_id, str(ws.path), ws.branch_name, guard=partial(ws.worktree_guard, conn, record_live),
+            )
+        elif blocker := ws.revalidate(conn):
+            results[ws.task_id] = blocker
+        else:
+            try:
+                shutil.rmtree(ws.path)
+                results[ws.task_id] = "removed"
+            except OSError:
+                results[ws.task_id] = "error"
+    return results
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort
@@ -369,63 +616,24 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
         if not row:
             return
-        kind: Optional[str] = row["workspace_kind"]
-        path: Optional[str] = row["workspace_path"]
-        if kind not in _REMOVABLE_KINDS or not path:
-            # Not removable itself, but completing may still unblock a deferred
-            # parent scratch cleanup (e.g. a 'dir' child of a scratch parent).
-            # See #33774.
-            _try_cleanup_parent_workspaces(conn, task_id)
-            return
-        # Defer while any child is not yet terminal so it can still read
-        # handoff artifacts from this workspace.
-        if _has_active_children(conn, task_id):
-            _kb._log.debug(
-                "Deferring %s workspace cleanup for task %s: "
-                "active children still need workspace at %s",
-                kind, task_id, path,
-            )
-            return
-        # Kill the (dead) tmux worker session BEFORE removing a worktree so a
-        # lingering worker never has its cwd deleted from under it.
-        if kind == "worktree":
-            _cleanup_worker_tmux(conn, task_id)
-            if not _defer_shared_worktree_cleanup(conn, task_id, path):
-                _cleanup_worktree_workspace(task_id, path, row["branch_name"])
-            _try_cleanup_parent_workspaces(conn, task_id)
-            return
-        wp = Path(path)
-        if wp.is_dir():
-            # Containment guard: a board's ``default_workdir`` can pair
-            # ``workspace_kind='scratch'`` with a user path pointing at a real
-            # source tree; without this, completion would rmtree the user's data.
-            # See #28818. Containment runs first so an unmanaged dir that is
-            # never removed does not pay for (or log) the shared-use scan.
-            if _is_managed_scratch_path(wp):
-                if not _defer_shared_workspace_cleanup(conn, task_id, path):
-                    release_lsp_clients(str(wp))
-                    shutil.rmtree(wp, ignore_errors=True)
-                    _kb._log.debug("Removed scratch workspace: %s", wp)
-            else:
-                _kb._log.warning(
-                    "Refusing to remove out-of-scratch workspace for task %s: %s "
-                    "(workspace_kind='scratch' but path is outside any "
-                    "kanban-managed workspaces root)",
-                    task_id, wp,
-                )
-        # Kill the owning worker's tmux session if it is now dead, then let any
-        # parent whose children are all done run its deferred cleanup.
-        _cleanup_worker_tmux(conn, task_id)
-        # After cleaning up this task's workspace, check if any parent tasks now have all children done —
-        # their deferred cleanup can proceed (#33774).
+        kind = row["workspace_kind"]
+        if kind in _REMOVABLE_KINDS:
+            if _has_active_children(conn, task_id):
+                return
+            if kind == "worktree":
+                _cleanup_worker_tmux(conn, task_id)
+            _cleanup_task_workspaces(conn, [row])
+            if kind == "scratch" and row["workspace_path"]:
+                _cleanup_worker_tmux(conn, task_id)
         _try_cleanup_parent_workspaces(conn, task_id)
     except Exception:
         pass  # best-effort — never block completion
 
 
 def _cleanup_worktree_workspace(
-    task_id: str, path: str, branch_name: Optional[str] = None
-) -> None:
+    task_id: str, path: str, branch_name: Optional[str] = None, *,
+    guard: Callable[[], str | None] | None = None,
+) -> str:
     """Remove a finished task's linked git worktree when it holds no work.
     Mirrors the CLI startup pruner (``cli._prune_stale_worktrees``): removal
     requires a clean tree AND every commit reachable from a remote-tracking
@@ -434,24 +642,30 @@ def _cleanup_worktree_workspace(
     branches are kept. Best-effort."""
     try:
         from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
-    except Exception:
-        return  # CLI safety predicates unavailable — preserve
-    try:
         wp = Path(path).expanduser()
         if not wp.is_dir():
-            return
-        common = _git_common_dir(wp)
-        if common is None or common.name != ".git":
-            return  # not a linked worktree of a normal repo — never guess
+            return "gone"
+        directories = _git_checkout_dirs(wp)
+        if directories is None:
+            return "unknown"
+        checkout, common = directories
+        if _path_key(checkout) == _path_key(common) or common.name != ".git":
+            return "unmanaged"
         repo_root = common.parent
         if _path_key(wp.resolve(strict=False)) == _path_key(repo_root.resolve(strict=False)):
-            return  # never remove the main checkout
-        if _worktree_is_dirty(str(wp), str(repo_root)) or _worktree_has_unpushed_commits(str(wp)):
+            return "unmanaged"
+        dirty = _worktree_is_dirty(str(wp), str(repo_root), on_error=None)
+        if dirty is None:
+            return "unknown"
+        has_work = dirty or _worktree_has_unpushed_commits(str(wp), on_error=None)
+        if has_work is None:
+            return "unknown"
+        if has_work:
             _kb._log.info(
                 "Preserving worktree for task %s: dirty or unpushed work at %s",
                 task_id, wp,
             )
-            return
+            return "preserved"
         # Windows cannot delete a directory while this process has its current
         # directory inside it. Completed workers normally run from their own
         # linked worktree, so move this process back to the main checkout
@@ -472,28 +686,34 @@ def _cleanup_worktree_workspace(
                     "Preserving worktree for task %s: cannot leave %s for %s: %s",
                     task_id, cwd or "<deleted cwd>", repo_root, exc,
                 )
-                return
+                return "error"
         # No --force: git's own dirty guard re-verifies at removal time, so if
         # the tree became dirty since our check (TOCTOU) removal fails safe.
-        release_lsp_clients(str(worktree_path))
-        result = _git(repo_root, "worktree", "remove", str(wp), timeout=60)
-        if result.returncode != 0:
-            # Windows can retain a directory handle briefly after cwd changes.
-            # Retry once without --force; Git still enforces its dirty guard.
-            time.sleep(0.1)
+        if guard is None:
+            release_lsp_clients(str(worktree_path))
+        for attempt in range(2):
+            if attempt:
+                time.sleep(0.1)
+            reason = guard() if guard else ("live" if _foreign_workspace_holders(task_id, wp) != [] else None)
+            if reason:
+                return reason
             result = _git(repo_root, "worktree", "remove", str(wp), timeout=60)
-        if result.returncode != 0:
+            if result.returncode == 0:
+                break
+        else:
             _kb._log.warning(
                 "git worktree remove failed for task %s at %s: %s",
                 task_id, wp, (result.stderr or result.stdout or "").strip(),
             )
-            return
+            return "error"
         _kb._log.debug("Removed worktree workspace: %s", wp)
         branch = (branch_name or "").strip() or f"wt/{task_id}"
         if branch.startswith("wt/"):
-            _git(repo_root, "branch", "-D", branch, timeout=30)
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                _git(repo_root, "branch", "-D", branch, timeout=30)
+        return "removed"
     except Exception:
-        pass  # best-effort — never block completion
+        return "error"
 
 
 def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
@@ -505,36 +725,74 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
     """
     try:
         parents = conn.execute(
-            "SELECT parent_id FROM task_links WHERE child_id = ?",
+            "SELECT t.id, t.workspace_kind, t.workspace_path, t.branch_name FROM task_links l "
+            "JOIN tasks t ON t.id = l.parent_id WHERE l.child_id = ? "
+            f"AND t.workspace_kind IN ('scratch','worktree') AND t.status IN {_TERMINAL_STATUSES_SQL}",
             (task_id,),
         ).fetchall()
-        for (parent_id,) in parents:
-            row = conn.execute(_WORKSPACE_ROW_SQL, (parent_id,)).fetchone()
-            if (
-                not row
-                or row["workspace_kind"] not in _REMOVABLE_KINDS
-                or not row["workspace_path"]
-                or not _is_terminal_task(conn, parent_id)
-                or _has_active_children(conn, parent_id)
-            ):
-                continue
-            ws_path = row["workspace_path"]
-            if row["workspace_kind"] == "worktree":
-                if _defer_shared_worktree_cleanup(conn, parent_id, ws_path):
-                    continue
-                _cleanup_worktree_workspace(parent_id, ws_path, row["branch_name"])
-                continue
-            wp = Path(ws_path)
-            if not wp.is_dir():
-                continue
-            if _is_managed_scratch_path(wp):
-                if _defer_shared_workspace_cleanup(conn, parent_id, ws_path):
-                    continue
-                release_lsp_clients(str(wp))
-                shutil.rmtree(wp, ignore_errors=True)
-                _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+        _cleanup_task_workspaces(conn, parents)
     except Exception:
         pass  # best-effort
+
+
+def _retry_page(conn: sqlite3.Connection, board: _DatabaseKey, recent: list[str], limit: int) -> list[sqlite3.Row]:
+    """Walk event ids in order; long-lived holders in a full page must not starve the next page."""
+    if limit <= 0:
+        return []
+    after = _LIVE_CLEANUP_AFTER.get(board, 0)
+    query = (
+        "SELECT t.id, t.workspace_kind, t.workspace_path, t.branch_name, e.id AS event_id, "
+        "json_extract(e.payload, '$.path') AS deferred_path "
+        f"FROM ({_PENDING_LIVE_EVENTS_SQL}) e "
+        f"JOIN tasks t ON t.id = e.task_id WHERE t.status IN {_TERMINAL_STATUSES_SQL} "
+        "AND t.id NOT IN (SELECT value FROM json_each(?)) AND e.id > ? ORDER BY e.id LIMIT ?"
+    )
+    exclude = json.dumps(recent)
+    rows = conn.execute(query, (exclude, after, limit)).fetchall()
+    if after and not rows:
+        rows = conn.execute(query, (exclude, 0, limit)).fetchall()
+    if len(rows) == limit:
+        _LIVE_CLEANUP_AFTER[board] = rows[-1]["event_id"]
+    else:
+        _LIVE_CLEANUP_AFTER.pop(board, None)
+    return rows
+
+
+def retry_deferred_workspace_cleanups(conn: sqlite3.Connection, *, limit: int = 20) -> list[str]:
+    """Retry terminal workspaces still queued by their latest live-cleanup event."""
+    now = time.monotonic()
+    board = _main_db_file(conn) or conn
+    recent = []
+    for key, last in _LIVE_CLEANUP_LAST_RETRY.copy().items():
+        if now - last >= _LIVE_CLEANUP_RETRY_INTERVAL_SECONDS:
+            _LIVE_CLEANUP_LAST_RETRY.pop(key, None)
+        elif key[0] == board:
+            recent.append(key[1])
+    rows = _retry_page(conn, board, recent, limit)
+    _LIVE_CLEANUP_LAST_RETRY.update({(board, row["id"]): now for row in rows})
+    results = _cleanup_task_workspaces(conn, rows, record_live=False)
+    finished = [row for row in rows if results[row["id"]] in _FINISHED_CLEANUPS]
+    if finished:
+        with _kb.write_txn(conn):
+            for row in finished:
+                task_id = row["id"]
+                latest = conn.execute(
+                    "SELECT id FROM task_events WHERE task_id=? AND kind IN "
+                    "('workspace_cleanup_deferred_live','workspace_cleanup_retried') ORDER BY id DESC LIMIT 1", (task_id,),
+                ).fetchone()
+                if latest and latest[0] == row["event_id"]:
+                    _kb._append_event(conn, task_id, "workspace_cleanup_retried", {"result": results[task_id]})
+                _LIVE_CLEANUP_LAST_RETRY.pop((board, task_id), None)
+    return [row["id"] for row in finished if results[row["id"]] == "removed"]
+
+
+def gc_archived_workspaces(conn: sqlite3.Connection) -> int:
+    """Sweep archived leftovers not already owned by the live-retry queue."""
+    rows = conn.execute(
+        "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks WHERE status = 'archived' "
+        f"AND workspace_kind IN ('scratch','worktree') AND id NOT IN (SELECT task_id FROM ({_PENDING_LIVE_EVENTS_SQL}))"
+    ).fetchall()
+    return sum(result == "removed" for result in _cleanup_task_workspaces(conn, rows).values())
 
 
 def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
@@ -563,8 +821,8 @@ _SCRATCH_TIP_SENTINEL_NAME = ".scratch_tip_shown"
 
 
 _SCRATCH_TIP_MESSAGE = (
-    "scratch workspaces are ephemeral — they're deleted when the task "
-    "completes. Use --workspace worktree: (git worktree) or "
+    "scratch workspaces are ephemeral — they're removed after completion or archive "
+    "once no longer in use. Use --workspace worktree: (git worktree) or "
     "--workspace dir:/abs/path (existing dir) to preserve worker output."
 )
 
@@ -654,18 +912,20 @@ def _git_current_branch(path: Path) -> Optional[str]:
     return _kb._git_out(path, "branch", "--show-current")
 
 
-def _is_linked_worktree_checkout(path: Path) -> bool:
-    """True when *path* is a linked worktree (git-dir differs from common-dir).
-
-    One ``rev-parse`` call answers both directories.
-    """
+def _git_checkout_dirs(path: Path) -> tuple[Path, Path] | None:
     out = _kb._git_out(
         path, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"
     )
     lines = out.splitlines() if out else []
-    return len(lines) == 2 and (
-        Path(lines[0]).resolve(strict=False) != Path(lines[1]).resolve(strict=False)
-    )
+    if len(lines) != 2:
+        return None
+    return Path(lines[0]).resolve(strict=False), Path(lines[1]).resolve(strict=False)
+
+
+def _is_linked_worktree_checkout(path: Path) -> bool:
+    """True when *path* is a linked worktree (git-dir differs from common-dir)."""
+    directories = _git_checkout_dirs(path)
+    return directories is not None and _path_key(directories[0]) != _path_key(directories[1])
 
 
 def _nearest_existing_path(path: Path) -> Path:
@@ -841,3 +1101,4 @@ def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) ->
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb
+from hermes_cli.kanban_db_connect import _main_db_file

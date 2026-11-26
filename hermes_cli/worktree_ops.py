@@ -472,8 +472,8 @@ def _worktree_merge_base_ref(path: str, timeout: float = 5) -> Optional[str]:
     return None
 
 
-def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> bool:
-    """Whether a worktree has commits unreachable from any remote branch. Fails SAFE toward True.
+def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10, *, on_error: bool | None = True) -> bool | None:
+    """Whether a worktree has commits unreachable from any remote branch. Unknown returns ``on_error``.
 
     No remote-tracking refs = nothing was ever pushed, so the tree is compared against the local
     trunk instead (``_worktree_local_trunk``); no trunk either -> True. A shallow boundary can
@@ -484,18 +484,18 @@ def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> boo
         remote_refs = _git_out(["for-each-ref", "--format=%(refname)", "refs/remotes"], worktree_path,
                                timeout=timeout)
         if remote_refs is None:
-            return True
+            return on_error
         baseline = ["--remotes"]
         if not remote_refs:
             trunk = _worktree_local_trunk(worktree_path, timeout=timeout)
             if trunk is None:
-                return True
+                return on_error
             baseline = [trunk]
         unpushed = _git_out(["log", "--oneline", "HEAD", "--not", *baseline], worktree_path,
                             timeout=timeout)
-        return unpushed is None or bool(unpushed)
+        return on_error if unpushed is None else bool(unpushed)
     except Exception:
-        return True
+        return on_error
 
 
 def _include_symlink_paths(worktree_path: str, repo_root) -> set:
@@ -517,8 +517,8 @@ def _include_symlink_paths(worktree_path: str, repo_root) -> set:
     return paths
 
 
-def _worktree_is_dirty(worktree_path: str, repo_root, timeout: int = 10) -> bool:
-    """Whether a worktree has staged/unstaged/untracked changes. Fails SAFE toward True.
+def _worktree_is_dirty(worktree_path: str, repo_root, timeout: int = 10, *, on_error: bool | None = True) -> bool | None:
+    """Whether a worktree has staged/unstaged/untracked changes. Unknown returns ``on_error``.
 
     Untracked ``.worktreeinclude`` directory symlinks back to the main checkout *repo_root* are
     ignored: they are our own scaffolding, and counting them would keep every worktree of such a
@@ -531,11 +531,11 @@ def _worktree_is_dirty(worktree_path: str, repo_root, timeout: int = 10) -> bool
         # Reclaimers run this unattended; status reads the index (core.fsmonitor, clean filters).
         env = noninteractive_repo_git_env(worktree_path)
         if env is None:
-            return True
+            return on_error
         result = _git(["status", "--porcelain", "-z", "--untracked-files=normal"], worktree_path,
                       timeout=timeout, stdin=subprocess.DEVNULL, env=env)
         if result.returncode != 0:
-            return True
+            return on_error
         entries = [e for e in result.stdout.split("\0") if e]
         if not entries:
             from hermes_cli.worktree_retention import hidden_index_edits
@@ -545,7 +545,7 @@ def _worktree_is_dirty(worktree_path: str, repo_root, timeout: int = 10) -> bool
         include_links = _include_symlink_paths(worktree_path, repo_root)
         return any(e[3:].rstrip("/") not in include_links for e in entries)
     except Exception:
-        return True
+        return on_error
 
 
 def _repo_is_shallow(repo_path: str, timeout: int = 5) -> bool:
