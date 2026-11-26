@@ -16,6 +16,8 @@ import os
 import threading
 import time
 from typing import Optional
+
+from hermes_dir_acl import make_user_dir
 from utils import atomic_json_write, read_json_or_empty
 
 _MAX_ENTRIES = 1000
@@ -38,7 +40,7 @@ def _update(chat_id, message_id, fields: dict) -> bool:
     path = _store_path()
     with _LOCK:
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
+            make_user_dir(os.path.dirname(path), mode=0o700, parents=True, exist_ok=True)
             data = read_json_or_empty(path)
             key = f"{chat_id}:{message_id}"
             entry = data.get(key)
@@ -47,7 +49,7 @@ def _update(chat_id, message_id, fields: dict) -> bool:
             if len(data) > _MAX_ENTRIES:  # trim oldest by timestamp
                 for k, _ in sorted(data.items(), key=lambda kv: kv[1].get("ts", 0))[: len(data) - _MAX_ENTRIES]:
                     data.pop(k, None)
-            atomic_json_write(path, data, indent=None)  # see _LOCK
+            atomic_json_write(path, data, indent=None, mode=0o600)  # see _LOCK
         except Exception:
             return False
     return True
