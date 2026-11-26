@@ -12,6 +12,7 @@ import math
 import os
 import re
 import shlex
+import stat
 import tempfile
 import threading
 import time
@@ -41,6 +42,8 @@ _MAX_RESULT_FILENAME_STEM = 120
 
 _spillover_prune_lock = threading.Lock()
 _spillover_pruned_homes: set = set()  # profile home keys already swept this process
+_private_dir_lock = threading.Lock()
+_tightened_archive_dirs: set[str] = set()  # resolved archive dirs already chmod'd 0o700 this process
 
 
 def get_spillover_dir():
@@ -134,31 +137,119 @@ def cleanup_spillover_cache(max_age_hours: int | None = None) -> int:
     return sum(_sweep_archive_dir(home / subdir, cutoff) for subdir in _ARCHIVE_SUBDIRS)
 
 
+def _archive_files_private() -> bool:
+    """True unless the active terminal backend is ``docker`` without ``docker_run_as_host_user``.
+
+    Docker bind-mounts ``cache/spillover`` and ``cache/pruned`` into the container, where a non-root
+    image user with a different uid cannot read 0600 host files; ssh/modal/daytona/vercel_sandbox
+    upload file contents so host permissions do not affect them. Hosted scopes, refusal scopes, and
+    any resolution error fail closed to private permissions.
+    """
+    try:
+        from tools.environments.sandbox_scope import hosted_scope
+        from tools.terminal_scope import terminal_env
+        from tools.terminal_tool_config import _tenv_bool
+
+        if hosted_scope() is not None:
+            return True
+        backend = terminal_env("TERMINAL_ENV", "local").strip().lower() or "local"
+        if backend != "docker":
+            return True
+        return _tenv_bool("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false")
+    except Exception:  # health: allow BLE001 -- fail closed to private perms on any policy/env error
+        return True
+
+
+def _ensure_archive_dir(spill_dir, *, private: bool) -> None:
+    """Create *spill_dir*, ensuring 0o700 when *private* (tightening an existing dir once per process)."""
+    if not private:
+        spill_dir.mkdir(parents=True, exist_ok=True)
+        return
+    existed = spill_dir.exists()
+    spill_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name != "posix":
+        return
+    try:
+        if spill_dir.is_symlink():
+            return
+        key = str(spill_dir.resolve())
+    except OSError as exc:
+        logger.debug("Could not resolve archive dir %s for chmod: %s", spill_dir, exc)
+        return
+    with _private_dir_lock:
+        already_tightened = key in _tightened_archive_dirs
+        if existed and already_tightened:
+            return
+        _tightened_archive_dirs.add(key)
+    try:
+        os.chmod(spill_dir, 0o700)
+    except OSError as exc:
+        logger.debug("Could not chmod archive dir %s to 0700: %s", spill_dir, exc)
+
+
+def _tighten_archive_file(path) -> None:
+    """Best-effort chmod of a regular archive file to 0o600 without following symlinks."""
+    if os.name != "posix" or not hasattr(os, "fchmod"):
+        return
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        logger.debug("Could not open archive file %s to tighten mode: %s", path, exc)
+        return
+    try:
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            os.fchmod(fd, 0o600)
+    except OSError as exc:
+        logger.debug("Could not chmod archive file %s to 0600: %s", path, exc)
+    finally:
+        os.close(fd)
+
+
 def _sweep_archive_dir(archive_dir, cutoff: float) -> int:
-    """Unlink files in *archive_dir* older than *cutoff* that no state.db message references."""
+    """Unlink files in *archive_dir* older than *cutoff* that no state.db message references.
+
+    When private archive permissions apply, also tightens any kept regular file with group/other
+    bits (``st_mode & 0o077``) to 0600 without following symlinks.
+    """
+    private = _archive_files_private()
     expired = []
+    kept_loose = []
     try:
         entries = list(archive_dir.iterdir())
     except OSError:
         return 0
     for f in entries:
         try:
-            if f.is_file() and f.stat().st_mtime < cutoff:
-                expired.append(f)
+            st = f.lstat()
         except OSError:
-            pass
-    if not expired:
-        return 0
-    referenced = referenced_spillover_names(archive_dir)
-    removed = 0
-    for f in expired:
-        if referenced is None or f.name in referenced:  # unknown set: fail closed, keep
             continue
-        try:
-            f.unlink()
-            removed += 1
-        except OSError:
-            pass
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        if st.st_mtime < cutoff:
+            expired.append((f, st))
+        elif private and (st.st_mode & 0o077):
+            kept_loose.append(f)
+    removed = 0
+    if expired:
+        referenced = referenced_spillover_names(archive_dir)
+        for f, st in expired:
+            if referenced is None or f.name in referenced:  # unknown set: fail closed, keep
+                if private and (st.st_mode & 0o077):
+                    kept_loose.append(f)
+                continue
+            try:
+                f.unlink()
+                removed += 1
+            except OSError as exc:
+                logger.debug("Could not unlink expired archive %s: %s", f, exc)
+    for f in kept_loose:
+        _tighten_archive_file(f)
     return removed
 
 
@@ -195,22 +286,42 @@ def _write_to_spillover(content: str, filename: str, subdir: str = SPILLOVER_SUB
     The write is read back and compared byte-for-byte before the caller tells the model "Full
     output saved": a partially-flushed or corrupted file (quota, ENOSPC race) fails closed to the
     bounded inline truncation instead of referencing an archive that silently lost bytes.
+    Writes use private permissions (0700 dir, 0600 file, O_NOFOLLOW) regardless of umask except on
+    the docker backend without ``docker_run_as_host_user``, where bind-mounted files follow umask.
     """
     data = content.encode("utf-8", errors="replace")
+    private = _archive_files_private()
     created = False
+    path = None
     try:
         from hermes_constants import get_hermes_home
         spill_dir = get_hermes_home() / subdir
-        spill_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_archive_dir(spill_dir, private=private)
         path = spill_dir / filename
-        with open(path, "xb" if exclusive else "wb") as fh:  # exclusive: never overwrite another original
-            created = True
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | (os.O_EXCL if exclusive else os.O_TRUNC)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_BINARY", 0)
+        )
+        fd = os.open(path, flags, 0o600 if private else 0o666)
+        created = True
+        try:
+            if private and hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            handle_cm = open(fd, "wb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with handle_cm as fh:
             fh.write(data)
         persisted_size = os.stat(path).st_size
         # Size first (cheap), then the bytes: the content is already in memory.
         exact = persisted_size == len(data) and path.read_bytes() == data
     except OSError as exc:
-        if exclusive and created:
+        if exclusive and created and path is not None:
             try:
                 path.unlink()
             except OSError as cleanup_error:
@@ -332,7 +443,8 @@ def write_pruned_original(content: str, session_id: str, tool_name: str, tool_ca
     ``(host path, stub path)``; the stub path is the ``~/``-relative display path, always ``/``-separated so
     the reference scan finds ``cache/pruned/<name>``; on a sandboxed backend it is the path the sandbox reads
     (:func:`_archive_stub_path`). None when the backend cannot open the archive or the write failed: the
-    caller then must keep that result unpruned.
+    caller then must keep that result unpruned. Archives are written private (0700 dir, 0600 file) except
+    on the docker backend without ``docker_run_as_host_user``, where bind-mounted files follow umask.
     """
     try:
         json.loads(content)
