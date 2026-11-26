@@ -188,7 +188,12 @@ def test_unwritable_store_degrades_once_throttles_and_catches_up_once(cron_store
     save_jobs([_due_job(), _half_paused_job(), once])
     ran, events, probes, writes = [], [], [], []
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", cron_store / "cron" / "executions.db")
-    monkeypatch.setattr(scheduler, "run_one_job", lambda job, **k: ran.append(job["id"]) or True)
+    # Keep the real worker and its catch-up accounting. Only the user workload is a double.
+    def run(job, **_kwargs):
+        ran.append(job["id"])
+        return True, "# report\n", "done", None
+    monkeypatch.setattr(scheduler, "run_job", run)
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda job: False)
     monkeypatch.setattr(scheduler, "_should_yield_tick_to_fresh_gateway", lambda: None)
     monkeypatch.setattr(scheduler, "_sweep_mcp_orphans", lambda: None)
     store_health.set_transition_listener(lambda event, record: events.append((event, record.skipped_runs)))
