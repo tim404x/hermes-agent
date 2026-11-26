@@ -1,7 +1,6 @@
 """Regex-based secret redaction for logs and tool output.
 
-Short tokens (< 18 chars) are fully masked; longer ones keep the first 6 and
-last 4 characters for debuggability.
+Opaque assignment values are fully masked; long vendor tokens can retain a display hint.
 """
 
 import copy
@@ -28,7 +27,7 @@ from agent.redact_credential_stores import (
 )
 from agent.redact_headers import (
     _COOKIE_HEADER_JSON_RE, _COOKIE_HEADER_JSON_UNTERMINATED_RE, _SECRET_HEADER_JSON_RE,
-    _SECRET_HEADER_JSON_UNTERMINATED_RE, json_header_value_is_credential, redact_cookie_assignments,
+    _SECRET_HEADER_JSON_UNTERMINATED_RE, _SECRET_HEADER_LINE_RE, json_header_value_is_credential, redact_cookie_assignments,
     redact_header_credentials,
 )
 from agent.redact_partial_keys import _redact_partial_private_keys
@@ -769,6 +768,9 @@ _URL_USERINFO_RE = re.compile(r"(https?|wss?|ftp)://([^/\s:@]+):([^/\s@]+)@")
 # followed by a token character is part of the value (``?token=abc'tail``); one followed by
 # anything else closes a quoted URL (``'…?token=abc')``, ``',``, ``'.strip()``) and stays.
 _STRICT_URL_PARAM_RE = re.compile(r"([?#&;])([A-Za-z0-9_.~+%\-]+)=([^#&;\s\"'<>]*(?:'[A-Za-z0-9_~+%\-][^#&;\s\"'<>]*)*)")
+_BEARER_SHORT_NAMES = frozenset({"t", "tk", "tok"})
+_BEARER_SHORT_PARAM_RE = re.compile(
+    r'''(?<=[?#&;])([tT%][A-Za-z0-9%]{0,80}+)=([A-Za-z0-9_=-]++)(?=$|[#&;\s"'<>\\])''')
 
 # Userinfo in absolute and network-path (``//user:pass@host``) references; the
 # authority stops at path/query/fragment delimiters. Anchored on the mandatory
@@ -949,6 +951,11 @@ def _mask_token(token: str) -> str:
     if not token:
         return "***"
     return mask_secret(token, head=6, tail=4, floor=18)
+
+
+def _mask_assignment_value(value: str, mask=_mask_token) -> str:
+    """Keep a display hint only for a known vendor prefix; file reads always use their sentinel."""
+    return mask(value) if mask is _mask_token_nonreusable or value.startswith(_PREFIX_SUBSTRINGS) else "***"
 
 
 # Output of an earlier pass: masking it again would erase the kind it keeps visible. Only a
@@ -1190,6 +1197,27 @@ def _decode_url_param_name(name: str) -> str:
     return decoded
 
 
+def _has_mixed_classes(value: str) -> bool:
+    return sum(any(check(char) for char in value) for check in (str.islower, str.isupper, str.isdigit)) >= 2
+
+
+def _is_bearer_shaped(value: str) -> bool:
+    return (len(value) >= 24 and re.fullmatch(r"[A-Za-z0-9_-]++=*+", value) is not None
+            and _has_mixed_classes(value))
+
+
+def _redact_bearer_short_params(text: str) -> str:
+    """Three rounds of percent-encoding can expand a three-letter name to 81 characters."""
+    if "=" not in text or not any(sep in text for sep in "?#&;"):
+        return text
+    folded = text.lower()
+    if "%" not in text and not any(name + "=" in folded for name in _BEARER_SHORT_NAMES):
+        return text
+    return _BEARER_SHORT_PARAM_RE.sub(
+        lambda match: match[1] + "=***" if _decode_url_param_name(match[1]).casefold() in _BEARER_SHORT_NAMES
+        and _is_bearer_shaped(match[2]) else match[0], text)
+
+
 def _canonical_url_param_name(name: str) -> str:
     """Decode a URL parameter name (up to 3 unquote rounds) for case-insensitive matching."""
     folded = _decode_url_param_name(name).casefold()
@@ -1198,14 +1226,12 @@ def _canonical_url_param_name(name: str) -> str:
     return folded if folded in _SENSITIVE_QUERY_PARAMS else folded.replace("-", "_")
 
 
-def _is_sensitive_url_param(name: str) -> bool:
-    """A query-param name that holds a credential: the URL-only names above, plus the names the JSON-field
-    rule masks (its closed list and the affixed-key policy: ``accessToken``, ``x-api-key``,
-    ``private_token``, ``secret_key``, ``passwd``, ``api_key_value``), so both passes agree on what a
-    secret is (#119852). Every ``redact_url_credentials=True`` caller shares this list, compaction
-    summaries included, so a ``pageToken`` or ``X-Amz-Credential`` value is masked there too, as the
-    JSON rule masks those fields."""
-    if _canonical_url_param_name(name) in _SENSITIVE_QUERY_PARAMS:
+def _is_sensitive_url_param(name: str, value: str) -> bool:
+    """Strict URL policy: credential names, including JSON aliases, or short names with a bearer value."""
+    canonical = _canonical_url_param_name(name)
+    if canonical in _BEARER_SHORT_NAMES:
+        return _is_bearer_shaped(value)
+    if canonical in _SENSITIVE_QUERY_PARAMS:
         return True
     decoded = _decode_url_param_name(name).replace("-", "_")  # camelCase kept: _key_name_words splits on it
     # Same suffix drop as _json_affixed_key_secret: ``api_key_value`` / ``passwordValue`` hold the credential.
@@ -1216,25 +1242,18 @@ def _is_sensitive_url_param(name: str) -> bool:
 def _redact_strict_url_credentials(text: str) -> str:
     """Strict egress-boundary redaction of URL credentials (absolute, relative and
     network references); preserves keys, separators, public params, hosts, paths."""
+    text = _redact_bearer_short_params(text)
     text = _STRICT_URL_PARAM_RE.sub(
         lambda m: f"{m.group(1)}{m.group(2)}=***"
-        if _is_sensitive_url_param(m.group(2)) else m.group(0), text)
+        if _is_sensitive_url_param(m.group(2), m.group(3)) else m.group(0), text)
     return _STRICT_URL_USERINFO_RE.sub("//***:***@", text)
 
 
 def redact_log_urls(text: str) -> str:
-    """Mask credential-named query params and URL userinfo in log-bound text.
-
-    A log file is a persistence boundary, not a live tool flow: magic-link /
-    OAuth-callback URLs only need their non-secret parts to survive on disk, so
-    the log path opts into the strict URL redactors that
-    ``redact_sensitive_text`` deliberately leaves off for live flows. Without
-    it, a remote MCP server configured as ``https://mcp.example.com/mcp?token=…``
-    lands its API key on every log line that mentions the URL (issue #133713).
-    """
-    if not text or "://" not in text or not _redact_enabled():
+    """Mask short bearers in all references; absolute log URLs also get the strict policy (#133713)."""
+    if not text or not _redact_enabled():
         return text
-    return _redact_strict_url_credentials(text)
+    return _redact_strict_url_credentials(text) if "://" in text else _redact_bearer_short_params(text)
 
 
 def redact_cdp_url(value: object) -> str:
@@ -1262,14 +1281,7 @@ def _redact_form_body(text: str) -> str:
 
 
 def _mask_token_nonreusable(token: str) -> str:
-    """Redact a prefix-matched credential to a NON-REUSABLE sentinel: no head/tail
-    chars (an agent once wrote a truncated-looking mask back into a config file),
-    only the vendor prefix label so the credential KIND stays visible.
-
-    * cannot be mistaken for a usable-but-truncated key, so an agent that reads it from a config file and
-    writes it back does NOT corrupt the stored credential into a dead 13-char string (issue #35519); and *
-    still does not leak the secret material (no head/tail chars).
-    """
+    """Keep only the vendor label, never a reusable or truncated-looking credential (#35519)."""
     label = next((sub for sub in _PREFIX_SUBSTRINGS if token.startswith(sub)), "") if token else ""
     return f"«redacted:{label}…»" if label else "«redacted-secret»"
 
@@ -1342,15 +1354,12 @@ def _redact_json_affixed_key_escaped(m: "re.Match[str]", mask) -> str:
 
 
 def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
-    """ENV / config / JSON / YAML assignment passes (skipped for code files). Passes
-    that would match ``token=``/``key=`` URL params skip ``://`` text (web-URL query
-    params are intentionally passed through, see redact_sensitive_text).
+    """Mask ENV/config/JSON/YAML assignments; file reads get a non-reusable sentinel (#35519)."""
+    token_mask = _mask_token_nonreusable if mask_nonreusable else _mask_token
 
-    ``mask_nonreusable`` masks the assignments with the ``«redacted:…»`` sentinel that
-    ``file_read=True`` already uses for prefix-matched credentials. Without it an agent
-    that read a secret-bearing file would hold a head/tail mask shaped like a real but
-    truncated key and could write it back as a dead credential (#35519)."""
-    mask = _mask_token_nonreusable if mask_nonreusable else _mask_token
+    def mask(value):
+        return _mask_assignment_value(value, token_mask)
+
     if "=" in text:
         text = redact_cookie_assignments(text, mask)
         if "://" not in text and _CFG_SECRET_WORD_RE.search(text):  # before the ENV passes: their ``\S+``
@@ -1358,20 +1367,9 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
         _redact_env = _assignment_sub(lambda g: f"{g[0]}={g[1]}{mask(g[2])}{g[1]}", check_keyword=True)
         text = _ENV_ASSIGN_RE.sub(_redact_env, text)
         if "://" not in text:  # lowercase names would match URL params
-            # Skip URLs — the query string may contain ``token=``/``key=`` params that are intentionally
-            # passed through (see note near the bottom of this function; _redact_strict_url_credentials
-            # handles the opt-in case). The uppercase regex above is all-caps-only, so it never matches URL
-            # params; the lowercase one would (issue #77484).
             text = _ENV_ASSIGN_LOWER_RE.sub(_redact_env, text)
         # The keyword pre-gate is exact and matters: _CFG_DOTTED_RE backtracks
         # quadratically on long unbroken [A-Za-z0-9_.\-] runs.
-        # Lowercase/dotted config keys (issue #16413). Skip URLs entirely — web-URL query params are
-        # intentionally passed through (see note near the bottom of this function); _DB_CONNSTR_RE still
-        # guards connection-string passwords. Extra gate: every _CFG_*_RE match requires a secret keyword in
-        # the key, so a text without any secret keyword cannot match — skipping is exact. This matters
-        # because _CFG_DOTTED_RE backtracks quadratically on long unbroken [A-Za-z0-9_.\-] runs (e.g.
-        # base64/hex blobs in compaction payloads); the linear keyword scan prevents that pathological path
-        # on secret-free text.
         if "://" not in text and _CFG_SECRET_WORD_RE.search(text):
             text = _CFG_DOTTED_RE.sub(_redact_env, text)
             text = _CFG_ANCHORED_RE.sub(_redact_env, text)
@@ -1401,6 +1399,8 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
     # quoted programmatic env lookups retain the same exemption as bare ones.
     if ":" in text and "://" not in text:
         def _redact_yaml(m):
+            if m.end() < len(m.string) and m.string[m.end()] not in "\r\n" and _SECRET_HEADER_LINE_RE.match(m.string, m.start()):
+                return m.group(0)
             key, sep, value = m.groups()
             quote = value[0] if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0] else ""
             inner = value[1:-1] if quote else value
@@ -1482,8 +1482,41 @@ def _redact_phone(m):
     return phone[:keep] + "****" + phone[-keep:]
 
 
+def _is_high_entropy_credential(value: str) -> bool:
+    return (len(value) >= 20 and not value.lower().startswith(("your", "example", "changeme", "xxx", "fixture-value-"))
+            and not _ENV_LOOKUP_VALUE_RE.match(value)
+            and re.fullmatch(r"[A-Za-z0-9_+/=.~-]++", value) is not None and _has_mixed_classes(value))
+
+
+def _redact_opaque_fields(text: str, code_file: bool, opaque_fields: bool, file_read: bool) -> str:
+    if not (code_file and opaque_fields and ":" in text):
+        return text
+
+    def field(match, group, key=None):
+        if key is not None and not (_JSON_KEY_NAMES_FULL_RE.fullmatch(key) or _is_python_repr_secret_key(key)
+                or (_key_has_secret_keyword(key) and {"password", "secret", "token"}.intersection(_key_name_words(key)))):
+            return match[0]
+        value = match[group]
+        if not _is_high_entropy_credential(value):
+            return match[0]
+        start, end = match.span(group)
+        mask = _mask_token_nonreusable(value) if file_read else "***"
+        return match[0][:start - match.start()] + mask + match[0][end - match.start():]
+
+    if '"' in text:
+        text = _JSON_FIELD_RE.sub(lambda match: field(match, 2), text)
+        text = _JSON_ANY_KEY_FIELD_RE.sub(lambda match: field(match, 3, match[2]), text)
+        if '\\"' in text:
+            text = _JSON_FIELD_ESCAPED_RE.sub(lambda match: field(match, 3), text)
+            text = _JSON_ANY_KEY_FIELD_ESCAPED_RE.sub(lambda match: field(match, 4, match[3]), text)
+    if "'" in text:
+        text = _PYTHON_REPR_FIELD_RE.sub(
+            lambda match: field(match, "single_value" if match["single_value"] else "double_value", match["key"]), text)
+    return text
+
+
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False,
-                          file_read: bool = False, secret_file: bool = False,
+                          file_read: bool = False, secret_file: bool = False, opaque_fields: bool = False,
                           redact_url_credentials: bool = False, keep_phone_numbers: bool = False) -> str:
     """Apply all redaction patterns to a block of text.
 
@@ -1491,36 +1524,15 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     disables); ``force=True`` is for safety boundaries that must never return
     raw secrets regardless.
 
-    ``redact_url_credentials=True``: also redact credential-named query params
-    and the entire URL userinfo (``***:***@``) — off by default because OAuth-callback /
-    magic-link / pre-signed URLs must survive ordinary tool flows unchanged.
-    ``code_file=True``: skip the ENV/JSON assignment passes for known source
-    code (``MAX_TOKENS=***``, ``"apiKey": "test"`` fixtures). ``file_read=True``
-    (implies code_file unless ``secret_file``): prefix-matched credentials become a
-    non-reusable sentinel (``«redacted:ghp_…»``) instead of a head/tail mask an agent
-    could write back into config.yaml as a dead credential.
-    Every regex sits behind a cheap substring gate that its pattern requires,
-    so the gates are never false-negative.
+    Short bearer parameters are masked in every mode. ``redact_url_credentials=True``
+    also masks credential-named parameters and entire URL userinfo. Ordinary tool flows
+    leave OAuth callbacks, magic links and pre-signed URLs usable by default (#34029).
 
-    Set code_file=True to also skip the Python-repr mapping pass (``{'API_KEY': '…'}``
-    fixtures in source); pytest/exception diagnostic lines get a narrow pass in
-    redact_terminal_output instead.
-
-    Set file_read=True for file *content* returned to the agent (read_file / search_files / cat). The old
-    mask looked like a real-but-truncated key, so an agent reading it from config.yaml and writing it back
-    silently corrupted the stored credential into a dead 13-char value → 401 (issue #35519). The sentinel is
-    syntactically invalid as a token, so it can't be mistaken for a usable key or written back as one.
-
-    Set ``secret_file=True`` when the caller has already classified the SOURCE as secret-bearing
-    (``_is_secret_file_arg``: command reads on the terminal side, resolved tool paths on the
-    file side). It re-enables the ENV/JSON/YAML assignment passes that ``file_read`` would
-    otherwise skip, so an opaque prefix-less credential assigned to a credential-shaped key is
-    masked instead of passed through in cleartext (issue #110567). With ``file_read=True`` those
-    assignments are masked with the non-reusable sentinel, so the #35519 write-back hazard stays
-    closed. ``secret_file`` is authoritative: it wins over ``code_file``, so a caller cannot be
-    fail-open by setting both. Files that are not secret-bearing (any source file, a project's own
-    ``config.yaml``) keep the code_file behaviour: ``MAX_TOKENS: 100`` and ``"apiKey": "test"``
-    fixtures are untouched.
+    ``code_file`` skips assignment/repr masking to preserve source fixtures. Opt into
+    ``opaque_fields`` for runtime output and data files: only opaque values under strong
+    secret keys are masked. ``file_read`` implies ``code_file`` and uses non-reusable
+    sentinels so an agent cannot write a truncated key back as a credential (#35519).
+    ``secret_file`` overrides ``code_file`` and restores full assignment masking (#110567).
     """
     if text is None:
         return None
@@ -1533,11 +1545,11 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         return text
     return redact_credential_shapes(text, force=force, code_file=code_file, file_read=file_read,
                                     secret_file=secret_file, redact_url_credentials=redact_url_credentials,
-                                    keep_phone_numbers=keep_phone_numbers)
+                                    keep_phone_numbers=keep_phone_numbers, opaque_fields=opaque_fields)
 
 
 def redact_credential_shapes(text: str, *, force: bool = False, code_file: bool = False,
-                             file_read: bool = False, secret_file: bool = False,
+                             file_read: bool = False, secret_file: bool = False, opaque_fields: bool = False,
                              redact_url_credentials: bool = False, keep_phone_numbers: bool = False) -> str:
     """The pattern passes of ``redact_sensitive_text`` alone: no registered exact values, no preference
     gate. A classifier (does this value have a credential shape?) must not read a registry, or another
@@ -1549,20 +1561,21 @@ def redact_credential_shapes(text: str, *, force: bool = False, code_file: bool 
     # Key blocks first: a body line holding a token prefix (``gAAAA``) would otherwise be masked into
     # ``gAAAAh...Y2Nj`` and end the partial-key run there, leaving the lines past it visible.
     text = _redact_private_key_blocks(text)
+    text = _redact_bearer_short_params(text)
+    text = _redact_opaque_fields(text, code_file=code_file, opaque_fields=opaque_fields, file_read=file_read)
     # Control/zero-width chars can split a token body so _PREFIX_RE alone misses it.
-    if _has_known_prefix_substring(text):
-        _prefix_sub = _mask_token_nonreusable if file_read else _mask_token
+    has_prefix = _has_known_prefix_substring(text)
+    token_mask = _mask_token_nonreusable if file_read else _mask_token
+    if has_prefix:
         # Control/zero-width chars (\\n, \\r, ESC, U+200B, …) split a token body so _PREFIX_RE cannot match
         # across them — a secret smuggled as ``sk-abc\\x1bdef…`` leaks verbatim (issue #77484). Mask such
         # runs by first matching on a control-stripped copy, then re-masking the corresponding span in the
         # original (the stripped copy and the original are aligned 1:1 for non-control chars).
-        text = mask_control_split_tokens(text, _prefix_sub, _PREFIX_RE, _PREFIX_SUB_RE, _is_glued_identifier)
-        text = mask_prefix_matches(text, _prefix_sub, _PREFIX_SUB_RE, _is_glued_identifier)
+        text = mask_control_split_tokens(text, token_mask, _PREFIX_RE, _PREFIX_SUB_RE, _is_glued_identifier)
 
     if "." in text:
-        _mask = _mask_token_nonreusable if file_read else _mask_token
-        text = _ZHIPU_API_KEY_RE.sub(lambda m: _mask(m.group(1)), text)
-        text = _redact_discord_tokens(text, _mask)
+        text = _ZHIPU_API_KEY_RE.sub(lambda match: token_mask(match[1]), text)
+        text = _redact_discord_tokens(text, token_mask)
 
     # Store lines first: the assignment passes would mask only the first word of ``password=a b``.
     aws_command_lines = []
@@ -1571,6 +1584,8 @@ def redact_credential_shapes(text: str, *, force: bool = False, code_file: bool 
         aws_command_lines = aws_credential_process_keys(text)
     if not code_file:
         text = outside_spans(text, aws_command_lines, lambda t: _redact_assignments(t, mask_nonreusable=file_read))
+    if has_prefix:
+        text = mask_prefix_matches(text, token_mask, _PREFIX_SUB_RE, _is_glued_identifier)
 
     # Flags and connection-string keys carry a credential in command text, so they are not
     # gated on code_file: the shape (``--password=`` / ``;AccountKey=``) is unambiguous, and
@@ -1628,15 +1643,6 @@ def redact_credential_shapes(text: str, *, force: bool = False, code_file: bool 
         text = _WEBAPP_LINK_CREDENTIAL_RE.sub(lambda m: m.group(1) + "***", text)
 
     if redact_url_credentials:  # opt-in; known credential shapes in URLs are caught above
-        # NOTE: Web-URL redaction (query params + userinfo + HTTP access-log request targets) is
-        # intentionally OFF. Many legitimate workflows pass opaque tokens through query strings — magic-link
-        # checkouts, OAuth callbacks the agent is meant to follow, pre-signed share URLs — and
-        # blanket-redacting param values by name breaks those skills mid-flow. DB connection-string
-        # passwords are still caught by _DB_CONNSTR_RE. The ONE userinfo case still redacted is the
-        # colon-less bare-token form ``scheme://TOKEN@host`` (#6396, handled by _URL_BARE_TOKEN_RE in the
-        # ``://`` block above): a bare credential in userinfo is never a round-trip workflow token (those
-        # live in the query string), so masking it can't break a skill. The ``user:pass@`` form is left to
-        # pass through per #34029.
         text = _redact_strict_url_credentials(text)
 
     if "&" in text and "=" in text:
@@ -1661,13 +1667,6 @@ def redact_derived_text(text: object) -> str:
     )
 
 
-# Commands whose stdout is an env-var dump: terminal redaction runs the
-# ENV-assignment pass (code_file=False) for these so opaque tokens with no vendor
-# prefix are masked; everything else uses code_file=True (``MAX_TOKENS=100``).
-# Commands whose stdout is an environment-variable dump (KEY=value lines), NOT source code.
-# ``MY_SERVICE_TOKEN=abc123randomstring``) are still masked. For all other commands, code_file=True is used
-# to avoid mangling legitimate source/config dumps (``MAX_TOKENS=100``, ``"apiKey": "x"`` fixtures,
-# ``postgresql://{user}`` f-string templates). See issue #43025.
 _ENV_DUMP_COMMANDS = frozenset({"env", "printenv", "set", "export", "declare"})
 
 # Commands that read file contents to stdout, plus the filter readers (``grep``/``awk``/``sed``)
@@ -1811,7 +1810,7 @@ def redact_terminal_output(output: str, command: str | None = None, *, force: bo
         return output
     secret_file = _command_reads_secret_file(command)
     code_file = not (secret_file or is_env_dump_command(command))
-    redacted = redact_sensitive_text(output, force=force, code_file=code_file, secret_file=secret_file)
+    redacted = redact_sensitive_text(output, force=force, code_file=code_file, secret_file=secret_file, opaque_fields=True)
     # Source-preserving output still gets the Python-repr pass on high-confidence
     # diagnostic lines (pytest ``E   `` introspection, final exception lines): that is
     # where {'BRAVE_API_KEY': '…'} leaks, not in source dumps.
@@ -1836,17 +1835,17 @@ def _mask_env_dump_line(m: "re.Match[str]", mask_env) -> str:
     quote = value[0] if len(value) > 1 and value[0] in "'\"" and value[-1] == value[0] else ""
     inner = value[1:-1] if quote else value
     if _should_redact_assignment(key, inner, check_keyword=True):
-        return f"{prefix}{key}={quote}{_mask_token(inner)}{quote}"
+        return f"{prefix}{key}={quote}{_mask_assignment_value(inner)}{quote}"
     return _ENV_ASSIGN_RE.sub(mask_env, m.group(0))
 
 
 def redact_code_output(output: str, *, force: bool = False) -> str:
     """Redaction for execute_code stdout/stderr: code_file=True, plus the ENV-assignment pass on
     lines shaped like an env dump so opaque prefix-less credentials are masked."""
-    redacted = redact_sensitive_text(output, force=force, code_file=True)
+    redacted = redact_sensitive_text(output, force=force, code_file=True, opaque_fields=True)
     if not redacted or "=" not in redacted or not (force or _redact_enabled()):
         return redacted
-    mask_env = _assignment_sub(lambda g: f"{g[0]}={g[1]}{_mask_token(g[2])}{g[1]}", check_keyword=True)
+    mask_env = _assignment_sub(lambda g: f"{g[0]}={g[1]}{_mask_assignment_value(g[2])}{g[1]}", check_keyword=True)
     return _ENV_DUMP_LINE_RE.sub(lambda m: _mask_env_dump_line(m, mask_env), redacted)
 
 # --- Prefix pre-screen: derived from _PREFIX_PATTERNS so a new prefix can't

@@ -65,7 +65,7 @@ class TestCookieCredentials:
         for text, tail in (
             ("SESSION_COOKIE='opaqueSessionValue1234567890';echo done", "';echo done"),
             ('{"output":"cookie=opaqueSessionValue1234567890","model":"m"}', '","model":"m"}'),
-            ("SESSION_COOKIE=opaqueSessionValue1234567890;echo done", "7890;echo done"),
+            ("SESSION_COOKIE=opaqueSessionValue1234567890;echo done", "***;echo done"),
             ("INFO x-api-key: opaqueSessionValue1234567890&& echo ok", "***&& echo ok"),
         ):
             out = redact_sensitive_text(text)

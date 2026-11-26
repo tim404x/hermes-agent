@@ -211,6 +211,16 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     return is_blocked_device_path(resolved)
 
 
+_SOURCE_CODE_SUFFIXES = frozenset({
+    ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".kt", ".rb", ".php", ".c",
+    ".cc", ".cpp", ".h", ".hpp", ".cs", ".swift", ".scala", ".sh", ".bash", ".zsh", ".lua", ".dart", ".m", ".mm",
+})
+
+
+def _is_source_code_path(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in _SOURCE_CODE_SUFFIXES
+
+
 def _resolved_match_path(path: str, task_id: str) -> str:
     """Best-effort task-cwd resolution of a search hit's path.
 
@@ -505,7 +515,7 @@ def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task
         rendered = result_dict["content"]
         result_dict["content"] = redact_sensitive_text(
             rendered, file_read=True,
-            secret_file=_is_secret_file_arg(str(_resolved)))
+            secret_file=_is_secret_file_arg(str(_resolved)), opaque_fields=not _is_source_code_path(_resolved))
         redacted = result_dict["content"] != rendered
     else:
         redacted = False
@@ -736,7 +746,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         if result.content:
             unredacted = result.content
             result.content = redact_sensitive_text(
-                unredacted, file_read=True, secret_file=_is_secret_file_arg(resolved_str))
+                unredacted, file_read=True, secret_file=_is_secret_file_arg(resolved_str),
+                opaque_fields=not _is_source_code_path(resolved_str))
             redacted = result.content != unredacted
             result_dict["content"] = result.content
 
@@ -1135,9 +1146,10 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         omitted = _filter_read_blocked_search_results(result, task_id)
         for m in getattr(result, "matches", None) or ():
             if getattr(m, "content", None):
+                match_path = _resolved_match_path(m.path, task_id)
                 m.content = redact_sensitive_text(
-                    m.content, file_read=True,
-                    secret_file=_is_secret_file_arg(_resolved_match_path(m.path, task_id)))
+                    m.content, file_read=True, secret_file=_is_secret_file_arg(match_path),
+                    opaque_fields=not _is_source_code_path(match_path))
         result_dict = result.to_dict(densify=True)
 
         if omitted:
