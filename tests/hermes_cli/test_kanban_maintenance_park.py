@@ -65,6 +65,34 @@ def test_four_maintenance_parks_in_a_row_never_reach_triage(board):
     ]
 
 
+def test_maintenance_park_against_active_work_repeated(board):
+    """Kepler t_c1e96549: a live worker parks its own run four times via the reason marker."""
+    task_id = _running_task(board)
+    base = int(time.time()) + 3600
+    run_ids = []
+    for window, tag in enumerate(["QUIET_WINDOW_1126", "QUIET_WINDOW_1126", "QUIET_WINDOW_1127", "QUIET_WINDOW_1127"]):
+        task = kb.get_task(board, task_id)
+        assert task.status == "running" and task.current_run_id is not None
+        run_ids.append(task.current_run_id)
+        if window:
+            # A stale worker from the previous attempt cannot park the live run.
+            assert not kb.schedule_task(board, task_id, reason="late", expected_run_id=run_ids[-2])
+        until = base + window * 3600
+        iso = datetime.fromtimestamp(until, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        reason = f"{tag}: parked at a checkpoint. SCHEDULED_UNTIL={iso}"
+        assert kb.schedule_task(board, task_id, reason=reason, expected_run_id=task.current_run_id)
+        parked = kb.get_task(board, task_id)
+        assert (parked.status, parked.scheduled_until, parked.current_run_id) == ("scheduled", until, None)
+        assert kb.release_due_scheduled(board, now=until - 1) == []
+        assert kb.release_due_scheduled(board, now=until) == [task_id]
+        assert kb.claim_task(board, task_id, claimer="worker") is not None
+        task = kb.get_task(board, task_id)
+        assert (task.status, task.block_kind, task.block_recurrences) == ("running", None, 0)
+    outcomes = {run.id: run.outcome for run in kb.list_runs(board, task_id)}
+    assert [outcomes[rid] for rid in run_ids] == ["scheduled"] * 4
+    assert "triage" not in {(e.payload or {}).get("status") for e in kb.list_events(board, task_id)}
+
+
 def test_maintenance_parks_do_not_feed_a_prior_transient_count(board):
     """26 Nov GRIP/FLEET: planned parks neither increment nor forgive a genuine failure."""
     task_id = _running_task(board)
