@@ -8,6 +8,7 @@ every later resume was refused ``admission_conflict``. A local route belongs to 
 the authority advances it (compression, reset), and the first admitted turn reopens a stamped row.
 """
 from types import SimpleNamespace
+import time
 
 import pytest
 from persistence_assembly import close_stores_under
@@ -38,6 +39,44 @@ async def _local_session(tmp_path, monkeypatch):
 def _rows(db):
     with raw_holder(db)._read_ctx() as conn:
         return [row[0] for row in conn.execute('SELECT id FROM sessions ORDER BY started_at')]
+
+
+@pytest.mark.parametrize('surface', ['oneshot', 'cron'])
+def test_old_finite_session_keeps_its_exact_route_on_first_store_touch(owner, tmp_path, monkeypatch, surface):
+    from cron import jobs
+    from gateway import run, session_cron
+    from gateway.session import SessionStore
+    from gateway.session_contract import SessionActor
+    from gateway.session_local import commit_local_session, create_local_session
+    from gateway.session_local_recovery import restore_local_session
+    from persistence.authority.vocabulary import RETRY_HORIZON_S
+
+    owner.runner.adapters = {}
+    monkeypatch.setattr(run, '_load_gateway_config', lambda: {'model': {}, 'platform_toolsets': {'cli': []}})
+    if surface == 'cron':
+        monkeypatch.setattr(jobs, 'get_job', lambda jid: {'id': jid, 'prompt': 'probe', 'model': 'frozen'})
+        receipt, _ = session_cron._create(owner, session_cron._actor(owner, None),
+                                         {'job_id': 'job', 'request_id': 'fire', 'extra_prompt': None})
+        commit_local_session(owner.persistence, epoch=owner.epoch, receipt=receipt)
+        ref = restore_local_session(owner, receipt['session_id'])
+    else:
+        actor = SessionActor('owner', owner.profile_id, frozenset({'session:create', 'session:read'}), 'socket')
+        ref = create_local_session(owner, actor, {'request_id': 'finite', 'source': surface,
+                                   'cwd': str(tmp_path), 'model': 'frozen', 'toolsets': []})
+    live, warm = owner.sessions[ref.session_id], owner.runner.session_store
+    original = warm.lookup_by_session_key(live.route).to_dict()
+    assert original == owner.persistence.bindings.receipt(ref.session_id).entry
+    warm._save_entries()
+    owner.persistence.sessions.end(ref.session_id, 'cron_complete' if surface == 'cron' else 'cli_close')
+    raw_holder(owner.persistence)._write_sql('UPDATE sessions SET ended_at=? WHERE id=?',
+                                            (time.time() - 2 * RETRY_HORIZON_S, ref.session_id))
+    cold = SessionStore(warm.sessions_dir, warm.config)
+    cold._db = owner.persistence
+    try:
+        assert cold.get_or_create_session(live.source, touch_activity=False).to_dict() == original
+        assert _rows(owner.persistence) == [ref.session_id]
+    finally:
+        cold.close_all_db_handles()
 
 
 @pytest.mark.asyncio

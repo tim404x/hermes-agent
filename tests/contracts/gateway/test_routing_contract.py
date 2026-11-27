@@ -33,6 +33,32 @@ def _sessions(backend, scope: ProfileScope, *session_ids: str) -> None:
 # ── routing index ─────────────────────────────────────────────────────────────
 
 
+def test_gateway_generation_filters_unchanged_retired_without_overwriting_direct_routes(backend, scope_a):
+    routing = backend.open(scope_a).routing
+    targets = {'agent:mine:unchanged': 'gone', 'agent:mine:changed': 'also-gone', 'keep': 'before'}
+    routing.fence_retired_routes(['gone', 'also-gone'], namespace='mine')
+    routing.upsert_routing_entry('keep', entry('direct'))
+    routing.upsert_routing_entry('agent:mine:unchanged', entry('repointed'))
+    retired, _ = routing.save_routing_edits({'agent:mine:changed': entry('also-gone')}, set(), targets,
+                                            routing_scope='', mirror=False)
+    assert retired == {key for key, sid in targets.items() if routing.route_retired(key, entry(sid))}
+    assert routing.load_routing_entries() == {'keep': entry('direct'), 'agent:mine:unchanged': entry('repointed')}
+
+
+def test_reconcile_consumes_only_committed_fallback_preserving_newer_targets(backend, scope_a):
+    routing = backend.open(scope_a).routing
+    routing.upsert_routing_entry('delete', entry('old'))
+    routing.upsert_routing_entry('conflict', entry('newer'))
+    pending = {'delete': (entry('old'), None), 'conflict': (entry('old'), entry('late'))}
+    missing = {'legacy': entry('import'), 'conflict': entry('stale')}
+    routing.reconcile_routing_mirror(missing, pending, routing_scope='', digest='first', owner=None)
+    assert routing.load_routing_entries() == {'legacy': entry('import'), 'conflict': entry('newer')}
+    routing.upsert_routing_entry('delete', entry('old'))
+    routing.reconcile_routing_mirror({}, {}, routing_scope='', digest='another-file', owner=None)
+    routing.reconcile_routing_mirror(missing, pending, routing_scope='', digest='first', owner=None)
+    assert routing.load_routing_entries()['delete'] == entry('old')
+
+
 def test_upsert_stores_the_text_as_given_and_the_latest_write_wins(backend, scope_a):
     store_a = backend.open(scope_a)
     odd = '{"session_id":"s1",  "z": 1, "a": [1,2]}'

@@ -68,6 +68,7 @@ def _db_with_rows(rows: dict) -> MagicMock:
     db.get_session.side_effect = lambda sid: rows.get(sid)
     db.sessions.get.side_effect = lambda sid: _record(rows[sid]) if sid in rows else None
     db.routing.latest_session_for_peer.return_value = None
+    db.routing.save_routing_edits.return_value = (set(), 'mock-owner')
     # Identity compression tip (no child session).
     db.get_compression_tip.side_effect = db.lineage.tip.side_effect = lambda sid: sid
     return db

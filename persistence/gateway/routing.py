@@ -239,12 +239,28 @@ class RoutingRepository(Protocol):
 
     # ── writes ──────────────────────────────────────────────────────────────
 
+    def save_routing_edits(self, puts: Mapping[str, str], deletes: set[str], targets: Mapping[str, str], *,
+                           routing_scope: str, mirror: bool, repairs: Mapping[str, str] | None = None,
+                           prior: Mapping[str, str] | None = None) -> tuple[set[str], str | None]:
+        """Apply only gateway edits, returning all retired snapshot keys and the scoped mirror identity."""
+        ...
+
+    def reconcile_routing_mirror(self, missing: Mapping[str, str], pending: Mapping[str, tuple[str | None, str | None]],
+                                 *, routing_scope: str, digest: str, owner: str | None) -> dict[str, str | None]:
+        """Import still-missing legacy keys, conditionally replay fallback edits, and consume these exact bytes
+        atomically. Return primary values for the candidates (None for an absent/retired key)."""
+        ...
+
     def upsert_routing_entry(self, session_key: str, entry_json: str, *, routing_scope: str = "") -> None:
         """Insert or replace the entry under ``session_key`` in ``routing_scope``. An empty key or entry is a silent no-op; a retired route (``route_retired``) is silently skipped inside the same write."""
         ...
 
-    def replace_routing_entries(self, entries: Mapping[str, str], *, routing_scope: str = "") -> set[str]:
-        """Replace ``routing_scope``'s whole index with ``entries`` in one write (keys absent from ``entries`` go; other routing scopes are untouched). Pairs with an empty key or entry are dropped; retired routes are skipped, and their keys are returned so the sessions.json mirror leaves them out too."""
+    def replace_routing_entries(
+        self, entries: Mapping[str, str], *, routing_scope: str = "", rewrite: bool = False,
+    ) -> set[str]:
+        """Replace ``routing_scope``'s index in one transaction; absent keys go and other scopes are untouched.
+        Writes only the difference; ``rewrite=True`` rewrites the whole scope (repair). Empty keys or entries
+        are dropped; retired routes are skipped and their keys returned so the sessions.json mirror omits them."""
         ...
 
     def fence_retired_routes(self, session_ids: Iterable[str], *, namespace: str, expiring: Iterable[str] = ()) -> None:
@@ -328,7 +344,7 @@ class RoutingRepository(Protocol):
         """Whether a routing save must skip this entry, judged against the profile the route belongs to: this store's own retirement marker of the entry's ``$.session_id`` for a ``main`` route, or a route fence for the key's namespace that has not aged out (a ``main`` fence only while this store holds no session of that id)."""
         ...
 
-    def load_routing_entries(self, *, routing_scope: str = "") -> dict[str, str]:
+    def load_routing_entries(self, *, routing_scope: str = "", fresh: bool = False) -> dict[str, str]:
         """``routing_scope``'s index as ``{session_key: entry_json}``, the text as stored."""
         ...
 

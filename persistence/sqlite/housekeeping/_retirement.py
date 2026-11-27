@@ -8,7 +8,8 @@ import time
 
 from ..conversation._store.retirement import RETIRED_PREFIX
 from ..conversation._store.terminal import ADMISSION_PREFIX, RESULT_PREFIX, WORKER_PREFIX, identity_key
-from ..gateway._routes import _EXPIRED, RETRY_HORIZON_S, ROUTE_FENCE_PREFIX, _reclaim_expired
+from ..gateway._revision import ROUTE_FENCE_PREFIX
+from ..gateway._routes import _EXPIRED, RETRY_HORIZON_S, _reclaim_expired
 
 __all__ = ["prune_retired_tombstones"]
 

@@ -66,6 +66,7 @@ def _db_returning(rows: dict) -> MagicMock:
     db.sessions.get.side_effect = (
         lambda sid: SimpleNamespace(origin=None, chat_id=None, **rows[sid]) if sid in rows else None)
     db.routing.route_retired.return_value = False
+    db.routing.save_routing_edits.return_value = (set(), 'mock-owner')
     return db
 
 

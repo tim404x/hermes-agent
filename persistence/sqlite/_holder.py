@@ -43,7 +43,7 @@ from persistence.sqlite._state.guard import (
     _register_test_instance,
 )
 from persistence.sqlite._state.readpool import (
-    _READ_POOL_MAX, _proc_fd_targets, _read_budget_for, note_read_pool_exhausted,
+    _READ_POOL_MAX, _proc_fd_targets, _read_budget_for, note_read_pool_exhausted, reserved_preparation_reader,
 )
 from persistence.sqlite._state import holders as _state_holders
 from persistence.sqlite._state import lockguard as _lockguard
@@ -649,7 +649,8 @@ class StoreHolder:
             return self._get_read_conn()
 
     @contextmanager
-    def _read_ctx(self, *, reopen: bool = True, pooled_only: bool = False) -> Iterator[sqlite3.Connection]:
+    def _read_ctx(self, *, reopen: bool = True, pooled_only: bool = False,
+                  fresh: bool = False) -> Iterator[sqlite3.Connection]:
         """Yield a connection for read-only statements: a pooled read-only
         connection with NO lock under WAL; otherwise (non-WAL, open failure,
         ceiling reached) the writer connection under self._lock — deliberate
@@ -657,8 +658,9 @@ class StoreHolder:
         ``reopen=False``: a read after ``close()`` raises instead of reopening the
         writer (an optional reader must not hold a home that is being deleted). Inside this thread's
         ``transcript_read_snapshot``: its connection, so every read there sees one generation.
-        ``pooled_only``: None instead of the writer connection when no pooled reader is available."""
-        pinned = self._pinned_read_conn()
+        ``pooled_only``: None instead of the writer connection when no pooled reader is available.
+        ``fresh``: a write preparing an optimistic commit must not reuse an outer transcript snapshot."""
+        pinned = None if fresh else self._pinned_read_conn()
         if pinned is not None:
             yield pinned
             return
@@ -701,6 +703,22 @@ class StoreHolder:
             finally:
                 with suppress(sqlite3.Error):
                     conn.execute(f"PRAGMA busy_timeout={int(previous_ms)}")
+
+    @contextmanager
+    def independent_read_connection(self) -> Iterator[sqlite3.Connection]:
+        """For optimistic write preparation: never an outer snapshot or the locked writer. In
+        rollback-journal mode (or with a closed pool), lease a short-lived budgeted reader instead."""
+        with self._read_ctx(fresh=True, pooled_only=True) as conn:
+            if conn is not None:
+                yield conn
+                return
+        with reserved_preparation_reader(self._WRITE_PATIENCE_S):
+            conn = self._connect_read_only(timeout=_READ_BUSY_TIMEOUT_S)
+            try:
+                apply_database_pragmas(conn, db_label="state.db")
+                yield conn
+            finally:
+                self._close_conn_logged(conn, 'write preparation reader')
 
     @contextmanager
     def _read_ctx_with_timeout(self, busy_timeout_s: float) -> Iterator[sqlite3.Connection]:
