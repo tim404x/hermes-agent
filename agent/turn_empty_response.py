@@ -89,17 +89,44 @@ def _settled_notice(agent: Any) -> bool:
     )
 
 
-def _current_turn_had_tool(messages: list[dict[str, Any]]) -> bool:
-    """True when a tool result landed after the current turn's user message."""
+def _current_turn_had_tool(agent: Any, messages: list[dict[str, Any]]) -> bool:
+    """True when a tool result landed within the current turn (ignoring prior turns,
+    while never letting an in-turn delivered steer row hide an earlier tool result)."""
+    from agent.prompt_builder import STEER_DISPLAY_KIND
+
+    turn_start = getattr(agent, "_current_turn_user_idx", None)
+    if isinstance(turn_start, int) and 0 <= turn_start < len(messages):
+        window = messages[max(turn_start + 1, len(messages) - 5):]
+        return any(isinstance(m, dict) and m.get("role") == "tool" for m in window)
     for msg in reversed(messages[-5:]):
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
         if role == "tool":
             return True
-        if role == "user":
+        if role == "user" and msg.get("display_kind") != STEER_DISPLAY_KIND:
             return False
     return False
+
+
+def _strip_reasoning_only(text: str) -> str:
+    """Strip ONLY reasoning/thinking blocks using the shared tag set (preserving malformed
+    ``<tool_call>`` / ``<function>`` XML so dropped tool output never looks like a quiet blank)."""
+    if not text:
+        return ""
+    from agent.agent_runtime_helpers import (
+        _ORPHAN_REASONING_TAG_PATTERN,
+        _REASONING_BLOCK_PATTERNS,
+        _UNTERMINATED_REASONING_BLOCK_PATTERN,
+    )
+    cleaned = text
+    for pattern in (
+        *_REASONING_BLOCK_PATTERNS,
+        _UNTERMINATED_REASONING_BLOCK_PATTERN,
+        _ORPHAN_REASONING_TAG_PATTERN,
+    ):
+        cleaned = pattern.sub("", cleaned)
+    return cleaned
 
 
 def notice_silence_marker(agent: Any, visible: str) -> bool:
@@ -130,7 +157,7 @@ def notice_final_text(agent: Any, message: Any, text: str, response: Any, finish
         agent._notice_work = None
     if not _settled_notice(agent):
         return ("" if is_intentional_silence_response(agent._strip_think_blocks(text)) else text), False
-    if agent._strip_think_blocks(text).strip():
+    if _strip_reasoning_only(text).strip():
         return text, False
     streamed = (agent._current_streamed_assistant_text or "").strip()
     if streamed:
@@ -142,13 +169,13 @@ def notice_final_text(agent: Any, message: Any, text: str, response: Any, finish
     reasoning_fields = ("reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items")
     if agent._last_content_with_tools or agent._post_tool_empty_retried:
         return text, False
-    # Thinking/reasoning models (Gemini adaptive thinking, GPT Responses API, inline <think>)
+    # Thinking/reasoning models (Gemini adaptive thinking, GPT Responses API, inline <think>/<thought>/<mm:think>)
     # emit reasoning even when intentionally stopping quietly on an internal wake. Keep PR #64's
     # safety check on the first attempt (so a mid-thought cutoff gets one completion reminder),
     # then settle quietly if the model still produces a confirmed-stop blank after that reminder.
     has_reasoning = (
         any(getattr(message, key, None) for key in reasoning_fields)
-        or bool(_INLINE_THINK_RE.search(text or ""))
+        or (bool((text or "").strip()) and not _strip_reasoning_only(text or "").strip())
     )
     if agent._thinking_prefill_retries == 0 and has_reasoning:
         return text, False
@@ -397,14 +424,35 @@ def recover_empty_response(
         return _verdict("break")
 
     # Post-tool-call empty (no prior content, or only mid-task narration): nudge once.
-    _prior_was_tool = _current_turn_had_tool(messages)
-    # Ollama puts <think> in content, not reasoning_content, so _has_structured misses
-    # it; detect here to route to the thinking-only reminder.
-    _has_inline_thinking = bool(_INLINE_THINK_RE.search(final_response or ""))
+    _prior_was_tool = _current_turn_had_tool(agent, messages)
+    # Ollama and other open models put reasoning tags (<think>/<thought>/<mm:think>) in content,
+    # not reasoning_content, so detect using the shared reasoning-only stripper (ignoring malformed
+    # <tool_call> blocks).
+    _raw_final = final_response or ""
+    _has_inline_thinking = bool(
+        _INLINE_THINK_RE.search(_raw_final)
+        or (bool(_raw_final.strip()) and not _strip_reasoning_only(_raw_final).strip())
+    )
+    _has_structured = bool(
+        getattr(assistant_message, "reasoning", None)
+        or getattr(assistant_message, "reasoning_content", None)
+        or getattr(assistant_message, "reasoning_details", None)
+        or getattr(assistant_message, "codex_reasoning_items", None)
+        or _has_inline_thinking
+    )
+    # On a settled machinery notice with no prior mid-task narration, route a reasoning-only
+    # blank to the thinking reminder first instead of setting _post_tool_empty_retried (which
+    # would block quiet settlement on the follow-up).
+    _settled_reasoning_notice = (
+        _settled_notice(agent)
+        and _has_structured
+        and not agent._last_content_with_tools
+    )
     if (
         _prior_was_tool
         and not getattr(agent, "_post_tool_empty_retried", False)
         and not _has_inline_thinking
+        and not _settled_reasoning_notice
     ):
         agent._post_tool_empty_retried = True
         # Clear stale narration so it doesn't resurface on a later empty response.
@@ -418,13 +466,6 @@ def recover_empty_response(
 
     # A thinking-only assistant prefill is stripped by the send-time sanitizer, making
     # that retry byte-identical. Send a completion reminder on the input instead.
-    _has_structured = bool(
-        getattr(assistant_message, "reasoning", None)
-        or getattr(assistant_message, "reasoning_content", None)
-        or getattr(assistant_message, "reasoning_details", None)
-        or getattr(assistant_message, "codex_reasoning_items", None)
-        or _has_inline_thinking
-    )
     if _has_structured and agent._thinking_prefill_retries < 2:
         agent._thinking_prefill_retries += 1
         logger.info(

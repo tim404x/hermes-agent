@@ -1627,7 +1627,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "user_intervened": bool(result.get("user_intervened", False)),
             "steer_delivered": bool(result.get("steer_delivered", False)),
-            "has_pending_steer": bool(result.get("pending_steer")),
+            "has_pending_steer": bool(result.get("has_pending_steer") or result.get("pending_steer")),
             "error": result.get("error"),
             **{key: result[key] for key in _FAILURE_DESCRIPTOR_KEYS if key in result},
             "compression_exhausted": result.get("compression_exhausted", False),

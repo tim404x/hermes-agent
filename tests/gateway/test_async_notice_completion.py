@@ -129,6 +129,11 @@ async def test_live_incident_unconsumed_steer_on_reasoning_notice_hands_off_quie
     delivered = await runner._handle_message_with_agent(event, event.source, entry.session_key, 1)
     assert len(calls) == 3
     assert delivered == "Full plan saved and sent for adversarial review."
+    handoff_messages = calls[2]["messages"]
+    assert handoff_messages[-1]["role"] == "user"
+    assert "Can you create the full plan?" in str(handoff_messages[-1]["content"])
+    assert handoff_messages[-2]["role"] == "assistant"
+    assert handoff_messages[-2]["content"] == "[SILENT]"
     updates = [message["content"].lower() for message in (*adapter.sent, *adapter.edits)]
     assert not any(word in update for update in updates for word in (
         "didn't produce a reply", "estimated cost", "send `continue`", "⚠",

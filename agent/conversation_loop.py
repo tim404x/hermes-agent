@@ -372,6 +372,8 @@ def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text
         _correction_row["content"] = format_steer_marker(text).lstrip()
         _correction_row["display_kind"] = STEER_DISPLAY_KIND
     append_message(messages, _correction_row)
+    agent._turn_steer_delivered = True
+    agent._notice_work = None
 
     # Stateful scrubber for <memory-context> spans split across stream deltas (#5719).  sanitize_context()
     # alone can't survive chunk boundaries because the block regex needs both tags in one string.
