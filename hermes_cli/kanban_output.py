@@ -16,7 +16,7 @@ _STATUS_ICONS = {c.key: c.icon for c in kanban_workflow.DEFAULT_WORKFLOW} | {kan
 _TASK_DICT_FIELDS = (
     "id", "title", "body", "assignee", "status", "priority", "tenant",
     "workspace_kind", "workspace_path", "branch_name", "project_id",
-    "created_by", "created_at", "started_at", "completed_at", "result",
+    "created_by", "created_at", "started_at", "completed_at", "scheduled_until", "result",
     "skills", "max_runtime_seconds", "max_retries", "model_override", "provider_override",
     "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
 )

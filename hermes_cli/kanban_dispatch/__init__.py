@@ -1,1 +1,1 @@
-"""Dispatch reporting: results defines the outcome and suppression summary of a board tick."""
+"""Board dispatch: results reports tick outcomes; resume handles deadlines and run recovery."""

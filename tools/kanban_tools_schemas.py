@@ -176,7 +176,8 @@ KANBAN_BLOCK_SCHEMA = _schema(
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
-        "block on things you can resolve yourself."
+        "block on things you can resolve yourself. For a planned pause (maintenance window, waiting until a known "
+        "time) use kanban_schedule with `until` instead: it never counts toward triage."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
@@ -202,10 +203,10 @@ KANBAN_BLOCK_SCHEMA = _schema(
 KANBAN_SCHEDULE_SCHEMA = _schema(
     "kanban_schedule",
     (
-        "Park your task as 'scheduled' while it waits for a time or external event. This ends the current run and makes the "
-        "task non-dispatchable until an orchestrator unblocks it; it does not "
-        "create a timer. Put any wake-up marker such as "
-        "``SCHEDULED_UNTIL=<ISO8601>`` in ``reason``."
+        "Park your task for a maintenance or quiet window, or any wait until a known time. "
+        "Set `until` to resume automatically. This ends the current run but, unlike kanban_block, "
+        "never counts toward the unblock-loop limit: repeated parks never send the task to triage. "
+        "Goal-mode tasks require a future resume time at most 12 hours away."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
@@ -213,6 +214,13 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
             "Optional reason or machine-readable wake-up marker recorded on "
             "the completed run and scheduled event."
         )),
+        "until": {
+            "type": ["string", "integer"],
+            "description": "When to resume: ISO8601 with Z or offset (e.g. 2026-11-27T04:21:00Z) or epoch "
+                           "seconds. The dispatcher resumes the task in ready or review once its parents are done. "
+                           "If omitted, a SCHEDULED_UNTIL=<ISO8601> marker in reason is used; with neither, "
+                           "the task waits for an orchestrator unblock.",
+        },
     },
     [],
 )

@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 from agent.delegation_context import owned_kanban_task
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
+from hermes_cli.kanban_dispatch.resume import GOAL_MODE_BLOCK_ALLOWED_KINDS, format_scheduled_until, goal_schedule_error
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
@@ -435,11 +436,11 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
-    "created_at started_at completed_at result current_run_id model_override "
+    "created_at started_at completed_at scheduled_until result current_run_id model_override "
     "provider_override completion_contract last_failure_error".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
-    "created_at started_at completed_at current_run_id model_override provider_override".split())
+    "created_at started_at completed_at scheduled_until current_run_id model_override provider_override".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
@@ -462,9 +463,6 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 
 
 # --- Goal-mode judge gate ---
-
-_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
-
 
 def _goal_judge_available() -> bool:
     """``judge_goal`` fails open (no auxiliary model -> ``"continue"``), which is
@@ -847,9 +845,9 @@ def _handle_block(args: dict, **kw) -> str:
         # worker cannot resolve itself; `capability` and `transient` (or an unset kind) route back through
         # kanban_complete, which the judge now gates.
         task = kb.get_task(conn, tid)
-        _check(not (task and task.goal_mode and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS),
+        _check(not (task and task.goal_mode and kind not in GOAL_MODE_BLOCK_ALLOWED_KINDS),
                f"goal_mode tasks can only block with kind in "
-               f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
+               f"{sorted(GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
@@ -869,23 +867,25 @@ def _handle_block(args: dict, **kw) -> str:
 
 @_kanban_handler("kanban_schedule")
 def _handle_schedule(args: dict, **kw) -> str:
-    """Park the current task until an orchestrator re-gates it."""
+    """Park the current task until its deadline or an orchestrator unblock."""
     tid = _worker_guard("kanban_schedule", args)
     raw_reason = args.get("reason")
     _check(raw_reason is None or isinstance(raw_reason, str), "reason must be a string")
     reason = _redact(raw_reason.strip()) if raw_reason and raw_reason.strip() else None
     with _board(args.get("board")) as (kb, conn):
-        # The goal loop treats ``scheduled`` as terminal like ``blocked``, so
-        # parking would bypass the completion judge (see kanban_block, #38696).
+        raw_until = args.get("until")
+        until = kb.coerce_until(raw_until) if raw_until is not None else kb.parse_scheduled_until(reason)
         task = kb.get_task(conn, tid)
-        _check(not (task and task.goal_mode),
-               "goal_mode tasks cannot be scheduled: use kanban_block with kind "
-               f"in {sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} for a genuine external "
-               "blocker, or kanban_complete so the completion judge can evaluate it.")
+        # A bounded auto-resuming park returns the card to the goal loop; it cannot escape the completion judge.
+        if task and task.goal_mode:
+            error = goal_schedule_error(until, int(time.time()))
+            if error:
+                raise _Reject(error)
         ok = kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
+            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid), until=until)
         _check(ok, f"could not schedule {tid} (unknown id or not in todo/ready/running/blocked)")
-        return _ok_landed(kb, conn, tid, "scheduled", reason=reason)
+        extra = {"scheduled_until": format_scheduled_until(until)} if until is not None else {}
+        return _ok_landed(kb, conn, tid, "scheduled", reason=reason, **extra)
 
 
 @_kanban_handler("kanban_request_review")
