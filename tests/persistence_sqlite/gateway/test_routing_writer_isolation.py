@@ -210,6 +210,18 @@ def test_legacy_nontext_session_ids_do_not_break_an_unrelated_generation(backend
     assert set(store.routing.load_routing_entries()) == {'none', 'ordinary'}
 
 
+def test_retired_generation_matches_the_id_actually_decoded_from_legacy_rows(backend, scope_a):
+    store = backend.open(scope_a)
+    rows = {'duplicate': '{"session_id":"old","session_id":"gone"}',
+            'keep': '{"session_id":"gone","session_id":"direct"}',
+            'nan': '{"other":NaN,"session_id":"gone"}', 'invalid': '{'}
+    store.holder()._write_sql("INSERT INTO gateway_routing VALUES ('',?,?,0)", rows.items(), many=True)
+    store.holder()._write_sql("INSERT INTO state_meta VALUES ('gateway.retired_session.v1.gone','{}')")
+    retired, _ = store.routing.save_routing_edits({}, set(), dict.fromkeys(rows, 'gone'), routing_scope='', mirror=False)
+    assert retired == rows.keys()
+    assert store.routing.load_routing_entries() == {key: rows[key] for key in ('keep', 'invalid')}
+
+
 @pytest.mark.parametrize('count', [1, 20])
 def test_retired_set_rechecks_rows_inserted_after_reader(backend, scope_a, count):
     store = backend.open(scope_a)

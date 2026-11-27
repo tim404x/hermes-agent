@@ -14,7 +14,7 @@ from ..conversation._store.retirement import RETIRED_PREFIX
 from ._delta import _Fences, _PUT
 from ._revision import ROUTE_FENCE_PREFIX, fences_changed, revision, verified_schema
 from ._routes import FENCE_EXPIRY, ROUTE_RETIRED_SQL, route_retired_params
-from ._targets import ROUTE_TARGET_SQL
+from ._targets import stored_target
 
 
 def _meta(conn, key):
@@ -77,9 +77,8 @@ class _LiveGeneration:
 def _retired_drops(conn, scope, retired, targets, prior):
     drops = []
     for key in retired:
-        row = conn.execute(f'SELECT entry_json,CAST({ROUTE_TARGET_SQL} AS TEXT) FROM gateway_routing WHERE scope=? AND session_key=?',
-                           (scope, key)).fetchone()
-        if row and (row[1] == targets[key] or _matches(row[0], prior.get(key))):
+        text = _current(conn, scope, key)
+        if text is not None and (_id_text(conn, stored_target(text)) == targets[key] or _matches(text, prior.get(key))):
             drops.append((scope, key))
     return drops
 
@@ -92,13 +91,19 @@ def _write_edits(conn, scope, puts, deletes, repairs, retired, stale, now):
                      ((now, puts[key], scope, key, repairs[key]) for key in repairs if key in puts and key not in retired))
 
 
+def _id_text(conn, sid):
+    if sid is None or isinstance(sid, str):
+        return sid
+    return conn.execute("SELECT CAST(json_extract(?,'$') AS TEXT)", (json.dumps(sid),)).fetchone()[0]
+
+
 def _text_targets(holder, entries):
     targets = dict(entries)
     legacy = [key for key, sid in targets.items() if not isinstance(sid, str)]
     if legacy:
         with holder.independent_read_connection() as reader:
             for key in legacy:
-                sid = reader.execute("SELECT CAST(json_extract(?,'$') AS TEXT)", (json.dumps(targets[key]),)).fetchone()[0]
+                sid = _id_text(reader, targets[key])
                 if sid is None:
                     del targets[key]
                 else:

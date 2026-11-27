@@ -111,6 +111,7 @@ def test_gateway_10k_competing_writers(tmp_path, monkeypatch, mode):
         assert len(totals['save']) == 20 and all(len(totals[name]) >= 20 for name in ('upsert', 'retire', 'admit'))
         assert sum(count != 0 for count in writes['save']) == 20
         assert max(writes['save']) <= 3 and max(blocks['save']) < 16
+        assert len(holds['save']) == 20 and all(max(blocks[name]) < 16 for name in ('upsert', 'admit'))
         assert max(blocks['retire']) < 32
         result = db.routing.load_routing_entries(routing_scope=store._routing_scope())
         assert len(result) == 10_000 and json.loads(result['agent:main:peer:2'])['last_prompt_tokens'] == 20

@@ -2,8 +2,6 @@
 
 import json
 
-ROUTE_TARGET_SQL = "CASE WHEN json_valid(entry_json) THEN json_extract(entry_json,'$.session_id') END"
-
 _INDEX_TARGET = ("CASE WHEN typeof(entry_json)='blob' THEN x'00' WHEN json_valid(entry_json) "
                  "THEN json_quote(json_extract(json_patch('{}',entry_json),'$.session_id')) "
                  "WHEN instr(entry_json,'NaN') OR instr(entry_json,'Infinity') THEN x'00' END")
@@ -27,14 +25,19 @@ def _point_predicates(sid, namespace):
     return f'{_INDEX_TARGET}=json_quote(?){fields}', (sid, *args), f"{_INDEX_TARGET}=x'00'{fields}", args
 
 
+def stored_target(text):
+    """The ID the gateway actually loads (last member wins, including historical byte encodings)."""
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return value.get('session_id') if isinstance(value, dict) else None
+
+
 def _legacy_targets(conn, sid, where, args):
     """Python's historical decoder also accepted non-finite numbers and UTF-16/32 byte strings."""
     for scope, key, text in conn.execute(f'SELECT scope,session_key,entry_json FROM gateway_routing WHERE {where}', args):
-        try:
-            value = json.loads(text)
-        except (TypeError, ValueError):
-            continue
-        if isinstance(value, dict) and value.get('session_id') == sid:
+        if stored_target(text) == sid:
             yield scope, key
 
 
