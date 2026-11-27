@@ -12,7 +12,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, SessionStore
-from persistence.core.errors import StoreContention
+from persistence.core.errors import PermanentStoreError, StoreContention
 from tests.fixtures.storage_holder import raw_holder
 
 
@@ -46,15 +46,18 @@ def test_disabled_import_preserves_concurrent_upsert(stores):
     store._save_sessions_json({})
     routing = store.persistence.routing
     load = routing.load_routing_entries
+    text = json.dumps({'session_key': 'external', 'session_id': 'new', 'created_at': '2026-01-01', 'updated_at': '2026-01-01'})
 
-    def race(**kwargs):
-        result = load(**kwargs)
-        routing.upsert_routing_entry('external', '{"session_id":"new"}', routing_scope=kwargs['routing_scope'])
+    def race(*args, **kwargs):
+        result = load(*args, **kwargs)
+        if 'external' not in result:
+            routing.upsert_routing_entry('external', text, routing_scope=kwargs['routing_scope'])
         return result
 
     with patch.object(routing, 'load_routing_entries', race):
         store._ensure_loaded()
     assert rows(store) == {'external': 'new'}
+    assert store._entries['external'].session_id == 'new'
 
 
 def test_multiple_generations_do_not_undo_direct_edits_or_deletes(stores):
@@ -140,10 +143,13 @@ def test_disabled_failed_commit_rolls_back_and_does_not_publish_generation(store
     changed.session_id = 'must-rollback'
     del store._entries[dropped.session_key]
     holder = raw_holder(store.persistence)
-    holder._write_sql("CREATE TRIGGER refuse BEFORE INSERT ON gateway_routing BEGIN SELECT RAISE(ABORT,'refused'); END")
-    with pytest.raises(Exception, match='refused'):
+    holder._write_sql('CREATE TABLE gate_parent(id INTEGER PRIMARY KEY)')
+    holder._write_sql('CREATE TABLE gate_child(id INTEGER REFERENCES gate_parent(id) DEFERRABLE INITIALLY DEFERRED)')
+    holder._write_sql('CREATE TRIGGER refuse AFTER UPDATE ON gateway_routing BEGIN INSERT INTO gate_child VALUES(1); END')
+    with pytest.raises(PermanentStoreError, match='FOREIGN KEY constraint failed'):
         store._save_entries()
     assert rows(store) == before and store._persisted_routing_generation == generation
+    assert not holder._read_one('SELECT 1 FROM gate_child')
     assert not (store.sessions_dir / 'sessions.json').exists()
     holder._write_sql('DROP TRIGGER refuse')
     store._save_entries()

@@ -108,9 +108,8 @@ def test_boot_heal_never_lets_a_stale_mirror_overwrite_newer_routing_state(tmp_p
         return real_load(*args, **kwargs)
 
     monkeypatch.setattr(routing, 'load_routing_entries', flaky)
-    store.lookup_by_session_key(key)  # boot: routing read fails, the mirror is imported
+    assert store.lookup_by_session_key(key).suspended is False  # boot: only the old mirror is readable
     recovered = store.lookup_by_session_key(key)  # DB is back: recovery merges its rows
-    assert len(calls) == 2
     assert recovered.suspended is True and recovered.origin is not None
     with store._lock:
         store._save()

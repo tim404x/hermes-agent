@@ -212,6 +212,7 @@ class SessionPersistenceMixin:
                 mirror = _read_mirror(self.sessions_dir, self._routing_scope())
                 rows = store.routing.load_routing_entries(routing_scope=self._routing_scope(), fresh=True)
                 self._reconcile_mirror(store.routing, rows, mirror)
+                rows = store.routing.load_routing_entries(routing_scope=self._routing_scope(), fresh=True)
                 _, owner = store.routing.save_routing_edits({}, set(), {}, routing_scope=self._routing_scope(), mirror=True)
                 data = {'_routing_db': owner, **_mirror_projection(rows, mirror.entries)}
                 self._pending_routing_edits = {}
@@ -589,11 +590,6 @@ class SessionPersistenceMixin:
                 missing[key] = text
         resolved = routing.reconcile_routing_mirror(missing, mirror.pending, digest=mirror.digest,
                                                     owner=mirror.owner, routing_scope=self._routing_scope())
-        for key, text in resolved.items():
-            if text is None:
-                rows.pop(key, None)
-            else:
-                rows[key] = text
         return any(value is None for value in resolved.values())
 
     def _load_primary(self, mirror):
@@ -604,11 +600,13 @@ class SessionPersistenceMixin:
             rows = store.routing.load_routing_entries(routing_scope=self._routing_scope(), fresh=True)
         except (StoreContention, DeclarativeDrift):
             raise
-        except (OSError, PersistenceError) as exc:
+        except (OSError, RuntimeError, PersistenceError) as exc:
             logger.warning('gateway.session: state.db routing load failed: %s', exc)
             return False
         try:
             strip = mirror is not None and self._reconcile_mirror(store.routing, rows, mirror)
+            if mirror is not None:
+                rows = store.routing.load_routing_entries(routing_scope=self._routing_scope(), fresh=True)
         except (StoreContention, DeclarativeDrift):
             raise
         except (OSError, PersistenceError) as exc:
@@ -636,7 +634,7 @@ class SessionPersistenceMixin:
                 _, owner = store.routing.save_routing_edits({}, set(), {}, routing_scope=self._routing_scope(), mirror=True)
                 self._mirror_owner = owner
                 self._save_sessions_json({**self._routing_data_locked(), '_routing_db': owner})
-            except OSError as exc:
+            except (OSError, PersistenceError) as exc:
                 logger.warning('gateway.session: could not refresh consumed mirror: %s', exc)
         return True
 
