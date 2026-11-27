@@ -85,3 +85,51 @@ async def test_async_notice_settlement(case, real_loop, tmp_path, monkeypatch):
         assert not any(word in update for update in updates for word in (
             "didn't produce a reply", "empty", "provider", "retr", "⚠",
         )), updates
+
+
+@pytest.mark.asyncio
+async def test_live_incident_unconsumed_steer_on_reasoning_notice_hands_off_quietly(real_loop, tmp_path, monkeypatch):
+    """Exact replay of the 27 Nov 2026 Telegram incident:
+    an internal_notification wakes the session, a human message is steered mid-call,
+    and the thinking model produces reasoning-only blanks (no tools). The background wake
+    must settle quietly without emitting 'No reply' or cost banners, and the steered human
+    message must immediately run as the next turn and deliver its reply."""
+    runner = _runner(monkeypatch, tmp_path)
+    agent = real_loop.agent
+    runner._session_db = real_loop.db
+    runner.session_store._entries = {}
+    entry = runner.session_store.get_or_create_session.return_value
+    entry.session_id = real_loop.sid
+    monkeypatch.setattr(runner, "_resolve_session_agent_runtime", lambda **_: (agent.model, {"provider": agent.provider}))
+    monkeypatch.setattr(TurnRunner, "_resolve_turn_agent", lambda *_: (agent, False))
+    monkeypatch.setattr("agent.turn_empty_response.interruptible_backoff_sleep", lambda *args, **kwargs: None)
+    event = _event(internal=True)
+    adapter = ProgressCaptureAdapter()
+    runner.adapters[event.source.platform] = adapter
+    event.text = _mark_internal_notification("[ASYNC DELEGATION BATCH COMPLETE — deleg_6] Task 6/9 finished.")
+    event.metadata = {"display_kind": "internal_notification"}
+
+    calls = []
+
+    def respond(**request):
+        calls.append(request)
+        if len(calls) == 1:
+            assert agent.steer("Can you create the full plan?")
+            resp = recovery._response()
+            resp.choices[0].message.reasoning_content = "waiting on remaining sibling tasks"
+            return resp
+        if len(calls) == 2:
+            resp = recovery._response()
+            resp.choices[0].message.reasoning_content = "still nothing to add"
+            return resp
+        return recovery._response("Full plan saved and sent for adversarial review.")
+
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = respond
+    delivered = await runner._handle_message_with_agent(event, event.source, entry.session_key, 1)
+    assert len(calls) == 3
+    assert delivered == "Full plan saved and sent for adversarial review."
+    updates = [message["content"].lower() for message in (*adapter.sent, *adapter.edits)]
+    assert not any(word in update for update in updates for word in (
+        "didn't produce a reply", "estimated cost", "send `continue`", "⚠",
+    )), updates

@@ -3228,6 +3228,8 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         _requeue_pending_steer(agent, steer_text)
         return
     messages.append(steer_user_row(steer_text))
+    agent._turn_steer_delivered = True
+    agent._notice_work = None
     from tools.bot_mode_dm_side_window import record_turn_human_text
     record_turn_human_text(agent, steer_text)
     _ra().logger.info(

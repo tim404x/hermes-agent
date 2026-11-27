@@ -430,6 +430,15 @@ def _explain_abnormal_exit(agent, final_response, _turn_exit_reason, preserved_v
     try:
         if not agent._turn_completion_explainer_enabled():
             return final_response
+        if _turn_exit_reason == "empty_response_exhausted":
+            from agent.turn_empty_response import is_unaddressed_machinery_turn
+            if is_unaddressed_machinery_turn(agent):
+                logger.warning(
+                    "Suppressing empty-response explainer on unaddressed machinery turn (%s, model=%s)",
+                    getattr(agent, "_turn_display_kind", None),
+                    getattr(agent, "model", None) or "?",
+                )
+                return ""
         _stripped = (final_response or "").strip()
         _is_empty_terminal = _stripped in ("", "(empty)")
         # A short fragment not from a text_response exit and lacking sentence-ending

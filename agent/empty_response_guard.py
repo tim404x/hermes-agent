@@ -61,6 +61,7 @@ DEFAULT_GUARD_ENABLED = True
 # site (turn start, compaction, tool success, fallback activation) is honoured.
 _ATTEMPTS_ATTR = "_empty_attempt_history"
 _STREAK_COST_ATTR = "_empty_streak_cost_usd"
+_STREAK_REDUCED_BUDGET_ATTR = "_empty_streak_reduced_budget"
 _ENABLED_ATTR = "_empty_guard_enabled"
 _THRESHOLD_ATTR = "_empty_guard_cost_threshold_usd"
 
@@ -185,6 +186,7 @@ def record_empty_attempt(
     if getattr(agent, "_empty_content_retries", 0) == 0:
         attempts.clear()
         setattr(agent, _STREAK_COST_ATTR, Decimal(0))
+        setattr(agent, _STREAK_REDUCED_BUDGET_ATTR, False)
 
     usage_present, zero_output = _zero_output(agent, response)
     attempts.append(
@@ -201,7 +203,11 @@ def record_empty_attempt(
     cost = _estimate_attempt_cost(agent, response)
     if cost is not None and cost > 0:
         prior = getattr(agent, _STREAK_COST_ATTR, Decimal(0)) or Decimal(0)
-        setattr(agent, _STREAK_COST_ATTR, prior + cost)
+        new_total = prior + cost
+        setattr(agent, _STREAK_COST_ATTR, new_total)
+        threshold = _cost_threshold_usd(agent)
+        if cost >= threshold or new_total >= threshold:
+            setattr(agent, _STREAK_REDUCED_BUDGET_ATTR, True)
 
 
 def deterministic_empty(agent: Any) -> bool:
@@ -227,12 +233,21 @@ def deterministic_empty(agent: Any) -> bool:
 
 
 def empty_retry_budget(agent: Any, response: Any) -> int:
-    """Empty-retry budget for the current streak (3, or 1 when a single attempt is
-    estimated to cost more than the configured threshold)."""
+    """Empty-retry budget for the current streak (3, or 1 once any attempt or the
+    accumulated streak cost hits the configured threshold). Latches for the streak
+    so a subsequent cache-hit attempt cannot raise a reduced budget back to 3."""
     if not guard_enabled(agent):
         return DEFAULT_EMPTY_RETRY_BUDGET
+    if getattr(agent, _STREAK_REDUCED_BUDGET_ATTR, False) is True:
+        return REDUCED_EMPTY_RETRY_BUDGET
+    threshold = _cost_threshold_usd(agent)
+    streak_cost = getattr(agent, _STREAK_COST_ATTR, None)
+    if isinstance(streak_cost, Decimal) and streak_cost >= threshold:
+        setattr(agent, _STREAK_REDUCED_BUDGET_ATTR, True)
+        return REDUCED_EMPTY_RETRY_BUDGET
     cost = _estimate_attempt_cost(agent, response)
-    if cost is not None and cost >= _cost_threshold_usd(agent):
+    if cost is not None and cost >= threshold:
+        setattr(agent, _STREAK_REDUCED_BUDGET_ATTR, True)
         return REDUCED_EMPTY_RETRY_BUDGET
     return DEFAULT_EMPTY_RETRY_BUDGET
 

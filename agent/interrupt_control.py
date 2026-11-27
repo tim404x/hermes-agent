@@ -456,6 +456,8 @@ class InterruptControlMixin:
                 accepted = bool(_native_steer(cleaned))
                 if accepted:
                     self._turn_user_intervened = True
+                    self._turn_steer_delivered = True
+                    self._notice_work = None
                 return accepted
             except Exception:
                 logger.debug("Codex app-server turn/steer failed", exc_info=True)

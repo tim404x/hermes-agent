@@ -1819,6 +1819,7 @@ def run_conversation(
 
     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
     agent._turn_user_intervened = False
+    agent._turn_steer_delivered = False
     agent._steer_cancels_since_response = 0  # debounced steer cancels (interrupt_control)
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
@@ -1854,6 +1855,7 @@ def run_conversation(
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))
+        result["steer_delivered"] = bool(getattr(agent, "_turn_steer_delivered", False))
     _close_durable_failed_turn(agent, result)
     return result
 

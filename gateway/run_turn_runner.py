@@ -1625,6 +1625,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             "usage_limit": result.get("usage_limit"),
             "partial": result.get("partial", False), "completed": result.get("completed"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
+            "user_intervened": bool(result.get("user_intervened", False)),
+            "steer_delivered": bool(result.get("steer_delivered", False)),
+            "has_pending_steer": bool(result.get("pending_steer")),
             "error": result.get("error"),
             **{key: result[key] for key in _FAILURE_DESCRIPTOR_KEYS if key in result},
             "compression_exhausted": result.get("compression_exhausted", False),
@@ -1658,11 +1661,18 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 **({"warning": result["warning"]} if isinstance(result.get("warning"), str) and result["warning"] else {}),
                 **({"silent": True} if silent else {}),
             }
-        from gateway.response_filters import is_intentional_silence_agent_result
+        from gateway.response_filters import is_intentional_silence_agent_result, is_suppressed_machinery_empty_result
         # A machinery turn the model chose to leave unanswered (``notification_no_reply``) stays
         # empty: the delivery seam gates that silence by turn kind, and a "no response" notice
         # filled in here would reach the chat for a turn no human started (#135816).
-        if not final_response and not is_intentional_silence_agent_result(result, final_response):
+        _suppressed_machinery_empty = is_suppressed_machinery_empty_result(
+            result, ctx.persist_user_display_kind, ctx.reply_expected,
+        )
+        if (
+            not final_response
+            and not is_intentional_silence_agent_result(result, final_response)
+            and not _suppressed_machinery_empty
+        ):
             final_response = _normalize_empty_agent_response(result, final_response or "", history_len=len(agent_history))
             final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
             if not final_response:
