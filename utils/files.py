@@ -14,7 +14,7 @@ import threading
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import hermes_yaml as yaml
 
@@ -284,22 +284,26 @@ def mkstemp_beside(target: str | Path, **kw: Any) -> tuple[int, str]:
         return tempfile.mkstemp(dir=link_dir, **kw)
 
 
-def fsync_directory(path: str | Path) -> None:
+def fsync_directory(path: str | Path, *, required: bool = False) -> None:
     """Best-effort fsync of a directory entry so a just-renamed file survives power loss.
 
     No-op on Windows (directories can't be opened with ``os.open``; the file fsync still applies)
-    and on any OSError — durability of the directory entry is never worth failing a write that
-    has already been replaced into place.
+    and normally on OSError. A caller whose only commit is this rename can require POSIX errors
+    to be reported instead of acknowledging a directory entry that may not survive a crash.
     """
     if os.name == "nt":
         return
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     except OSError:
+        if required:
+            raise
         return
     try:
-        with suppress(OSError):
-            os.fsync(fd)
+        os.fsync(fd)
+    except OSError:
+        if required:
+            raise
     finally:
         os.close(fd)
 
@@ -359,7 +363,7 @@ def rmtree_readonly(path: str | Path, *, ignore_errors: bool = False) -> None:
 
 
 def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mode: int | None = None,
-                  preserve_owner: bool = True, binary: bool = False, fsync_dir: bool = False) -> None:
+                  preserve_owner: bool = True, binary: bool = False, fsync_dir: bool | Literal['required'] = False) -> None:
     """Temp file + fsync + :func:`atomic_replace`, then re-apply owner/mode.
 
     *write(f)* emits the payload into the open handle (text, or bytes when *binary*). The temp file
@@ -393,7 +397,9 @@ def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mo
             os.fsync(f.fileno())
         replaced = Path(atomic_replace(tmp_path, path))  # symlink-preserving actual destination
         _restore_file_metadata(replaced, original_owner, mode)
-        if fsync_dir:
+        if fsync_dir == 'required':
+            fsync_directory(replaced.parent, required=True)
+        elif fsync_dir:
             fsync_directory(replaced.parent)
     except BaseException:
         with suppress(OSError):
@@ -450,7 +456,7 @@ def _dump_json(data: Any, f, *, indent: int | None, ensure_ascii: bool, dump_kwa
 
 def atomic_json_write(
     path: str | Path, data: Any, *, indent: int = 2, mode: int | None = None,
-    ensure_ascii: bool = False, fsync_dir: bool = False, **dump_kwargs: Any,
+    ensure_ascii: bool = False, fsync_dir: bool | Literal['required'] = False, **dump_kwargs: Any,
 ) -> None:
     """Write JSON to *path* atomically (temp file + fsync + replace).
 

@@ -77,7 +77,7 @@ class _LiveGeneration:
 def _retired_drops(conn, scope, retired, targets, prior):
     drops = []
     for key in retired:
-        row = conn.execute(f'SELECT entry_json,{ROUTE_TARGET_SQL} FROM gateway_routing WHERE scope=? AND session_key=?',
+        row = conn.execute(f'SELECT entry_json,CAST({ROUTE_TARGET_SQL} AS TEXT) FROM gateway_routing WHERE scope=? AND session_key=?',
                            (scope, key)).fetchone()
         if row and (row[1] == targets[key] or _matches(row[0], prior.get(key))):
             drops.append((scope, key))
@@ -92,8 +92,22 @@ def _write_edits(conn, scope, puts, deletes, repairs, retired, stale, now):
                      ((now, puts[key], scope, key, repairs[key]) for key in repairs if key in puts and key not in retired))
 
 
+def _text_targets(holder, entries):
+    targets = dict(entries)
+    legacy = [key for key, sid in targets.items() if not isinstance(sid, str)]
+    if legacy:
+        with holder.independent_read_connection() as reader:
+            for key in legacy:
+                sid = reader.execute("SELECT CAST(json_extract(?,'$') AS TEXT)", (json.dumps(targets[key]),)).fetchone()[0]
+                if sid is None:
+                    del targets[key]
+                else:
+                    targets[key] = sid
+    return targets
+
+
 def save_edits(holder, scope, puts, deletes, targets, mirror, repairs, prior, previous):
-    targets = dict(targets)
+    targets = _text_targets(holder, targets)
     wanted = set(targets.values())
     namespaces = {route_namespace(key) for key in targets}
     names = ('legacy', *('ns:' + namespace for namespace in namespaces))

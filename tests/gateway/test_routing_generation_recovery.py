@@ -1,8 +1,10 @@
 """A gateway saves its own edits, not everything its last load didn't see."""
 
 import json
+import os
 from pathlib import Path
 import sqlite3
+import stat
 from contextlib import closing
 from unittest.mock import patch
 
@@ -264,3 +266,23 @@ def test_transient_reader_contention_never_acknowledges_a_json_only_save(stores)
     assert store._persisted_routing_generation == generation and rows(store)[entry.session_key] != 'changed'
     store._save_entries()
     assert rows(store)[entry.session_key] == 'changed'
+
+
+@pytest.mark.platforms('linux', 'macos')
+def test_sole_fallback_directory_fsync_failure_is_not_acknowledged(stores):
+    store = stores(True)
+    entry = route(store)
+    generation = store._persisted_routing_generation
+    entry.session_id = 'pending'
+    sync = os.fsync
+
+    def fail_directory(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError('directory sync failed')
+        sync(fd)
+
+    with (patch.object(store.persistence.routing, 'save_routing_edits', side_effect=OSError('db unavailable')),
+          patch('utils.files.os.fsync', side_effect=fail_directory), pytest.raises(OSError, match='directory sync failed')):
+        store._save_entries()
+    assert store._persisted_routing_generation == generation
+    assert cold_entries(stores())[entry.session_key].session_id == 'pending'

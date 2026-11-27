@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 from uuid import uuid4
-from persistence.core.errors import DeclarativeDrift, StoreContention
+from persistence.core.errors import DeclarativeDrift, PersistenceError, StoreContention
 from utils import atomic_json_write
 
 if TYPE_CHECKING:
@@ -575,6 +575,8 @@ class SessionPersistenceMixin:
         try:
             return _read_mirror(self.sessions_dir, self._routing_scope())
         except (ValueError, OSError) as exc:
+            if isinstance(exc, OSError) and getattr(self, '_write_sessions_json', True):
+                raise
             logger.warning('gateway.session: cannot read sessions.json: %s', exc)
             return None
 
@@ -602,14 +604,14 @@ class SessionPersistenceMixin:
             rows = store.routing.load_routing_entries(routing_scope=self._routing_scope(), fresh=True)
         except (StoreContention, DeclarativeDrift):
             raise
-        except Exception as exc:
+        except (OSError, PersistenceError) as exc:
             logger.warning('gateway.session: state.db routing load failed: %s', exc)
             return False
         try:
             strip = mirror is not None and self._reconcile_mirror(store.routing, rows, mirror)
         except (StoreContention, DeclarativeDrift):
             raise
-        except Exception as exc:
+        except (OSError, PersistenceError) as exc:
             if not self._loaded:
                 self._install_routing_rows({**{key: json.dumps(value) for key, value in mirror.entries.items()}, **rows})
             logger.warning('gateway.session: routing mirror reconciliation failed: %s', exc)
@@ -842,7 +844,7 @@ class SessionPersistenceMixin:
                 repairs=getattr(self, '_routing_repairs', {}), prior=prior)
         except (StoreContention, DeclarativeDrift, _RoutingJournalError):
             raise
-        except Exception as exc:
+        except (OSError, PersistenceError) as exc:
             if not write_mirror:
                 raise
             logger.warning('gateway.session: state.db routing save failed; journaling gateway edits: %s', exc)
@@ -869,13 +871,13 @@ class SessionPersistenceMixin:
         self._mirror_owner = owner
         try:
             self._save_sessions_json({**{key: value for key, value in data.items() if key not in retired}, '_routing_db': owner})
-        except Exception as exc:
+        except (OSError, TypeError, ValueError) as exc:
             logger.warning('gateway.session: sessions.json mirror save failed after state.db commit: %s', exc)
 
     def _save_sessions_json(self, data: dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index (atomic + fsync)."""
         atomic_json_write(self.sessions_dir / "sessions.json", {"_README": _SESSIONS_JSON_README, **data},
-                          mode=0o600, fsync_dir='_routing_journal' in data)
+                          mode=0o600, fsync_dir='required' if '_routing_journal' in data else False)
 
     def _save_entries(self) -> None:
         """Snapshot latest state under ``_lock`` and persist after releasing it."""

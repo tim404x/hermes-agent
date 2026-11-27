@@ -197,6 +197,19 @@ def test_gateway_retired_set_matches_point_oracle_across_generations(backend, sc
         assert actual == expected
 
 
+def test_legacy_nontext_session_ids_do_not_break_an_unrelated_generation(backend, scope_a):
+    store = backend.open(scope_a)
+    targets = {'array': [1, 2], 'number': 1.0, 'none': None, 'ordinary': 'unchanged'}
+    texts = {key: json.dumps({'session_id': value}) for key, value in targets.items()}
+    store.routing.save_routing_edits(texts, set(), targets, routing_scope='', mirror=False)
+    store.holder()._write_sql('INSERT INTO state_meta VALUES (?,?)',
+                             [('gateway.retired_session.v1.' + sid, '{}') for sid in ('1.0', '[1,2]')], many=True)
+    expected = {key for key, text in texts.items() if store.routing.route_retired(key, text)}
+    retired, _ = store.routing.save_routing_edits({}, set(), targets, routing_scope='', mirror=False)
+    assert retired == expected == {'array', 'number'}
+    assert set(store.routing.load_routing_entries()) == {'none', 'ordinary'}
+
+
 @pytest.mark.parametrize('count', [1, 20])
 def test_retired_set_rechecks_rows_inserted_after_reader(backend, scope_a, count):
     store = backend.open(scope_a)
