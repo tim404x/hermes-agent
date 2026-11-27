@@ -566,15 +566,22 @@ class SessionPersistenceMixin:
     def _archive_sessions_json(self) -> None:
         mirror = self.sessions_dir / "sessions.json"
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        archive = mirror.with_suffix(f".json.retired-{stamp}")
         suffix = 0
-        while archive.exists():
-            suffix += 1
-            archive = mirror.with_suffix(f".json.retired-{stamp}.{suffix}")
+        while True:
+            archive = mirror.with_suffix(f".json.retired-{stamp}" + (f".{suffix}" if suffix else ""))
+            try:
+                archive.touch(mode=0o600, exist_ok=False)
+                break
+            except FileExistsError:
+                suffix += 1
         try:
-            mirror.rename(archive)
+            mirror.replace(archive)
         except FileNotFoundError:
+            archive.unlink(missing_ok=True)
             return
+        except OSError:
+            archive.unlink(missing_ok=True)
+            raise
         logger.info("gateway.session: archived disabled sessions.json mirror as %s", archive.name)
 
     def _prune_stale_sessions_locked(self) -> None:
@@ -680,6 +687,8 @@ class SessionPersistenceMixin:
         fast saves MUST allocate from this one counter: the stale-write protection is a total order
         over serialization times and silently breaks otherwise."""
         self._routing_generation = getattr(self, "_routing_generation", 0) + 1
+        if getattr(self, "_routing_fallback_baseline", None) is not None:
+            self._last_unreconciled_generation = self._routing_generation
         return self._routing_generation
 
     def _reconcile_recovered_routing_locked(self) -> None:
@@ -743,7 +752,7 @@ class SessionPersistenceMixin:
                         data[key] = json.loads(entry_json)
             db_saved = False
             store = self._routing_persistence
-            if store is not None:
+            if store is not None and generation > getattr(self, "_last_unreconciled_generation", 0):
                 try:
                     retired = store.routing.replace_routing_entries(
                         {k: json.dumps(v) for k, v in data.items()}, routing_scope=self._routing_scope())
@@ -767,14 +776,15 @@ class SessionPersistenceMixin:
         """Keep a fallback until its contents have been reconciled and committed to state.db."""
         write_mirror = getattr(self, "_write_sessions_json", True)
         if not write_mirror and db_saved:
-            if getattr(self, "_archive_mirror_on_commit", False) and self._routing_db_loaded:
-                try:
-                    self._archive_sessions_json()
-                except OSError as exc:
-                    logger.warning("gateway.session: could not archive sessions.json after state.db commit: %s", exc)
-                else:
-                    self._archive_mirror_on_commit = False
-            return
+            if not (getattr(self, "_archive_mirror_on_commit", False) and self._routing_db_loaded):
+                return
+            try:
+                self._archive_sessions_json()
+            except OSError as exc:
+                logger.warning("gateway.session: could not archive sessions.json after state.db commit: %s", exc)
+            else:
+                self._archive_mirror_on_commit = False
+                return
         try:
             self._save_sessions_json(data)
         except Exception as exc:

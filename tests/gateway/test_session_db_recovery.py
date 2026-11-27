@@ -361,3 +361,29 @@ def test_recovered_db_rows_survive_fallback_structural_save(monkeypatch, tmp_pat
     restarted._ensure_loaded()
     assert deleted.session_key not in restarted._entries
     restarted.close_all_db_handles()
+
+
+def test_delayed_fallback_snapshot_cannot_erase_unseen_primary_rows(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig, Platform
+    from gateway.session import SessionSource, SessionStore
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    config, directory = GatewayConfig(write_sessions_json=False), tmp_path / 'sessions'
+    first = SessionStore(directory, config)
+    entry = first.get_or_create_session(SessionSource(Platform.TELEGRAM, chat_id='kept', chat_type='dm'))
+    first.close_all_db_handles()
+    cold = SessionStore(directory, config)
+    try:
+        routing = cold._routing_persistence.routing
+        with patch.object(routing, 'load_routing_entries', side_effect=OSError('read failed')):
+            cold._ensure_loaded()
+            with cold._lock:
+                incomplete = cold._snapshot_routing_locked()
+        cold._ensure_loaded()
+        assert cold._entries[entry.session_key].session_id == entry.session_id
+        cold._persist_routing_data(*incomplete)
+        assert entry.session_key in routing.load_routing_entries(routing_scope=cold._routing_scope())
+        cold._save_entries()
+        assert not (directory / 'sessions.json').exists()
+    finally:
+        cold.close_all_db_handles()

@@ -25,11 +25,12 @@ from ..conversation._store.core import _session_row_dict
 from ..conversation._store.local import owned_lineage_ids
 from ..conversation._store.sessions import _own_profile_name
 from ..conversation.sessions import session_record
+from ._delta import replace_scope
 from ._local_lineage import hand_off_conversations, moved_receipts
 from ._routes import (
     _COMPRESSION_LINEAGE_CTE, _ORPHAN_CONTIGUITY_DONORS_SQL, _ORPHAN_LINEAGE_DONOR_SQL, _ORPHANS_SQL,
     _PEER_BY_KEY_SQL, _PEER_BY_TUPLE_SQL, ROUTE_RETIRED_SQL, apply_telegram_topic_migration, fence_shared_routes,
-    delete_retired_routes, route_retired_params,
+    route_retired_params,
 )
 
 __all__ = ["SQLiteRoutingRepository"]
@@ -118,29 +119,8 @@ class SQLiteRoutingRepository:
     ) -> set[str]:
         if rewrite:
             return self._rewrite_routing_entries(entries, routing_scope=routing_scope)
-        now = time.time()
-
-        def _do(conn):
-            desired = {key: text for key, text in entries.items() if key and text}
-            current = dict(conn.execute("SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?",
-                                        (routing_scope,)))
-            changed = [key for key in desired if current.get(key) != desired[key]]
-            obsolete = (current.keys() - desired.keys()) | (current.keys() & changed)
-            conn.executemany("DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?",
-                             ((routing_scope, key) for key in obsolete))
-            retired = delete_retired_routes(conn, routing_scope, now)
-            inserted = conn.executemany(_INSERT_ROUTE_SQL, (
-                {'scope': routing_scope, 'key': key, **route_retired_params(key, desired[key], now)}
-                for key in changed))
-            if inserted.rowcount < len(changed):
-                retired.update(row[0] for row in conn.execute(
-                    "SELECT value FROM json_each(?) WHERE NOT EXISTS "
-                    "(SELECT 1 FROM gateway_routing WHERE scope = ? AND session_key = value)",
-                    (json.dumps(changed), routing_scope)))
-            return retired
-
         with translated():
-            return self._store.holder()._execute_write(_do)
+            return replace_scope(self._store.holder(), entries, routing_scope)
 
     def _rewrite_routing_entries(self, entries: Mapping[str, str], *, routing_scope: str) -> set[str]:
         now = time.time()

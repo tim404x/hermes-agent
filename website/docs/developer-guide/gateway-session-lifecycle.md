@@ -148,9 +148,36 @@ behavior on the next access.
 
 ## 3. SessionStore — Storage and Operations
 
-`SessionStore` is the main storage layer. It maintains an in-memory dict (`_entries`) persisted
-to `sessions.json`, with SQLite (the storage interface's `sessions` and `messages` repositories) as the canonical store for session metadata and
-message transcripts.
+`SessionStore` keeps an in-memory routing index (`_entries`). Its primary copy is the scoped
+`gateway_routing` table in `state.db`; `sessions.json` is an optional mirror and fallback.
+Session metadata and transcripts live in the `sessions` and `messages` repositories.
+
+### Full saves and retirement
+
+A full save still replaces **one entire scope**. On an independent read connection, one SQLite
+snapshot compares the proposed entries, tests retirement, and finds obsolete keys. Under
+`BEGIN IMMEDIATE` the writer checks the schema cookie and two revisions: one for that scope,
+one for retirement markers and fences. Direct SQL mutations, including moves between scopes,
+advance those revisions in the same transaction. Active main-namespace fence matches also
+need a session-existence point check; expiring fences contribute a time interval. If a proof
+is stale, preparation runs again **outside** the writer. Otherwise only changed keys are
+written. An empty delta still validates. `rewrite=True` is the explicit whole-scope repair.
+
+A snapshot taken before a fallback load reconciles with SQLite cannot replace the primary,
+even if its delayed saver finds the database writable. With mirroring disabled, a legacy
+file is archived only after reconciliation and commit. If rename fails, keep the fallback
+current and retry the archive on a later save rather than reporting the primary write failed.
+
+**Retention boundary:** an applicable retirement fence is proof to drop a route. An old
+`gateway_routing.updated_at` is not. Even past `RETRY_HORIZON_S` measured from the owning
+profile's `sessions.ended_at`, a local one-shot or cron creation receipt is not by itself
+proof the route is disposable. Authority restore by id reads the receipt; a cold
+`SessionStore.get_or_create_session(source)` miss goes through peer recovery and can mint a
+different id. The empty-scope authority route also participates in compression/target advances.
+The creation copy need not contain a later pin, suspension, resume marker, or `/yolo` toggle.
+API bindings and ordinary messaging lanes likewise are not made disposable by age. No automatic
+horizon sweep is enabled: it needs scope-correct resolution on **both** key-only lookup and
+admission, including refused or unavailable bindings. The legacy opt-in idle prune is separate.
 
 ### Constructor
 
@@ -186,8 +213,8 @@ SessionStore(sessions_dir: Path, config: GatewayConfig, has_active_processes_fn=
 
 ### Internal Helpers
 
-- `_ensure_loaded()` / `_ensure_loaded_locked()` — Load `sessions.json` into `_entries` dict.
-- `_save()` — Atomic write to `sessions.json` via temp file + `atomic_replace`.
+- `_ensure_loaded()` / `_ensure_loaded_locked()` — Load the SQLite scope, then import missing keys from a legacy mirror.
+- `_save()` — Persist a generation-ordered full snapshot, then handle the mirror outside the SQLite writer.
 - `_generate_session_key(source)` — Delegates to `build_session_key()` with config params.
 
 ### Storage Layout

@@ -1191,7 +1191,9 @@ platform you'll see only those (e.g. `agent:main:whatsapp:dm:...`).
 
 When mirror writes are disabled, startup imports any missing routes from an existing
 mirror, commits them to `state.db`, then renames the file to `sessions.json.retired-<UTC timestamp>`.
-Later starts do not re-import that archive. If SQLite is unavailable, the gateway keeps using the mirror as a fallback.
+Later starts do not re-import that archive. An existing archive is never overwritten. If the rename fails,
+the gateway retries it on a later save. If SQLite is unavailable, the gateway keeps using the mirror as a
+fallback; if neither store can be written, the save reports an error.
 
 This is **expected** and does **not** mean your CLI sessions are missing.
 `hermes sessions list`, `/sessions`, and the dashboard all read `state.db`,

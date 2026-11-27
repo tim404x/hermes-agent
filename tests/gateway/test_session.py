@@ -1676,4 +1676,47 @@ class TestGatewayRoutingTable:
         assert not (tmp_path / "sessions.json").exists()
         store.close_all_db_handles()
 
+    @pytest.mark.platforms('posix')
+    def test_archive_collision_and_rename_failure_after_commit(self, tmp_path, monkeypatch):
+        from pathlib import Path
+        from gateway import session_persistence
+
+        first = SessionStore(tmp_path, GatewayConfig())
+        entry = first.get_or_create_session(self._source())
+        first.close_all_db_handles()
+        clock = MagicMock()
+        clock.now.return_value.strftime.return_value = 'fixed'
+        monkeypatch.setattr(session_persistence, 'datetime', clock)
+        occupied = tmp_path / 'sessions.json.retired-fixed'
+        occupied.symlink_to(tmp_path / 'missing-backup-target')
+        cold = SessionStore(tmp_path, GatewayConfig(write_sessions_json=False))
+        try:
+            with patch.object(Path, 'replace', side_effect=PermissionError('archive denied')):
+                cold._ensure_loaded()
+                assert entry.session_key in cold.persistence.routing.load_routing_entries(routing_scope=cold._routing_scope())
+                with cold._lock:
+                    del cold._entries[entry.session_key]
+                    cold._save()
+                assert entry.session_key not in json.loads((tmp_path / 'sessions.json').read_text())
+            cold._save_entries()
+            assert not (tmp_path / 'sessions.json').exists()
+            assert occupied.is_symlink()
+            archived, = tmp_path.glob('sessions.json.retired-fixed.*')
+            assert entry.session_key not in json.loads(archived.read_text())
+        finally:
+            cold.close_all_db_handles()
+
+    def test_disabled_mirror_cannot_report_success_without_either_store(self, tmp_path):
+        store = SessionStore(tmp_path, GatewayConfig(write_sessions_json=False))
+        try:
+            store._ensure_loaded()
+            generation = getattr(store, '_persisted_routing_generation', 0)
+            with (patch.object(store._routing_persistence.routing, 'replace_routing_entries', side_effect=OSError('db offline')),
+                  patch.object(store, '_save_sessions_json', side_effect=OSError('fallback unavailable')),
+                  pytest.raises(OSError, match='fallback unavailable')):
+                store._save_entries()
+            assert getattr(store, '_persisted_routing_generation', 0) == generation
+        finally:
+            store.close_all_db_handles()
+
 

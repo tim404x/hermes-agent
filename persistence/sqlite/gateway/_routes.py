@@ -12,6 +12,7 @@ from persistence.gateway.routing import route_namespace
 from .._schema import _rebuild_table
 from .._schema_ddl import _RESET_CHILD_SQL, _RESET_END_REASONS_SQL, _sql_json_extract
 from ..conversation._store.retirement import RETIRED_PREFIX, _mark_retired, entry_session_id
+from ._revision import ROUTE_FENCE_PREFIX
 
 # Accidental end reasons recovery treats as resumable: superseded_by_resume = sentinel-parked runtime replaced
 # by a fresh session.resume; startup_orphan_reap = dead-gateway sweep, same class as ws_orphan_reap but kept
@@ -51,7 +52,6 @@ def _sql_session_last_active(alias: str = "s") -> str:
 # (the launch home's state.db): ``<prefix><namespace>:<id>``, keyed by the ``agent:<namespace>:``
 # slot of that profile's routing keys. Only routing saves read it, so the launch profile's own
 # creates, binds and generation walks never see another profile's retirement.
-ROUTE_FENCE_PREFIX = 'gateway.retired_route.v1.'
 _EXPIRED = "json_valid(value) AND json_extract(value, '$.retired_at') < ?"
 
 
@@ -79,53 +79,34 @@ def route_namespace_sql(key_expr: str) -> str:
 # ``json_valid(...) AND``, so each JSON read sits in a ``CASE WHEN json_valid(...)`` branch.
 # Bound by name (``route_retired_params``): :entry is the route's JSON, :ns its key's
 # ``route_namespace``, :now the save's time.
-def route_retired_sql(entry_expr: str, ns_expr: str) -> str:
-    """The same retirement verdict for a bound entry or a stored routing row."""
+FENCE_EXPIRY = """CASE WHEN json_valid(f.value) THEN CASE WHEN json_extract(f.value, '$.expires')
+                   THEN json_extract(f.value, '$.retired_at') END END"""
+
+
+def marker_applies_sql(ns):
+    return (f"({ns} = 'main' OR NOT CASE WHEN json_valid(m.value) "
+            "THEN json_extract(m.value, '$.own') IS NOT NULL ELSE 0 END)")
+
+
+def _route_retired_sql(sid_expr: str, ns_expr: str) -> str:
     return f"""(
     EXISTS (SELECT 1 FROM state_meta m
-             WHERE m.key = :retired_prefix || json_extract({entry_expr}, '$.session_id')
-               AND ({ns_expr} = 'main' OR NOT CASE WHEN json_valid(m.value)
-                                             THEN json_extract(m.value, '$.own') IS NOT NULL ELSE 0 END))
+             WHERE m.key = :retired_prefix || {sid_expr}
+               AND {marker_applies_sql(ns_expr)})
     OR EXISTS (SELECT 1 FROM state_meta f
-                WHERE f.key = :fence_prefix || {ns_expr} || ':' || json_extract({entry_expr}, '$.session_id')
-                  AND NOT CASE WHEN json_valid(f.value)
-                               THEN coalesce(json_extract(f.value, '$.expires')
-                                             AND json_extract(f.value, '$.retired_at') < :now - :horizon, 0)
-                               ELSE 0 END
+                WHERE f.key = :fence_prefix || {ns_expr} || ':' || {sid_expr}
+                  AND NOT coalesce(({FENCE_EXPIRY}) < :now - :horizon, 0)
                   AND ({ns_expr} != 'main' OR NOT EXISTS (
-                          SELECT 1 FROM sessions s WHERE s.id = json_extract({entry_expr}, '$.session_id')))))"""
+                          SELECT 1 FROM sessions s WHERE s.id = {sid_expr}))))"""
 
 
-ROUTE_RETIRED_SQL = route_retired_sql(":entry", ":ns")
-_STORED_ROUTE_RETIRED_SQL = route_retired_sql("gateway_routing.entry_json",
-                                             route_namespace_sql("gateway_routing.session_key"))
-
-# Build a shortlist of target ids once from the two indexed key ranges. Only possible hits
-# need namespace extraction and the correlated verdict; an id can itself contain colons or NULs.
-_DELETE_RETIRED_ROUTES_SQL = f"""DELETE FROM gateway_routing WHERE scope = :scope
-    AND CAST(json_extract(entry_json, '$.session_id') AS BLOB) IN (
-        SELECT substr(CAST(key AS BLOB), length(:retired_prefix) + 1) FROM state_meta WHERE key GLOB :marker_glob
-        UNION ALL
-        SELECT substr(tail, instr(tail, x'3a') + 1) FROM (
-            SELECT substr(CAST(key AS BLOB), length(:fence_prefix) + 1) AS tail
-            FROM state_meta WHERE key GLOB :fence_glob))
-    AND {_STORED_ROUTE_RETIRED_SQL} RETURNING session_key"""
-
-
-def _route_retirement_params(now):
-    return {'now': now, 'horizon': RETRY_HORIZON_S,
-            'retired_prefix': RETIRED_PREFIX, 'fence_prefix': ROUTE_FENCE_PREFIX}
-
-
-def delete_retired_routes(conn, scope, now):
-    params = {'scope': scope, 'marker_glob': RETIRED_PREFIX + '*', 'fence_glob': ROUTE_FENCE_PREFIX + '*',
-              **_route_retirement_params(now)}
-    return {row[0] for row in conn.execute(_DELETE_RETIRED_ROUTES_SQL, params)}
+ROUTE_RETIRED_SQL = _route_retired_sql("json_extract(:entry, '$.session_id')", ":ns")
 
 
 def route_retired_params(session_key, entry_json, now):
     """The named parameters of ``ROUTE_RETIRED_SQL`` for one routing entry saved at *now*."""
-    return {'entry': entry_json, 'ns': route_namespace(session_key), **_route_retirement_params(now)}
+    return {'entry': entry_json, 'ns': route_namespace(session_key), 'now': now, 'horizon': RETRY_HORIZON_S,
+            'retired_prefix': RETIRED_PREFIX, 'fence_prefix': ROUTE_FENCE_PREFIX}
 
 
 def fence_shared_routes(conn, namespace, session_ids, *, expiring=()):
