@@ -416,6 +416,8 @@ def build_subprocess_env(
     ``.env`` + source values, which never enter ``os.environ``) and re-applies the managed keys,
     all BEFORE the scrub, so those values pass the same scrub / passthrough rules as any other."""
     env: dict[str, str] = dict(base) if base is not None else os.environ.copy()
+    from agent.delegation_context import unpair_kanban_overrides
+    unpair_kanban_overrides(env, extra)
     if strip_launch_profile:
         strip_launch_profile_env(env)
         from agent.secret_scope import current_secret_scope, is_multiplex_active

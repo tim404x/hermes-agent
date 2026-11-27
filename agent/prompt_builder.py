@@ -263,7 +263,8 @@ SKILLS_GUIDANCE = "When you work out a non-trivial workflow, record it with skil
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from the shared board at `~/.hermes/kanban.db`. Your task id is in "
-    "`$HERMES_KANBAN_TASK`; your workspace is `$HERMES_KANBAN_WORKSPACE`. The `kanban_*` tools in your schema are your "
+    "`$HERMES_KANBAN_TASK` (local shells and scripts you start see it as `$HERMES_KANBAN_ORIGIN_TASK`, never as "
+    "worker identity); your workspace is `$HERMES_KANBAN_WORKSPACE`. The `kanban_*` tools in your schema are your "
     "primary coordination surface — they write directly to the shared SQLite DB and work regardless of terminal "
     "backend (local/docker/modal/ssh).\n"
     "\n"
@@ -314,7 +315,7 @@ KANBAN_GUIDANCE = (
     "\n"
     "## Reference details that change outcomes\n\n"
     "- **Workspace.** `cd $HERMES_KANBAN_WORKSPACE` first. For a `worktree` kind with no `.git`, `git worktree add "
-    "<path> ${HERMES_KANBAN_BRANCH:-wt/$HERMES_KANBAN_TASK}` from the main repo, then cd there. For a project-linked "
+    "<path> ${HERMES_KANBAN_BRANCH:-wt/$HERMES_KANBAN_ORIGIN_TASK}` from the main repo, then cd there. For a project-linked "
     "task the workspace is a fresh `<repo>/.worktrees/<task-id>` and `$HERMES_KANBAN_BRANCH` a deterministic "
     "`<project-slug>/<task-id>` — the main repo is two levels up, so run `git worktree add` from there.\n"
     "- **Deliverables.** Files a human wants go in `kanban_complete(artifacts=[<absolute paths>])` (top-level param; "
