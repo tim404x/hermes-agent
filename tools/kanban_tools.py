@@ -1272,7 +1272,9 @@ def _resolve_notify_target() -> Optional[dict[str, Any]]:
         user_id=env("HERMES_SESSION_USER_ID", "") or None,
         user_id_alt=env("HERMES_SESSION_USER_ID_ALT", "") or None,
         notifier_profile=notifier_profile,
-        delivery_mode="notify+wake" if platform != "tui" else None,
+        # Telegram DMs get wake-only: no raw card ping in Tim's chat, the agent is woken and
+        # decides whether a human update is worth sending (Tim, 27 Nov 2026: "no need to spam that much in dm").
+        delivery_mode=("wake" if platform == "telegram" else "notify+wake") if platform != "tui" else None,
         delivery_metadata=delivery_metadata or None)
 
 

@@ -534,6 +534,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 if live is not None:
                     live.event_stream.publish(session_id, {"text": str(message)}, event_type="review.summary")
                 return
+            if getattr(ctx.source, "platform", None) == Platform.TELEGRAM:
+                # The review still runs and saves; Telegram just gets no "💾 Self-improvement review" ping
+                # (Tim, 27 Nov 2026: "no need to spam that much in dm").
+                return
             if self._status_live():
                 self._send_status_text(
                     message,
