@@ -22,7 +22,7 @@ def live_board(tmp_path, monkeypatch):
     kanban = {}
     monkeypatch.setattr(config, "load_config_readonly", lambda: {"kanban": kanban})
     monkeypatch.setattr(kbd, "derive_default_max_in_progress", lambda: 8)
-    monkeypatch.setattr(kbd, "detect_crashed_workers", lambda conn, board: [])
+    monkeypatch.setattr(kbd, "detect_crashed_workers", lambda conn, **kwargs: [])
     pids = count(100_000)
     spawn = partial(kbd.dispatch_once, spawn_fn=lambda task, workspace: next(pids))
     monkeypatch.setattr(kbd, "dispatch_once", spawn)

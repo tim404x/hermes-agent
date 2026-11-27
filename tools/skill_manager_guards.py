@@ -144,15 +144,14 @@ def _is_pinned(name: str, what: str) -> Optional[bool]:
 
 def _pinned_guard(name: str) -> Optional[str]:
     """Refusal message if *name* is pinned or essential, else None. Pin only guards DELETION;
-    patches/edits stay allowed. ESSENTIAL_SKILLS are permanently pinned (the system prompt
-    references them). Best-effort: an unreadable sidecar lets the delete through."""
+    patches/edits stay allowed. ESSENTIAL_SKILLS are permanently pinned.
+    Best-effort: an unreadable sidecar lets the delete through."""
     try:
         from agent.skill_utils import ESSENTIAL_SKILLS
         if name in ESSENTIAL_SKILLS:
             return (
-                f"Skill '{name}' is essential to Hermes (the agent's own "
-                f"operating manual referenced by the system prompt) and "
-                f"cannot be deleted. Patches and edits are still allowed.")
+                f"Skill '{name}' is essential to Hermes (its operating manual or a skill Hermes loads "
+                "by name) and cannot be deleted. Patches and edits are still allowed.")
     except Exception:
         logger.debug("essential-guard lookup failed for %s", name, exc_info=True)
     if _is_pinned(name, "pinned-guard"):

@@ -17,6 +17,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from agent.skill_utils import is_excluded_skill_path
+from pm.filesystem import is_junction
 from tools.skills_guard import ScanResult, content_hash
 from tools.skills_hub_github import GitHubAuth
 from tools.skills_hub_models import (
@@ -33,12 +34,11 @@ logger = logging.getLogger("tools.skills_hub")
 
 def _is_path_redirect(path: Path) -> bool:
     """True when ``path`` is a symlink or (on Windows) a directory junction —
-    either lets a writer in ``skills/`` redirect a later ``rmtree`` outside it.
-    ``is_junction`` only exists on Python 3.12+ Windows; gate with ``hasattr``."""
-    return path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction())
+    either lets a writer in ``skills/`` redirect a later ``rmtree`` outside it."""
+    return path.is_symlink() or is_junction(path)
 
 
-def _resolve_lock_install_path(install_path: str, skill_name: str) -> Path:
+def _resolve_lock_install_path(install_path: str, skill_name: str, *, skills_dir: Path | None = None) -> Path:
     """Resolve a lock-file install path without allowing escapes from ``SKILLS_DIR``.
 
     Walks component-by-component refusing symlink/junction redirects (which
@@ -46,9 +46,11 @@ def _resolve_lock_install_path(install_path: str, skill_name: str) -> Path:
     ``resolved == SKILLS_DIR`` — an empty/``"."`` install_path resolves to the
     skills root and ``rmtree`` there would wipe every installed skill.
     """
-    from tools.skills_hub import _skills_dir
+    if skills_dir is None:
+        from tools.skills_hub import _skills_dir
+        skills_dir = _skills_dir()
     normalized = _normalize_lock_install_path(install_path, skill_name)
-    target = skills_dir = _skills_dir()
+    target = skills_dir
     skills_root = skills_dir.resolve()
     for part in normalized.split("/"):
         target = target / part

@@ -7,6 +7,7 @@ failure_limit=1 after that single host event.
 """
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -29,9 +30,10 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _start_and_lose(conn, tid, host, n, *, reason="managed_worker_failed", code=1):
+def _start_and_lose(conn, tid, host, n, *, reason="managed_worker_failed", code=1, review=False):
     """Claim a fresh run on this host, bind a dead pid, record the owner's ``worker_lost``."""
-    claimed = kb.claim_task(conn, tid, claimer=f"{host}:w{n}")
+    claim = kb.claim_review_task if review else kb.claim_task
+    claimed = claim(conn, tid, claimer=f"{host}:w{n}")
     pid = 72000 + n * 10 + abs(hash(tid)) % 7
     conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
     if reason:
@@ -82,6 +84,66 @@ def _log(tid, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(text.replace("<EXIT>", TR))
+
+
+@pytest.mark.parametrize('lane,limit,override', [('review', 1, None), ('ready', 3, None), ('review', 1, 2)])
+@pytest.mark.parametrize('expired', [False, True], ids=['crash', 'ttl'])
+def test_unknown_skill_blocks_at_configured_limit(kanban_home, lane, limit, override, expired):
+    from hermes_cli.kanban_ops import _cmd_dispatch
+    from hermes_cli.kanban_parser import build_parser
+
+    (kanban_home / 'config.yaml').write_text(f'kanban:\n  failure_limit: {limit}\n')
+    parser = argparse.ArgumentParser()
+    build_parser(parser.add_subparsers())
+    args = parser.parse_args(['kanban', 'dispatch', '--max', '0'])
+    with kbc.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title=lane, assignee="a", max_retries=override)
+        if lane == 'review':
+            assert kb.request_review(conn, tid, reviewer="b")
+        threshold = override or limit
+        for attempt in range(threshold + 1):
+            reason = 'unknown_skill' if attempt else 'managed_worker_failed'
+            _start_and_lose(conn, tid, host, attempt, reason=reason, review=lane == 'review')
+            _log(tid, f"{REFUSAL}\n<EXIT>1\n")
+            if expired:
+                conn.execute('UPDATE tasks SET claim_expires=1 WHERE id=?', (tid,))
+                conn.commit()
+            assert _cmd_dispatch(args) == 0
+            task = kb.get_task(conn, tid)
+            assert (task.status, task.consecutive_failures) == ('blocked' if attempt == threshold else lane, attempt)
+            assert f'managed worker lost: {reason}' in task.last_failure_error
+        kinds = [row[0] for row in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
+        assert kinds.count('reclaimed' if expired else 'crashed') == threshold + int(expired)
+        assert _gave_up(conn, tid) == 1
+
+
+@pytest.mark.parametrize('expired', [False, True], ids=['crash', 'ttl'])
+def test_only_current_worker_result_overrides_generic_owner_loss(kanban_home, expired):
+    with kbc.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="missing preload", assignee="a")
+        for attempt, evidence in enumerate(('bound', 'wrong_pid', 'wrong_claim', 'no_result')):
+            pid = _start_and_lose(conn, tid, host, attempt)
+            claim = kb.get_task(conn, tid)
+            bound = {'pid': pid + 1, 'claim_lock': claim.claim_lock}
+            kb._append_event(conn, tid, 'worker_bound', bound, run_id=claim.current_run_id)
+            if evidence != 'no_result':
+                record = dict(bound, error='unknown_skill', exit_code=1)
+                if evidence == 'wrong_pid':
+                    record['pid'] += 1
+                if evidence == 'wrong_claim':
+                    record['claim_lock'] = 'old-lock'
+                kb._append_event(conn, tid, 'worker_result', record, run_id=claim.current_run_id)
+            if expired:
+                conn.execute('UPDATE tasks SET claim_expires=1 WHERE id=?', (tid,))
+            _log(tid, f'{REFUSAL}\n<EXIT>1\n')
+            kbd.dispatch_once(conn, max_spawn=0, failure_limit=3)
+            task = kb.get_task(conn, tid)
+            assert (task.status, task.consecutive_failures) == ('ready', 1)
+            reason = 'unknown_skill' if evidence == 'bound' else 'managed_worker_failed'
+            assert f'managed worker lost: {reason}' in task.last_failure_error
+            assert kbd._prior_infra_losses(conn, tid) == attempt
 
 
 def test_owner_refused_output_alone_is_an_infra_loss(kanban_home):

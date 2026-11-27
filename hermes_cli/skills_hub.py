@@ -1310,20 +1310,19 @@ def do_opt_out(remove: bool = False, console: Optional[Console] = None, skip_con
     c.print(f"[dim]Marker: {res['marker']}[/]")
     if not remove:
         c.print("[dim]Existing skills on disk were left in place. "
-                "Re-run with --remove to also delete unmodified bundled skills.[/]\n")
+                "Re-run with --remove to delete unmodified, non-essential bundled skills.[/]\n")
         return
 
     # Destructive step: preview, confirm, then delete.
     preview = remove_pristine_bundled_skills(dry_run=True)
     candidates = preview["removed"]
     if not candidates:
-        c.print("[dim]No pristine bundled skills to remove "
-                "(nothing tracked, or all are user-modified/local).[/]\n")
+        c.print("[dim]No pristine, non-essential bundled skills to remove.[/]\n")
         return
     c.print(f"\n[bold]Will remove {len(candidates)} unmodified bundled skill(s):[/]")
     c.print(f"[dim]{', '.join(candidates)}[/]")
     if preview["skipped"]:
-        c.print(f"[dim]Keeping {len(preview['skipped'])} (user-modified or non-bundled).[/]")
+        c.print(f"[dim]Keeping {len(preview['skipped'])} (essential, user-modified or non-bundled).[/]")
     if not skip_confirm and not _confirm_or_cancel(
         c, "[dim]This deletes the on-disk copies. User-edited and hub/local skills are NOT touched.[/]",
         cancel="[dim]Marker kept; no skills deleted.[/]\n"):

@@ -1,12 +1,11 @@
 """Bundled-skill maintenance ops: reset, diff, list-modified, opt-out, remove-pristine.
 Profile-scoped paths and patchable helpers resolve through ``_ss()`` at call time."""
 
-import os
-import shutil
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional
 
-from tools.skills_sync_optional import _ignore_runtime_cache, _skill_file_list, _ss
+from agent.skill_utils import ESSENTIAL_SKILLS
+from tools.skills_sync_optional import _skill_file_list, _ss
 
 
 def _bundled_state():
@@ -93,29 +92,11 @@ def ensure_bundled_skill(name: str) -> dict:
             f"'{name}' is a built-in skill, but a skill installed from the hub uses the same name and "
             f"shadows it. To get the built-in back: `hermes skills uninstall {name}`, then "
             f"`hermes skills install {name}`.")}
-    # The rglob walk does not descend a symlinked category the loader follows, so the canonical
-    # SKILL.md counts as present too.
-    skill_md = dest / "SKILL.md"
-    active = next((md.parent for md in ss._iter_active_skill_mds()
-                   if ss.read_skill_name(md, md.parent.name) == name), None) or (
-        dest if skill_md.is_file() and ss.read_skill_name(skill_md, name) == name else None)
+    active = ss._active_skill_path(name)
     if active is not None or name in ss._build_external_skill_index():
         return {"ok": True, "action": "present", "path": active, "message": ""}
-    try:  # the hub's containment check: a symlinked category must not carry the copy out of skills/
-        from pm.filesystem import is_junction
-        from tools.skills_hub_install import _resolve_lock_install_path
-        rel = dest.relative_to(ss._skills_dir()).as_posix()
-        _resolve_lock_install_path(rel, dest.name)
-        # A dir with no SKILL.md (a delete or earlier copy that died partway) is no skill; filling in
-        # its missing files beats failing with EEXIST on every retry. A link inside it would carry the
-        # copy out of skills/, and a SKILL.md there is another skill: refuse both.
-        if os.path.lexists(skill_md):
-            raise ValueError("the directory holds a different skill's SKILL.md")
-        if dest.exists() and any(p.is_symlink() or is_junction(p) for p in dest.rglob("*")):
-            raise ValueError("the leftover directory contains a symlink or junction")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(src, dest, ignore=_ignore_runtime_cache, dirs_exist_ok=True,
-                        copy_function=lambda s, d: d if os.path.lexists(d) else shutil.copy2(s, d))
+    try:
+        ss._fill_missing_skill_files(src, dest)
     except (OSError, ValueError) as e:
         return {"ok": False, "action": "not_restored", "path": dest,
                 "message": f"Could not copy the built-in skill '{name}' to {dest}: {e}"}
@@ -196,7 +177,7 @@ def diff_bundled_skill(name: str) -> dict:
 
 
 _OPT_OUT_MESSAGES = {  # (enabled, changed) -> message
-    (True, True): "Opted out of bundled skills. Future install / update / sync runs will not seed bundled skills into this profile.",
+    (True, True): "Opted out of bundled skills. Future install / update / sync runs will seed only essential skills into this profile.",
     (True, False): "Already opted out — marker was already present.",
     (False, True): "Opted back in. The next `hermes update` (or `hermes skills opt-in --sync`) will re-seed bundled skills.",
     (False, False): "Not opted out — no marker to remove."}
@@ -225,7 +206,7 @@ def set_bundled_skills_opt_out(enabled: bool) -> dict:
 
 
 def remove_pristine_bundled_skills(dry_run: bool = False) -> dict:
-    """Delete bundled skills that are manifest-tracked, still in the bundled source AND
+    """Delete non-essential bundled skills that are manifest-tracked, still in the bundled source AND
     byte-identical to the origin hash; everything else lands in ``skipped``. Removed skills lose
     their manifest entry so a later opt-in re-seed treats them as new.
     Returns ``{ok, removed, skipped: [{name, reason}], dry_run, message}``."""
@@ -233,6 +214,9 @@ def remove_pristine_bundled_skills(dry_run: bool = False) -> dict:
     removed: list[str] = []
     skipped: list[dict] = []
     for name, origin_hash in sorted(manifest.items()):
+        if name in ESSENTIAL_SKILLS:
+            skipped.append({'name': name, 'reason': 'essential (kept)'})
+            continue
         src = bundled_by_name.get(name)
         if src is None:
             skipped.append({"name": name, "reason": "no bundled source (removed upstream)"})
