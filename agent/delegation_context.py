@@ -24,6 +24,13 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS",
 )
 
+#: Attribution-only copies of the worker's task/run id that DO cross the descendant boundary, so
+#: shells, scripts and execute_code can stamp the card that launched them (``$HERMES_KANBAN_TASK``
+#: is scrubbed there). Never authority: no Hermes code may treat these as worker identity.
+KANBAN_ORIGIN_TASK_ENV = "HERMES_KANBAN_ORIGIN_TASK"
+KANBAN_ORIGIN_RUN_ID_ENV = "HERMES_KANBAN_ORIGIN_RUN_ID"
+KANBAN_ORIGIN_ENV_KEYS: tuple[str, ...] = (KANBAN_ORIGIN_TASK_ENV, KANBAN_ORIGIN_RUN_ID_ENV)
+
 
 @contextmanager
 def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
@@ -131,14 +138,31 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     against a temp ``HERMES_HOME`` got a silently read-only board there. An inherited
     path-valued marker is kept (a grandchild that moved HERMES_HOME must not re-fence
     onto its scratch root and unfence the real one).
+
+    The scrubbed task/run id survive as attribution-only ``HERMES_KANBAN_ORIGIN_TASK`` /
+    ``HERMES_KANBAN_ORIGIN_RUN_ID`` (see :data:`KANBAN_ORIGIN_ENV_KEYS`): a task id in *env*
+    (else this process's own) wins, else an inherited origin is kept for grandchildren.
     """
-    cleaned = {k: v for k, v in env.items() if k not in KANBAN_ENV_KEYS}
+    cleaned = {k: v for k, v in env.items() if k not in KANBAN_ENV_KEYS and k not in KANBAN_ORIGIN_ENV_KEYS}
+    cleaned.update(_kanban_origin_env(env))
     # Only the gateway mints ``kanban`` sessions: a descendant ``hermes chat`` sending it is refused.
     if cleaned.get("HERMES_SESSION_SOURCE") == "kanban":
         del cleaned["HERMES_SESSION_SOURCE"]
     inherited = str(env.get(DELEGATED_CHILD_ENV_MARKER) or "")
     cleaned[DELEGATED_CHILD_ENV_MARKER] = inherited if inherited and inherited != "1" else _fenced_kanban_root()
     return cleaned
+
+
+def _kanban_origin_env(env: Mapping[str, str]) -> dict[str, str]:
+    """The ``HERMES_KANBAN_ORIGIN_*`` pair a scrubbed descendant env should carry. Task and run id
+    come from the same source (never mixed): *env*'s own task id, else this process's
+    (a caller-built env that omitted it), else the origin *env* already inherited."""
+    for source in (env, os.environ):
+        task = str(source.get("HERMES_KANBAN_TASK") or "").strip()
+        if task:
+            run_id = str(source.get("HERMES_KANBAN_RUN_ID") or "").strip()
+            return {KANBAN_ORIGIN_TASK_ENV: task, **({KANBAN_ORIGIN_RUN_ID_ENV: run_id} if run_id else {})}
+    return {k: str(env[k]) for k in KANBAN_ORIGIN_ENV_KEYS if env.get(k)}
 
 
 def kanban_path_is_fenced(path: os.PathLike[str] | str) -> bool:
