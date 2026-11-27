@@ -197,11 +197,9 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
     return settled or (bool(pids) and _owner_process_gone(receipt))
 
 
-def run_loss_evidence(conn, task_id, result=None) -> tuple[dict, str]:
+def run_loss_evidence(conn, task_id, result) -> tuple[dict, str]:
     """Keep the owner's raw loss event, but prefer the worker's diagnosis if its frame was lost."""
     lost = _latest_run_event(conn, task_id, 'worker_lost')
-    if result is None:
-        result = _latest_run_event(conn, task_id, 'worker_result')
     reason = 'unknown_skill' if result.get('error') == 'unknown_skill' else str(lost.get('reason') or '')
     return lost, reason
 
@@ -285,8 +283,8 @@ def owner_reclaim_blocked_after_kill(conn, task_id, *, signalled: bool) -> bool:
     return owner_reclaim_blocked(conn, task_id, crash_sweep=signalled)
 
 
-def managed_run_exit_code(conn, task_id, worker_pid, claim_lock, result):
-    """The exit code a managed run's authority recorded for the task's CURRENT run, else None.
+def managed_run_result(conn, row) -> dict:
+    """The result a managed run's authority recorded for the task's CURRENT run, else {}.
 
     Managed interpreters are children of the authority, not the dispatcher, so their result is
     read from the run's ``worker_result`` event (it survives a dispatcher restart and cannot be
@@ -294,8 +292,10 @@ def managed_run_exit_code(conn, task_id, worker_pid, claim_lock, result):
     the dispatcher's own worker, or the owner-side interpreter ``worker_bound`` recorded under
     that claim — ``session_kanban._record_worker_result`` writes the interpreter's pid, never the
     spawned submitter's ``tasks.worker_pid``."""
-    if result.get('claim_lock') != claim_lock:
-        return None
-    bound = _latest_run_event(conn, task_id, 'worker_bound')
-    pids = {worker_pid, *([bound.get('pid')] if bound.get('claim_lock') == claim_lock else [])}
-    return result.get('exit_code') if result.get('pid') in pids else None
+    result = _latest_run_event(conn, row['id'], 'worker_result')
+    if not result.get('pid') or result.get('claim_lock') != row['claim_lock']:
+        return {}
+    if result['pid'] == row['worker_pid']:
+        return result
+    bound = _latest_run_event(conn, row['id'], 'worker_bound')
+    return result if (bound.get('claim_lock'), bound.get('pid')) == (row['claim_lock'], result['pid']) else {}

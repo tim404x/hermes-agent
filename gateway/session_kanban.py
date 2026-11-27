@@ -3,6 +3,8 @@ import asyncio
 import contextlib
 from contextlib import closing
 from dataclasses import asdict, replace
+from itertools import groupby
+import logging
 import threading
 import json
 from pathlib import Path
@@ -243,9 +245,13 @@ def bind_worker_context(frame):
             kb._append_event(conn, task.id, 'worker_bound', bound_payload, run_id=context['run_id'])
             claimed = conn.execute("SELECT payload, created_at FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",
                                    (task.id, context['run_id'])).fetchone()
+    claim = json.loads(claimed[0]) if claimed else {}
+    if claim.get('source_status') == 'review':
+        from agent.skill_utils import REVIEW_LANE_SKILL
+        frame['kanban_required_skill'] = REVIEW_LANE_SKILL
     # Heartbeats extend the claim by the TTL the dispatcher claimed it with (a spawned worker
     # inherited it from the dispatcher's environment); this daemon's own default is not that.
-    expires = json.loads(claimed[0]).get('expires') if claimed else None
+    expires = claim.get('expires')
     if isinstance(expires, int) and claimed[1]:
         env['HERMES_KANBAN_CLAIM_TTL_SECONDS'] = str(max(1, expires - int(claimed[1])))
     _watch_submitter(Path(context['db']), context['run_id'])
@@ -345,7 +351,12 @@ def _run_worker_turns(agent, frame, history):
         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
         raise
     finally:
-        _record_worker_result(context, code, last_output, error=error)
+        try:
+            _record_worker_result(context, code, last_output, error=error)
+        except Exception:
+            if error != 'unknown_skill':
+                raise
+            logging.getLogger(__name__).exception('Could not record the missing-skill worker result')
 
 
 def record_start_failure(frame, exc):
@@ -451,11 +462,25 @@ def _stored_conversation(agent):
     return [message.as_openai_message() for message in store.messages.read_conversation(agent.session_id)]
 
 
-def _run_task_turns(agent, frame, history, context):
+def _task_skill_prompt(names, required, task_id):
+    """A path can load the same name while the required bare identifier is ambiguous."""
     from agent.skill_commands import build_preloaded_skills_prompt
-    skills, loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
-    if missing and not loaded:
+    groups = groupby(dict.fromkeys([*names, required]), key=lambda name: name == required) if required else [(False, names)]
+    blocks, missing = [], []
+    for mandatory, identifiers in groups:
+        text, loaded, absent = build_preloaded_skills_prompt(list(identifiers), task_id=task_id)
+        missing.extend(absent)
+        if mandatory and not loaded:
+            raise KanbanSkillsUnavailable(missing)
+        if loaded:
+            blocks.append(text)
+    if missing and not blocks:
         raise KanbanSkillsUnavailable(missing)
+    return '\n\n'.join(blocks)
+
+
+def _run_task_turns(agent, frame, history, context):
+    skills = _task_skill_prompt(context['skills'], frame.get('kanban_required_skill'), agent.session_id)
     prompt = '\n\n'.join(p for p in (skills, context['context'], frame['text']) if p)
     result = agent.run_conversation(prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
 

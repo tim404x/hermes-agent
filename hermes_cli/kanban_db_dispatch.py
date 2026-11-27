@@ -589,7 +589,7 @@ def heartbeat_worker(
     return True
 
 
-def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
+def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None, failure_limit: int | None = None) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
     SIGTERM, short grace, then SIGKILL. Emits ``timed_out`` and restores the
@@ -690,7 +690,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             _record_task_failure(
                 conn, tid,
                 error=error,
-                outcome="timed_out",
+                outcome="timed_out", failure_limit=failure_limit,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
@@ -1210,7 +1210,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     rows = conn.execute('SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, current_run_id '
                         "FROM tasks WHERE status='running' AND worker_pid IS NOT NULL").fetchall()
     host_prefix = _kb._host_prefix()
-    from hermes_cli.kanban_owner_recovery import _latest_run_event, managed_run_exit_code, owner_reclaim_blocked
+    from hermes_cli.kanban_owner_recovery import managed_run_result, owner_reclaim_blocked
     for row in rows:
         lock = row['claim_lock'] or ''
         started_at = _kb._to_epoch(row['started_at'])
@@ -1230,9 +1230,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
 
             pid = int(row["worker_pid"])
             # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
-            worker_result = _latest_run_event(conn, row["id"], "worker_result")
-            exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"], worker_result)
-            dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
+            worker_result = managed_run_result(conn, row)
+            dead = _classify_dead_worker(pid, lock, worker_result.get('exit_code'), task_id=row["id"], board=board)
             _mark_infra_loss(conn, row["id"], dead, worker_result, board=board)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
@@ -1280,7 +1279,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     return sweep
 
 
-def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
+def _account_crashes(conn: sqlite3.Connection, crash_details: list, failure_limit: int | None) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
     Protocol violations get a BOUNDED violation-only budget independent of
@@ -1341,7 +1340,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
-                outcome="crashed",
+                outcome="crashed", failure_limit=failure_limit,
                 force_trip=True,
                 release_claim=False,
                 end_run=False,
@@ -1357,7 +1356,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 conn, tid,
                 error=error_text,
                 outcome="crashed",
-                failure_limit=1 if is_systemic else None,
+                failure_limit=1 if is_systemic else failure_limit,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra=extra,
@@ -1367,7 +1366,8 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     return auto_blocked
 
 
-def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> list[str]:
+def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None, *,
+                           failure_limit: int | None = None) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Restores the source phase immediately (no waiting for the claim TTL), for
@@ -1379,7 +1379,7 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     """
     sweep = _reclaim_dead_workers(conn, board=board)
     # Outside the main txn: account each crash and maybe trip the breaker.
-    auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
+    auto_blocked = _account_crashes(conn, sweep.crash_details, failure_limit)
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
     # requeues did NOT count a failure and are NOT crashes.
@@ -2272,12 +2272,12 @@ def _run_reclaim_phase(
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
-    result.crashed = detect_crashed_workers(conn, board=board)
+    result.crashed = detect_crashed_workers(conn, board=board, failure_limit=failure_limit)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
-    result.timed_out = enforce_max_runtime(conn)
+    result.timed_out = enforce_max_runtime(conn, failure_limit=failure_limit)
     try:
         result.released_scheduled = _kb.release_due_scheduled(conn)
     except Exception:

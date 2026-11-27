@@ -76,17 +76,34 @@ def test_unknown_worker_loss_publishes_error_status(tmp_path, monkeypatch):
 
 @pytest.mark.platforms("linux")
 def test_missing_skill_worker_frame_preserves_refusal(tmp_path, monkeypatch):
+    from dataclasses import replace
+    import json
     from gateway import session_managed_worker as managed
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
     from persistence.core.errors import AuthorityRefusal
 
-    child = '''from agent import managed_worker
+    child = '''import sqlite3
+from agent import managed_worker
 def missing_skill(frame, channel):
-    from gateway.session_kanban import KanbanSkillsUnavailable
-    raise KanbanSkillsUnavailable(['not-installed'])
+    from gateway import session_kanban
+    def unavailable(*args):
+        raise session_kanban.KanbanSkillsUnavailable(['not-installed'])
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError('database is locked')
+    session_kanban._run_task_turns = unavailable
+    session_kanban._record_worker_result = locked
+    session_kanban._run_worker_turns(None, frame, [])
 managed_worker.execute = missing_skill
 raise SystemExit(managed_worker.main())
 '''
     authority, ref, policy, claim, _, db = _authority_with_a_lost_worker(tmp_path, monkeypatch, child)
+    kb.init_db()
+    with connect_closing() as board:
+        tid = kb.create_task(board, title='review', assignee='default')
+        task = kb.claim_task(board, tid)
+    policy = replace(policy, kanban_json=json.dumps(dict(db=str(kb.kanban_db_path()), task_id=tid,
+                                                        run_id=task.current_run_id, claim_lock=task.claim_lock)))
 
     async def scenario():
         row = await claim()
@@ -98,6 +115,10 @@ raise SystemExit(managed_worker.main())
         assert isinstance(refusal, AuthorityRefusal) and refusal.reason == 'unknown_skill'
     with db:
         asyncio.run(scenario())
+    with connect_closing() as board:
+        events = [(event.kind, event.payload['reason']) for event in kb.list_events(board, tid)
+                  if event.run_id == task.current_run_id and event.kind in ('worker_lost', 'worker_result')]
+        assert events == [('worker_lost', 'unknown_skill')]
 
 
 def _kanban_loss_recorder(monkeypatch, policy, started, release, write_s):

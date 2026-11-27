@@ -2321,9 +2321,9 @@ def release_stale_claims(
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error, run_loss_evidence
+    from hermes_cli import kanban_owner_recovery as recovery
     for row in stale:
-        if owner_reclaim_blocked(conn, row["id"]):
+        if recovery.owner_reclaim_blocked(conn, row["id"]):
             continue
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = _to_epoch(row["last_heartbeat_at"])
@@ -2351,11 +2351,11 @@ def release_stale_claims(
         with write_txn(conn):
             # Again under the write lock: an interpreter that bound since the check above
             # changes neither claim_lock nor worker_pid, so the CAS below cannot see it.
-            if owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
+            if recovery.owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
                 continue
-            _, lost_reason = run_loss_evidence(conn, row["id"])
+            _, lost_reason = recovery.run_loss_evidence(conn, row["id"], recovery.managed_run_result(conn, row))
             retry_status = _retry_status_for_run(conn, row["id"])
-            error = reclaim_error(conn, row["id"], row["claim_lock"], lost_reason)
+            error = recovery.reclaim_error(conn, row["id"], row["claim_lock"], lost_reason)
             # A dead worker its owner lost (stall/restart) is a host event: no failure charged.
             infra = infra_loss_booking(conn, row["id"], lost_reason)
             cur = conn.execute(

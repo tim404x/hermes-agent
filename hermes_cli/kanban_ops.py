@@ -25,9 +25,15 @@ def _kanban_config() -> dict:
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
-        return (cfg.get("kanban", {}) if isinstance(cfg, dict) else {}) or {}
+        section = cfg.get('kanban') if isinstance(cfg, dict) else None
+        return section if isinstance(section, dict) else {}
     except Exception:
         return {}
+
+
+def _failure_limit(args, config: dict) -> int:
+    override = getattr(args, 'failure_limit', None)
+    return override if override is not None else kbd._positive_int(config.get('failure_limit'), kbd.DEFAULT_FAILURE_LIMIT)
 
 
 def _poll_loop(interval: float, tick) -> int:
@@ -62,10 +68,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee, kanban.max_in_progress,
     # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
     # semantics as the gateway dispatch path.
+    _kanban_cfg = _kanban_config()
     try:
-        from hermes_cli.config import load_config
-        _cfg = load_config()
-        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
         default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
         max_in_progress_per_profile = kbd._positive_int(
             _kanban_cfg.get("max_in_progress_per_profile"), None
@@ -88,7 +92,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
-            failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
+            failure_limit=_failure_limit(args, _kanban_cfg),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
@@ -263,7 +267,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         kbd.run_daemon(
             interval=args.interval,
             max_spawn=args.max,
-            failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
+            failure_limit=_failure_limit(args, _kanban_config()),
             on_tick=_on_tick,
         )
     finally:
