@@ -29,13 +29,16 @@ from ._local_lineage import hand_off_conversations, moved_receipts
 from ._routes import (
     _COMPRESSION_LINEAGE_CTE, _ORPHAN_CONTIGUITY_DONORS_SQL, _ORPHAN_LINEAGE_DONOR_SQL, _ORPHANS_SQL,
     _PEER_BY_KEY_SQL, _PEER_BY_TUPLE_SQL, ROUTE_RETIRED_SQL, apply_telegram_topic_migration, fence_shared_routes,
-    route_retired_params,
+    delete_retired_routes, route_retired_params,
 )
 
 __all__ = ["SQLiteRoutingRepository"]
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
+
+_INSERT_ROUTE_SQL = ("INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
+                     "SELECT :scope, :key, :entry, :now WHERE NOT " + ROUTE_RETIRED_SQL)
 
 
 class SQLiteRoutingRepository:
@@ -110,7 +113,36 @@ class SQLiteRoutingRepository:
                  **route_retired_params(session_key, entry_json, time.time())},
             )
 
-    def replace_routing_entries(self, entries: Mapping[str, str], *, routing_scope: str = "") -> set[str]:
+    def replace_routing_entries(
+        self, entries: Mapping[str, str], *, routing_scope: str = "", rewrite: bool = False,
+    ) -> set[str]:
+        if rewrite:
+            return self._rewrite_routing_entries(entries, routing_scope=routing_scope)
+        now = time.time()
+
+        def _do(conn):
+            desired = {key: text for key, text in entries.items() if key and text}
+            current = dict(conn.execute("SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?",
+                                        (routing_scope,)))
+            changed = [key for key in desired if current.get(key) != desired[key]]
+            obsolete = (current.keys() - desired.keys()) | (current.keys() & changed)
+            conn.executemany("DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?",
+                             ((routing_scope, key) for key in obsolete))
+            retired = delete_retired_routes(conn, routing_scope, now)
+            inserted = conn.executemany(_INSERT_ROUTE_SQL, (
+                {'scope': routing_scope, 'key': key, **route_retired_params(key, desired[key], now)}
+                for key in changed))
+            if inserted.rowcount < len(changed):
+                retired.update(row[0] for row in conn.execute(
+                    "SELECT value FROM json_each(?) WHERE NOT EXISTS "
+                    "(SELECT 1 FROM gateway_routing WHERE scope = ? AND session_key = value)",
+                    (json.dumps(changed), routing_scope)))
+            return retired
+
+        with translated():
+            return self._store.holder()._execute_write(_do)
+
+    def _rewrite_routing_entries(self, entries: Mapping[str, str], *, routing_scope: str) -> set[str]:
         now = time.time()
         rows = [{'scope': routing_scope, 'key': k, **route_retired_params(k, v, now)}
                 for k, v in entries.items() if k and v]
@@ -118,10 +150,7 @@ class SQLiteRoutingRepository:
         def _do(conn):
             conn.execute("DELETE FROM gateway_routing WHERE scope = ?", (routing_scope,))
             if rows:
-                conn.executemany(
-                    "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
-                    "SELECT :scope, :key, :entry, :now WHERE NOT " + ROUTE_RETIRED_SQL,
-                    rows)
+                conn.executemany(_INSERT_ROUTE_SQL, rows)
             kept = {r[0] for r in conn.execute(
                 "SELECT session_key FROM gateway_routing WHERE scope = ?", (routing_scope,))}
             return {row['key'] for row in rows} - kept

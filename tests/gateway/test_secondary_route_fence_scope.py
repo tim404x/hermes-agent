@@ -369,7 +369,12 @@ async def test_a_start_within_the_horizon_strips_a_pruned_route_from_an_older_mi
         store._save_sessions_json(stale[0])
         _restart(store)
         assert key not in store._entries
-        assert key not in _mirror(store), 'the start kept the pruned route in the mirror'
+        if mirror:
+            assert key not in _mirror(store), 'the start kept the pruned route in the mirror'
+        else:
+            assert not (store.sessions_dir / 'sessions.json').exists()
+            archive, = store.sessions_dir.glob('sessions.json.retired-*')
+            assert key not in json.loads(archive.read_text())
         _past_the_horizon(served.alpha_db, served.launch_db)
         _restart(store)
         assert key not in store._entries, 'a pruned route came back on startup after its fence aged out'
@@ -412,7 +417,10 @@ async def test_a_pruned_route_stays_out_of_the_mirror_and_a_reused_id_keeps_one_
         _age_retirements(served.alpha_db, served.launch_db)  # a quiet week: no full save, no restart
         _restart(store)
         assert key not in store._entries, 'the first start past the horizon restored the pruned route'
-        assert key not in _mirror(store)
+        if mirror:
+            assert key not in _mirror(store)
+        else:
+            assert not (store.sessions_dir / 'sessions.json').exists()
 
         status, text = await _create(served, sid)  # the launch profile reuses the id
         assert status == 201, text

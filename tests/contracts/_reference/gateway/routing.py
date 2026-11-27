@@ -194,7 +194,9 @@ class InMemoryRoutingRepository:
             return
         self._index().setdefault(routing_scope, {})[session_key] = StoredRoute.of(session_key, entry_json)
 
-    def replace_routing_entries(self, entries: Mapping[str, str], *, routing_scope: str = "") -> set[str]:
+    def replace_routing_entries(
+        self, entries: Mapping[str, str], *, routing_scope: str = "", rewrite: bool = False,
+    ) -> set[str]:
         now = time.time()
         rows = [(key, text) for key, text in entries.items() if key and text]
         skipped = {key for key, text in rows if self._route_retired(key, text, now)}

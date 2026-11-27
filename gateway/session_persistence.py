@@ -9,6 +9,7 @@ import functools
 import logging
 import json
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 from utils import atomic_json_write
@@ -468,13 +469,8 @@ class SessionPersistenceMixin:
         return None
 
     def _ensure_loaded_locked(self) -> None:
-        """Load the routing index (lock held). state.db ``gateway_routing`` is primary;
-        sessions.json is the legacy import for keys the DB lacks (persisted on the next _save).
-
-        Read order (#9006 follow-up): the ``gateway_routing`` table in state.db is the primary source;
-        sessions.json is the legacy import path for pre-migration installs (its entries are folded in for
-        keys the DB doesn't have, then persisted to the DB on the next _save).
-        """
+        """Load state.db routes first, then missing keys from the legacy mirror. When mirror writes
+        are disabled, commit the import before archiving the file so later loads cannot replay it."""
         if self._loaded:
             self._reconcile_recovered_routing_locked()
             self._promote_held_routes_locked()
@@ -482,24 +478,22 @@ class SessionPersistenceMixin:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         db_load_succeeded = self._load_routing_rows_locked()
         db_had_entries = db_load_succeeded and bool(self._entries)
-        mirror_retired = self._import_legacy_sessions_json(db_had_entries)
+        mirror_retired, mirror_loaded = self._import_legacy_sessions_json(db_had_entries)
         self._loaded = True
         self._routing_db_loaded = db_load_succeeded
         # Heal before the fallback baseline: a heal after it reads as a caller edit, and recovery
         # would then keep the stale mirror entry over the newer DB row.
         self._heal_missing_origins(self._entries.values())
         self._routing_fallback_baseline = None if db_load_succeeded else self._routing_data_locked()
-        if mirror_retired and db_load_succeeded:
-            # Rewrite the mirror while the fences that kept those routes out still hold: a prune's
-            # ages out, and the import would then restore the retired route.
-            self._save()
-            if not getattr(self, "_write_sessions_json", True):
-                # That save left an existing mirror as it was: strip the routes from it directly,
-                # or every later start imports them again.
+        mirror_disabled = not getattr(self, "_write_sessions_json", True)
+        self._archive_mirror_on_commit = mirror_disabled and mirror_loaded
+        if db_load_succeeded and (mirror_retired or self._archive_mirror_on_commit):
+            if mirror_disabled and mirror_retired:
                 try:
                     self.strip_retired_mirror_routes()
                 except Exception:
                     logger.warning("gateway.session: could not strip retired routes from sessions.json", exc_info=True)
+            self._save()
         # A hard crash skips graceful shutdown and leaves sessions.json pointing at ended sessions.
         self._prune_stale_sessions_locked()
 
@@ -528,14 +522,13 @@ class SessionPersistenceMixin:
             return None
         return source if self._generate_session_key(source) == entry.session_key else None
 
-    def _import_legacy_sessions_json(self, db_had_entries: bool) -> int:
-        """Legacy import: sessions.json fills only keys the DB lacks. Lock held. Returns how many
-        mirror entries it skipped as retired routes."""
+    def _import_legacy_sessions_json(self, db_had_entries: bool) -> tuple[int, bool]:
+        """Fill keys the DB lacks. Return the retired count and whether a whole mirror was read."""
         from gateway.session import SessionEntry
         sessions_file = self.sessions_dir / "sessions.json"
         retired = 0
         if not sessions_file.exists():
-            return retired
+            return retired, False
         try:
             with open(sessions_file, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
@@ -567,7 +560,22 @@ class SessionPersistenceMixin:
                     "state.db routing table", imported, "y" if imported == 1 else "ies")
         except Exception as e:
             print(f"[gateway] Warning: Failed to load sessions: {e}")
-        return retired
+            return retired, False
+        return retired, True
+
+    def _archive_sessions_json(self) -> None:
+        mirror = self.sessions_dir / "sessions.json"
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        archive = mirror.with_suffix(f".json.retired-{stamp}")
+        suffix = 0
+        while archive.exists():
+            suffix += 1
+            archive = mirror.with_suffix(f".json.retired-{stamp}.{suffix}")
+        try:
+            mirror.rename(archive)
+        except FileNotFoundError:
+            return
+        logger.info("gateway.session: archived disabled sessions.json mirror as %s", archive.name)
 
     def _prune_stale_sessions_locked(self) -> None:
         """Remove routing entries whose session has ended in state.db (startup, lock held). Stale ==
@@ -746,23 +754,35 @@ class SessionPersistenceMixin:
                         data = {k: v for k, v in data.items() if k not in retired}
                 except Exception as exc:
                     logger.warning("gateway.session: state.db routing save failed: %s", exc)
-            if getattr(self, "_write_sessions_json", True) or not db_saved:
-                try:
-                    self._save_sessions_json(data)
-                except Exception as exc:
-                    if not db_saved:
-                        raise
-                    # state.db is authoritative: a failed legacy mirror must not report the
-                    # already-committed primary write as failed.
-                    logger.warning(
-                        "gateway.session: sessions.json mirror save failed after state.db commit: "
-                        "%s", exc)
+            # Mirror I/O follows the DB transaction, outside the state.db writer mutex.
+            self._persist_sessions_json(data, db_saved=db_saved)
             self._persisted_routing_generation = generation
             # This rewrite supersedes fast records at or below its generation; newer ones stay for
             # the next delayed full writer.
             if fast_persisted:
                 for key in [k for k, (rev, _) in fast_persisted.items() if rev <= generation]:
                     del fast_persisted[key]
+
+    def _persist_sessions_json(self, data: dict[str, Any], *, db_saved: bool) -> None:
+        """Keep a fallback until its contents have been reconciled and committed to state.db."""
+        write_mirror = getattr(self, "_write_sessions_json", True)
+        if not write_mirror and db_saved:
+            if getattr(self, "_archive_mirror_on_commit", False) and self._routing_db_loaded:
+                try:
+                    self._archive_sessions_json()
+                except OSError as exc:
+                    logger.warning("gateway.session: could not archive sessions.json after state.db commit: %s", exc)
+                else:
+                    self._archive_mirror_on_commit = False
+            return
+        try:
+            self._save_sessions_json(data)
+        except Exception as exc:
+            if not db_saved:
+                raise
+            logger.warning("gateway.session: sessions.json mirror save failed after state.db commit: %s", exc)
+        else:
+            self._archive_mirror_on_commit = not write_mirror
 
     def _save_sessions_json(self, data: dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index (atomic + fsync)."""

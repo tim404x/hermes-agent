@@ -330,6 +330,7 @@ def test_recovered_db_rows_survive_fallback_structural_save(monkeypatch, tmp_pat
     # The failed open stays in its backoff through the load, however long the load takes.
     store._db_handle_cache._unavailable[db_path.parent].next_retry_at = float("inf")
     store._ensure_loaded()
+    assert (sessions_dir / "sessions.json").exists()
     store._db_handle_cache._unavailable[db_path.parent].next_retry_at = 0
 
     current = SessionEntry(
@@ -356,3 +357,7 @@ def test_recovered_db_rows_survive_fallback_structural_save(monkeypatch, tmp_pat
     )
     assert store._entries[current.session_key].session_id == current.session_id
     store.close_all_db_handles()
+    restarted = SessionStore(sessions_dir, GatewayConfig(sessions_dir=sessions_dir, write_sessions_json=False))
+    restarted._ensure_loaded()
+    assert deleted.session_key not in restarted._entries
+    restarted.close_all_db_handles()

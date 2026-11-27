@@ -243,8 +243,12 @@ class RoutingRepository(Protocol):
         """Insert or replace the entry under ``session_key`` in ``routing_scope``. An empty key or entry is a silent no-op; a retired route (``route_retired``) is silently skipped inside the same write."""
         ...
 
-    def replace_routing_entries(self, entries: Mapping[str, str], *, routing_scope: str = "") -> set[str]:
-        """Replace ``routing_scope``'s whole index with ``entries`` in one write (keys absent from ``entries`` go; other routing scopes are untouched). Pairs with an empty key or entry are dropped; retired routes are skipped, and their keys are returned so the sessions.json mirror leaves them out too."""
+    def replace_routing_entries(
+        self, entries: Mapping[str, str], *, routing_scope: str = "", rewrite: bool = False,
+    ) -> set[str]:
+        """Replace ``routing_scope``'s index in one transaction; absent keys go and other scopes are untouched.
+        Writes only the difference; ``rewrite=True`` rewrites the whole scope (repair). Empty keys or entries
+        are dropped; retired routes are skipped and their keys returned so the sessions.json mirror omits them."""
         ...
 
     def fence_retired_routes(self, session_ids: Iterable[str], *, namespace: str, expiring: Iterable[str] = ()) -> None:

@@ -1620,4 +1620,60 @@ class TestGatewayRoutingTable:
         assert recovered.session_id == entry.session_id
         restarted.close_all_db_handles()
 
+    def test_disabling_sessions_json_imports_it_once_before_archiving(self, tmp_path):
+        mirror = tmp_path / "sessions.json"
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        entry = store.get_or_create_session(self._source())
+        key = entry.session_key
+        original = mirror.read_bytes()
+        assert json.loads(original)[key]["session_id"] == entry.session_id
+        assert not list(tmp_path.glob("sessions.json.retired-*"))
+        store.persistence.routing.replace_routing_entries({}, routing_scope=store._routing_scope())
+        store.close_all_db_handles()
+
+        enabled = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        enabled._ensure_loaded()
+        assert enabled._entries[key].session_id == entry.session_id
+        assert mirror.read_bytes() == original
+        assert not list(tmp_path.glob("sessions.json.retired-*"))
+        enabled.close_all_db_handles()
+
+        config = GatewayConfig(write_sessions_json=False)
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._ensure_loaded()
+        assert store._entries[key].session_id == entry.session_id
+        durable = store.persistence.routing.load_routing_entries(routing_scope=store._routing_scope())
+        assert json.loads(durable[key])["session_id"] == entry.session_id
+        assert not mirror.exists()
+        archive, = tmp_path.glob("sessions.json.retired-*")
+        assert archive.read_bytes() == original
+
+        with store._lock:
+            del store._entries[key]
+            store._save()
+        store.close_all_db_handles()
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        restarted._ensure_loaded()
+        assert key not in restarted._entries
+        assert not mirror.exists()
+        restarted.close_all_db_handles()
+
+    def test_disabled_mirror_survives_failed_import_commit(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig(write_sessions_json=False))
+        now = datetime.now().astimezone()
+        key = "agent:main:telegram:dm:legacy"
+        entry = SessionEntry(session_key=key, session_id="legacy", created_at=now, updated_at=now)
+        store._save_sessions_json({key: entry.to_dict()})
+        routing = store._routing_persistence.routing
+        with patch.object(routing, "replace_routing_entries", side_effect=OSError("write failed")):
+            store._ensure_loaded()
+        assert not routing.load_routing_entries(routing_scope=store._routing_scope())
+        assert json.loads((tmp_path / "sessions.json").read_text())[key]["session_id"] == "legacy"
+        assert not list(tmp_path.glob("sessions.json.retired-*"))
+
+        store._save_entries()
+        assert key in routing.load_routing_entries(routing_scope=store._routing_scope())
+        assert not (tmp_path / "sessions.json").exists()
+        store.close_all_db_handles()
+
 
