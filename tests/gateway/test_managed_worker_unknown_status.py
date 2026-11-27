@@ -23,8 +23,8 @@ for line in sys.stdin.buffer:
 """
 
 
-def _authority_with_a_lost_worker(tmp_path, monkeypatch):
-    """A real authority whose next managed turn's child says hello, then sends a bogus frame."""
+def _authority_with_a_lost_worker(tmp_path, monkeypatch, child=CHILD):
+    """A real authority whose next managed turn's child fails after hello."""
     from gateway import session_managed_worker as managed
     from gateway.session_authority import LiveSession, SessionAuthority, admission_row
     from gateway.session_contract import Submission
@@ -35,20 +35,20 @@ def _authority_with_a_lost_worker(tmp_path, monkeypatch):
     seed_session(db, 's', 'test')
     runner = SimpleNamespace(_draining=False, _cached_agent_for=lambda route: None,
                              _adapter_for_source=lambda source: None)
-    authority = SessionAuthority(runner, profile_id='owned', instance_id='i',
+    authority = SessionAuthority(runner, profile_id=str(tmp_path), instance_id='i',
                                  epoch=db.runtime.begin_epoch(instance_id='i'), persistence=storage_handle(tmp_path))
     live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='human', chat_id='c'), 'route')
     published = []
     original = live.event_stream.publish
     monkeypatch.setattr(live.event_stream, 'publish', lambda sid, payload, **kw: (
         published.append((kw.get('event_type', 'message.complete'), payload)), original(sid, payload, **kw))[1])
-    actor = SessionActor('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
-    ref = SessionRef('owned', 's')
+    actor = SessionActor('human', authority.profile_id, frozenset({'session:submit', 'session:control'}), 'cli')
+    ref = SessionRef(authority.profile_id, 's')
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)
 
     class Child(subprocess.Popen):
         def __init__(self, args, **kw):
-            super().__init__([sys.executable, '-c', CHILD], **kw)
+            super().__init__([sys.executable, '-c', child], **kw)
     monkeypatch.setattr(managed.subprocess, 'Popen', Child)
     policy = build_policy({'cwd': str(tmp_path), 'model': 'm'}, {}, profile_terminal=False)
 
@@ -72,6 +72,53 @@ def test_unknown_worker_loss_publishes_error_status(tmp_path, monkeypatch):
         asyncio.run(scenario())
     complete = [p for kind, p in published if kind == 'message.complete' and p.get('outcome') == 'unknown']
     assert complete and complete[0]['status'] == 'error', published
+
+
+@pytest.mark.platforms("linux")
+def test_missing_skill_worker_frame_preserves_refusal(tmp_path, monkeypatch):
+    from dataclasses import replace
+    import json
+    from gateway import session_managed_worker as managed
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    from persistence.core.errors import AuthorityRefusal
+
+    child = '''import sqlite3
+from agent import managed_worker
+def missing_skill(frame, channel):
+    from gateway import session_kanban
+    def unavailable(*args):
+        raise session_kanban.KanbanSkillsUnavailable(['not-installed'])
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError('database is locked')
+    session_kanban._run_task_turns = unavailable
+    session_kanban._record_worker_result = locked
+    session_kanban._run_worker_turns(None, frame, [])
+managed_worker.execute = missing_skill
+raise SystemExit(managed_worker.main())
+'''
+    authority, ref, policy, claim, _, db = _authority_with_a_lost_worker(tmp_path, monkeypatch, child)
+    kb.init_db()
+    with connect_closing() as board:
+        tid = kb.create_task(board, title='review', assignee='default')
+        task = kb.claim_task(board, tid)
+    policy = replace(policy, kanban_json=json.dumps(dict(db=str(kb.kanban_db_path()), task_id=tid,
+                                                        run_id=task.current_run_id, claim_lock=task.claim_lock)))
+
+    async def scenario():
+        row = await claim()
+        authority.executing[ref.session_id] = row['generation']
+        with pytest.raises(managed.ManagedExecutionUnknown) as lost:
+            async with asyncio.timeout(30):
+                await managed.execute_managed(authority, ref, row, policy)
+        refusal = lost.value.__cause__
+        assert isinstance(refusal, AuthorityRefusal) and refusal.reason == 'unknown_skill'
+    with db:
+        asyncio.run(scenario())
+    with connect_closing() as board:
+        events = [(event.kind, event.payload['reason']) for event in kb.list_events(board, tid)
+                  if event.run_id == task.current_run_id and event.kind in ('worker_lost', 'worker_result')]
+        assert events == [('worker_lost', 'unknown_skill')]
 
 
 def _kanban_loss_recorder(monkeypatch, policy, started, release, write_s):

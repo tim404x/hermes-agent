@@ -3,7 +3,7 @@
 ~/.hermes/skills/, tracking each synced skill's origin hash in .bundled_manifest (v2 "name:hash"
 lines; v1 plain names auto-migrate). NEW skills are copied and recorded; EXISTING skills update
 only when bundled changed AND the user copy still matches the origin hash (else user-customized
--> SKIP); user-DELETED skills are not re-added; upstream-REMOVED ones leave the manifest once no active or
+-> SKIP); user-DELETED skills are not re-added unless essential; upstream-REMOVED ones leave the manifest once no active or
 archived copy remains (the entry is that copy's only built-in provenance record)."""
 
 import hashlib
@@ -24,8 +24,9 @@ for _stream in (sys.stdout, sys.stderr):
         with suppress(ValueError, TypeError):
             _stream.reconfigure(encoding="utf-8", errors="replace")
 from hermes_constants import get_bundled_skills_dir, get_hermes_home, get_optional_skills_dir
+from agent.skill_index import root_index
 from agent.skill_utils import ESSENTIAL_SKILLS, is_excluded_skill_path
-from tools.skill_usage import read_skill_name
+from tools.skill_usage import is_hub_installed, read_skill_name
 from tools.skills_sync_optional import (
     _backfill_optional_provenance, _ignore_runtime_cache, _is_runtime_cache, _read_hub_install_paths,
 )
@@ -99,6 +100,14 @@ def _iter_active_skill_mds(sort: bool = False) -> Iterator[Path]:
     return _iter_skill_mds(_skills_dir(), sort)
 
 
+def _provides_skill(md: Path, name: str) -> bool:
+    return md.is_file() and read_skill_name(md, md.parent.name) == name
+
+
+def _active_skill_path(name: str) -> Path | None:
+    return next((md.parent for md in root_index(_skills_dir()).skill_index_files() if _provides_skill(md, name)), None)
+
+
 def _build_external_skill_index() -> set[str]:
     """Names (directory and frontmatter) of every skill provided by external_dirs,
     so sync_skills never shadows an externally-delegated skill."""
@@ -106,7 +115,7 @@ def _build_external_skill_index() -> set[str]:
     _external_dirs_cache_clear()  # so a config edit (or a test patch) is seen
     external_names: set[str] = set()
     for ext_dir in get_external_skills_dirs():
-        for skill_md in _iter_skill_mds(ext_dir):
+        for skill_md in root_index(ext_dir).skill_index_files():
             external_names.update({skill_md.parent.name, read_skill_name(skill_md, "")})
     external_names.discard("")
     return external_names
@@ -224,6 +233,24 @@ def _copy_dir(src: Path, dest: Path) -> None:
     shutil.copytree(src, dest, ignore=_ignore_runtime_cache)
 
 
+def _check_bundled_dest(dest: Path) -> None:
+    from tools.skills_hub_install import _resolve_lock_install_path
+    _resolve_lock_install_path(_rel_skills_posix(dest), dest.name, skills_dir=_skills_dir())
+
+
+def _fill_missing_skill_files(src: Path, dest: Path) -> None:
+    """Fill a missing skill without following a redirect or replacing any surviving file."""
+    from pm.filesystem import is_junction
+    _check_bundled_dest(dest)
+    if os.path.lexists(dest / 'SKILL.md'):
+        raise ValueError("the directory holds a different skill's SKILL.md")
+    if dest.exists() and any(path.is_symlink() or is_junction(path) for path in dest.rglob('*')):
+        raise ValueError('the leftover directory contains a symlink or junction')
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dest, ignore=_ignore_runtime_cache, dirs_exist_ok=True,
+                    copy_function=lambda source, target: target if os.path.lexists(target) else shutil.copy2(source, target))
+
+
 def _recover_renamed_skill(st: "_SyncState", skill_name: str, dest: Path) -> Optional[str]:
     """Move a bundled skill's stale copy to its new canonical path after an upstream RENAME /
     RECATEGORIZATION (else it is misread as user-deleted and stranded forever). Only a copy
@@ -307,10 +334,16 @@ def _defer_to_external(st: _SyncState, skill_name: str, dest: Path, bundled_hash
         st.manifest.pop(skill_name, None)
 
 
-def _install_new_skill(st: _SyncState, skill_name: str, skill_src: Path, dest: Path, bundled_hash: str) -> None:
-    """Handle a skill never offered before (not in manifest)."""
+def _install_bundled_skill(st: _SyncState, skill_name: str, skill_src: Path, dest: Path, bundled_hash: str,
+                           *, missing_essential: bool, suppressed: bool) -> None:
+    """Install a new skill or re-seed a missing essential from bundled, never from the archive."""
     try:
-        if dest.exists():
+        if missing_essential:
+            if _active_skill_path(skill_name) is not None or is_hub_installed(skill_name):
+                st.skipped += 1
+                return
+            _fill_missing_skill_files(skill_src, dest)
+        elif dest.exists():
             # Never overwrite a same-named user skill. Baseline the manifest only when
             # byte-identical: a differing copy's bundled_hash reads as "user-modified" forever.
             st.skipped += 1
@@ -321,13 +354,23 @@ def _install_new_skill(st: _SyncState, skill_name: str, skill_src: Path, dest: P
                     f"  ⚠ {skill_name}: bundled version shipped but you already have a local skill "
                     f"by this name — yours was kept. Run `hermes skills reset {skill_name}` to "
                     f"replace it with the bundled version.")
+            return
         else:
             _copy_dir(skill_src, dest)
-            st.copied.append(skill_name)
-            st.manifest[skill_name] = bundled_hash
-            st.say(f"  + {skill_name}")
-    except OSError as e:
-        st.say(f"  ! Failed to copy {skill_name}: {e}")  # not in manifest — next sync retries
+    except (OSError, ValueError) as e:
+        st.say(f"  ! Failed to copy {skill_name}: {e}")
+        return
+    st.copied.append(skill_name)
+    restored = skill_name in st.manifest
+    st.manifest[skill_name] = bundled_hash
+    st.say(f"  + {skill_name}" + (" (essential, restored)" if restored else ""))
+    if suppressed:
+        try:
+            from tools import skill_usage
+            skill_usage._toggle_suppressed_name(skill_name, add=False)
+            skill_usage.set_state(skill_name, skill_usage.STATE_ACTIVE)
+        except Exception:
+            logger.debug("Could not reactivate %s", skill_name, exc_info=True)
 
 
 def _replace_skill_dir(skill_src: Path, dest: Path) -> None:
@@ -389,16 +432,16 @@ def _seed_category_descriptions(bundled_dir: Path, only_dirs: Optional[set[Path]
         if (only_dirs is not None and dest_desc.parent not in only_dirs) or dest_desc.exists():
             continue
         try:
+            _check_bundled_dest(dest_desc)
             dest_desc.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(desc_md, dest_desc)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             logger.debug("Could not copy %s: %s", desc_md, e)
 
 
 def sync_skills(quiet: bool = False) -> dict:
     """Sync bundled skills into ~/.hermes/skills/ using the manifest; returns the per-category
-    result dict. Opted-out profiles seed ONLY ESSENTIAL_SKILLS (the system prompt always
-    points at ``hermes-agent``)."""
+    result dict. Opted-out profiles seed only the operating manual and force-loaded skills."""
     essential_only = (_hermes_home() / NO_BUNDLED_SKILLS_MARKER).exists()
     if essential_only and not quiet:
         print("  (profile opted out of bundled skills via .no-bundled-skills — seeding essential skills only)")
@@ -420,15 +463,24 @@ def sync_skills(quiet: bool = False) -> dict:
             st.suppressed.append(skill_name)
             continue
         dest = _compute_relative_dest(skill_src, bundled_dir)
+        if skill_name in ESSENTIAL_SKILLS:
+            try:
+                _check_bundled_dest(dest)
+            except (OSError, ValueError) as e:
+                st.skipped += 1
+                st.say(f"  ! Skipping {skill_name}: {e}")
+                continue
         bundled_hash = dir_hash(skill_src)
         # Recoveries run BEFORE classification so a missing dest isn't misread as user-deleted.
         _recover_orphan_backup(dest)
         if not dest.exists() and skill_name in st.manifest and _recover_renamed_skill(st, skill_name, dest):
             st.relocated.append(skill_name)
+        missing_essential = skill_name in ESSENTIAL_SKILLS and not _provides_skill(dest / 'SKILL.md', skill_name)
         if skill_name in external_index:
             _defer_to_external(st, skill_name, dest, bundled_hash)
-        elif skill_name not in st.manifest:
-            _install_new_skill(st, skill_name, skill_src, dest, bundled_hash)
+        elif missing_essential or skill_name not in st.manifest:
+            _install_bundled_skill(st, skill_name, skill_src, dest, bundled_hash,
+                                   missing_essential=missing_essential, suppressed=skill_name in suppressed)
         elif dest.exists():
             _update_existing_skill(st, skill_name, skill_src, dest, bundled_hash)
         else:

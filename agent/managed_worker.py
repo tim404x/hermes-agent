@@ -595,6 +595,7 @@ def hello():
 def main():
     channel = WorkerChannel(os.fdopen(os.dup(sys.stdout.fileno()), 'wb', buffering=0))  # windows-footgun: ok — binary frames
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    from gateway.session_kanban import KanbanSkillsUnavailable
     # This process's own stderr only, never the channel. The owner drains it into the profile's
     # private managed-worker.log, redacting each line (patterns plus this worker's launch key and
     # assignment secret) before it reaches disk; this process never opens a profile log itself.
@@ -605,6 +606,10 @@ def main():
         channel.send('hello', **hello())
         frame = validate_bootstrap(read_frame(sys.stdin.buffer))
         execute(frame, channel)
+    except KanbanSkillsUnavailable:
+        logger.exception('kanban skills unavailable')
+        channel.send('error', reason='unknown_skill')
+        return 1
     except Exception:
         # Runtime exceptions can contain credentials; the owner gets no raw traceback.
         logger.exception('managed worker failed')

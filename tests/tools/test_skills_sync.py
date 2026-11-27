@@ -326,6 +326,66 @@ class TestRenamedBundledSkillRecovery:
         # Future syncs can now detect further upstream changes.
         assert recorded == dir_hash(bundled / "newcat" / "moved-skill")
 
+    @pytest.mark.parametrize('tracked', [True, False])
+    def test_essential_keeps_edited_copy_at_its_active_path(self, tmp_path, monkeypatch, tracked):
+        monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+        bundled, skills = tmp_path / 'bundled', tmp_path / 'skills'
+        src = self._skill(bundled, 'devops/sdlc-review', name='sdlc-review')
+        old = self._skill(skills, 'mine/custom-review', name='sdlc-review', body='My review procedure')
+        with self._patches(bundled, skills, skills / '.bundled_manifest'):
+            if tracked:
+                _write_manifest({'sdlc-review': dir_hash(src)})
+            assert sync_skills(quiet=True)['copied'] == []
+        assert list(skills.rglob('SKILL.md')) == [old / 'SKILL.md']
+        assert (old / 'SKILL.md').read_text().endswith('My review procedure')
+
+    @pytest.mark.parametrize('tracked', [True, False])
+    def test_essential_fills_incomplete_dir_preserving_local_files(self, tmp_path, monkeypatch, tracked):
+        monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+        bundled, skills = tmp_path / 'bundled', tmp_path / 'skills'
+        src = self._skill(bundled, 'devops/reviewer', name='sdlc-review')
+        other = self._skill(bundled, 'misc/other', name='other')
+        (src / 'notes').write_text('stock')
+        dest = skills / 'devops/reviewer'
+        dest.mkdir(parents=True)
+        (dest / 'notes').write_text('my notes')
+        with self._patches(bundled, skills, skills / '.bundled_manifest'):
+            if tracked:
+                _write_manifest({'sdlc-review': dir_hash(src)})
+            assert set(sync_skills(quiet=True)['copied']) == {'sdlc-review', 'other'}
+            assert _read_manifest() == {'sdlc-review': dir_hash(src), 'other': dir_hash(other)}
+            assert not sync_skills(quiet=True)['copied']
+        assert (dest / 'SKILL.md').read_bytes() == (src / 'SKILL.md').read_bytes()
+        assert (dest / 'notes').read_text() == 'my notes'
+
+    def test_essential_never_restores_through_redirected_category(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+        bundled, skills, outside = tmp_path / 'bundled', tmp_path / 'skills', tmp_path / 'outside'
+        src = self._skill(bundled, 'devops/reviewer', name='sdlc-review')
+        (src.parent / 'DESCRIPTION.md').write_text('devops')
+        skills.mkdir()
+        outside.mkdir()
+        (skills / 'devops').symlink_to(outside, target_is_directory=True)
+        with self._patches(bundled, skills, skills / '.bundled_manifest'):
+            assert not sync_skills(quiet=True)['copied']
+            assert not _read_manifest()
+        assert not list(outside.iterdir())
+
+    def test_essential_defers_to_external_frontmatter_name(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+        bundled, skills, external = tmp_path / 'bundled', tmp_path / 'skills', tmp_path / 'external'
+        src = self._skill(bundled, 'devops/reviewer', name='sdlc-review')
+        active = self._skill(tmp_path / 'checkout', 'custom', name='sdlc-review', body='external edits')
+        external.mkdir()
+        (external / 'reviews').symlink_to(active.parent, target_is_directory=True)
+        monkeypatch.setattr('agent.skill_utils.get_external_skills_dirs', lambda: [external])
+        with self._patches(bundled, skills, skills / '.bundled_manifest'):
+            _write_manifest({'sdlc-review': dir_hash(src)})
+            result = sync_skills(quiet=True)
+        assert result['shadowed_by_external'] == ['sdlc-review'] and not result['copied']
+        assert not (skills / 'devops/reviewer').exists()
+        assert (active / 'SKILL.md').read_text().endswith('external edits')
+
     def test_rename_leaves_user_modified_and_hub_owned_copies_alone(self, tmp_path):
         """A user-edited copy is never moved or overwritten, and a hub-owned
         path is never relocated — the hub lock owns it."""
@@ -432,6 +492,35 @@ class TestSyncSkills:
         # The non-suppressed bundled skill is still copied normally.
         assert "new-skill" in result["copied"]
         assert (skills_dir / "category" / "new-skill" / "SKILL.md").exists()
+
+    @pytest.mark.parametrize("tracked", [True, False])
+    def test_sync_reseeds_only_suppressed_essentials_and_keeps_archives(self, tmp_path, monkeypatch, tracked):
+        from tools import skill_usage
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        bundled = self._setup_bundled(tmp_path)
+        skills = tmp_path / "skills"
+        essential, other = "sdlc-review", "old-skill"
+        (bundled / essential).mkdir()
+        (bundled / essential / "SKILL.md").write_text("bundled review")
+        for name in (essential, other):
+            archive = skills / ".archive" / name
+            archive.mkdir(parents=True)
+            (archive / "SKILL.md").write_text(f"archived {name}")
+        (skills / ".curator_suppressed").write_text(f"{essential}\n{other}\n")
+        skill_usage.save_usage({name: {"state": "archived"} for name in (essential, other)})
+        with self._patches(bundled, skills, skills / ".bundled_manifest"):
+            _write_manifest({name: dir_hash(skills / ".archive" / name) for name in (essential, other)} if tracked else {})
+            result = sync_skills(quiet=True)
+            assert _read_manifest()[essential] == dir_hash(bundled / essential)
+        assert essential in result["copied"] and result["suppressed"] == [other]
+        assert (skills / essential / "SKILL.md").read_text() == "bundled review"
+        assert not (skills / other).exists()
+        assert skill_usage.read_suppressed_names() == {other}
+        usage = skill_usage.load_usage()
+        assert (usage[essential]["state"], usage[other]["state"]) == ("active", "archived")
+        for name in (essential, other):
+            assert (skills / ".archive" / name / "SKILL.md").read_text() == f"archived {name}"
 
     def test_fresh_install_copies_all_and_records_origin_hashes(self, tmp_path):
         bundled = self._setup_bundled(tmp_path)
@@ -793,7 +882,7 @@ class TestOptOutToggleAndRemove:
 
     def _setup_bundled(self, tmp_path):
         bundled = tmp_path / "bundled"
-        for n in ("alpha", "beta"):
+        for n in ("alpha", "beta", "sdlc-review"):
             d = bundled / n
             d.mkdir(parents=True)
             (d / "SKILL.md").write_text(f"---\nname: {n}\n---\nbody {n}\n")
@@ -838,11 +927,13 @@ class TestOptOutToggleAndRemove:
             (skills_dir / "mine" / "SKILL.md").write_text("---\nname: mine\n---\nlocal\n")
 
             preview = remove_pristine_bundled_skills(dry_run=True)
-            assert "alpha" in preview["removed"]
-            assert "beta" not in preview["removed"]
+            assert preview["removed"] == ["alpha"]
+            assert (skills_dir / 'alpha' / 'SKILL.md').is_file()
 
             result = remove_pristine_bundled_skills(dry_run=False)
-            assert "alpha" in result["removed"]
+            assert result["removed"] == preview["removed"] and result['skipped'] == preview['skipped']
+            assert (skills_dir / 'sdlc-review' / 'SKILL.md').is_file()
+            assert 'sdlc-review' in _read_manifest()
             assert not (skills_dir / "alpha").exists()
             # user-modified bundled skill kept
             assert (skills_dir / "beta" / "SKILL.md").exists()

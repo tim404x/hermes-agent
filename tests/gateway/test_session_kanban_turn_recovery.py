@@ -1,6 +1,10 @@
 """Owner-side kanban workers retry a failed turn in place, proven from the bound frame's claim."""
 import json
 import os
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
 
 from agent import kanban_turn_recovery as rec
 from gateway import session_kanban
@@ -27,7 +31,7 @@ class _Agent:
         return self.results.pop(0)
 
 
-def _claimed_frame(tmp_path, monkeypatch, *, expired=False, goal_mode=False):
+def _claimed_frame(tmp_path, monkeypatch, *, expired=False, goal_mode=False, skills=(), review=False):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_KANBAN_TURN_RECOVERY", raising=False)
     # The owner/gateway process carries a FOREIGN (stale) env carrier: the proof must ignore it.
@@ -35,12 +39,14 @@ def _claimed_frame(tmp_path, monkeypatch, *, expired=False, goal_mode=False):
                        ("HERMES_KANBAN_RUN_ID", "999"), ("HERMES_KANBAN_CLAIM_LOCK", "foreign")):
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(rec, "RECOVERY_DELAYS_SECONDS", (0.0,))
-    monkeypatch.setattr("agent.skill_commands.build_preloaded_skills_prompt", lambda *a, **k: ("", [], []))
     kb.init_db()
     path = kb.kanban_db_path()
     with connect_closing(path) as conn:
-        task_id = kb.create_task(conn, title="recover", assignee="default")
-        task = kb.claim_task(conn, task_id, claimer="private-host:owner")
+        task_id = kb.create_task(conn, title="recover", assignee="default", skills=list(skills), workspace_path=str(tmp_path))
+        if review:
+            assert kb.request_review(conn, task_id, reviewer='reviewer')
+        claim = kb.claim_review_task if review else kb.claim_task
+        task = claim(conn, task_id, claimer="private-host:owner")
         assert task is not None
         with kb.write_txn(conn):
             kb._append_event(conn, task_id, "worker_bound", {"pid": os.getpid(), "claim_lock": task.claim_lock},
@@ -51,6 +57,56 @@ def _claimed_frame(tmp_path, monkeypatch, *, expired=False, goal_mode=False):
     context = {"db": str(path), "task_id": task_id, "run_id": task.current_run_id, "claim_lock": task.claim_lock,
                "skills": [], "context": "", "goal_mode": goal_mode, "goal_text": "g", "goal_max_turns": 2}
     return path, context, {"text": "work", "policy": {"kanban_json": json.dumps(context)}}
+
+
+def test_missing_preloads_record_a_deterministic_worker_result(tmp_path, monkeypatch):
+    path, context, frame = _claimed_frame(tmp_path, monkeypatch)
+    monkeypatch.setattr("agent.skill_commands.build_preloaded_skills_prompt", lambda *_args, **_kwargs: ("", [], ["missing"]))
+    with pytest.raises(ValueError, match="^kanban_skills_unavailable$") as exc:
+        session_kanban.run_worker_turns(_Agent([]), frame, [])
+    assert exc.value.missing == ["missing"]
+    result = session_kanban.worker_result(path, context)
+    assert (result["exit_code"], result["error"], result["last_output"]) == (1, "unknown_skill", "Unknown skill(s): missing")
+
+
+@pytest.mark.parametrize('review,copies', [(True, 0), (True, 2), (True, 1), (False, 0)])
+def test_only_review_claim_requires_an_unambiguous_reviewer(tmp_path, monkeypatch, review, copies):
+    from gateway.session_contract import SessionActor
+
+    for dirname, name in [('card', 'card'), *((f'copy{idx}', 'sdlc-review') for idx in range(copies))]:
+        skill = tmp_path / 'skills' / dirname / 'SKILL.md'
+        skill.parent.mkdir(parents=True)
+        skill.write_text(f'---\nname: {name}\ndescription: testing\n---\nBody of {dirname}')
+    names = ['card', 'absent-optional'] if review else ['card', 'sdlc-review']
+    if copies == 2:
+        names.append('copy0')
+    path, context, frame = _claimed_frame(tmp_path, monkeypatch, review=review, skills=names)
+    monkeypatch.setattr('hermes_cli.profiles.resolve_profile_env', lambda _: str(tmp_path))
+    actor = SessionActor('owner', str(tmp_path), frozenset({'session:create'}), 'transport')
+    connection = SimpleNamespace(native_owner=True, actor=actor, authority=SimpleNamespace(profile_id=str(tmp_path)))
+    params = {key: context[key] for key in ('db', 'task_id', 'run_id', 'claim_lock')}
+    policy, _ = session_kanban.build_kanban_policy(connection, dict(params, board='default'),
+                                                  {'model': {'default': 'test', 'provider': 'custom'}})
+    frame['policy'].update(source=policy.source, kanban_json=policy.kanban_json)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(session_kanban, '_watch_submitter', lambda *_: None)
+    with patch.dict(os.environ):
+        session_kanban.bind_worker_context(frame)
+    agent = _Agent([{'completed': True}])
+    if review and copies != 1:
+        with pytest.raises(session_kanban.KanbanSkillsUnavailable) as exc:
+            session_kanban._run_worker_turns(agent, frame, [])
+        if copies == 2:
+            assert 'copy0' not in exc.value.missing
+            assert any(label.startswith('Ambiguous skill name sdlc-review:') for label in exc.value.missing)
+        result = session_kanban.worker_result(path, context)
+        assert result['error'] == 'unknown_skill' and 'sdlc-review' in result['last_output']
+        assert not agent.calls
+    else:
+        session_kanban._run_worker_turns(agent, frame, [])
+        assert 'Body of card' in agent.calls[0][0]
+        if review:
+            assert 'Body of copy0' in agent.calls[0][0]
 
 
 def test_failed_turn_retries_in_place_from_frame_carrier(tmp_path, monkeypatch):

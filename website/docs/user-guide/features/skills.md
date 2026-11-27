@@ -43,13 +43,13 @@ same source-qualified target.
 
 ## Starting with a blank slate
 
-By default every profile is seeded with the bundled skill catalog, and each `hermes update` adds any newly bundled skills. If you want a profile with **no bundled skills** — and that stays empty across updates — you have two paths:
+By default every profile is seeded with the bundled skill catalog, and each `hermes update` adds any newly bundled skills. You can opt out of the catalog. Hermes still keeps its essential skills: its operating manual and the skills it loads by name for Kanban reviews and swarm tasks.
 
 **At install time** (applies to the default `~/.hermes` profile): the
 installer has no `--no-skills` flag. Its setup stage asks whether to seed the
 bundled catalog when you pick the Blank Slate setup; answering no writes the
 opt-out marker described below. Non-interactive installs seed the catalog, so
-run `hermes skills opt-out` afterwards if you want the profile empty.
+run `hermes skills opt-out` afterwards to stop seeding non-essential skills.
 
 **At profile-create time** (named profiles):
 
@@ -61,14 +61,14 @@ hermes profile create research --no-skills
 
 ```bash
 hermes skills opt-out            # stop future seeding — nothing on disk is touched
-hermes skills opt-out --remove   # also delete UNMODIFIED bundled skills (confirms first)
+hermes skills opt-out --remove   # also remove unmodified, non-essential bundled skills (confirms first)
 hermes skills opt-in --sync      # undo: remove the marker and re-seed now
 ```
 
-All of these paths write a `.no-bundled-skills` marker into the profile directory. While the marker is present, the installer, `hermes update`, and any skill sync all skip bundled-skill seeding for that profile. Delete the marker (or run `hermes skills opt-in`) to re-enable.
+Opting out writes a `.no-bundled-skills` marker into the profile directory. While the marker is present, the installer, `hermes update`, and skill sync seed only essential bundled skills. Delete the marker (or run `hermes skills opt-in`) to re-enable the full catalog.
 
 :::note Safe by default
-`hermes skills opt-out` only stops *future* seeding — it never deletes anything already on disk. The optional `--remove` flag deletes bundled skills **only** when they are unmodified (byte-identical to the version Hermes installed). Skills you have edited, skills installed from the hub, and skills you wrote yourself are always kept.
+`hermes skills opt-out` never deletes anything already on disk. The optional `--remove` flag deletes non-essential bundled skills **only** when they are unmodified (byte-identical to the version Hermes installed). Essential skills, skills you have edited, skills installed from the hub, and skills you wrote yourself are kept.
 :::
 
 ## Using Skills

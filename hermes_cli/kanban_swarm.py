@@ -21,6 +21,7 @@ import sqlite3
 import time
 from typing import Any, Iterable, Optional
 
+from agent.skill_utils import SWARM_SYNTHESIZER_SKILL, SWARM_VERIFIER_SKILL
 from hermes_cli import kanban_db as kb
 
 BLACKBOARD_PREFIX = "[swarm:blackboard] "
@@ -235,7 +236,7 @@ def _create_swarm_uncommitted(
         assignee=verifier_assignee,
         parents=worker_ids,
         priority=priority,
-        skills=["requesting-code-review"],
+        skills=[SWARM_VERIFIER_SKILL],
         **common,
     )
     synthesizer = kb.create_task(
@@ -249,7 +250,7 @@ def _create_swarm_uncommitted(
         assignee=synthesizer_assignee,
         parents=[verifier],
         priority=priority,
-        skills=["humanizer"],
+        skills=[SWARM_SYNTHESIZER_SKILL],
         **common,
     )
 

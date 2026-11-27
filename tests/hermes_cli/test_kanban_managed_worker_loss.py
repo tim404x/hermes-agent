@@ -153,23 +153,41 @@ def test_a_non_infra_worker_loss_still_charges_the_breaker(board):
     assert row["consecutive_failures"] == 1               # A3: the breaker sees it
 
 
-def test_a_killed_managed_worker_blocks_the_card_at_the_failure_limit(board):
-    """The breaker covers this class: one loss short of the limit, the next loss blocks.
+def test_runtime_ceiling_uses_dispatcher_failure_limit(board, monkeypatch):
+    monkeypatch.setenv('HERMES_KANBAN_CRASH_GRACE_SECONDS', '600')
+    monkeypatch.setattr(kbd, '_kill_fn', lambda signal_fn: None)
+    run_id = board.running('t_ceiling', claim_expires_in=900, owner=False)
+    board.conn.execute("UPDATE tasks SET max_runtime_seconds=1 WHERE id='t_ceiling'")
+    board.conn.commit()
+    board.tick(failure_limit=1)
+    assert board.run(run_id)['outcome'] == 'timed_out'
+    assert board.state('t_ceiling')['status'] == 'blocked'
 
-    ``_account_crashes`` books a plain crash against ``DEFAULT_FAILURE_LIMIT`` (the sweep
-    resolves the threshold there rather than against the dispatcher's ``failure_limit``),
-    so the card is seeded one failure short of that limit instead of pinning a threshold
-    this path never reads.
-    """
+
+@pytest.mark.parametrize('expires', [900, CLAIM_LAPSED], ids=['crash', 'ttl'])
+def test_generic_owner_receipt_preserves_recorded_failure_reason(board, expires):
+    tid = 't_receipt'
+    run_id = board.running(tid, claim_expires_in=expires, worker_lost=None)
+    task = board.state(tid)
+    board.event(tid, run_id, 'worker_result', {'claim_lock': task['claim_lock'], 'pid': task['worker_pid'],
+                'exit_code': 1, 'error': 'unknown_skill'}, NOW)
+    board.conn.commit()
+    board.tick(failure_limit=1)
+    run = board.run(run_id)
+    assert run['outcome'] == ('crashed' if expires > 0 else 'reclaimed')
+    assert 'managed worker lost: unknown_skill' in run['error']
+    assert 'managed worker lost: unknown_skill' in board.state(tid)['last_failure_error']
+    assert 'infra_loss' not in json.loads(run['metadata']) and board.state(tid)['status'] == 'blocked'
+
+
+def test_a_killed_managed_worker_blocks_the_card_at_the_failure_limit(board):
+    """The dispatcher can park a plain crash on the first loss."""
     board.running("t_killed", claim_expires_in=900, heartbeat_age=30,
                   worker_lost="managed_worker_hello_timeout")
-    board.conn.execute("UPDATE tasks SET consecutive_failures = ? WHERE id = 't_killed'",
-                       (kbd.DEFAULT_FAILURE_LIMIT - 1,))
-    board.conn.commit()
-    board.tick()
+    board.tick(failure_limit=1)
     row = board.state("t_killed")
     assert row["status"] == "blocked"
-    assert row["consecutive_failures"] == kbd.DEFAULT_FAILURE_LIMIT
+    assert row["consecutive_failures"] == 1
     kinds = [r["kind"] for r in board.conn.execute(
         "SELECT kind FROM task_events WHERE task_id = 't_killed' ORDER BY id")]
     assert "gave_up" in kinds

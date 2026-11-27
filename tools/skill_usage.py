@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from hermes_constants import get_hermes_home
-from agent.skill_utils import is_excluded_skill_path, is_external_skill_path
+from agent.skill_utils import ESSENTIAL_SKILLS, is_excluded_skill_path, is_external_skill_path
 from utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,7 @@ PROTECTED_BUILTIN_SKILLS: set[str] = set()
 
 
 def is_protected_builtin(skill_name: str) -> bool:
-    return skill_name in PROTECTED_BUILTIN_SKILLS
+    return skill_name in PROTECTED_BUILTIN_SKILLS or skill_name in ESSENTIAL_SKILLS
 
 
 def _skills_dir() -> Path:
@@ -570,7 +570,7 @@ def mark_agent_created(skill_name: str) -> None:
 
 
 def set_state(skill_name: str, state: str) -> None:
-    """Set lifecycle state (no-op if invalid / unmanageable). Emits archived/stale/restored; active<-stale is silent."""
+    """Set lifecycle state on manageable skills or reactivate a restored essential; active<-stale is silent."""
     if state not in _VALID_STATES:
         logger.debug("set_state: invalid state %r for %s", state, skill_name)
         return
@@ -582,7 +582,9 @@ def set_state(skill_name: str, state: str) -> None:
             if state != STATE_STALE:
                 rec["archived_at"] = _now_iso() if state == STATE_ARCHIVED else None
         return {"changed": previous != state, "created_by": rec.get("created_by"), "previous_state": previous}
-    facts = _mutate(skill_name, _apply, require_curation_eligible=True)
+    # Sync can reactivate a formerly pruned essential even though it is no longer curator-managed.
+    reactivate_essential = state == STATE_ACTIVE and skill_name in ESSENTIAL_SKILLS
+    facts = _mutate(skill_name, _apply, require_curation_eligible=not reactivate_essential)
     if isinstance(facts, dict) and facts["changed"]:
         restored = state == STATE_ACTIVE and facts["previous_state"] == STATE_ARCHIVED
         action = "restored" if restored else {STATE_ARCHIVED: "archived", STATE_STALE: "stale"}.get(state)
