@@ -335,11 +335,16 @@ _SPECS = [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
         _bulk_ids("schedule"),
+        _arg("--until", metavar="ISO|epoch", help="Resume at this ISO8601 time (with Z or offset) or epoch second"),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    _cmd("untriage", [
+        _TASK_IDS,
+        _reason("Optional reason recorded as a comment before untriaging."),
+    ], help="Return triaged tasks to todo without editing their spec and reset their block-loop counter"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

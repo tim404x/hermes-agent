@@ -451,14 +451,14 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
 
     assert out == {
         "ok": True, "task_id": worker_env, "run_id": out["run_id"],
-        "status": "scheduled", "reason": reason,
+        "status": "scheduled", "reason": reason, "scheduled_until": "2026-09-13T00:00:00+00:00",
     }
     with kbc.connect() as conn:
         assert kb.get_task(conn, worker_env).status == "scheduled"
         run = kb.latest_run(conn, worker_env)
         assert (run.outcome, run.summary) == ("scheduled", reason)
         assert any(
-            event.kind == "scheduled" and event.payload == {"reason": reason}
+            event.kind == "scheduled" and event.payload == {"reason": reason, "until": 1789257600}
             for event in kb.list_events(conn, worker_env)
         )
 

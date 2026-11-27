@@ -19,12 +19,7 @@ import time
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
-from typing import Any
-from typing import Callable
-from typing import Iterator
-from typing import Mapping
-from typing import Optional
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli._startup_fast import project_root_str
@@ -2284,6 +2279,10 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
+    try:
+        result.released_scheduled = _kb.release_due_scheduled(conn)
+    except Exception:
+        logging.getLogger(__name__).exception("Cannot release due scheduled kanban tasks")
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 

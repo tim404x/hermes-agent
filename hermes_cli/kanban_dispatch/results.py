@@ -78,6 +78,20 @@ class DispatchResult:
     """Binding (cap name, running workers, limit); host-wide for max_in_progress, board-local for max_spawn."""
     capacity_source: Optional[str] = None
     """Origin of the binding cap, when supplied by the dispatcher that resolved it."""
+    released_scheduled: list[str] = field(default_factory=list)
+    """Scheduled task ids re-gated this tick because their resume time arrived."""
+
+    def tick_outcome(self) -> str:
+        """A release is tick activity even when an open parent prevents a spawn."""
+        if self.skipped_locked:
+            return "skipped_locked"
+        activity = (
+            "spawned", "adopted", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers",
+            "crashed", "stale", "retried_workspace_cleanups", "released_scheduled", "timed_out", "auto_blocked",
+            "rate_limited", "auto_assigned_default", "respawn_guarded", "skipped_per_profile_capped",
+            "skipped_unassigned", "skipped_nonspawnable",
+        )
+        return "ok" if any(getattr(self, name) for name in activity) else "idle"
 
 
 def describe_capacity(name: str, running: int, limit: int) -> str:
