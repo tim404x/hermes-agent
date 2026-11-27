@@ -107,7 +107,7 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None, toolchain
     # a process boundary: strip dispatcher-owned Kanban vars AFTER the scrub so an explicit
     # passthrough cannot re-grant a delegated child the parent's board mutation capability.
     from agent.delegation_context import (
-        DELEGATED_CHILD_ENV_MARKER, delegated_child_subprocess_env,
+        DELEGATED_CHILD_ENV_MARKER, KANBAN_ORIGIN_ENV_KEYS, delegated_child_subprocess_env,
     )
     scoped = delegated_child_subprocess_env(source_env)
     # Preserve location only when carrying the descendant fence, not for arbitrary
@@ -116,7 +116,15 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None, toolchain
         for key in (DELEGATED_CHILD_ENV_MARKER, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
             if key in scoped:
                 scrubbed[key] = scoped[key]
-    return delegated_child_subprocess_env(scrubbed)
+    final = delegated_child_subprocess_env(scrubbed)
+    if scoped.get(DELEGATED_CHILD_ENV_MARKER):
+        # The origin pair comes from the unfiltered source only: a passthrough-registered task id
+        # without its run id must not re-derive a half pair in the second scrub.
+        for key in KANBAN_ORIGIN_ENV_KEYS:
+            final.pop(key, None)
+            if scoped.get(key):
+                final[key] = scoped[key]
+    return final
 
 
 def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
