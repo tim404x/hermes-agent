@@ -3696,10 +3696,14 @@ def specify_triage_task(
                 "Specified — updated " + ", ".join(changed_fields) + " and promoted to todo.",
                 int(time.time()),
             )
-        _append_event(
-            conn, task_id, "specified",
-            {"changed_fields": changed_fields} if changed_fields else None,
-        )
+        payload: dict[str, Any] = {}
+        if changed_fields:
+            payload["changed_fields"] = changed_fields
+        if author and author.strip() == "auto-decomposer":
+            # Distinguish automatic background triage sweeps from explicit operator
+            # releases so auto-decompose cannot silently lift ``active_pr``.
+            payload["source"] = "auto-decomposer"
+        _append_event(conn, task_id, "specified", payload or None)
     # Own IMMEDIATE txn (outside the one above): a parent-free specified task
     # flips to 'ready' now instead of idling until the next tick.
     recompute_ready(conn)
@@ -3723,12 +3727,14 @@ def untriage_task(
             "UPDATE tasks SET status='todo', block_recurrences=0, block_kind=NULL WHERE id=? AND status='triage'",
             (task_id,),
         )
-        if reason:
-            add_comment(conn, task_id, author or "operator", f"UNTRIAGE: {reason}")
-        _append_event(conn, task_id, "untriaged", {
+        comment_id = add_comment(conn, task_id, author or "operator", f"UNTRIAGE: {reason}") if reason else None
+        payload: dict[str, Any] = {
             "prev_block_kind": prior["block_kind"], "prev_block_recurrences": prior["block_recurrences"],
             "reason": reason,
-        })
+        }
+        if comment_id is not None:
+            payload["comment_id"] = comment_id
+        _append_event(conn, task_id, "untriaged", payload)
     recompute_ready(conn)
     return True
 

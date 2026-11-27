@@ -1645,8 +1645,8 @@ def check_respawn_guard(
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
-    handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
+    handoff or explicit operator triage release followed the comment: the named
+    profile must work on that PR). The review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
     """
@@ -1714,26 +1714,57 @@ def check_respawn_guard(
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
-    #    reviewer changes_requested, review reopen) names the profile that must
-    #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
-    #    so the worker that opened the PR is still not re-spawned against it.
-    pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
-                                          cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
-                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
-    if pr_times:
-        # Strictly after: a same-second tie stays guarded (fail closed).
-        if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
-                conn, "task_events", task_id, max(pr_times),
-                "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
-            return None
-        return "active_pr"
+    #    Exception: a handoff or explicit operator triage release AFTER the
+    #    newest PR comment (operator reassign, reviewer changes_requested,
+    #    review reopen, operator specify/untriage) means the profile named on
+    #    the card must now work on THAT PR — not a duplicate implementation
+    #    (#111910). A crash, reclaim, ordinary comment, or background
+    #    auto-decomposer pass is not a handoff, so the worker that opened the
+    #    PR is still not re-spawned against it.
+    pr_rows = [
+        (t, c["id"])
+        for t, c in _rows_since(
+            conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
+            cols=", id, body", unreadable=now,  # duplicate-PR risk: fail closed
+        )
+        if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")
+    ]
+    if pr_rows:
+        ignored_cids = _untriage_audit_comment_ids(conn, task_id)
+        pr_times = [t for t, cid in pr_rows if cid not in ignored_cids]
+        if pr_times:
+            # Strictly after: a same-second tie stays guarded (fail closed).
+            if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
+                    conn, "task_events", task_id, max(pr_times),
+                    _ACTIVE_PR_LIFT_WHERE, cols=", kind, payload", strict=True)):
+                return None
+            return "active_pr"
 
     return None
 
 
+_ACTIVE_PR_LIFT_EVENTS = ("assigned", "changes_requested", "review_reopened", "specified", "untriaged")
+_ACTIVE_PR_LIFT_WHERE = "AND kind IN (" + ", ".join(f"'{k}'" for k in _ACTIVE_PR_LIFT_EVENTS) + ")"
 _GUARD_TIME_COLS = {"task_runs": "ended_at", "task_events": "created_at", "task_comments": "created_at"}
+
+
+def _untriage_audit_comment_ids(conn: sqlite3.Connection, task_id: str) -> set[int]:
+    """Comment ids written by ``untriage_task(..., reason=...)`` itself.
+
+    An operator's ``UNTRIAGE:`` reason may cite the existing PR URL to tell the
+    worker which PR to finish; excluding that comment id prevents the operator's
+    own audit comment from tying with the same-second ``untriaged`` event and
+    immediately re-arming ``active_pr``.
+    """
+    ids: set[int] = set()
+    for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'untriaged'",
+        (task_id,),
+    ):
+        cid = _kb._json_dict(row["payload"]).get("comment_id")
+        if isinstance(cid, int) and not isinstance(cid, bool):
+            ids.add(cid)
+    return ids
 
 
 def _rows_since(conn: sqlite3.Connection, table: str, task_id: str, since: int, where: str = "", *,
@@ -1752,12 +1783,19 @@ def _rows_since(conn: sqlite3.Connection, table: str, task_id: str, since: int, 
 
 
 def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
-    """Only an ``assigned`` event that moves the card to a DIFFERENT profile is
-    a handoff. A no-op re-assign (dev→dev via CLI/dashboard/``reassign
-    --reclaim``), an unassign, or the dispatcher's own
-    ``kanban.default_assignee`` write would otherwise lift ``active_pr`` for
-    the very implementer that opened the PR. Events without ``from`` (written
-    before it was recorded) are not trusted as handoffs — fail closed."""
+    """Return True when ``kind`` is a deliberate handoff or explicit operator
+    triage release that should lift ``active_pr``.
+
+    - ``assigned``: only a move to a DIFFERENT non-null profile (never a no-op
+      dev→dev reassign, unassign, or ``kanban.default_assignee``). Events
+      without ``from`` (written before it was recorded) fail closed.
+    - ``specified``: lifts unless written by the automatic ``auto-decomposer``
+      pass; pre-existing/operator ``specify_triage_task`` releases lift.
+    - ``changes_requested``, ``review_reopened``, ``untriaged``: always lift.
+    """
+    if kind == "specified":
+        data = _kb._json_or(payload, {})
+        return not (isinstance(data, dict) and data.get("source") == "auto-decomposer")
     if kind != "assigned":
         return True
     data = _kb._json_or(payload, {})

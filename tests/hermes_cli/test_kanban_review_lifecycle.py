@@ -605,6 +605,158 @@ def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
         assert kbd.check_respawn_guard(conn, done_id) == "recent_success"
 
 
+def _task_status(conn, tid: str) -> str:
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    return task.status
+
+
+def _move_to_triage_via_block_loop(conn, tid: str, *, claimer: str = "dev") -> None:
+    """Drive a task into ``triage`` through the real block-loop breaker."""
+    if _task_status(conn, tid) != "running":
+        assert kb.claim_task(conn, tid, claimer=claimer) is not None
+    assert kb.block_task(conn, tid, kind="capability", reason="waiting on approval")
+    assert kb.unblock_task(conn, tid)
+    assert kb.claim_task(conn, tid, claimer=claimer) is not None
+    assert kb.block_task(conn, tid, kind="capability", reason="still waiting on approval")
+    assert _task_status(conn, tid) == "triage"
+
+
+def test_active_pr_guard_lifts_after_specify_triage_release(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator ``specify_triage_task`` release strictly after the newest PR
+    comment lifts ``active_pr`` so dispatch claims the card instead of
+    deadlocking in ``ready``. Duplicate-PR protection still holds for
+    crashes/reclaims/ordinary comments, same-second ties, automatic
+    ``auto-decomposer`` sweeps, and any newer PR comment posted after release.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    pr_comment = "Opened https://github.com/example/repo/pull/68 for review."
+    claimed_ids: list[str] = []
+
+    def spawn(task, _workspace):
+        claimed_ids.append(task.id)
+
+    with kbc.connect() as conn:
+        # 1. Repro: PR comment -> triage -> specify_triage_task -> ready -> claimed.
+        tid = kb.create_task(conn, title="merge PR 68", assignee="dev")
+        assert kb.claim_task(conn, tid, claimer="dev") is not None
+        kb.add_comment(conn, tid, author="dev", body=pr_comment)
+        _move_to_triage_via_block_loop(conn, tid)
+        _backdate_comments(conn, tid)
+
+        assert kb.specify_triage_task(conn, tid) is True
+        assert _task_status(conn, tid) == "ready"
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+        res = kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert tid in [s[0] for s in res.spawned]
+        assert tid in claimed_ids
+        assert dict(res.respawn_guarded).get(tid) is None
+        assert _task_status(conn, tid) == "running"
+
+        # A newer PR comment after release re-arms ``active_pr``.
+        assert kb.reclaim_task(conn, tid, reason="worker crashed") is True
+        kb.add_comment(conn, tid, author="dev", body="Pushed follow-up to https://github.com/example/repo/pull/68")
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+        # Ordinary comment or reclaim never lifts ``active_pr``.
+        kb.add_comment(conn, tid, author="operator", body="Checking status")
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+        # 2. Same-second tie between PR comment and specify_triage_task stays guarded.
+        tied_id = kb.create_task(conn, title="same second tie", assignee="dev")
+        assert kb.claim_task(conn, tied_id, claimer="dev") is not None
+        kb.add_comment(conn, tied_id, author="dev", body=pr_comment)
+        _move_to_triage_via_block_loop(conn, tied_id)
+        assert kb.specify_triage_task(conn, tied_id) is True
+        # Force exact same-second timestamp on the PR comment and specified event.
+        with kb.write_txn(conn):
+            spec_ts = conn.execute(
+                "SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind = 'specified'",
+                (tied_id,),
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE task_comments SET created_at = ? WHERE task_id = ?",
+                (spec_ts, tied_id),
+            )
+        assert kbd.check_respawn_guard(conn, tied_id) == "active_pr"
+
+        # 3. Background ``auto-decomposer`` specify pass must not silently lift ``active_pr``.
+        auto_id = kb.create_task(conn, title="auto decompose guard", assignee="dev")
+        assert kb.claim_task(conn, auto_id, claimer="dev") is not None
+        kb.add_comment(conn, auto_id, author="dev", body=pr_comment)
+        _move_to_triage_via_block_loop(conn, auto_id)
+        _backdate_comments(conn, auto_id)
+        assert kb.specify_triage_task(conn, auto_id, author="auto-decomposer") is True
+        assert _task_status(conn, auto_id) == "ready"
+        assert kbd.check_respawn_guard(conn, auto_id) == "active_pr"
+
+
+def test_active_pr_guard_lifts_after_untriage_release(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit operator ``untriage_task`` (fork #66) strictly after the newest
+    PR comment lifts ``active_pr`` — including when ``--reason`` itself cites
+    the PR URL — while any subsequent worker PR comment re-arms the guard.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    pr_comment = "Opened https://github.com/example/repo/pull/68 for review."
+    claimed_ids: list[str] = []
+
+    def spawn(task, _workspace):
+        claimed_ids.append(task.id)
+
+    with kbc.connect() as conn:
+        # Untriage with a reason citing the existing PR URL must not self-re-arm.
+        with_reason_id = kb.create_task(conn, title="untriage with pr url", assignee="dev")
+        assert kb.claim_task(conn, with_reason_id, claimer="dev") is not None
+        kb.add_comment(conn, with_reason_id, author="dev", body=pr_comment)
+        _move_to_triage_via_block_loop(conn, with_reason_id)
+        _backdate_comments(conn, with_reason_id)
+
+        assert kb.untriage_task(
+            conn, with_reason_id, author="operator",
+            reason="Approved: merge https://github.com/example/repo/pull/68",
+        ) is True
+        assert _task_status(conn, with_reason_id) == "ready"
+        assert kbd.check_respawn_guard(conn, with_reason_id) is None
+
+        # Untriage without reason also lifts ``active_pr``.
+        bare_id = kb.create_task(conn, title="untriage bare", assignee="dev")
+        assert kb.claim_task(conn, bare_id, claimer="dev") is not None
+        kb.add_comment(conn, bare_id, author="dev", body=pr_comment)
+        _move_to_triage_via_block_loop(conn, bare_id)
+        _backdate_comments(conn, bare_id)
+
+        assert kb.untriage_task(conn, bare_id, author="operator") is True
+        assert _task_status(conn, bare_id) == "ready"
+        assert kbd.check_respawn_guard(conn, bare_id) is None
+
+        res = kbd.dispatch_once(conn, spawn_fn=spawn)
+        spawned_ids = [s[0] for s in res.spawned]
+        assert with_reason_id in spawned_ids and with_reason_id in claimed_ids
+        assert bare_id in spawned_ids and bare_id in claimed_ids
+        assert not res.respawn_guarded
+
+        # A worker posting a new PR comment after untriage re-arms ``active_pr`` (even same second).
+        assert kb.reclaim_task(conn, with_reason_id, reason="reclaimed") is True
+        kb.add_comment(
+            conn, with_reason_id, author="dev",
+            body="Updated https://github.com/example/repo/pull/68",
+        )
+        assert kbd.check_respawn_guard(conn, with_reason_id) == "active_pr"
+
+
 def test_dispatch_json_exposes_suppression_reasons(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
