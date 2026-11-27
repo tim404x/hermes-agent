@@ -1279,6 +1279,7 @@ def build_turn_context(
     _bot_chain_turn_start(agent, turn_author, persist_user_display_kind, persist_user_message or user_message)
     # Set every turn so a cached agent never carries a wake turn's kind into the human turn after it.
     agent._turn_display_kind = persist_user_display_kind
+    agent._turn_reply_expected = bool((persist_user_display_metadata or {}).get("reply_expected") is True)
     agent._notice_work = NoticeWork.for_turn(persist_user_display_kind, persist_user_display_metadata)
 
     # Tag log records on this thread with the session ID for ``hermes logs``; bind the

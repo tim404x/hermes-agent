@@ -305,6 +305,8 @@ def _inject_steer_after_newest_tool_result(
                 ):
                     break
                 messages.insert(idx + 1, steer_user_row(steer_text))
+                agent._turn_steer_delivered = True
+                agent._notice_work = None
                 logger.debug("Pre-API-call steer drain: appended user row after tool msg at index %d", idx)
                 return
     from agent.agent_runtime_helpers import _requeue_pending_steer

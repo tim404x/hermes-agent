@@ -54,11 +54,79 @@ class NoticeWork:
             self.stop_withheld = False
 
 
+def _turn_has_active_user_intervention(agent: Any) -> bool:
+    """True when a human interrupted, redirected, or had a steer delivered into THIS turn.
+
+    A steer that arrived while a model call was in flight and is still sitting unconsumed
+    in ``_pending_steer`` has NOT been shown to the model yet — the gateway will drain it
+    as the next turn once this turn ends. Treating that unconsumed steer as active
+    intervention would trap a finished internal notification in empty retries instead of
+    yielding immediately to the user's waiting message.
+    """
+    if getattr(agent, "_interrupt_requested", False) or getattr(agent, "_turn_steer_delivered", False):
+        return True
+    if not getattr(agent, "_turn_user_intervened", False):
+        return False
+    return not bool(getattr(agent, "_pending_steer", None))
+
+
+def is_unaddressed_machinery_turn(agent: Any) -> bool:
+    """True for an unaddressed internal/producer wake with no active human intervention."""
+    return (
+        is_machinery_display_kind(getattr(agent, "_turn_display_kind", None))
+        and not getattr(agent, "_turn_reply_expected", False)
+        and not _turn_has_active_user_intervention(agent)
+    )
+
+
 def _settled_notice(agent: Any) -> bool:
     notice = getattr(agent, "_notice_work", None)
-    return (notice is not None and not notice.pending and not notice.stop_withheld
-            and not getattr(agent, "_turn_user_intervened", False)
-            and not getattr(agent, "_interrupt_requested", False))
+    return (
+        notice is not None
+        and not notice.pending
+        and not notice.stop_withheld
+        and not _turn_has_active_user_intervention(agent)
+    )
+
+
+def _current_turn_had_tool(agent: Any, messages: list[dict[str, Any]]) -> bool:
+    """True when a tool result landed within the current turn (ignoring prior turns,
+    while never letting an in-turn delivered steer row hide an earlier tool result)."""
+    from agent.prompt_builder import STEER_DISPLAY_KIND
+
+    turn_start = getattr(agent, "_current_turn_user_idx", None)
+    if isinstance(turn_start, int) and 0 <= turn_start < len(messages):
+        window = messages[max(turn_start + 1, len(messages) - 5):]
+        return any(isinstance(m, dict) and m.get("role") == "tool" for m in window)
+    for msg in reversed(messages[-5:]):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "tool":
+            return True
+        if role == "user" and msg.get("display_kind") != STEER_DISPLAY_KIND:
+            return False
+    return False
+
+
+def _strip_reasoning_only(text: str) -> str:
+    """Strip ONLY reasoning/thinking blocks using the shared tag set (preserving malformed
+    ``<tool_call>`` / ``<function>`` XML so dropped tool output never looks like a quiet blank)."""
+    if not text:
+        return ""
+    from agent.agent_runtime_helpers import (
+        _ORPHAN_REASONING_TAG_PATTERN,
+        _REASONING_BLOCK_PATTERNS,
+        _UNTERMINATED_REASONING_BLOCK_PATTERN,
+    )
+    cleaned = text
+    for pattern in (
+        *_REASONING_BLOCK_PATTERNS,
+        _UNTERMINATED_REASONING_BLOCK_PATTERN,
+        _ORPHAN_REASONING_TAG_PATTERN,
+    ):
+        cleaned = pattern.sub("", cleaned)
+    return cleaned
 
 
 def notice_silence_marker(agent: Any, visible: str) -> bool:
@@ -89,7 +157,7 @@ def notice_final_text(agent: Any, message: Any, text: str, response: Any, finish
         agent._notice_work = None
     if not _settled_notice(agent):
         return ("" if is_intentional_silence_response(agent._strip_think_blocks(text)) else text), False
-    if text.strip():
+    if _strip_reasoning_only(text).strip():
         return text, False
     streamed = (agent._current_streamed_assistant_text or "").strip()
     if streamed:
@@ -99,8 +167,17 @@ def notice_final_text(agent: Any, message: Any, text: str, response: Any, finish
             return visible, False
         return text, False
     reasoning_fields = ("reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items")
-    if (agent._last_content_with_tools or agent._post_tool_empty_retried or agent._thinking_prefill_retries
-            or any(getattr(message, key, None) for key in reasoning_fields)):
+    if agent._last_content_with_tools or agent._post_tool_empty_retried:
+        return text, False
+    # Thinking/reasoning models (Gemini adaptive thinking, GPT Responses API, inline <think>/<thought>/<mm:think>)
+    # emit reasoning even when intentionally stopping quietly on an internal wake. Keep PR #64's
+    # safety check on the first attempt (so a mid-thought cutoff gets one completion reminder),
+    # then settle quietly if the model still produces a confirmed-stop blank after that reminder.
+    has_reasoning = (
+        any(getattr(message, key, None) for key in reasoning_fields)
+        or (bool((text or "").strip()) and not _strip_reasoning_only(text or "").strip())
+    )
+    if agent._thinking_prefill_retries == 0 and has_reasoning:
         return text, False
     message.content = MACHINERY_NO_REPLY_ROW
     return message.content, True
@@ -202,6 +279,28 @@ def _terminal_empty(agent: Any, assistant_message: Any, finish_reason: str, mess
     delivery text. Reasoning is never copied into the delivery text here — the persisted row
     keeps the sentinel so later "continue" turns don't replay it and loop on empties."""
     _streak_cost = _empty_guard.streak_cost_usd(agent)
+    if is_unaddressed_machinery_turn(agent):
+        if _streak_cost is not None:
+            logger.info(
+                "Unaddressed machinery turn exhausted empty replies (estimated cost ~$%.2f); "
+                "suppressing chat diagnostics (model=%s provider=%s)",
+                _streak_cost, agent.model, agent.provider,
+            )
+        if callable(getattr(agent, "_clear_status_buffer", None)):
+            agent._clear_status_buffer()
+        agent._drop_trailing_empty_response_scaffolding(messages)
+        assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
+        assistant_msg["content"] = "(empty)"
+        assistant_msg["_empty_terminal_sentinel"] = True
+        append_message(messages, assistant_msg)
+        logger.warning(
+            "Empty response after %d retries on unaddressed machinery turn (%s). "
+            "model=%s provider=%s",
+            agent._empty_content_retries, getattr(agent, "_turn_display_kind", None),
+            agent.model, agent.provider,
+        )
+        return "(empty)"
+
     if _streak_cost is not None:
         agent._buffer_diagnostic_status(
             f"ℹ️ Estimated cost of these empty attempts: ~${_streak_cost:.2f} (input tokens are billed "
@@ -325,14 +424,35 @@ def recover_empty_response(
         return _verdict("break")
 
     # Post-tool-call empty (no prior content, or only mid-task narration): nudge once.
-    _prior_was_tool = any(m.get("role") == "tool" for m in messages[-5:])
-    # Ollama puts <think> in content, not reasoning_content, so _has_structured misses
-    # it; detect here to route to the thinking-only reminder.
-    _has_inline_thinking = bool(_INLINE_THINK_RE.search(final_response or ""))
+    _prior_was_tool = _current_turn_had_tool(agent, messages)
+    # Ollama and other open models put reasoning tags (<think>/<thought>/<mm:think>) in content,
+    # not reasoning_content, so detect using the shared reasoning-only stripper (ignoring malformed
+    # <tool_call> blocks).
+    _raw_final = final_response or ""
+    _has_inline_thinking = bool(
+        _INLINE_THINK_RE.search(_raw_final)
+        or (bool(_raw_final.strip()) and not _strip_reasoning_only(_raw_final).strip())
+    )
+    _has_structured = bool(
+        getattr(assistant_message, "reasoning", None)
+        or getattr(assistant_message, "reasoning_content", None)
+        or getattr(assistant_message, "reasoning_details", None)
+        or getattr(assistant_message, "codex_reasoning_items", None)
+        or _has_inline_thinking
+    )
+    # On a settled machinery notice with no prior mid-task narration, route a reasoning-only
+    # blank to the thinking reminder first instead of setting _post_tool_empty_retried (which
+    # would block quiet settlement on the follow-up).
+    _settled_reasoning_notice = (
+        _settled_notice(agent)
+        and _has_structured
+        and not agent._last_content_with_tools
+    )
     if (
         _prior_was_tool
         and not getattr(agent, "_post_tool_empty_retried", False)
         and not _has_inline_thinking
+        and not _settled_reasoning_notice
     ):
         agent._post_tool_empty_retried = True
         # Clear stale narration so it doesn't resurface on a later empty response.
@@ -346,12 +466,6 @@ def recover_empty_response(
 
     # A thinking-only assistant prefill is stripped by the send-time sanitizer, making
     # that retry byte-identical. Send a completion reminder on the input instead.
-    _has_structured = bool(
-        getattr(assistant_message, "reasoning", None)
-        or getattr(assistant_message, "reasoning_content", None)
-        or getattr(assistant_message, "reasoning_details", None)
-        or _has_inline_thinking
-    )
     if _has_structured and agent._thinking_prefill_retries < 2:
         agent._thinking_prefill_retries += 1
         logger.info(

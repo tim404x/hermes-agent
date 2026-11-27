@@ -252,6 +252,41 @@ class TestEmptyRetryBudget:
             == guard.DEFAULT_EMPTY_RETRY_BUDGET
         )
 
+    def test_reduced_budget_latches_across_subsequent_cache_hit_attempt(self, monkeypatch):
+        """An uncached attempt >= threshold latches budget=1 for the whole streak
+        so a cheaper cached retry cannot bump the budget back up to 3."""
+        costs = iter([Decimal("1.80"), Decimal("0.05"), Decimal("0.05")])
+        monkeypatch.setattr(guard, "_estimate_attempt_cost", lambda a, r: next(costs))
+        agent = _agent()
+        guard.record_empty_attempt(agent, finish_reason="stop", response=_response())
+        assert guard.empty_retry_budget(agent, _response()) == guard.REDUCED_EMPTY_RETRY_BUDGET
+        agent._empty_content_retries = 1
+        guard.record_empty_attempt(agent, finish_reason="stop", response=_response())
+        assert guard.empty_retry_budget(agent, _response()) == guard.REDUCED_EMPTY_RETRY_BUDGET
+
+    def test_cumulative_streak_cost_latches_reduced_budget(self, monkeypatch):
+        """Multiple sub-threshold attempts whose cumulative streak cost crosses
+        the threshold latch the reduced budget for the rest of the streak."""
+        monkeypatch.setattr(guard, "_estimate_attempt_cost", lambda a, r: r.cost)
+        agent = _agent()
+        r1 = SimpleNamespace(usage=_response().usage, cost=Decimal("0.15"))
+        r2 = SimpleNamespace(usage=_response().usage, cost=Decimal("0.15"))
+        guard.record_empty_attempt(agent, finish_reason="stop", response=r1)
+        assert guard.empty_retry_budget(agent, r1) == guard.DEFAULT_EMPTY_RETRY_BUDGET
+        agent._empty_content_retries = 1
+        guard.record_empty_attempt(agent, finish_reason="stop", response=r2)
+        assert guard.empty_retry_budget(agent, r2) == guard.REDUCED_EMPTY_RETRY_BUDGET
+
+    def test_reduced_budget_latch_resets_on_new_streak(self, monkeypatch):
+        costs = iter([Decimal("1.20"), Decimal("0.02"), Decimal("0.02")])
+        monkeypatch.setattr(guard, "_estimate_attempt_cost", lambda a, r: next(costs))
+        agent = _agent()
+        guard.record_empty_attempt(agent, finish_reason="stop", response=_response())
+        assert guard.empty_retry_budget(agent, _response()) == guard.REDUCED_EMPTY_RETRY_BUDGET
+        agent._empty_content_retries = 0
+        guard.record_empty_attempt(agent, finish_reason="stop", response=_response())
+        assert guard.empty_retry_budget(agent, _response()) == guard.DEFAULT_EMPTY_RETRY_BUDGET
+
 
 class TestStreakCost:
     def test_streak_cost_accumulates(self, monkeypatch):

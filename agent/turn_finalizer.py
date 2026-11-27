@@ -430,6 +430,15 @@ def _explain_abnormal_exit(agent, final_response, _turn_exit_reason, preserved_v
     try:
         if not agent._turn_completion_explainer_enabled():
             return final_response
+        if _turn_exit_reason == "empty_response_exhausted":
+            from agent.turn_empty_response import is_unaddressed_machinery_turn
+            if is_unaddressed_machinery_turn(agent):
+                logger.warning(
+                    "Suppressing empty-response explainer on unaddressed machinery turn (%s, model=%s)",
+                    getattr(agent, "_turn_display_kind", None),
+                    getattr(agent, "model", None) or "?",
+                )
+                return ""
         _stripped = (final_response or "").strip()
         _is_empty_terminal = _stripped in ("", "(empty)")
         # A short fragment not from a text_response exit and lacking sentence-ending
@@ -879,7 +888,12 @@ def finalize_turn(
     # A /steer landing after the final assistant turn has no tool batch to drain into;
     # hand it back so it becomes the next user turn instead of being lost. A gateway transfer
     # (ticketed) stays buffered: the claim's settlement returns it to its own queue place.
+    # Record whether ANY unconsumed steer (ticketed or unticketed) existed before draining
+    # without transferring its text or changing queue ownership.
+    _had_unconsumed_steer = bool(getattr(agent, "_pending_steer", None))
     _leftover_steer = (getattr(agent, "_drain_leftover_steer", None) or agent._drain_pending_steer)()
+    if _had_unconsumed_steer:
+        result["has_pending_steer"] = True
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False

@@ -29,7 +29,8 @@ __all__ = [
     "NOTIFICATION_NO_REPLY_EXIT", "PRODUCER_CARD_KINDS", "PRODUCER_NOTICE_DISPLAY_KINDS", "SilenceMarkerStreamHold",
     "display_kind_for_event", "display_metadata_for_event", "ends_with_partial_silence_marker",
     "is_autonomous_silence_response", "is_intentional_silence_agent_result", "is_intentional_silence_response",
-    "is_machinery_display_kind", "is_partial_silence_marker", "persisted_user_metadata_for_event",
+    "is_machinery_display_kind", "is_partial_silence_marker", "is_suppressed_machinery_empty_result",
+    "persisted_user_metadata_for_event",
     "reply_expected_metadata", "silence_allowed", "strip_trailing_silence_marker",
 ]
 
@@ -58,6 +59,30 @@ def is_intentional_silence_agent_result(agent_result: dict | None, response: Any
     return agent_result.get("turn_exit_reason") == NOTIFICATION_NO_REPLY_EXIT and not (
         isinstance(response, str) and response.strip()
     )
+
+
+def is_suppressed_machinery_empty_result(
+    agent_result: dict | None,
+    display_kind: str | None,
+    reply_expected: bool | None = False,
+) -> bool:
+    """True when an unaddressed machinery wake exhausted empty replies without a delivered user steer.
+
+    Suppresses chat-facing 'No reply / Send continue' banners while preserving real errors
+    (failed=True), human turns, addressed wakes, and turns where a user steer was already
+    delivered into the conversation.
+    """
+    if not isinstance(agent_result, dict) or agent_result.get("failed") or agent_result.get("interrupted"):
+        return False
+    if not is_machinery_display_kind(display_kind) or reply_expected:
+        return False
+    if agent_result.get("steer_delivered"):
+        return False
+    if agent_result.get("user_intervened") and not (
+        agent_result.get("pending_steer") or agent_result.get("has_pending_steer")
+    ):
+        return False
+    return agent_result.get("turn_exit_reason") == "empty_response_exhausted"
 
 
 def display_kind_for_event(event: Any) -> str | None:
