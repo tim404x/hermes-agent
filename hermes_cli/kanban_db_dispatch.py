@@ -1734,9 +1734,13 @@ def check_respawn_guard(
         pr_times = [t for t, cid in pr_rows if cid not in ignored_cids]
         if pr_times:
             # Strictly after: a same-second tie stays guarded (fail closed).
-            if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
+            if any(
+                _is_handoff_event(e["kind"], e["payload"], conn=conn, task_id=task_id, event_ts=ets)
+                for ets, e in _rows_since(
                     conn, "task_events", task_id, max(pr_times),
-                    _ACTIVE_PR_LIFT_WHERE, cols=", kind, payload", strict=True)):
+                    _ACTIVE_PR_LIFT_WHERE, cols=", kind, payload", strict=True,
+                )
+            ):
                 return None
             return "active_pr"
 
@@ -1754,16 +1758,50 @@ def _untriage_audit_comment_ids(conn: sqlite3.Connection, task_id: str) -> set[i
     An operator's ``UNTRIAGE:`` reason may cite the existing PR URL to tell the
     worker which PR to finish; excluding that comment id prevents the operator's
     own audit comment from tying with the same-second ``untriaged`` event and
-    immediately re-arming ``active_pr``.
+    immediately re-arming ``active_pr``. New events record ``comment_id``
+    directly; legacy events written before ``comment_id`` existed are matched
+    once against the earliest identical ``UNTRIAGE: <reason>`` comment at
+    ``event_ts - 1 .. event_ts``.
     """
     ids: set[int] = set()
+    legacy_events: list[tuple[int, str]] = []
     for row in conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'untriaged'",
+        "SELECT created_at, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'untriaged' ORDER BY id ASC",
         (task_id,),
     ):
-        cid = _kb._json_dict(row["payload"]).get("comment_id")
+        data = _kb._json_dict(row["payload"])
+        cid = data.get("comment_id")
         if isinstance(cid, int) and not isinstance(cid, bool):
             ids.add(cid)
+            continue
+        reason = data.get("reason")
+        event_ts = _kb._to_epoch(row["created_at"])
+        if isinstance(reason, str) and reason and event_ts is not None:
+            legacy_events.append((event_ts, reason))
+
+    if legacy_events:
+        from hermes_cli.kanban_swarm import redact_blackboard_comment
+
+        comments = conn.execute(
+            "SELECT id, body, created_at FROM task_comments "
+            "WHERE task_id = ? ORDER BY id ASC",
+            (task_id,),
+        ).fetchall()
+        for event_ts, reason in legacy_events:
+            raw = f"UNTRIAGE: {reason}".strip()
+            redacted = redact_blackboard_comment(raw) or str(_kb.redact_review_value(raw)).strip()
+            expected = {raw, redacted}
+            for c in comments:
+                cid = c["id"]
+                if cid in ids:
+                    continue
+                cts = _kb._to_epoch(c["created_at"])
+                if cts is None or not (event_ts - 1 <= cts <= event_ts):
+                    continue
+                if (_kb._lossy_text(c["body"]) or "").strip() in expected:
+                    ids.add(cid)
+                    break
     return ids
 
 
@@ -1782,20 +1820,65 @@ def _rows_since(conn: sqlite3.Connection, table: str, task_id: str, since: int, 
             yield t, row
 
 
-def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
+def _is_legacy_operator_specify(
+    conn: Optional[sqlite3.Connection],
+    task_id: Optional[str],
+    event_ts: Optional[int],
+    data: dict[str, Any],
+) -> bool:
+    """Distinguish a legacy ``specified`` event (no ``source`` key) using the
+    audit comment written inside the same ``specify_triage_task`` transaction.
+
+    - Matching audit comment with non-empty ``author != 'auto-decomposer'`` → True.
+    - Matching audit comment with ``author == 'auto-decomposer'`` → False.
+    - No matching audit comment (ambiguous legacy row) → False (fail closed).
+    """
+    if conn is None or not task_id or event_ts is None:
+        return False
+    changed = data.get("changed_fields")
+    if not isinstance(changed, list) or not changed or not all(isinstance(f, str) and f for f in changed):
+        return False
+    expected_body = "Specified — updated " + ", ".join(changed) + " and promoted to todo."
+    matched_authors: list[str] = []
+    for row in conn.execute(
+        "SELECT author, body, created_at FROM task_comments WHERE task_id = ?",
+        (task_id,),
+    ):
+        cts = _kb._to_epoch(row["created_at"])
+        if cts is None or not (event_ts - 1 <= cts <= event_ts):
+            continue
+        if _kb._lossy_text(row["body"]) == expected_body:
+            matched_authors.append((_kb._lossy_text(row["author"]) or "").strip())
+    return bool(matched_authors) and all(a and a != "auto-decomposer" for a in matched_authors)
+
+
+def _is_handoff_event(
+    kind: str,
+    payload: Optional[str],
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+    task_id: Optional[str] = None,
+    event_ts: Optional[int] = None,
+) -> bool:
     """Return True when ``kind`` is a deliberate handoff or explicit operator
     triage release that should lift ``active_pr``.
 
     - ``assigned``: only a move to a DIFFERENT non-null profile (never a no-op
       dev→dev reassign, unassign, or ``kanban.default_assignee``). Events
       without ``from`` (written before it was recorded) fail closed.
-    - ``specified``: lifts unless written by the automatic ``auto-decomposer``
-      pass; pre-existing/operator ``specify_triage_task`` releases lift.
+    - ``specified``: lifts when ``source == 'operator'``; automatic
+      ``auto-decomposer`` sweeps fail closed. Legacy rows without ``source``
+      must be proven operator-authored by their matching audit comment;
+      ambiguous legacy rows fail closed.
     - ``changes_requested``, ``review_reopened``, ``untriaged``: always lift.
     """
     if kind == "specified":
         data = _kb._json_or(payload, {})
-        return not (isinstance(data, dict) and data.get("source") == "auto-decomposer")
+        if not isinstance(data, dict):
+            return False
+        if "source" in data:
+            return data.get("source") == "operator"
+        return _is_legacy_operator_specify(conn, task_id, event_ts, data)
     if kind != "assigned":
         return True
     data = _kb._json_or(payload, {})

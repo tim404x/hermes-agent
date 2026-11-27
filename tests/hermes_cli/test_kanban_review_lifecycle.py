@@ -627,9 +627,9 @@ def test_active_pr_guard_lifts_after_specify_triage_release(
 ) -> None:
     """Operator ``specify_triage_task`` release strictly after the newest PR
     comment lifts ``active_pr`` so dispatch claims the card instead of
-    deadlocking in ``ready``. Duplicate-PR protection still holds for
-    crashes/reclaims/ordinary comments, same-second ties, automatic
-    ``auto-decomposer`` sweeps, and any newer PR comment posted after release.
+    deadlocking in ``ready``. Same-second ties, explicit ``source="auto-decomposer"``
+    gateway passes, and newer PR comments posted after release stay guarded;
+    a manual release by a profile literally named ``auto-decomposer`` still lifts.
     """
     import hermes_cli.config as cfgmod
     import hermes_cli.profiles as profmod
@@ -661,12 +661,8 @@ def test_active_pr_guard_lifts_after_specify_triage_release(
         assert _task_status(conn, tid) == "running"
 
         # A newer PR comment after release re-arms ``active_pr``.
-        assert kb.reclaim_task(conn, tid, reason="worker crashed") is True
+        assert kb.reclaim_task(conn, tid, reason="worker exited") is True
         kb.add_comment(conn, tid, author="dev", body="Pushed follow-up to https://github.com/example/repo/pull/68")
-        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
-
-        # Ordinary comment or reclaim never lifts ``active_pr``.
-        kb.add_comment(conn, tid, author="operator", body="Checking status")
         assert kbd.check_respawn_guard(conn, tid) == "active_pr"
 
         # 2. Same-second tie between PR comment and specify_triage_task stays guarded.
@@ -687,15 +683,160 @@ def test_active_pr_guard_lifts_after_specify_triage_release(
             )
         assert kbd.check_respawn_guard(conn, tied_id) == "active_pr"
 
-        # 3. Background ``auto-decomposer`` specify pass must not silently lift ``active_pr``.
+        # 3. Gateway ``source="auto-decomposer"`` pass must not silently lift ``active_pr``.
         auto_id = kb.create_task(conn, title="auto decompose guard", assignee="dev")
         assert kb.claim_task(conn, auto_id, claimer="dev") is not None
         kb.add_comment(conn, auto_id, author="dev", body=pr_comment)
         _move_to_triage_via_block_loop(conn, auto_id)
         _backdate_comments(conn, auto_id)
-        assert kb.specify_triage_task(conn, auto_id, author="auto-decomposer") is True
+        assert kb.specify_triage_task(
+            conn, auto_id, title="Refined auto", body="auto spec",
+            author="auto-decomposer", source="auto-decomposer",
+        ) is True
         assert _task_status(conn, auto_id) == "ready"
         assert kbd.check_respawn_guard(conn, auto_id) == "active_pr"
+
+        # 4. A manual operator specify from a profile named ``auto-decomposer`` still lifts.
+        named_profile_id = kb.create_task(conn, title="manual profile named auto-decomposer", assignee="dev")
+        assert kb.claim_task(conn, named_profile_id, claimer="dev") is not None
+        kb.add_comment(conn, named_profile_id, author="dev", body=pr_comment)
+        _move_to_triage_via_block_loop(conn, named_profile_id)
+        _backdate_comments(conn, named_profile_id)
+        assert kb.specify_triage_task(
+            conn, named_profile_id, title="Refined manual", author="auto-decomposer",
+        ) is True
+        assert _task_status(conn, named_profile_id) == "ready"
+        assert kbd.check_respawn_guard(conn, named_profile_id) is None
+
+        res2 = kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert named_profile_id in [s[0] for s in res2.spawned]
+        assert dict(res2.respawn_guarded).get(auto_id) == "active_pr"
+        assert auto_id not in claimed_ids
+
+
+def test_active_pr_guard_holds_after_crash_reclaim_or_ordinary_comment(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash, reclaim, or ordinary comment strictly AFTER the only PR comment
+    (with no operator release) must keep ``active_pr`` intact and prevent dispatch.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    pr_comment = "Opened https://github.com/example/repo/pull/68 for review."
+    spawned: list[str] = []
+
+    with kbc.connect() as conn:
+        # (a) Real worker crash strictly after the PR comment.
+        crash_id = kb.create_task(conn, title="crashed after pr", assignee="dev")
+        assert kb.claim_task(conn, crash_id, claimer="dev") is not None
+        kb.add_comment(conn, crash_id, author="dev", body=pr_comment)
+        _backdate_comments(conn, crash_id)
+        assert kbd._record_task_failure(
+            conn, crash_id, "worker exited 1", outcome="crashed",
+            release_claim=True, end_run=True,
+        ) is False
+        assert _task_status(conn, crash_id) == "ready"
+        assert kbd.check_respawn_guard(conn, crash_id) == "active_pr"
+
+        # (b) Real reclaim strictly after the PR comment.
+        reclaim_id = kb.create_task(conn, title="reclaimed after pr", assignee="dev")
+        assert kb.claim_task(conn, reclaim_id, claimer="dev") is not None
+        kb.add_comment(conn, reclaim_id, author="dev", body=pr_comment)
+        _backdate_comments(conn, reclaim_id)
+        assert kb.reclaim_task(conn, reclaim_id, reason="stale lock") is True
+        assert _task_status(conn, reclaim_id) == "ready"
+        assert kbd.check_respawn_guard(conn, reclaim_id) == "active_pr"
+
+        # (c) Ordinary comment strictly after the PR comment.
+        comment_id = kb.create_task(conn, title="commented after pr", assignee="dev")
+        kb.add_comment(conn, comment_id, author="dev", body=pr_comment)
+        _backdate_comments(conn, comment_id)
+        kb.add_comment(conn, comment_id, author="operator", body="Checking status")
+        assert _task_status(conn, comment_id) == "ready"
+        assert kbd.check_respawn_guard(conn, comment_id) == "active_pr"
+
+        res = kbd.dispatch_once(conn, spawn_fn=lambda task, _ws: spawned.append(task.id))
+        assert not res.spawned
+        assert not spawned
+        guarded = dict(res.respawn_guarded)
+        assert guarded == {
+            crash_id: "active_pr",
+            reclaim_id: "active_pr",
+            comment_id: "active_pr",
+        }
+
+
+def test_active_pr_guard_legacy_specified_upgrade_cases(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Upgrade compatibility for legacy ``specified`` events written without ``source``:
+    - Legacy ``auto-decomposer`` release (audit comment by ``auto-decomposer``) stays guarded.
+    - Ambiguous legacy ``specified`` event (no matching audit comment) fails closed.
+    - Legacy operator ``specify`` release (audit comment by operator/specifier) lifts.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    pr_comment = "Opened https://github.com/example/repo/pull/68 for review."
+    claimed_ids: list[str] = []
+
+    def _strip_specified_source(conn, tid: str) -> None:
+        with kb.write_txn(conn):
+            row = conn.execute(
+                "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'specified' ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            assert row is not None
+            data = kb._json_dict(row["payload"])
+            data.pop("source", None)
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (json.dumps(data) if data else None, row["id"]),
+            )
+
+    with kbc.connect() as conn:
+        # 1. Legacy fork/main auto-decomposer release (no ``source``, audit comment by auto-decomposer).
+        legacy_auto = kb.create_task(conn, title="legacy auto", assignee="dev")
+        assert kb.claim_task(conn, legacy_auto, claimer="dev") is not None
+        kb.add_comment(conn, legacy_auto, author="dev", body=pr_comment)
+        _move_to_triage_via_block_loop(conn, legacy_auto)
+        _backdate_comments(conn, legacy_auto)
+        assert kb.specify_triage_task(conn, legacy_auto, body="rewritten", author="auto-decomposer") is True
+        _strip_specified_source(conn, legacy_auto)
+        assert kbd.check_respawn_guard(conn, legacy_auto) == "active_pr"
+
+        # 2. Ambiguous legacy ``specified`` (no ``source``, no audit comment) fails closed.
+        legacy_ambig = kb.create_task(conn, title="legacy ambiguous", assignee="dev")
+        assert kb.claim_task(conn, legacy_ambig, claimer="dev") is not None
+        kb.add_comment(conn, legacy_ambig, author="dev", body=pr_comment)
+        _move_to_triage_via_block_loop(conn, legacy_ambig)
+        _backdate_comments(conn, legacy_ambig)
+        assert kb.specify_triage_task(conn, legacy_ambig) is True
+        _strip_specified_source(conn, legacy_ambig)
+        assert kbd.check_respawn_guard(conn, legacy_ambig) == "active_pr"
+
+        # 3. Legacy operator ``specify`` (no ``source``, operator audit comment) lifts.
+        legacy_op = kb.create_task(conn, title="legacy operator", assignee="dev")
+        assert kb.claim_task(conn, legacy_op, claimer="dev") is not None
+        kb.add_comment(conn, legacy_op, author="dev", body=pr_comment)
+        _move_to_triage_via_block_loop(conn, legacy_op)
+        _backdate_comments(conn, legacy_op)
+        assert kb.specify_triage_task(conn, legacy_op, body="operator spec", author="operator") is True
+        _strip_specified_source(conn, legacy_op)
+        assert kbd.check_respawn_guard(conn, legacy_op) is None
+
+        res = kbd.dispatch_once(conn, spawn_fn=lambda task, _ws: claimed_ids.append(task.id))
+        assert [s[0] for s in res.spawned] == [legacy_op]
+        assert claimed_ids == [legacy_op]
+        assert dict(res.respawn_guarded) == {
+            legacy_auto: "active_pr",
+            legacy_ambig: "active_pr",
+        }
 
 
 def test_active_pr_guard_lifts_after_untriage_release(
@@ -703,7 +844,8 @@ def test_active_pr_guard_lifts_after_untriage_release(
 ) -> None:
     """Explicit operator ``untriage_task`` (fork #66) strictly after the newest
     PR comment lifts ``active_pr`` — including when ``--reason`` itself cites
-    the PR URL — while any subsequent worker PR comment re-arms the guard.
+    the PR URL (both new ``comment_id`` rows and legacy rows without ``comment_id``) —
+    while any separate same-second or subsequent PR comment keeps ``active_pr`` armed.
     """
     import hermes_cli.config as cfgmod
     import hermes_cli.profiles as profmod
@@ -716,8 +858,19 @@ def test_active_pr_guard_lifts_after_untriage_release(
     def spawn(task, _workspace):
         claimed_ids.append(task.id)
 
+    def _strip_untriaged_comment_id(conn, tid: str) -> None:
+        with kb.write_txn(conn):
+            row = conn.execute(
+                "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'untriaged' ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            assert row is not None
+            data = kb._json_dict(row["payload"])
+            data.pop("comment_id", None)
+            conn.execute("UPDATE task_events SET payload = ? WHERE id = ?", (json.dumps(data), row["id"]))
+
     with kbc.connect() as conn:
-        # Untriage with a reason citing the existing PR URL must not self-re-arm.
+        # 1. Untriage with a reason citing the existing PR URL must not self-re-arm.
         with_reason_id = kb.create_task(conn, title="untriage with pr url", assignee="dev")
         assert kb.claim_task(conn, with_reason_id, claimer="dev") is not None
         kb.add_comment(conn, with_reason_id, author="dev", body=pr_comment)
@@ -731,7 +884,7 @@ def test_active_pr_guard_lifts_after_untriage_release(
         assert _task_status(conn, with_reason_id) == "ready"
         assert kbd.check_respawn_guard(conn, with_reason_id) is None
 
-        # Untriage without reason also lifts ``active_pr``.
+        # 2. Untriage without reason also lifts ``active_pr``.
         bare_id = kb.create_task(conn, title="untriage bare", assignee="dev")
         assert kb.claim_task(conn, bare_id, claimer="dev") is not None
         kb.add_comment(conn, bare_id, author="dev", body=pr_comment)
@@ -742,11 +895,48 @@ def test_active_pr_guard_lifts_after_untriage_release(
         assert _task_status(conn, bare_id) == "ready"
         assert kbd.check_respawn_guard(conn, bare_id) is None
 
+        # 3. Legacy fork/main untriaged row (has ``reason`` with PR URL, no ``comment_id``) lifts.
+        legacy_untriage = kb.create_task(conn, title="legacy untriage with pr url", assignee="dev")
+        assert kb.claim_task(conn, legacy_untriage, claimer="dev") is not None
+        kb.add_comment(conn, legacy_untriage, author="dev", body=pr_comment)
+        _move_to_triage_via_block_loop(conn, legacy_untriage)
+        _backdate_comments(conn, legacy_untriage)
+        assert kb.untriage_task(
+            conn, legacy_untriage, author="operator",
+            reason="Approved: merge https://github.com/example/repo/pull/68",
+        ) is True
+        _strip_untriaged_comment_id(conn, legacy_untriage)
+        assert kbd.check_respawn_guard(conn, legacy_untriage) is None
+
+        # 4. Legacy untriaged row + a separate same-second PR comment stays guarded.
+        legacy_tied = kb.create_task(conn, title="legacy untriage same-second worker pr", assignee="dev")
+        assert kb.claim_task(conn, legacy_tied, claimer="dev") is not None
+        kb.add_comment(conn, legacy_tied, author="dev", body=pr_comment)
+        _move_to_triage_via_block_loop(conn, legacy_tied)
+        _backdate_comments(conn, legacy_tied)
+        assert kb.untriage_task(
+            conn, legacy_tied, author="operator",
+            reason="Approved: merge https://github.com/example/repo/pull/68",
+        ) is True
+        _strip_untriaged_comment_id(conn, legacy_tied)
+        # Separate same-second worker PR comment (pin its created_at to the untriaged event).
+        extra_cid = kb.add_comment(
+            conn, legacy_tied, author="dev",
+            body="Pushed https://github.com/example/repo/pull/69",
+        )
+        with kb.write_txn(conn):
+            ut_ts = conn.execute(
+                "SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind = 'untriaged'",
+                (legacy_tied,),
+            ).fetchone()[0]
+            conn.execute("UPDATE task_comments SET created_at = ? WHERE id = ?", (ut_ts, extra_cid))
+        assert kbd.check_respawn_guard(conn, legacy_tied) == "active_pr"
+
         res = kbd.dispatch_once(conn, spawn_fn=spawn)
         spawned_ids = [s[0] for s in res.spawned]
-        assert with_reason_id in spawned_ids and with_reason_id in claimed_ids
-        assert bare_id in spawned_ids and bare_id in claimed_ids
-        assert not res.respawn_guarded
+        assert {with_reason_id, bare_id, legacy_untriage} <= set(spawned_ids)
+        assert {with_reason_id, bare_id, legacy_untriage} <= set(claimed_ids)
+        assert dict(res.respawn_guarded) == {legacy_tied: "active_pr"}
 
         # A worker posting a new PR comment after untriage re-arms ``active_pr`` (even same second).
         assert kb.reclaim_task(conn, with_reason_id, reason="reclaimed") is True

@@ -228,7 +228,9 @@ def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
     )
 
 
-def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -> DecomposeOutcome:
+def _apply_single(
+    task: kb.Task, parsed: dict, routing: _Routing, author: str, *, source: str = "operator",
+) -> DecomposeOutcome:
     """``fanout=false``: single-task spec promotion (same effect as specify)."""
     title_val, body_val = _title_body(parsed)
     assignee_val = None
@@ -240,7 +242,8 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
         return DecomposeOutcome(task.id, False, "decomposer returned fanout=false with no title/body")
     with kbc.connect_closing() as conn:
         ok = kb.specify_triage_task(
-            conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,
+            conn, task.id, title=title_val, body=body_val, assignee=assignee_val,
+            author=author, source=source,
         )
     if not ok:
         return DecomposeOutcome(task.id, False, "task moved out of triage before promotion")
@@ -314,6 +317,7 @@ def decompose_task(
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    source: str = "operator",
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks. Expected failures
     (not in triage, no aux client, API error, malformed/empty reply) surface
@@ -341,7 +345,7 @@ def decompose_task(
 
     audit_author = author or _profile_author()
     if not parsed.get("fanout"):
-        return _apply_single(task, parsed, routing, audit_author)
+        return _apply_single(task, parsed, routing, audit_author, source=source)
     return _apply_fanout(task_id, parsed, routing, audit_author)
 
 

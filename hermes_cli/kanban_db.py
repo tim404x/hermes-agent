@@ -3652,6 +3652,7 @@ def invalidate_descendants_for_parent_reopen(
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
+    source: str = "operator",
 ) -> bool:
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
@@ -3660,6 +3661,7 @@ def specify_triage_task(
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
+    resolved_source = (source or "").strip() or "operator"
     with write_txn(conn):
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
@@ -3696,14 +3698,10 @@ def specify_triage_task(
                 "Specified — updated " + ", ".join(changed_fields) + " and promoted to todo.",
                 int(time.time()),
             )
-        payload: dict[str, Any] = {}
+        payload: dict[str, Any] = {"source": resolved_source}
         if changed_fields:
             payload["changed_fields"] = changed_fields
-        if author and author.strip() == "auto-decomposer":
-            # Distinguish automatic background triage sweeps from explicit operator
-            # releases so auto-decompose cannot silently lift ``active_pr``.
-            payload["source"] = "auto-decomposer"
-        _append_event(conn, task_id, "specified", payload or None)
+        _append_event(conn, task_id, "specified", payload)
     # Own IMMEDIATE txn (outside the one above): a parent-free specified task
     # flips to 'ready' now instead of idling until the next tick.
     recompute_ready(conn)
