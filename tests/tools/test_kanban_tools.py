@@ -466,7 +466,7 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
 def test_schedule_published_schema_and_handler_accept_integer_epoch(worker_env):
     from jsonschema import validate
 
-    from agent.gemini_schema import sanitize_gemini_tool_parameters
+    from plugins.model_providers.google.schema import sanitize_gemini_tool_parameters
     from agent.moonshot_schema import sanitize_moonshot_tools
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
