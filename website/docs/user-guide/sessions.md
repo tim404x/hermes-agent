@@ -1189,11 +1189,14 @@ kept for backward compatibility (disable with
 It only ever contains gateway/messaging entries, so if you run a messaging
 platform you'll see only those (e.g. `agent:main:whatsapp:dm:...`).
 
-When mirror writes are disabled, startup imports any missing routes from an existing
-mirror, commits them to `state.db`, then renames the file to `sessions.json.retired-<UTC timestamp>`.
-Later starts do not re-import that archive. An existing archive is never overwritten. If the rename fails,
-the gateway retries it on a later save. If SQLite is unavailable, the gateway keeps using the mirror as a
-fallback; if neither store can be written, the save reports an error.
+With mirror writes disabled, the gateway leaves existing backups untouched. It imports missing,
+non-retired routes from a legacy mirror once and records the import in `state.db` in the same
+transaction. It does not rename the file, write a new copy, or report a failed SQLite save as
+successful. With mirror writes enabled, a save can record pending edits and deletions in the
+mirror if SQLite is unavailable. When the database returns, the gateway reconciles them without
+overwriting newer database changes. A mirror produced by the same database does not restore a
+route that was subsequently deleted. Before downgrading to a gateway that predates these import
+markers, move any old `sessions.json` backup aside so the older importer cannot replay it.
 
 This is **expected** and does **not** mean your CLI sessions are missing.
 `hermes sessions list`, `/sessions`, and the dashboard all read `state.db`,

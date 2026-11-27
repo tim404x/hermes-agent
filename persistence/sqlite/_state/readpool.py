@@ -6,10 +6,12 @@ their permit and are reclaimable across peers on the same path."""
 import errno
 import logging
 import os
+import sqlite3
 import threading
 import time
 import weakref
 from pathlib import Path
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterator, Optional
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -32,7 +34,7 @@ logger = logging.getLogger("hermes_state")
 # number of short retries makes the open succeed instead of 500-ing the whole /api/sessions poll (or any
 # other read-only opener). Deliberately NOT attempted on writable opens: a writer owns the transition, so an
 # IOERR there means a real storage/fd problem.
-_READ_POOL_MAX = 8
+_READ_POOL_MAX = 7
 
 # Ceiling ALIVE in this PROCESS across every state.db (a multiplexed gateway
 # opens one per profile); three profiles' worth, then readers degrade likewise.
@@ -41,7 +43,7 @@ _READ_POOL_MAX = 8
 # the same shape as the per-instance bug, one level out (#98573). Past it, readers on the (N+1)th file
 # degrade to their writer connection instead of opening descriptors, which is the same trade _READ_POOL_MAX
 # makes and for the same reason: a slow read path is recoverable, a process-wide EMFILE is not.
-_READ_POOL_PROCESS_MAX = 24
+_READ_POOL_PROCESS_MAX = 23
 
 # Warn past this many store holders on one file in one process (diagnostic:
 # writer connections cannot be rationed the way read connections can).
@@ -60,6 +62,18 @@ _FD_HEADROOM_RESERVE = 64
 _FD_USAGE_CACHE_SECONDS = 0.25
 
 _process_read_permits = threading.BoundedSemaphore(_READ_POOL_PROCESS_MAX)
+_preparation_permit = threading.Lock()
+
+
+@contextmanager
+def reserved_preparation_reader(timeout):
+    """One non-pooled lease process-wide: seven ordinary readers + this one per file, 24 total."""
+    if not _fd_headroom_ok() or not _preparation_permit.acquire(timeout=timeout):
+        raise sqlite3.OperationalError('database is busy: independent routing reader unavailable')
+    try:
+        yield
+    finally:
+        _preparation_permit.release()
 
 # Read opens refused for low descriptor headroom — the only visible signal the
 # guard fires. Guarded by _read_budgets_lock.

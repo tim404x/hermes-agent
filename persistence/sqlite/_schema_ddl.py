@@ -325,11 +325,6 @@ CREATE TABLE IF NOT EXISTS gateway_routing (
     PRIMARY KEY (scope, session_key)
 );
 
-CREATE TABLE IF NOT EXISTS gateway_routing_revision (
-    name TEXT PRIMARY KEY,
-    revision INTEGER NOT NULL
-) WITHOUT ROWID;
-
 CREATE TABLE IF NOT EXISTS gateway_hygiene_state (
     session_key TEXT PRIMARY KEY,
     failure_streak INTEGER NOT NULL DEFAULT 0

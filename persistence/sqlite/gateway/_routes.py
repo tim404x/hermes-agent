@@ -11,8 +11,9 @@ from persistence.gateway.routing import route_namespace
 
 from .._schema import _rebuild_table
 from .._schema_ddl import _RESET_CHILD_SQL, _RESET_END_REASONS_SQL, _sql_json_extract
-from ..conversation._store.retirement import RETIRED_PREFIX, _mark_retired, entry_session_id
-from ._revision import ROUTE_FENCE_PREFIX
+from ..conversation._store.retirement import RETIRED_PREFIX, _mark_retired
+from ._revision import EXPIRING_MARKER, EXPIRY_STAMP, ROUTE_FENCE_PREFIX
+from ._targets import delete_target
 
 # Accidental end reasons recovery treats as resumable: superseded_by_resume = sentinel-parked runtime replaced
 # by a fresh session.resume; startup_orphan_reap = dead-gateway sweep, same class as ws_orphan_reap but kept
@@ -57,14 +58,6 @@ _EXPIRED = "json_valid(value) AND json_extract(value, '$.retired_at') < ?"
 
 def route_fence_key(namespace, session_id):
     return f'{ROUTE_FENCE_PREFIX}{namespace}:{session_id}'
-
-
-def route_namespace_sql(key_expr: str) -> str:
-    """SQL equivalent of route_namespace, slicing UTF-8 bytes so embedded NULs survive substr."""
-    tail = f"substr(CAST({key_expr} AS BLOB), 7)"
-    colon = f"instr({tail}, x'3a')"
-    return (f"CASE WHEN substr({key_expr}, 1, 6) = 'agent:' AND {colon} > 1 "
-            f"THEN CAST(substr({tail}, 1, {colon} - 1) AS TEXT) ELSE 'main' END")
 
 
 # True when a routing save must skip an entry, checked only against the profile the route belongs
@@ -117,24 +110,20 @@ def fence_shared_routes(conn, namespace, session_ids, *, expiring=()):
     launch-keyed route to it names the retired session. The sweep fences that aged out here are
     reclaimed in the same write, so the owner's prunes bound them without the launch profile's sweep."""
     _reclaim_expired(conn, ROUTE_FENCE_PREFIX, time.time() - RETRY_HORIZON_S)
-    expiring, owned = set(expiring), {}
+    expiring = set(expiring)
     for sid in session_ids:
         names = {namespace}
         if not conn.execute('SELECT 1 FROM sessions WHERE id=?', (sid,)).fetchone():
             names.add('main')
         for name in names:
             _mark_retired(conn, route_fence_key(name, sid), expires=sid in expiring)
-        owned[sid] = names
-    for row in conn.execute('SELECT scope,session_key,entry_json FROM gateway_routing').fetchall():
-        if route_namespace(row['session_key']) in owned.get(entry_session_id(row['entry_json']), ()):
-            conn.execute('DELETE FROM gateway_routing WHERE scope=? AND session_key=?',
-                         (row['scope'], row['session_key']))
+            delete_target(conn, sid, name)
 
 
 def _reclaim_expired(conn, prefix, cutoff):
     """Drop the sweep (``expires``) markers under *prefix* retired before *cutoff*."""
-    conn.execute(f"DELETE FROM state_meta WHERE key GLOB ? AND {_EXPIRED} AND json_extract(value, '$.expires')",
-                 (prefix + '*', cutoff))
+    conn.execute(f'DELETE FROM state_meta INDEXED BY idx_routing_marker_expiry WHERE {EXPIRING_MARKER} '
+                 f'AND {EXPIRY_STAMP} < ? AND key GLOB ?', (cutoff, prefix + '*'))
 
 
 # ── peers and orphans ─────────────────────────────────────────────────────────

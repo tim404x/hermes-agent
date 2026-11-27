@@ -19,6 +19,7 @@ import time
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any, Optional
+from uuid import uuid4
 
 from persistence import JsonValue, PermanentStoreError, SessionArtifacts, SessionId, SessionRowMissing
 from persistence.authority.vocabulary import RETRY_HORIZON_S
@@ -203,7 +204,45 @@ class InMemoryRoutingRepository:
         self._index()[routing_scope] = {key: StoredRoute.of(key, text) for key, text in rows if key not in skipped}
         return skipped
 
-    def load_routing_entries(self, *, routing_scope: str = "") -> dict[str, str]:
+    def save_routing_edits(self, puts, deletes, targets, *, routing_scope, mirror, repairs=None, prior=None):
+        rows = self._index().setdefault(routing_scope, {})
+        retired = {key for key, sid in targets.items() if self.route_retired(key, json.dumps({'session_id': sid}))}
+        for key in deletes | {key for key in retired if key in rows and (_route_sid(rows[key]) == targets[key]
+                              or (prior and key in prior and _parse(rows[key].text(key)) == _parse(prior[key])))}:
+            rows.pop(key, None)
+        for key in puts.keys() - retired:
+            if repairs and key in repairs and (key not in rows or rows[key].text(key) != repairs[key]):
+                continue
+            rows[key] = StoredRoute.of(key, puts[key])
+        owners = self._store().setdefault('routing_mirror_owners', {})
+        return retired, owners.setdefault(routing_scope, uuid4().hex) if mirror else None
+
+    def reconcile_routing_mirror(self, missing, pending, *, routing_scope, digest, owner):
+        consumed = self._store().setdefault('consumed_routing_mirrors', set())
+        if (routing_scope, digest) in consumed:
+            return {}
+        projection = owner is not None and owner == self._store().get('routing_mirror_owners', {}).get(routing_scope)
+        if projection and not pending:
+            return {}
+        rows, resolved = self._index().setdefault(routing_scope, {}), {}
+        for key in pending.keys() if projection else pending.keys() | missing.keys():
+            current = rows[key].text(key) if key in rows else None
+            before, after = pending.get(key, (None, missing.get(key)))
+            if current != before and (current is not None or projection or key not in missing) and not (
+                    before is not None and current is not None and json.dumps(_parse(before), sort_keys=True) == json.dumps(_parse(current), sort_keys=True)):
+                resolved[key] = current
+                continue
+            if after is not None and self.route_retired(key, after):
+                after = None
+            if after is None:
+                rows.pop(key, None)
+            else:
+                rows[key] = StoredRoute.of(key, after)
+            resolved[key] = after
+        consumed.add((routing_scope, digest))
+        return resolved
+
+    def load_routing_entries(self, *, routing_scope: str = "", fresh: bool = False) -> dict[str, str]:
         return {key: _entry_text(key, route) for key, route in self._index().get(routing_scope, {}).items()}
 
     def routing_entry_for_session(self, session_id: str) -> Mapping[str, JsonValue] | None:

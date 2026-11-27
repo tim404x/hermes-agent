@@ -6,12 +6,16 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import logging
 import json
 import threading
-from datetime import UTC, datetime
+from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
+from uuid import uuid4
+from persistence.core.errors import DeclarativeDrift, StoreContention
 from utils import atomic_json_write
 
 if TYPE_CHECKING:
@@ -104,6 +108,51 @@ def _apply_to_held_row(data: dict, mutate) -> Optional[dict]:
     return _with_platform({**data, **entry.to_dict()}, data["origin"]["platform"])
 
 
+@dataclass(frozen=True)
+class _Mirror:
+    digest: str
+    owner: str | None
+    entries: dict
+    pending: dict
+    allow_missing: bool
+
+
+class _RoutingJournalError(RuntimeError):
+    """A durable fallback cannot safely be replayed or replaced."""
+
+
+def _read_mirror(directory, scope):
+    try:
+        raw = (directory / 'sessions.json').read_bytes()
+    except FileNotFoundError:
+        return None
+    data = json.loads(raw.decode('utf-8-sig'))
+    if not isinstance(data, dict):
+        raise ValueError('expected a routing mirror object')
+    journal = data.get('_routing_journal', {})
+    if not isinstance(journal, dict):
+        raise _RoutingJournalError('invalid routing journal')
+    pending = journal.get('edits', {}) if journal.get('scope') == scope else {}
+    if not isinstance(pending, dict) or not all(not key.startswith('_') and isinstance(pair, list) and len(pair) == 2
+            and all(value is None or isinstance(value, str) for value in pair) for key, pair in pending.items()):
+        raise _RoutingJournalError('invalid pending routing edits')
+    return _Mirror(hashlib.sha256(raw).hexdigest(), data.get('_routing_db'),
+                   {key: value for key, value in data.items() if not key.startswith('_') and isinstance(value, dict)},
+                   pending, not journal.get('primary') or bool(data.get('_routing_db')))
+
+
+def _mirror_projection(rows, backup):
+    entries = {}
+    for key, text in rows.items():
+        try:
+            entry = json.loads(text)
+        except (ValueError, TypeError):
+            entry = backup.get(key)
+        if isinstance(entry, dict):
+            entries[key] = entry
+    return entries
+
+
 class SessionPersistenceMixin:
     """SessionStore storage plumbing: storage interface handle resolution and routing-index load/save."""
 
@@ -142,20 +191,31 @@ class SessionPersistenceMixin:
         store.routing.fence_retired_routes(session_ids, namespace=namespace, expiring=expiring)
 
     def strip_retired_mirror_routes(self, session_ids=None) -> None:
-        """Drop from an existing sessions.json every route a routing save now skips as retired
-        (``route_retired``, the check ``replace_gateway_routing_entries`` applies), only those naming
-        *session_ids* when given. Runs whatever ``write_sessions_json`` says and never creates the
-        file: the mirror is derived, and a retired route left in it would come back through the
-        next start's legacy import once a prune's fence ages out."""
+        """Prevent an existing mirror from replaying retired routes after their fences expire.
+        With writes disabled, consume a legacy import in SQLite without modifying the backup."""
         store = self._routing_persistence
         sessions_file = self.sessions_dir / "sessions.json"
         if store is None or not sessions_file.exists():
             return
         targets = None if session_ids is None else set(session_ids)
         with self._lazy("_save_lock", threading.Lock):  # never interleaves with a full save's write
+            if not getattr(self, '_write_sessions_json', True):
+                mirror = _read_mirror(self.sessions_dir, self._routing_scope())
+                if mirror:
+                    self._reconcile_mirror(store.routing, {}, mirror)
+                return
             with open(sessions_file, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
+                return
+            if '_routing_journal' in data:
+                mirror = _read_mirror(self.sessions_dir, self._routing_scope())
+                rows = store.routing.load_routing_entries(routing_scope=self._routing_scope(), fresh=True)
+                self._reconcile_mirror(store.routing, rows, mirror)
+                _, owner = store.routing.save_routing_edits({}, set(), {}, routing_scope=self._routing_scope(), mirror=True)
+                data = {'_routing_db': owner, **_mirror_projection(rows, mirror.entries)}
+                self._pending_routing_edits = {}
+                self._save_sessions_json(data)
                 return
             kept = {}
             for key, entry in data.items():
@@ -410,23 +470,15 @@ class SessionPersistenceMixin:
         chat_name, chat_topic = json.loads(raw)
         return chat_name, chat_topic
 
-    def _load_routing_rows_locked(self) -> bool:
-        """Load state.db routing entries into ``_entries``; False when there is no loader or the
-        load failed (warned). Lock held."""
-        store = self._routing_persistence
-        if store is None:
-            return False
-        try:
-            for key, entry_json in store.routing.load_routing_entries(routing_scope=self._routing_scope()).items():
-                entry = self._routing_entry_from_json(key, entry_json)
-                if entry is not None:
-                    self._entries[key] = entry
-                else:
-                    self._keep_unparsed_route(key, entry_json)
-            return True
-        except Exception as e:
-            logger.warning("gateway.session: state.db routing load failed: %s", e)
-            return False
+    def _install_routing_rows(self, rows):
+        self._entries.clear()
+        self._unparsed_routes = {}
+        for key, text in rows.items():
+            entry = self._routing_entry_from_json(key, text)
+            if entry is not None:
+                self._entries[key] = entry
+            else:
+                self._keep_unparsed_route(key, text)
 
     def _keep_unparsed_route(self, key: str, entry_json: str) -> None:
         """Hold a row that fails to parse ONLY because its platform's plugin is not registered (installed
@@ -469,31 +521,28 @@ class SessionPersistenceMixin:
         return None
 
     def _ensure_loaded_locked(self) -> None:
-        """Load state.db routes first, then missing keys from the legacy mirror. When mirror writes
-        are disabled, commit the import before archiving the file so later loads cannot replay it."""
+        """Load primary routes and transactionally consume any legacy import or fallback edits."""
         if self._loaded:
             self._reconcile_recovered_routing_locked()
             self._promote_held_routes_locked()
             return
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
-        db_load_succeeded = self._load_routing_rows_locked()
-        db_had_entries = db_load_succeeded and bool(self._entries)
-        mirror_retired, mirror_loaded = self._import_legacy_sessions_json(db_had_entries)
+        live = dict(self._entries)
+        mirror = self._startup_mirror()
+        with self._lazy('_save_lock', threading.Lock):
+            if mirror is not None:
+                self._install_routing_rows({key: json.dumps(value) for key, value in mirror.entries.items()})
+            if not self._load_primary(mirror):
+                if mirror is not None:
+                    self._pending_routing_edits = mirror.pending
+                    self._mirror_owner = mirror.owner
+                self._heal_missing_origins(self._entries.values())
+                self._routing_baseline = self._routing_data_locked()
+                self._routing_db_loaded = False
+            for key, entry in live.items():
+                if key not in getattr(self, '_unparsed_routes', {}):
+                    self._entries.setdefault(key, entry)
         self._loaded = True
-        self._routing_db_loaded = db_load_succeeded
-        # Heal before the fallback baseline: a heal after it reads as a caller edit, and recovery
-        # would then keep the stale mirror entry over the newer DB row.
-        self._heal_missing_origins(self._entries.values())
-        self._routing_fallback_baseline = None if db_load_succeeded else self._routing_data_locked()
-        mirror_disabled = not getattr(self, "_write_sessions_json", True)
-        self._archive_mirror_on_commit = mirror_disabled and mirror_loaded
-        if db_load_succeeded and (mirror_retired or self._archive_mirror_on_commit):
-            if mirror_disabled and mirror_retired:
-                try:
-                    self.strip_retired_mirror_routes()
-                except Exception:
-                    logger.warning("gateway.session: could not strip retired routes from sessions.json", exc_info=True)
-            self._save()
         # A hard crash skips graceful shutdown and leaves sessions.json pointing at ended sessions.
         self._prune_stale_sessions_locked()
 
@@ -522,67 +571,72 @@ class SessionPersistenceMixin:
             return None
         return source if self._generate_session_key(source) == entry.session_key else None
 
-    def _import_legacy_sessions_json(self, db_had_entries: bool) -> tuple[int, bool]:
-        """Fill keys the DB lacks. Return the retired count and whether a whole mirror was read."""
-        from gateway.session import SessionEntry
-        sessions_file = self.sessions_dir / "sessions.json"
-        retired = 0
-        if not sessions_file.exists():
-            return retired, False
+    def _startup_mirror(self):
         try:
-            with open(sessions_file, "r", encoding="utf-8-sig") as f:
-                data = json.load(f)
-            imported = 0
-            for key, entry_data in data.items():
-                # "_"-prefixed keys are sentinels (e.g. "_README"), not entries.
-                # A held unparsed DB row is the newer copy too (state.db first).
-                if key.startswith("_") or key in self._entries or key in (getattr(self, "_unparsed_routes", None) or {}):
-                    continue
-                if not isinstance(entry_data, dict):  # corrupt file must not abort the whole load
-                    logger.warning(
-                        "Skipping invalid session entry %r: expected dict, got %s", key,
-                        type(entry_data).__name__)
-                    continue
-                try:
-                    store = self._routing_persistence
-                    if store is not None and store.routing.route_retired(key, json.dumps(
-                            {'session_id': entry_data['session_id']})):
-                        retired += 1
-                        continue
-                    self._entries[key] = SessionEntry.from_dict(entry_data)
-                    imported += 1
-                except (ValueError, KeyError, TypeError) as e:
-                    logger.warning("Skipping invalid session entry %r: %s", key, e)
-                    self._keep_unparsed_route(key, json.dumps(entry_data))
-            if imported and db_had_entries:
-                logger.info(
-                    "gateway.session: imported %d legacy sessions.json entr%s missing from "
-                    "state.db routing table", imported, "y" if imported == 1 else "ies")
-        except Exception as e:
-            print(f"[gateway] Warning: Failed to load sessions: {e}")
-            return retired, False
-        return retired, True
+            return _read_mirror(self.sessions_dir, self._routing_scope())
+        except (ValueError, OSError) as exc:
+            logger.warning('gateway.session: cannot read sessions.json: %s', exc)
+            return None
 
-    def _archive_sessions_json(self) -> None:
-        mirror = self.sessions_dir / "sessions.json"
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        suffix = 0
-        while True:
-            archive = mirror.with_suffix(f".json.retired-{stamp}" + (f".{suffix}" if suffix else ""))
-            try:
-                archive.touch(mode=0o600, exist_ok=False)
-                break
-            except FileExistsError:
-                suffix += 1
+    def _reconcile_mirror(self, routing, rows, mirror):
+        missing = {}
+        for key in mirror.entries.keys() - rows.keys() if mirror.allow_missing else ():
+            data = mirror.entries[key]
+            text = json.dumps(data)
+            if self._routing_entry_from_json(key, text) is not None or _fails_only_on_platform(data):
+                missing[key] = text
+        resolved = routing.reconcile_routing_mirror(missing, mirror.pending, digest=mirror.digest,
+                                                    owner=mirror.owner, routing_scope=self._routing_scope())
+        for key, text in resolved.items():
+            if text is None:
+                rows.pop(key, None)
+            else:
+                rows[key] = text
+        return any(value is None for value in resolved.values())
+
+    def _load_primary(self, mirror):
+        store = self._routing_persistence
+        if store is None:
+            return False
         try:
-            mirror.replace(archive)
-        except FileNotFoundError:
-            archive.unlink(missing_ok=True)
-            return
-        except OSError:
-            archive.unlink(missing_ok=True)
+            rows = store.routing.load_routing_entries(routing_scope=self._routing_scope(), fresh=True)
+        except (StoreContention, DeclarativeDrift):
             raise
-        logger.info("gateway.session: archived disabled sessions.json mirror as %s", archive.name)
+        except Exception as exc:
+            logger.warning('gateway.session: state.db routing load failed: %s', exc)
+            return False
+        try:
+            strip = mirror is not None and self._reconcile_mirror(store.routing, rows, mirror)
+        except (StoreContention, DeclarativeDrift):
+            raise
+        except Exception as exc:
+            if not self._loaded:
+                self._install_routing_rows({**{key: json.dumps(value) for key, value in mirror.entries.items()}, **rows})
+            logger.warning('gateway.session: routing mirror reconciliation failed: %s', exc)
+            return False
+        self._install_routing_rows(rows)
+        self._routing_baseline = self._routing_data_locked()
+        self._routing_original = {key: text for key, text in rows.items() if key in self._routing_baseline and
+                                  json.loads(text) != self._routing_baseline[key]}
+        if mirror:
+            self._mirror_owner = mirror.owner
+            for key in (rows.keys() - self._routing_baseline.keys()) & mirror.entries.keys():
+                text = json.dumps(mirror.entries[key])
+                entry = self._routing_entry_from_json(key, text)
+                if entry and not store.routing.route_retired(key, text):
+                    self._entries[key] = entry
+                    self._lazy('_routing_repairs', dict)[key] = rows[key]
+        self._routing_db_loaded = True
+        self._pending_routing_edits = {}
+        self._heal_missing_origins(self._entries.values())
+        if strip and self._write_sessions_json:
+            try:
+                _, owner = store.routing.save_routing_edits({}, set(), {}, routing_scope=self._routing_scope(), mirror=True)
+                self._mirror_owner = owner
+                self._save_sessions_json({**self._routing_data_locked(), '_routing_db': owner})
+            except OSError as exc:
+                logger.warning('gateway.session: could not refresh consumed mirror: %s', exc)
+        return True
 
     def _prune_stale_sessions_locked(self) -> None:
         """Remove routing entries whose session has ended in state.db (startup, lock held). Stale ==
@@ -675,8 +729,21 @@ class SessionPersistenceMixin:
         return "prune"
 
     def _entries_as_dicts(self) -> dict[str, Any]:
-        """Serializable snapshot of ``_entries``. Lock held."""
-        return {key: entry.to_dict() for key, entry in self._entries.items()}
+        """Reuse unchanged wire rows. Even off the SQLite lock, re-encoding every history pin
+        starves threads trying to get the GIL back to finish their commit. The comparison copy
+        must not alias in-place edits to origin, policy or nested metadata. Session lock held."""
+        previous = self._lazy('_entry_snapshots', dict)
+        for key in previous.keys() - self._entries.keys():
+            del previous[key]
+        rows = {}
+        for key, entry in self._entries.items():
+            fields = vars(entry)
+            cached = previous.get(key)
+            metadata = json.dumps(entry.metadata) if entry.metadata else ''
+            if cached is None or cached[0] != fields or cached[1] != metadata:
+                cached = previous[key] = (deepcopy(fields), metadata, entry.to_dict())
+            rows[key] = cached[2]
+        return rows
 
     def _save(self) -> None:
         """Persist the routing index while the caller holds ``_lock``."""
@@ -687,46 +754,25 @@ class SessionPersistenceMixin:
         fast saves MUST allocate from this one counter: the stale-write protection is a total order
         over serialization times and silently breaks otherwise."""
         self._routing_generation = getattr(self, "_routing_generation", 0) + 1
-        if getattr(self, "_routing_fallback_baseline", None) is not None:
+        if getattr(self, '_routing_db_loaded', None) is False:
             self._last_unreconciled_generation = self._routing_generation
         return self._routing_generation
 
     def _reconcile_recovered_routing_locked(self) -> None:
         """Merge authoritative rows after a fallback-only startup load."""
-        baseline = getattr(self, "_routing_fallback_baseline", None)
-        if getattr(self, "_routing_db_loaded", False) or baseline is None:
+        if getattr(self, '_routing_db_loaded', None) is not False:
             return
-        store = self._routing_persistence
-        if store is None:
-            return
-        try:
-            durable = store.routing.load_routing_entries(routing_scope=self._routing_scope())
-        except Exception as exc:
-            logger.warning("gateway.session: recovered state.db routing load failed: %s", exc)
-            return
-        current = self._routing_data_locked()  # a held row counts as loaded too (its plugin may register meanwhile)
-        held = self._lazy("_unparsed_routes", dict)
-        for key, entry_json in durable.items():
-            durable_entry = self._routing_entry_from_json(key, entry_json)
-            if durable_entry is None:
-                if key not in self._entries and (
-                        key not in baseline or (key in held and held[key] == baseline[key])):
-                    # A DB-only row is held; an unchanged held mirror copy yields to the DB copy, a changed
-                    # one (a boot marker verdict) or a removed one stays as it is.
-                    self._keep_unparsed_route(key, entry_json)
-                continue
-            if key not in baseline:
-                # A key created while on fallback wins over a DB-only key; otherwise restore the
-                # authoritative row that fallback never saw.
-                self._entries.setdefault(key, durable_entry)
-            elif key not in current:
-                continue  # loaded from fallback and deliberately removed
-            elif current[key] == baseline[key]:
-                self._entries[key] = durable_entry  # unchanged fallback data yields to the DB copy
-                held.pop(key, None)
-        self._heal_missing_origins(self._entries.values())
-        self._routing_db_loaded = True
-        self._routing_fallback_baseline = None
+        with self._lazy('_save_lock', threading.Lock):
+            baseline, current = self._routing_baseline, self._routing_data_locked()
+            changed = {key for key, value in current.items() if baseline.get(key) != value}
+            live = {key: self._entries[key] for key in changed if key in self._entries}
+            held = {key: current[key] for key in changed - live.keys()}
+            if not self._load_primary(self._startup_mirror()):
+                return
+            self._drop_routes_locked((baseline.keys() - current.keys()) | changed)
+            self._entries.update(live)
+            self._unparsed_routes.update(held)
+            self._recovered_fallback = (getattr(self, '_last_unreconciled_generation', 0), baseline)
 
     def _snapshot_routing_locked(self) -> tuple[dict[str, Any], int]:
         """Capture immutable routing data and a monotonic generation."""
@@ -736,13 +782,21 @@ class SessionPersistenceMixin:
     def _routing_data_locked(self) -> dict[str, Any]:
         """Every row a full write persists: held unparsed rows, then live entries (a live entry under the
         same key wins). Lock held."""
-        return {**(getattr(self, "_unparsed_routes", None) or {}), **self._entries_as_dicts()}
+        return {**deepcopy(getattr(self, "_unparsed_routes", None) or {}), **self._entries_as_dicts()}
 
     def _persist_routing_data(self, data: dict[str, Any], generation: int) -> None:
         """Serialize all whole-index writers through one durable write lock."""
         with self._lazy("_save_lock", threading.Lock):
             if generation <= getattr(self, "_persisted_routing_generation", 0):
                 return
+            recovery = getattr(self, '_recovered_fallback', None)
+            if recovery and generation <= recovery[0]:
+                fallback = recovery[1]
+                merged = dict(self._routing_baseline)
+                for key in fallback.keys() - data.keys():
+                    merged.pop(key, None)
+                merged.update((key, value) for key, value in data.items() if fallback.get(key) != value)
+                data = merged
             # Fold in fast upserts numbered above this snapshot: they were serialized after us and
             # a delayed full rewrite must not regress them.
             fast_persisted = getattr(self, "_fast_persisted_entries", None)
@@ -750,53 +804,78 @@ class SessionPersistenceMixin:
                 for key, (revision, entry_json) in fast_persisted.items():
                     if revision > generation:
                         data[key] = json.loads(entry_json)
-            db_saved = False
-            store = self._routing_persistence
-            if store is not None and generation > getattr(self, "_last_unreconciled_generation", 0):
-                try:
-                    retired = store.routing.replace_routing_entries(
-                        {k: json.dumps(v) for k, v in data.items()}, routing_scope=self._routing_scope())
-                    db_saved = True
-                    # A retired route the save skipped stays out of the mirror too: its fence may
-                    # age out (a prune's), and the next start's legacy import would restore it.
-                    if retired:
-                        data = {k: v for k, v in data.items() if k not in retired}
-                except Exception as exc:
-                    logger.warning("gateway.session: state.db routing save failed: %s", exc)
-            # Mirror I/O follows the DB transaction, outside the state.db writer mutex.
-            self._persist_sessions_json(data, db_saved=db_saved)
+            baseline = getattr(self, '_routing_baseline', {})
+            puts = {key: text for key, value in data.items() if value is not baseline.get(key)
+                    and (text := json.dumps(value)) != json.dumps(baseline.get(key))}
+            deletes = baseline.keys() - data.keys()
+            self._save_generation(data, puts, deletes, baseline)
+            self._routing_baseline = data
             self._persisted_routing_generation = generation
+            if recovery and generation >= recovery[0]:
+                self._recovered_fallback = None
             # This rewrite supersedes fast records at or below its generation; newer ones stay for
             # the next delayed full writer.
             if fast_persisted:
                 for key in [k for k, (rev, _) in fast_persisted.items() if rev <= generation]:
                     del fast_persisted[key]
 
-    def _persist_sessions_json(self, data: dict[str, Any], *, db_saved: bool) -> None:
-        """Keep a fallback until its contents have been reconciled and committed to state.db."""
-        write_mirror = getattr(self, "_write_sessions_json", True)
-        if not write_mirror and db_saved:
-            if not (getattr(self, "_archive_mirror_on_commit", False) and self._routing_db_loaded):
-                return
-            try:
-                self._archive_sessions_json()
-            except OSError as exc:
-                logger.warning("gateway.session: could not archive sessions.json after state.db commit: %s", exc)
-            else:
-                self._archive_mirror_on_commit = False
-                return
+    def _save_generation(self, data, puts, deletes, baseline):
+        write_mirror = getattr(self, '_write_sessions_json', True)
+        pending = getattr(self, '_pending_routing_edits', {})
+        scope = self._routing_scope()
         try:
-            self._save_sessions_json(data)
+            store = self._routing_persistence
+            if store is None or getattr(self, '_routing_db_loaded', None) is False:
+                raise OSError('state.db routing unavailable')
+            if pending:
+                mirror = _read_mirror(self.sessions_dir, scope)
+                if mirror is None or mirror.pending != pending:
+                    raise _RoutingJournalError('pending routing journal changed before replay')
+                store.routing.reconcile_routing_mirror({}, pending, digest=mirror.digest, owner=mirror.owner, routing_scope=scope)
+                for key in pending:
+                    getattr(self, '_routing_original', {}).pop(key, None)
+                self._pending_routing_edits = pending = {}
+            originals = getattr(self, '_routing_original', {})
+            prior = {key: originals.get(key) or json.dumps(baseline[key]) for key in puts if key in baseline}
+            retired, owner = store.routing.save_routing_edits(puts, deletes,
+                {key: value['session_id'] for key, value in data.items()}, routing_scope=scope, mirror=write_mirror,
+                repairs=getattr(self, '_routing_repairs', {}), prior=prior)
+        except (StoreContention, DeclarativeDrift, _RoutingJournalError):
+            raise
         except Exception as exc:
-            if not db_saved:
+            if not write_mirror:
                 raise
-            logger.warning("gateway.session: sessions.json mirror save failed after state.db commit: %s", exc)
-        else:
-            self._archive_mirror_on_commit = not write_mirror
+            logger.warning('gateway.session: state.db routing save failed; journaling gateway edits: %s', exc)
+            journal = dict(pending)
+            for key in puts.keys() | deletes:
+                before = getattr(self, '_routing_original', {}).get(key) or getattr(self, '_routing_repairs', {}).get(key)
+                if key in journal:
+                    before = journal[key][0]
+                elif before is None and key in baseline:
+                    before = json.dumps(baseline[key])
+                journal[key] = [before, puts.get(key)]
+            self._save_sessions_json({**data, '_routing_db': getattr(self, '_mirror_owner', None),
+                                      '_routing_journal': {'scope': scope, 'generation': uuid4().hex, 'edits': journal,
+                                                           'primary': getattr(self, '_routing_db_loaded', None) is True}})
+            self._pending_routing_edits = journal
+            return
+        self._pending_routing_edits = {}
+        self._routing_repairs = {}
+        originals = getattr(self, '_routing_original', {})
+        for key in puts.keys() | deletes:
+            originals.pop(key, None)
+        if not write_mirror:
+            return
+        self._mirror_owner = owner
+        try:
+            self._save_sessions_json({**{key: value for key, value in data.items() if key not in retired}, '_routing_db': owner})
+        except Exception as exc:
+            logger.warning('gateway.session: sessions.json mirror save failed after state.db commit: %s', exc)
 
     def _save_sessions_json(self, data: dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index (atomic + fsync)."""
-        atomic_json_write(self.sessions_dir / "sessions.json", {"_README": _SESSIONS_JSON_README, **data}, mode=0o600)
+        atomic_json_write(self.sessions_dir / "sessions.json", {"_README": _SESSIONS_JSON_README, **data},
+                          mode=0o600, fsync_dir='_routing_journal' in data)
 
     def _save_entries(self) -> None:
         """Snapshot latest state under ``_lock`` and persist after releasing it."""
@@ -833,8 +912,12 @@ class SessionPersistenceMixin:
                     persisted = fast_persisted.get(session_key)
                     if persisted is not None and persisted[0] >= revision:
                         return
+                    if getattr(self, '_pending_routing_edits', {}) or getattr(self, '_routing_db_loaded', None) is False:
+                        raise OSError('gateway routing reconciliation pending')
                     store.routing.upsert_routing_entry(session_key, entry_json, routing_scope=self._routing_scope())
                     fast_persisted[session_key] = (revision, entry_json)
+                    self._lazy('_routing_baseline', dict)[session_key] = json.loads(entry_json)
+                    getattr(self, '_routing_original', {}).pop(session_key, None)
                 return
             except Exception as exc:
                 logger.warning(

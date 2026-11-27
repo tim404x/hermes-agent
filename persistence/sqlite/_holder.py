@@ -43,7 +43,7 @@ from persistence.sqlite._state.guard import (
     _register_test_instance,
 )
 from persistence.sqlite._state.readpool import (
-    _READ_POOL_MAX, _proc_fd_targets, _read_budget_for, note_read_pool_exhausted,
+    _READ_POOL_MAX, _proc_fd_targets, _read_budget_for, note_read_pool_exhausted, reserved_preparation_reader,
 )
 from persistence.sqlite._state import holders as _state_holders
 from persistence.sqlite._state import lockguard as _lockguard
@@ -708,26 +708,17 @@ class StoreHolder:
     def independent_read_connection(self) -> Iterator[sqlite3.Connection]:
         """For optimistic write preparation: never an outer snapshot or the locked writer. In
         rollback-journal mode (or with a closed pool), lease a short-lived budgeted reader instead."""
-        deadline = time.monotonic() + self._WRITE_PATIENCE_S
-        while True:
-            with self._read_ctx(fresh=True, pooled_only=True) as conn:
-                if conn is not None:
-                    yield conn
-                    return
-            if self._read_budget.acquire(self):
-                try:
-                    conn = self._connect_read_only(timeout=_READ_BUSY_TIMEOUT_S)
-                    try:
-                        apply_database_pragmas(conn, db_label="state.db")
-                        yield conn
-                    finally:
-                        self._close_conn_logged(conn, 'write preparation reader')
-                finally:
-                    self._read_budget.release()
+        with self._read_ctx(fresh=True, pooled_only=True) as conn:
+            if conn is not None:
+                yield conn
                 return
-            if time.monotonic() >= deadline:
-                raise sqlite3.OperationalError('database is busy: no independent reader for write preparation')
-            time.sleep(self._WRITE_RETRY_SLOW_MIN_S)
+        with reserved_preparation_reader(self._WRITE_PATIENCE_S):
+            conn = self._connect_read_only(timeout=_READ_BUSY_TIMEOUT_S)
+            try:
+                apply_database_pragmas(conn, db_label="state.db")
+                yield conn
+            finally:
+                self._close_conn_logged(conn, 'write preparation reader')
 
     @contextmanager
     def _read_ctx_with_timeout(self, busy_timeout_s: float) -> Iterator[sqlite3.Connection]:

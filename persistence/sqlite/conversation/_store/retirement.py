@@ -6,6 +6,7 @@ import time
 from persistence.core.errors import AuthorityRefusal
 from persistence.sqlite._state.keys import admission_fingerprint
 from persistence.core.canonical import canonical_json as _json
+from persistence.sqlite.gateway._targets import delete_target
 
 
 RETIRED_PREFIX = 'gateway.retired_session.v1.'
@@ -211,17 +212,6 @@ def retire_prunable(conn, session_ids, *, media_root):
     return quiet
 
 
-def entry_session_id(raw):
-    """The ``session_id`` a stored routing/receipt JSON object names, else None. Unrelated rows
-    are not validated here: a malformed one (an array, invalid JSON) names no target, so it can
-    neither be retired nor abort the delete of a different session; the routing loader skips it too."""
-    try:
-        value = json.loads(raw)
-    except (TypeError, ValueError):
-        return None
-    return value.get('session_id') if isinstance(value, dict) else None
-
-
 def _mark_retired(conn, key, *, expires, **fields):
     # Replace: the marker is a fact, not a receipt; re-retiring an id that was recreated
     # beside its tombstone must not abort the delete that removes it again (and restarts its horizon).
@@ -249,8 +239,4 @@ def retire_routes(conn, session_ids, *, expiring=()):
         _mark_retired(conn, RETIRED_PREFIX + sid, expires=sid in expiring, own=True)
         conn.execute('DELETE FROM state_meta WHERE key=?', ('gateway.api.settings.v1.' + sid,))
         conn.execute('DELETE FROM state_meta WHERE key=?', (VIEWER_CLOSE_PREFIX + sid,))
-    targets = set(session_ids)
-    for row in conn.execute('SELECT scope,session_key,entry_json FROM gateway_routing').fetchall():
-        if entry_session_id(row['entry_json']) in targets:
-            conn.execute('DELETE FROM gateway_routing WHERE scope=? AND session_key=?',
-                         (row['scope'], row['session_key']))
+        delete_target(conn, sid)

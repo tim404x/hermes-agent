@@ -210,8 +210,7 @@ async def test_a_shared_fence_an_earlier_release_wrote_still_guards_every_route(
         assert key not in _durable(store)
         assert key not in json.loads((store.sessions_dir / 'sessions.json').read_text())
         store._save_sessions_json({key: store._entries.pop(key).to_dict()})  # an earlier release's unfiltered mirror
-        with store._lock:
-            store._import_legacy_sessions_json(True)
+        _restart(store)
         assert key not in store._entries, 'the sessions.json mirror restored a fenced route'
         assert _conflict(served.launch_db, 'gone') == ('session_deleted', 'Session was deleted; its id cannot be reused')
 
@@ -367,14 +366,13 @@ async def test_a_start_within_the_horizon_strips_a_pruned_route_from_an_older_mi
         key, _sid, stale = await _pruned_alpha_route(served, tmp_path)
         store._write_sessions_json = mirror
         store._save_sessions_json(stale[0])
+        original = (store.sessions_dir / 'sessions.json').read_bytes()
         _restart(store)
         assert key not in store._entries
         if mirror:
             assert key not in _mirror(store), 'the start kept the pruned route in the mirror'
         else:
-            assert not (store.sessions_dir / 'sessions.json').exists()
-            archive, = store.sessions_dir.glob('sessions.json.retired-*')
-            assert key not in json.loads(archive.read_text())
+            assert (store.sessions_dir / 'sessions.json').read_bytes() == original
         _past_the_horizon(served.alpha_db, served.launch_db)
         _restart(store)
         assert key not in store._entries, 'a pruned route came back on startup after its fence aged out'
@@ -409,6 +407,7 @@ async def test_a_pruned_route_stays_out_of_the_mirror_and_a_reused_id_keeps_one_
             with store._lock:
                 store._save()  # a full save while mirror writes are on
             assert key in _mirror(store)
+            original_mirror = (store.sessions_dir / 'sessions.json').read_bytes()
             store._write_sessions_json = mirror
             await _prune(served, ref)
         if not mirror:
@@ -420,7 +419,7 @@ async def test_a_pruned_route_stays_out_of_the_mirror_and_a_reused_id_keeps_one_
         if mirror:
             assert key not in _mirror(store)
         else:
-            assert not (store.sessions_dir / 'sessions.json').exists()
+            assert (store.sessions_dir / 'sessions.json').read_bytes() == original_mirror
 
         status, text = await _create(served, sid)  # the launch profile reuses the id
         assert status == 201, text

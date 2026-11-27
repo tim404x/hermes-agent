@@ -15,7 +15,8 @@ from persistence.authority.vocabulary import RETRY_HORIZON_S
 from persistence.core.errors import PermanentStoreError
 from persistence.gateway.routing import route_namespace
 from persistence.sqlite.conversation._store.retirement import RETIRED_PREFIX
-from persistence.sqlite.gateway._routes import route_fence_key, route_namespace_sql
+from persistence.sqlite.gateway._routes import route_fence_key
+from persistence.sqlite.gateway._targets import route_namespace_sql
 
 
 def test_one_changed_route_among_10k_writes_o1_rows_and_holds_writer_briefly(backend, scope_a, monkeypatch):

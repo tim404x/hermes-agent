@@ -7,6 +7,7 @@ import logging
 import os
 import json
 import threading
+from copy import deepcopy
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, fields
@@ -575,7 +576,7 @@ class SessionEntry:
             "created_at": self.created_at.isoformat(), "updated_at": self.updated_at.isoformat(),
             "display_name": self.display_name,
             "platform": self.platform.value if self.platform else None,
-            "chat_type": self.chat_type, "metadata": self.metadata,
+            "chat_type": self.chat_type, "metadata": deepcopy(self.metadata) if self.metadata else {},
         }
         result.update((name, getattr(self, name)) for name in self._PLAIN_FIELDS)
         # ``yolo`` keeps the pre-tri-state meaning (ON only) for older readers; ``yolo_toggle`` is authoritative.
@@ -835,8 +836,7 @@ class SessionStore(
         self._entries: dict[str, SessionEntry] = {}
         self._loaded = False
         # A fallback-only initial load is reconciled with state.db once the handle recovers.
-        self._routing_db_loaded = False
-        self._routing_fallback_baseline: Optional[dict[str, Any]] = None
+        self._routing_db_loaded: bool | None = None
         self._lock = threading.Lock()  # guards _entries / _loaded only
         self._save_lock = threading.Lock()  # whole-index persistence, never held with _lock
         # Fast (single-entry) and full saves share one generation counter so they are totally

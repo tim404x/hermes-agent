@@ -25,7 +25,9 @@ from ..conversation._store.core import _session_row_dict
 from ..conversation._store.local import owned_lineage_ids
 from ..conversation._store.sessions import _own_profile_name
 from ..conversation.sessions import session_record
-from ._delta import replace_scope
+from ._delta import load_scope, replace_scope
+from ._edits import reconcile, save_edits
+from ._targets import delete_target, target_keys
 from ._local_lineage import hand_off_conversations, moved_receipts
 from ._routes import (
     _COMPRESSION_LINEAGE_CTE, _ORPHAN_CONTIGUITY_DONORS_SQL, _ORPHAN_LINEAGE_DONOR_SQL, _ORPHANS_SQL,
@@ -47,6 +49,7 @@ class SQLiteRoutingRepository:
 
     def __init__(self, store: SQLiteStore) -> None:
         self._store = store
+        self._live_generation = None
 
     def _own_profile_name(self) -> Optional[str]:
         return _own_profile_name(self._store.holder())
@@ -74,30 +77,27 @@ class SQLiteRoutingRepository:
         return self._topic_read(lambda: self._store.holder()._read_all(sql, params), [])
 
     def _routing_entries_for_sessions(self, session_ids: set[str]) -> list[tuple[str, str, str]]:
-        """``(scope, session_key, session_id)`` of ``gateway_routing`` rows pointing at any of
-        *session_ids*; the target id lives only inside ``entry_json``, so matching is in Python."""
-        found: list[tuple[str, str, str]] = []
-        if not session_ids:
-            return found
-        for row in self._store.holder()._read_all("SELECT scope, session_key, entry_json FROM gateway_routing"):
-            try:
-                entry = json.loads(row["entry_json"] or "{}")
-            except (ValueError, TypeError, RecursionError):  # malformed / non-text / over-nested entry
-                continue
-            if isinstance(entry, dict) and entry.get("session_id") in session_ids:
-                found.append((row["scope"], row["session_key"], entry["session_id"]))
-        return found
+        """Point-indexed (scope, key, target) bindings, including historical encodings."""
+        with self._store.holder()._read_ctx() as conn:
+            return [(scope, key, sid) for sid in session_ids for scope, key in target_keys(conn, sid)]
 
     def _delete_routing_entries_for_sessions(self, session_ids: set[str]) -> int:
         """Drop ``gateway_routing`` rows pointing at any of *session_ids*."""
-        doomed = [(scope, key) for scope, key, _ in self._routing_entries_for_sessions(session_ids)]
-        if not doomed:
+        if not session_ids:
             return 0
-        self._store.holder()._write_sql(
-            "DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?", doomed, many=True)
-        return len(doomed)
+        return self._store.holder()._execute_write(lambda conn: sum(delete_target(conn, sid) for sid in session_ids))
 
     # ── writes ──────────────────────────────────────────────────────────────
+
+    def save_routing_edits(self, puts, deletes, targets, *, routing_scope, mirror, repairs=None, prior=None):
+        with translated():
+            result, self._live_generation = save_edits(self._store.holder(), routing_scope, puts, deletes, targets,
+                                                       mirror, repairs or {}, prior or {}, self._live_generation)
+            return result
+
+    def reconcile_routing_mirror(self, missing, pending, *, routing_scope, digest, owner):
+        with translated():
+            return self._store.holder()._execute_write(lambda conn: reconcile(conn, routing_scope, digest, owner, missing, pending))
 
     def upsert_routing_entry(self, session_key: str, entry_json: str, *, routing_scope: str = "") -> None:
         if not session_key or not entry_json:
@@ -430,9 +430,11 @@ class SQLiteRoutingRepository:
                 return bool(conn.execute('SELECT ' + ROUTE_RETIRED_SQL,
                                          route_retired_params(session_key, entry_json, time.time())).fetchone()[0])
 
-    def load_routing_entries(self, *, routing_scope: str = "") -> dict[str, str]:
+    def load_routing_entries(self, *, routing_scope: str = "", fresh: bool = False) -> dict[str, str]:
         with translated():
             holder = self._store.holder()
+            if fresh and not holder.read_only:
+                return load_scope(holder, routing_scope)
             rows = holder._read_all(
                 "SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?", (routing_scope,))
         return {r["session_key"]: r["entry_json"] for r in rows}

@@ -3,20 +3,20 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from itertools import islice
 from math import inf
 
 from persistence.authority.vocabulary import RETRY_HORIZON_S
-from persistence.core.errors import PermanentStoreError, StoreContention
+from persistence.core.errors import StoreContention
+from persistence.gateway.routing import route_namespace
 
 from ..conversation._store.retirement import RETIRED_PREFIX
-from ._revision import ROUTE_FENCE_PREFIX, TRIGGERS
-from ._routes import FENCE_EXPIRY, marker_applies_sql, route_namespace_sql
+from ._revision import ROUTE_FENCE_PREFIX, revision, verified_schema
+from ._routes import FENCE_EXPIRY, marker_applies_sql
+from ._targets import route_namespace_sql
 
 
-_REVISION = """SELECT (SELECT revision FROM gateway_routing_revision WHERE name='scope:' || ?),
-                      (SELECT revision FROM gateway_routing_revision WHERE name='fences')"""
 _PROBE = f"""WITH desired(key, entry) AS (VALUES {{slots}}),
     targets AS MATERIALIZED (
         SELECT key, current.session_key IS NOT NULL AS present, current.entry_json IS NOT entry AS changed,
@@ -40,7 +40,33 @@ def _proposed_rows(conn, scope, desired):
         for index, (key, text) in enumerate(batch):
             params[f'k{index}'], params[f'v{index}'] = key, text
             slots.append(f'(:k{index},:v{index})')
-        yield from conn.execute(_PROBE.format(slots=','.join(slots)), params)
+        yield from conn.execute(_PROBE.format(slots=','.join(slots)), params).fetchall()
+
+
+def scope_rows(conn, scope, columns):
+    after = None
+    while True:
+        where, params = ('', (scope,)) if after is None else (' AND session_key>?', (scope, after))
+        page = conn.execute(f'SELECT {columns} FROM gateway_routing WHERE scope=?{where} '
+                            'ORDER BY session_key LIMIT 64', params).fetchall()
+        yield from page
+        if len(page) < 64:
+            return
+        after = page[-1][0]
+
+
+def load_scope(holder, scope):
+    names = ('scope:' + scope,)
+    deadline = time.monotonic() + holder._WRITE_PATIENCE_S
+    with holder.independent_read_connection() as conn:
+        while True:
+            schema = verified_schema(conn)
+            before = revision(conn, names)
+            rows = dict(scope_rows(conn, scope, 'session_key,entry_json'))
+            if before == revision(conn, names) and conn.execute('PRAGMA main.schema_version').fetchone()[0] == schema:
+                return rows
+            if time.monotonic() >= deadline:
+                raise StoreContention('routing scope kept changing during load')
 
 
 @dataclass
@@ -51,27 +77,23 @@ class _Fences:
 
     after: float = -inf
     through: float = inf
-    owners: dict[str, bool] = field(default_factory=dict)
 
-    def retired(self, sid, stamp, owned, cutoff):
+    def retired(self, stamp, owned, cutoff):
         if isinstance(stamp, (int, float)):
             if stamp < cutoff:
                 self.after = max(self.after, stamp)
                 return False
             self.through = min(self.through, stamp)
-        if owned is not None:
-            self.owners[sid] = bool(owned)
         return not owned
 
-    def valid(self, conn, cutoff):
-        return self.after < cutoff <= self.through and all(
-            (conn.execute('SELECT 1 FROM sessions WHERE id=?', (sid,)).fetchone() is not None) == owned
-            for sid, owned in self.owners.items())
+    def valid(self, cutoff):
+        return self.after < cutoff <= self.through
 
 
 @dataclass(frozen=True)
 class _Delta:
-    revision: tuple[int | None, int | None]
+    revision: tuple
+    names: tuple[str, ...]
     schema: int
     scope: str
     drops: set[str]
@@ -80,31 +102,26 @@ class _Delta:
     fences: _Fences
 
     @classmethod
-    def prepare(cls, conn, scope, desired):
-        revision = tuple(conn.execute(_REVISION, (scope,)).fetchone())
-        schema = conn.execute('PRAGMA main.schema_version').fetchone()[0]
-        slots = ','.join('?' for _ in TRIGGERS)
-        if conn.execute(f"SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name IN ({slots})",
-                        TRIGGERS).fetchone()[0] != len(TRIGGERS):
-            raise PermanentStoreError('routing revision triggers missing; reopen state.db before replacing a scope')
-        drops = {key for (key,) in conn.execute('SELECT session_key FROM gateway_routing WHERE scope=?', (scope,))
-                 if key not in desired}
+    def prepare(cls, conn, scope, desired, names):
+        schema = verified_schema(conn)
+        before = revision(conn, names)
+        drops = {key for (key,) in scope_rows(conn, scope, 'session_key') if key not in desired}
         puts, retired, fences = {}, set(), _Fences()
         cutoff = time.time() - RETRY_HORIZON_S
-        for key, present, changed, marked, fenced, stamp, sid, owned in _proposed_rows(conn, scope, desired):
-            if marked or (fenced and fences.retired(sid, stamp, owned, cutoff)):
+        for key, present, changed, marked, fenced, stamp, _, owned in _proposed_rows(conn, scope, desired):
+            if marked or (fenced and fences.retired(stamp, owned, cutoff)):
                 retired.add(key)
                 if present:
                     drops.add(key)
             elif changed:
                 puts[key] = desired[key]
-        return cls(revision, schema, scope, drops, puts, retired, fences)
+        return cls(before, names, schema, scope, drops, puts, retired, fences)
 
     def commit(self, conn):
         now = time.time()
-        if (tuple(conn.execute(_REVISION, (self.scope,)).fetchone()) != self.revision
+        if (revision(conn, self.names) != self.revision
                 or conn.execute('PRAGMA main.schema_version').fetchone()[0] != self.schema
-                or not self.fences.valid(conn, now - RETRY_HORIZON_S)):
+                or not self.fences.valid(now - RETRY_HORIZON_S)):
             return False
         conn.executemany('DELETE FROM gateway_routing WHERE scope=? AND session_key=?',
                          ((self.scope, key) for key in self.drops))
@@ -113,18 +130,14 @@ class _Delta:
 
 
 def replace_scope(holder, entries, scope):
-    """The revision witnesses route membership, contents and retirement metadata. Only existing
-    fence hits can also depend on the clock or the existence of a main session, so recheck those
-    point verdicts under BEGIN IMMEDIATE. Messages and activity never invalidate this snapshot."""
+    """Replace one scope after validating membership, relevant fences, ownership and expiry.
+    Messages and ordinary session activity never invalidate this preparation."""
     desired = {key: text for key, text in entries.items() if key and text}
+    names = tuple({'scope:' + scope, 'legacy', *('ns:' + route_namespace(key) for key in desired)})
     deadline = time.monotonic() + holder._WRITE_PATIENCE_S
     while True:
         with holder.independent_read_connection() as conn:
-            conn.execute('BEGIN')
-            try:
-                delta = _Delta.prepare(conn, scope, desired)
-            finally:
-                conn.rollback()
+            delta = _Delta.prepare(conn, scope, desired, names)
         if holder._execute_write(delta.commit):
             return delta.retired
         if time.monotonic() >= deadline:

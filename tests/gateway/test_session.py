@@ -1620,11 +1620,12 @@ class TestGatewayRoutingTable:
         assert recovered.session_id == entry.session_id
         restarted.close_all_db_handles()
 
-    def test_disabling_sessions_json_imports_it_once_before_archiving(self, tmp_path):
+    def test_disabling_sessions_json_imports_legacy_bytes_once_without_changing_them(self, tmp_path):
         mirror = tmp_path / "sessions.json"
         store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
         entry = store.get_or_create_session(self._source())
         key = entry.session_key
+        store._save_sessions_json({key: entry.to_dict()})
         original = mirror.read_bytes()
         assert json.loads(original)[key]["session_id"] == entry.session_id
         assert not list(tmp_path.glob("sessions.json.retired-*"))
@@ -1644,9 +1645,7 @@ class TestGatewayRoutingTable:
         assert store._entries[key].session_id == entry.session_id
         durable = store.persistence.routing.load_routing_entries(routing_scope=store._routing_scope())
         assert json.loads(durable[key])["session_id"] == entry.session_id
-        assert not mirror.exists()
-        archive, = tmp_path.glob("sessions.json.retired-*")
-        assert archive.read_bytes() == original
+        assert mirror.read_bytes() == original
 
         with store._lock:
             del store._entries[key]
@@ -1655,7 +1654,7 @@ class TestGatewayRoutingTable:
         restarted = SessionStore(sessions_dir=tmp_path, config=config)
         restarted._ensure_loaded()
         assert key not in restarted._entries
-        assert not mirror.exists()
+        assert mirror.read_bytes() == original
         restarted.close_all_db_handles()
 
     def test_disabled_mirror_survives_failed_import_commit(self, tmp_path):
@@ -1665,7 +1664,8 @@ class TestGatewayRoutingTable:
         entry = SessionEntry(session_key=key, session_id="legacy", created_at=now, updated_at=now)
         store._save_sessions_json({key: entry.to_dict()})
         routing = store._routing_persistence.routing
-        with patch.object(routing, "replace_routing_entries", side_effect=OSError("write failed")):
+        original = (tmp_path / "sessions.json").read_bytes()
+        with patch.object(routing, "reconcile_routing_mirror", side_effect=OSError("write failed")):
             store._ensure_loaded()
         assert not routing.load_routing_entries(routing_scope=store._routing_scope())
         assert json.loads((tmp_path / "sessions.json").read_text())[key]["session_id"] == "legacy"
@@ -1673,36 +1673,33 @@ class TestGatewayRoutingTable:
 
         store._save_entries()
         assert key in routing.load_routing_entries(routing_scope=store._routing_scope())
-        assert not (tmp_path / "sessions.json").exists()
+        assert (tmp_path / "sessions.json").read_bytes() == original
         store.close_all_db_handles()
 
     @pytest.mark.platforms('posix')
-    def test_archive_collision_and_rename_failure_after_commit(self, tmp_path, monkeypatch):
+    def test_disabled_mirror_leaves_existing_backup_and_unrenamable_source_alone(self, tmp_path):
         from pathlib import Path
-        from gateway import session_persistence
 
         first = SessionStore(tmp_path, GatewayConfig())
         entry = first.get_or_create_session(self._source())
         first.close_all_db_handles()
-        clock = MagicMock()
-        clock.now.return_value.strftime.return_value = 'fixed'
-        monkeypatch.setattr(session_persistence, 'datetime', clock)
+        original = (tmp_path / 'sessions.json').read_bytes()
         occupied = tmp_path / 'sessions.json.retired-fixed'
         occupied.symlink_to(tmp_path / 'missing-backup-target')
         cold = SessionStore(tmp_path, GatewayConfig(write_sessions_json=False))
         try:
-            with patch.object(Path, 'replace', side_effect=PermissionError('archive denied')):
+            with patch.object(Path, 'replace', side_effect=PermissionError('archive denied')) as rename:
                 cold._ensure_loaded()
                 assert entry.session_key in cold.persistence.routing.load_routing_entries(routing_scope=cold._routing_scope())
                 with cold._lock:
                     del cold._entries[entry.session_key]
                     cold._save()
-                assert entry.session_key not in json.loads((tmp_path / 'sessions.json').read_text())
+                assert not cold.persistence.routing.load_routing_entries(routing_scope=cold._routing_scope())
+                rename.assert_not_called()
             cold._save_entries()
-            assert not (tmp_path / 'sessions.json').exists()
+            assert (tmp_path / 'sessions.json').read_bytes() == original
             assert occupied.is_symlink()
-            archived, = tmp_path.glob('sessions.json.retired-fixed.*')
-            assert entry.session_key not in json.loads(archived.read_text())
+            assert list(tmp_path.glob('sessions.json.retired-*')) == [occupied]
         finally:
             cold.close_all_db_handles()
 
@@ -1711,10 +1708,11 @@ class TestGatewayRoutingTable:
         try:
             store._ensure_loaded()
             generation = getattr(store, '_persisted_routing_generation', 0)
-            with (patch.object(store._routing_persistence.routing, 'replace_routing_entries', side_effect=OSError('db offline')),
-                  patch.object(store, '_save_sessions_json', side_effect=OSError('fallback unavailable')),
-                  pytest.raises(OSError, match='fallback unavailable')):
+            with (patch.object(store._routing_persistence.routing, 'save_routing_edits', side_effect=OSError('db offline')),
+                  patch.object(store, '_save_sessions_json') as write,
+                  pytest.raises(OSError, match='db offline')):
                 store._save_entries()
+            write.assert_not_called()
             assert getattr(store, '_persisted_routing_generation', 0) == generation
         finally:
             store.close_all_db_handles()
