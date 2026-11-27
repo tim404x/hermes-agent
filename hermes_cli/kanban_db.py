@@ -3462,11 +3462,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str, *, auto_release: Option
         status = parked_status(conn, task_id, auto_release)
         if status is None:
             return False
-        resume_status = _resume_status_from_events(conn, task_id) if status == "blocked" else "ready"
-        reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
-            note="invariant recovery on unblock",
-        )
+        if status == "scheduled":
+            event = _latest_event(conn, task_id, "scheduled")
+            source = _json_dict(_row_get(event, "payload")).get("source_status")
+            resume_status = "review" if source == "review" else "ready"
+        else:
+            resume_status = _resume_status_from_events(conn, task_id)
         # Re-gate on parent completion before restoring the source phase.
         landing_status = _landing_status_after_parents(conn, task_id)
         new_status = (
@@ -3474,12 +3475,17 @@ def unblock_task(conn: sqlite3.Connection, task_id: str, *, auto_release: Option
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
-        if new_status == "review" and _admit_task(conn, task_id, "blocked"):
+        if new_status == "review" and _admit_task(conn, task_id, status):
             return False
+        reclaim_dangling_run(
+            conn, task_id, statuses=("blocked", "scheduled"), now=now,
+            note="invariant recovery on unblock",
+        )
         # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
         # a re-block is still a recurrence; only the dispatch retry budget gets a fresh start.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, scheduled_until = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
@@ -3499,9 +3505,15 @@ def release_due_scheduled(conn: sqlite3.Connection, now: Optional[int] = None) -
         "AND scheduled_until IS NOT NULL AND scheduled_until <= ?",
         (int(time.time()) if now is None else now,),
     ).fetchall()
-    return [row["id"] for row in rows if unblock_task(
-        conn, row["id"], auto_release={"auto": "scheduled_until", "until": row["scheduled_until"]},
-    )]
+    released = []
+    for row in rows:
+        task_id = row["id"]
+        try:
+            if unblock_task(conn, task_id, auto_release={"auto": "scheduled_until", "until": row["scheduled_until"]}):
+                released.append(task_id)
+        except Exception:
+            _log.exception("Failed to release scheduled task %s", task_id)
+    return released
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -3694,7 +3706,9 @@ def specify_triage_task(
     return True
 
 
-def untriage_task(conn: sqlite3.Connection, task_id: str, *, author: Optional[str] = None) -> bool:
+def untriage_task(
+    conn: sqlite3.Connection, task_id: str, *, author: Optional[str] = None, reason: Optional[str] = None,
+) -> bool:
     """Restore an intact spec to todo: a human ruled this was not a loop.
 
     Specify kept the counter, so the next block re-triaged the card in 26 s.
@@ -3709,8 +3723,11 @@ def untriage_task(conn: sqlite3.Connection, task_id: str, *, author: Optional[st
             "UPDATE tasks SET status='todo', block_recurrences=0, block_kind=NULL WHERE id=? AND status='triage'",
             (task_id,),
         )
+        if reason:
+            add_comment(conn, task_id, author or "operator", f"UNTRIAGE: {reason}")
         _append_event(conn, task_id, "untriaged", {
             "prev_block_kind": prior["block_kind"], "prev_block_recurrences": prior["block_recurrences"],
+            "reason": reason,
         })
     recompute_ready(conn)
     return True
@@ -3806,6 +3823,12 @@ def schedule_task(
     until the deadline or a manual ``unblock_task`` re-gates it."""
     scheduled_until = coerce_until(until) if until is not None else parse_scheduled_until(reason)
     with write_txn(conn):
+        prior_status = _task_status(conn, task_id)
+        source_status = "ready"
+        if prior_status == "running":
+            source_status = _retry_status_for_run(conn, task_id)
+        elif prior_status == "blocked":
+            source_status = _resume_status_from_events(conn, task_id)
         params: list[Any] = [scheduled_until, task_id]
         sql = """
             UPDATE tasks
@@ -3825,7 +3848,9 @@ def schedule_task(
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
-        _append_event(conn, task_id, "scheduled", {"reason": reason, "until": scheduled_until}, run_id=run_id)
+        _append_event(conn, task_id, "scheduled", {
+            "reason": reason, "until": scheduled_until, "source_status": source_status,
+        }, run_id=run_id)
         return True
 
 

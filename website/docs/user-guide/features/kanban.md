@@ -1179,7 +1179,7 @@ kanban:
 
 ### Scheduled maintenance windows
 
-Use `schedule` rather than a transient block for planned waits. On the first tick at or after `--until`, the dispatcher returns the task to `ready`, or `todo` if a parent is unfinished. Repeated parks never count toward triage. Without `--until`, a `SCHEDULED_UNTIL=<ISO8601>` marker in the reason sets the timer; with neither, the task waits for `unblock`. A manual unblock clears the timer.
+Use `schedule` rather than a transient block for planned waits. On the first tick at or after `--until`, the dispatcher returns the task to its prior phase (`ready` or `review`), or to `todo` if a parent is unfinished. Repeated parks never count toward triage. Without `--until`, a `SCHEDULED_UNTIL=<ISO8601>` marker in the reason sets the timer; with neither, the task waits for `unblock`. A manual unblock clears the timer. Workers on goal-mode tasks must supply a future resume time no more than 12 hours away; orchestrator CLI calls have no such limit.
 
 ```bash
 hermes kanban schedule t_abcd "database maintenance" --until 2026-11-27T04:21:00Z

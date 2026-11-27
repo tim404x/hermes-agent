@@ -18,7 +18,7 @@ from typing import Any, Callable, Optional
 from agent.delegation_context import owned_kanban_task
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
-from hermes_cli.kanban_dispatch.resume import format_scheduled_until
+from hermes_cli.kanban_dispatch.resume import GOAL_MODE_BLOCK_ALLOWED_KINDS, format_scheduled_until, goal_schedule_error
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
@@ -464,10 +464,6 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 
 # --- Goal-mode judge gate ---
 
-_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
-GOAL_MODE_MAX_SCHEDULE_SECONDS = 12 * 3600
-
-
 def _goal_judge_available() -> bool:
     """``judge_goal`` fails open (no auxiliary model -> ``"continue"``), which is
     indistinguishable from "not done yet" and would wedge every goal_mode
@@ -849,9 +845,9 @@ def _handle_block(args: dict, **kw) -> str:
         # worker cannot resolve itself; `capability` and `transient` (or an unset kind) route back through
         # kanban_complete, which the judge now gates.
         task = kb.get_task(conn, tid)
-        _check(not (task and task.goal_mode and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS),
+        _check(not (task and task.goal_mode and kind not in GOAL_MODE_BLOCK_ALLOWED_KINDS),
                f"goal_mode tasks can only block with kind in "
-               f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
+               f"{sorted(GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
@@ -882,10 +878,9 @@ def _handle_schedule(args: dict, **kw) -> str:
         task = kb.get_task(conn, tid)
         # A bounded auto-resuming park returns the card to the goal loop; it cannot escape the completion judge.
         if task and task.goal_mode:
-            _check(until is not None and 0 < until - int(time.time()) <= GOAL_MODE_MAX_SCHEDULE_SECONDS,
-                   "goal_mode tasks cannot be scheduled without a future until at most 12 hours away: "
-                   f"use kanban_block with kind in {sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} for a genuine "
-                   "external blocker, or kanban_complete so the completion judge can evaluate it.")
+            error = goal_schedule_error(until, int(time.time()))
+            if error:
+                raise _Reject(error)
         ok = kb.schedule_task(
             conn, tid, reason=reason, expected_run_id=_worker_run_id(tid), until=until)
         _check(ok, f"could not schedule {tid} (unknown id or not in todo/ready/running/blocked)")

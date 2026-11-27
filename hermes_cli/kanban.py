@@ -24,7 +24,7 @@ from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
 from hermes_cli import kanban_workflow
-from hermes_cli.kanban_dispatch.resume import format_scheduled_until
+from hermes_cli.kanban_dispatch.resume import format_scheduled_until, goal_schedule_error
 from hermes_cli.kanban_output import (
     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err,
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
@@ -1107,8 +1107,17 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     resume = f" until {format_scheduled_until(until)}" if until is not None else ""
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
+        run_ids = {tid: _worker_run_id_for(tid) for tid in ids}
+        for tid, run_id in run_ids.items():
+            if run_id is None:
+                continue
+            task = kb.get_task(conn, tid)
+            if task and task.goal_mode:
+                error = goal_schedule_error(until, int(time.time()))
+                if error:
+                    return _err(error)
         op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid), until=until))
+            conn, tid, reason=reason, expected_run_id=run_ids[tid], until=until))
         return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{resume}{suffix}", lambda tid: f"cannot schedule {tid}")
 
 
@@ -1136,8 +1145,8 @@ def _cmd_untriage(args: argparse.Namespace) -> int:
     reason = _stripped_or_none(getattr(args, "reason", None))
     author = _profile_author() if reason else None
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNTRIAGE", lambda tid: kb.untriage_task(conn, tid, author=author))
-        return _bulk_apply(ids, op, lambda tid: f"Untriaged {tid} -> todo",
+        return _bulk_apply(ids, lambda tid: kb.untriage_task(conn, tid, author=author, reason=reason),
+                           lambda tid: f"Untriaged {tid} -> {kb.get_task(conn, tid).status}",
                            lambda tid: f"cannot untriage {tid} (not in triage?)")
 
 

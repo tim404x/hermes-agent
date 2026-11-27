@@ -215,9 +215,9 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
             "the completed run and scheduled event."
         )),
         "until": {
-            "type": "string",
+            "type": ["string", "integer"],
             "description": "When to resume: ISO8601 with Z or offset (e.g. 2026-11-27T04:21:00Z) or epoch "
-                           "seconds as a string. The dispatcher returns the task to ready at that time if its parents are done. "
+                           "seconds. The dispatcher resumes the task in ready or review once its parents are done. "
                            "If omitted, a SCHEDULED_UNTIL=<ISO8601> marker in reason is used; with neither, "
                            "the task waits for an orchestrator unblock.",
         },

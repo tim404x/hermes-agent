@@ -6,6 +6,18 @@ from datetime import UTC, datetime
 from typing import Optional
 
 
+GOAL_MODE_MAX_SCHEDULE_SECONDS = 12 * 3600
+GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+
+
+def goal_schedule_error(until: Optional[int], now: int) -> Optional[str]:
+    if until is not None and 0 < until - now <= GOAL_MODE_MAX_SCHEDULE_SECONDS:
+        return None
+    return ("goal_mode tasks cannot be scheduled without a future until at most 12 hours away: "
+            f"use kanban_block with kind in {sorted(GOAL_MODE_BLOCK_ALLOWED_KINDS)} for a genuine "
+            "external blocker, or kanban_complete so the completion judge can evaluate it.")
+
+
 def _scheduled_iso_epoch(text: str) -> int:
     parsed = datetime.fromisoformat(text)
     if parsed.tzinfo is None:
@@ -75,7 +87,7 @@ def reclaim_dangling_run(
                SET status = 'reclaimed', outcome = 'reclaimed',
                    summary = COALESCE(summary, ?),
                    ended_at = ?,
-                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+                   claim_expires = NULL
              WHERE id = ? AND ended_at IS NULL
             """,
             (note, now, int(stale["current_run_id"])),

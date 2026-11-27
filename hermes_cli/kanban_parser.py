@@ -340,11 +340,11 @@ _SPECS = [
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
-    ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    ], help="Return blocked/scheduled tasks to ready or review, or to todo while parents remain open"),
     _cmd("untriage", [
         _TASK_IDS,
-        _reason("Optional reason recorded as a comment before untriaging."),
-    ], help="Return triaged tasks to todo without editing their spec and reset their block-loop counter"),
+        _reason("Optional audit reason recorded when the task leaves triage."),
+    ], help="Restore triaged tasks to todo or ready without editing their spec and reset their block-loop counter"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

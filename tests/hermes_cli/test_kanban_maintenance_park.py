@@ -28,6 +28,17 @@ def board(tmp_path, monkeypatch):
         yield conn
 
 
+@pytest.fixture
+def cli():
+    parser = argparse.ArgumentParser(prog="hermes")
+    kanban_cli.build_parser(parser.add_subparsers())
+
+    def invoke(*words):
+        return kanban_cli.kanban_command(parser.parse_args(["kanban", *words]))
+
+    return invoke
+
+
 def _running_task(conn, **kwargs):
     task_id = kb.create_task(conn, title="maintenance", assignee="worker", **kwargs)
     assert kb.claim_task(conn, task_id, claimer="worker") is not None
@@ -130,7 +141,7 @@ def test_untriage_keeps_body_byte_identical(board):
     assert (task.title.encode(), task.body.encode(), task.assignee) == (title.encode(), body.encode(), "worker")
     assert (task.status, task.block_kind, task.block_recurrences) == ("ready", None, 0)
     assert _payloads(board, task_id, "untriaged") == [
-        {"prev_block_kind": "needs_input", "prev_block_recurrences": 2}
+        {"prev_block_kind": "needs_input", "prev_block_recurrences": 2, "reason": None}
     ]
     assert not kb.untriage_task(board, task_id)
     assert kb.claim_task(board, task_id, claimer="worker") is not None
@@ -144,7 +155,7 @@ def test_release_deadline_precedence_and_manual_clear(board):
     task_id = _running_task(board)
     assert kb.schedule_task(board, task_id, reason=reason, until=200)
     assert kb.release_due_scheduled(board, now=199) == []
-    assert _payloads(board, task_id, "scheduled")[-1] == {"reason": reason, "until": 200}
+    assert _payloads(board, task_id, "scheduled")[-1] == {"reason": reason, "until": 200, "source_status": "ready"}
     assert kb.unblock_task(board, task_id)
     assert kb.get_task(board, task_id).scheduled_until is None
     assert kb.schedule_task(board, task_id, reason=reason)
@@ -179,6 +190,56 @@ def test_release_regates_on_open_parent(board):
     ]
 
 
+@pytest.mark.parametrize("block_first", [False, True])
+def test_scheduled_reviewer_can_request_changes_after_release(board, block_first, tmp_path):
+    task_id = _running_task(board, workspace_kind="dir", workspace_path=str(tmp_path))
+    run_id = kb.get_task(board, task_id).current_run_id
+    assert kb.request_review(board, task_id, reviewer="reviewer", expected_run_id=run_id)
+    review = kb.claim_review_task(board, task_id, claimer="reviewer")
+    assert review is not None
+    if block_first:
+        assert kb.block_task(board, task_id, reason="waiting", expected_run_id=review.current_run_id)
+    assert kb.schedule_task(board, task_id, until=60, expected_run_id=None if block_first else review.current_run_id)
+    registry = kb.kanban_home() / "kanban" / "guarded-projects.json"
+    registry.parent.mkdir(exist_ok=True)
+    registry.write_text(json.dumps({"guarded": {
+        "workspace_root": str(tmp_path), "board_db": str(kb.kanban_db_path()),
+        "priorities_file": str(tmp_path / "missing-priorities"),
+    }}), encoding="utf-8")
+    assert kb.release_due_scheduled(board, now=60) == []
+    assert kb.get_task(board, task_id).admission_reason == "priorities_unavailable"
+    registry.unlink()
+    assert kb.release_due_scheduled(board, now=60) == [task_id]
+    assert kb.get_task(board, task_id).status == "review"
+    assert _payloads(board, task_id, "scheduled")[-1]["source_status"] == "review"
+    resumed = kb.claim_review_task(board, task_id, claimer="reviewer")
+    assert resumed is not None and resumed.current_run_id != review.current_run_id
+    assert kb.request_changes(
+        board, task_id, reason="missing tests", expected_run_id=resumed.current_run_id,
+    ) == (True, "worker")
+
+
+def test_due_release_continues_after_one_card_fails(board, monkeypatch, caplog):
+    task_ids = [kb.create_task(board, title="due") for _ in range(3)]
+    for task_id in task_ids:
+        assert kb.schedule_task(board, task_id, until=60)
+    attempts = []
+    unblock = kb.unblock_task
+
+    def fail_second(conn, task_id, **kwargs):
+        attempts.append(task_id)
+        if len(attempts) == 2:
+            raise sqlite3.OperationalError("cannot release card")
+        return unblock(conn, task_id, **kwargs)
+
+    monkeypatch.setattr(kb, "unblock_task", fail_second)
+    released = kb.release_due_scheduled(board, now=60)
+    assert set(attempts) == set(task_ids)
+    assert released == [attempts[0], attempts[2]]
+    assert [kb.get_task(board, tid).status for tid in attempts] == ["ready", "scheduled", "ready"]
+    assert any(attempts[1] in record.getMessage() and record.exc_info for record in caplog.records)
+
+
 def test_stale_release_does_not_wake_a_new_park(board, monkeypatch):
     """A second connection re-parks between the dispatcher's due scan and its write transaction."""
     task_id = _running_task(board)
@@ -202,12 +263,18 @@ def test_due_park_recovers_a_dangling_run(board):
     """A legacy writer that parked without closing its run must not leave two live attempts."""
     task_id = _running_task(board)
     run_id = kb.get_task(board, task_id).current_run_id
+    kbd._set_worker_pid(board, task_id, 123, run_id=run_id, spawn_metadata={"started_at": "test-start"})
+    old_run = kb.get_run(board, run_id)
     with kb.write_txn(board):
         board.execute("UPDATE tasks SET status='scheduled', scheduled_until=1 WHERE id=?", (task_id,))
     assert kb.release_due_scheduled(board, now=1) == [task_id]
     assert kb.get_run(board, run_id).outcome == "reclaimed"
     task = kb.get_task(board, task_id)
     assert (task.status, task.current_run_id, task.scheduled_until) == ("ready", None, None)
+    assert kb.claim_task(board, task_id, claimer="next-worker") is not None
+    assert (task.claim_lock, task.claim_expires, task.worker_pid) == (None, None, None)
+    reclaimed = kb.get_run(board, run_id)
+    assert (reclaimed.claim_lock, reclaimed.worker_pid) == (old_run.claim_lock, old_run.worker_pid)
 
 
 def test_dispatch_reports_released_scheduled(board):
@@ -275,14 +342,42 @@ def test_tool_schedule_requires_valid_and_bounded_goal_timer(board, monkeypatch,
         assert task.status == "running"
 
 
-def test_cli_schedule_and_orchestrator_untriage(board, monkeypatch, capsys):
+@pytest.mark.parametrize("delay", [None, 13 * 3600])
+def test_worker_cli_goal_schedule_bound_precedes_comment(board, cli, monkeypatch, capsys, delay):
+    task_id = _running_task(board, goal_mode=True)
+    run_id = kb.get_task(board, task_id).current_run_id
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    now = int(time.time())
+    deadline = [] if delay is None else ["--until", str(now + delay)]
+    assert cli("schedule", task_id, "maintenance", *deadline) != 0
+    assert "goal_mode" in capsys.readouterr().err
+    task = kb.get_task(board, task_id)
+    assert (task.status, task.current_run_id) == ("running", run_id)
+    assert not kb.list_comments(board, task_id)
+    assert cli("schedule", task_id, "maintenance", "--until", str(now + 3600)) == 0
+    assert kb.get_task(board, task_id).scheduled_until == now + 3600
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    assert kb.unblock_task(board, task_id)
+    assert cli("schedule", task_id, "maintenance", *deadline) == 0
+
+
+def test_untriage_reason_only_audits_success(board, cli, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE", "operator")
+    task_id = kb.create_task(board, title="intact", triage=True)
+    assert cli("untriage", task_id, "--reason", "false alarm") == 0
+    comments = kb.list_comments(board, task_id)
+    events = kb.list_events(board, task_id)
+    assert [(comment.author, comment.body) for comment in comments] == [("operator", "UNTRIAGE: false alarm")]
+    assert cli("untriage", task_id, "--reason", "already released") != 0
+    assert kb.list_comments(board, task_id) == comments
+    assert kb.list_events(board, task_id) == events
+    assert [event.payload["reason"] for event in events if event.kind == "untriaged"] == ["false alarm"]
+
+
+def test_cli_schedule_and_orchestrator_untriage(board, cli, monkeypatch, capsys):
     """26 Nov GRIP/FLEET: bulk park validation precedes writes; only operators clear triage."""
-    parser = argparse.ArgumentParser(prog="hermes")
-    kanban_cli.build_parser(parser.add_subparsers())
-
-    def cli(*words):
-        return kanban_cli.kanban_command(parser.parse_args(["kanban", *words]))
-
     first, second = (_running_task(board) for _ in range(2))
     assert cli("schedule", first, "quiet", "--ids", second, "--until", "1970-01-01T00:01:00") != 0
     assert all(kb.get_task(board, tid).status == "running" for tid in (first, second))
@@ -290,7 +385,7 @@ def test_cli_schedule_and_orchestrator_untriage(board, monkeypatch, capsys):
     assert cli("schedule", first, "quiet", "--ids", second, "--until", "60") == 0
     assert "1970-01-01T00:01:00" in capsys.readouterr().out
     assert all(kb.get_task(board, tid).scheduled_until == 60 for tid in (first, second))
-    triaged = [kb.create_task(board, title="intact", triage=True) for _ in range(2)]
+    triaged = [kb.create_task(board, title="intact", triage=True, parents=parents) for parents in ([], [first])]
     monkeypatch.setenv("HERMES_KANBAN_TASK", first)
     assert cli("untriage", *triaged) != 0
     assert "orchestrator-only" in capsys.readouterr().err
@@ -298,9 +393,9 @@ def test_cli_schedule_and_orchestrator_untriage(board, monkeypatch, capsys):
     monkeypatch.delenv("HERMES_KANBAN_TASK")
     assert cli("untriage", *triaged, "--reason", "false alarm") == 0
     output = capsys.readouterr().out
-    for tid in triaged:
-        assert f"Untriaged {tid} -> todo" in output
-        assert kb.get_task(board, tid).status == "ready"
+    for tid, status in zip(triaged, ("ready", "todo")):
+        assert f"Untriaged {tid} -> {status}" in output
+        assert kb.get_task(board, tid).status == status
         assert kb.list_comments(board, tid)[-1].body == "UNTRIAGE: false alarm"
     assert cli("untriage", triaged[0]) != 0
     assert f"cannot untriage {triaged[0]} (not in triage?)" in capsys.readouterr().err

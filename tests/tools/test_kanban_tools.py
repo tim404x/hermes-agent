@@ -458,9 +458,32 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert (run.outcome, run.summary) == ("scheduled", reason)
         assert any(
-            event.kind == "scheduled" and event.payload == {"reason": reason, "until": 1789257600}
+            event.kind == "scheduled" and event.payload == {"reason": reason, "until": 1789257600, "source_status": "ready"}
             for event in kb.list_events(conn, worker_env)
         )
+
+
+def test_schedule_published_schema_and_handler_accept_integer_epoch(worker_env):
+    from jsonschema import validate
+
+    from agent.gemini_schema import sanitize_gemini_tool_parameters
+    from agent.moonshot_schema import sanitize_moonshot_tools
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.kanban_tools import registry
+    from tools.schema_sanitizer import sanitize_tool_schemas
+
+    definitions = registry.get_definitions({"kanban_schedule"}, quiet=True)
+    published = definitions[0]["function"]["parameters"]
+    moonshot = sanitize_moonshot_tools(sanitize_tool_schemas(definitions))
+    args = {"until": 1789257600}
+    for schema in (published, sanitize_gemini_tool_parameters(published), moonshot[0]["function"]["parameters"]):
+        validate(args, schema)
+        validate({"until": "2026-09-13T00:00:00Z"}, schema)
+    result = json.loads(registry.get_entry("kanban_schedule").handler(args))
+    assert result["ok"] and result["task_id"] == worker_env
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, worker_env).scheduled_until == args["until"]
 
 
 def test_schedule_rejects_invalid_reason_and_unowned_contexts(monkeypatch, worker_env):
