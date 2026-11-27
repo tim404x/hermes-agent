@@ -2321,7 +2321,7 @@ def release_stale_claims(
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import _latest_run_event, owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error
+    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked, owner_reclaim_blocked_after_kill, reclaim_error, run_loss_evidence
     for row in stale:
         if owner_reclaim_blocked(conn, row["id"]):
             continue
@@ -2353,11 +2353,11 @@ def release_stale_claims(
             # changes neither claim_lock nor worker_pid, so the CAS below cannot see it.
             if owner_reclaim_blocked_after_kill(conn, row["id"], signalled=bool(termination.get("termination_attempted"))):
                 continue
-            retry_status, error = _retry_status_for_run(conn, row["id"]), reclaim_error(conn, row["id"], row["claim_lock"])
+            _, lost_reason = run_loss_evidence(conn, row["id"])
+            retry_status = _retry_status_for_run(conn, row["id"])
+            error = reclaim_error(conn, row["id"], row["claim_lock"], lost_reason)
             # A dead worker its owner lost (stall/restart) is a host event: no failure charged.
-            infra = infra_loss_booking(
-                conn, row["id"], str(_latest_run_event(conn, row["id"], "worker_lost").get("reason") or ""),
-            )
+            infra = infra_loss_booking(conn, row["id"], lost_reason)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "

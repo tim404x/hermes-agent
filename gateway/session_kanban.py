@@ -11,6 +11,12 @@ import sqlite3
 from persistence.core.errors import AuthorityRefusal
 
 
+class KanbanSkillsUnavailable(ValueError):
+    def __init__(self, missing: list[str]):
+        super().__init__('kanban_skills_unavailable')
+        self.missing = missing
+
+
 def _resolve_assignee_home(assignee: str, source_home: str | None) -> Path:
     from hermes_cli.profiles import profile_root_for_env_home, resolve_profile_at_root, resolve_profile_env
     if not source_home:
@@ -20,6 +26,7 @@ def _resolve_assignee_home(assignee: str, source_home: str | None) -> Path:
 
 
 def build_kanban_policy(connection, params, config):
+    from agent.skill_utils import REVIEW_LANE_SKILL
     from hermes_cli import kanban_db as kb
     authority, actor = connection.authority, connection.actor
     if not connection.native_owner or 'session:create' not in actor.capabilities:
@@ -52,8 +59,7 @@ def build_kanban_policy(connection, params, config):
             context = kb.build_worker_context(conn, task.id)
             skills = list(task.skills or ())
             if kb._retry_status_for_run(conn, task.id, task.current_run_id) == 'review':
-                # Same rule as the dispatcher's review lane: the reviewer always loads sdlc-review.
-                skills = list(dict.fromkeys([*skills, 'sdlc-review']))
+                skills = list(dict.fromkeys([*skills, REVIEW_LANE_SKILL]))
     except (ValueError, OSError, sqlite3.Error) as exc:
         raise AuthorityRefusal('invalid_kanban_claim') from exc
     cwd = task.workspace_path
@@ -319,22 +325,27 @@ def _run_worker_turns(agent, frame, history):
             return agent.run_conversation(frame['text'], conversation_history=history, **worker_display_kwargs(),
                                           **({'task_id': task_id} if task_id else {}),
                                           **({'turn_author': author} if author is not None else {}))
+    from hermes_cli import kanban_db as kb
     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
-    code, last_output = 1, ''
+    code, last_output, error = 1, '', None
     try:
         result = _run_task_turns(agent, frame, history, context)
         code = turn_exit_code(result, kanban_worker=True)
         if isinstance(result, dict):
             # Redact before the tail cut: a cut through a PEM header or a token prefix
             # leaves a body the redactor no longer recognises.
-            from hermes_cli import kanban_db as kb
             last_output = kb.redact_review_value(str(result.get('final_response') or ''))[-500:]
         return result
+    except KanbanSkillsUnavailable as exc:
+        from agent.skill_commands import format_missing_skills
+        error = 'unknown_skill'
+        last_output = kb.redact_review_value(format_missing_skills(exc.missing))[:500]
+        raise
     except Exception as exc:
         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
         raise
     finally:
-        _record_worker_result(context, code, last_output)
+        _record_worker_result(context, code, last_output, error=error)
 
 
 def record_start_failure(frame, exc):
@@ -347,7 +358,7 @@ def record_start_failure(frame, exc):
     _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)), '')
 
 
-def _record_worker_result(context, code, last_output):
+def _record_worker_result(context, code, last_output, *, error=None):
     _TURNS_DONE.set()
     import os
     from hermes_cli.kanban_db_connect import connect_closing
@@ -358,7 +369,7 @@ def _record_worker_result(context, code, last_output):
             # result in the immutable attempt event stream instead.
             kb._append_event(conn, context['task_id'], 'worker_result',
                 {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
-                 'last_output': last_output}, run_id=context['run_id'])
+                 'last_output': last_output, **({'error': error} if error else {})}, run_id=context['run_id'])
 
 
 def record_worker_loss(policy, reason, *, pid=None, bound=False):
@@ -444,7 +455,7 @@ def _run_task_turns(agent, frame, history, context):
     from agent.skill_commands import build_preloaded_skills_prompt
     skills, loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
     if missing and not loaded:
-        raise ValueError('kanban_skills_unavailable')
+        raise KanbanSkillsUnavailable(missing)
     prompt = '\n\n'.join(p for p in (skills, context['context'], frame['text']) if p)
     result = agent.run_conversation(prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
 

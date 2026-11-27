@@ -21,6 +21,7 @@ from dataclasses import field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Optional
 
+from agent.skill_utils import REVIEW_LANE_SKILL
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 from hermes_cli._startup_fast import project_root_str
 from hermes_cli.kanban_dispatch.results import DispatchResult, describe_suppression
@@ -1107,14 +1108,11 @@ def _classify_dead_worker_exit(
     return _DeadWorker(kind, code, error_text, "crashed", event_payload)
 
 
-# A managed worker the owner lost (``worker_lost``) or a submitter whose owner refused/went
-# silent is a HOST event (owner-loop stall, gateway restart, state.db writer contention), not
-# a broken card: one stall killed 8 workers on 25 Nov 2026 and the systemic breaker parked 6
-# cards after that single death. These re-queue like a TTL reclaim, without a failure, without
-# a subscriber wake, and never count toward the systemic same-error breaker. Bounded: after
-# ``_INFRA_LOSS_REQUEUE_LIMIT`` consecutive infra losses the next ones book as plain crashes
-# (until a non-infra run breaks the streak), so a card that really kills its worker surfaces.
+# One owner stall can kill many workers: requeue host losses without charging cards, waking
+# subscribers or tripping the systemic breaker. Bound the streak so a real crash loop surfaces.
 _INFRA_LOSS_REASONS = frozenset({"managed_worker_failed", "managed_worker_lost"})
+# A failed preload belongs to the card even when its submitter reports an owner refusal.
+_DETERMINISTIC_LOSS_REASONS = frozenset({"unknown_skill"})
 _INFRA_LOSS_OUTPUT_RE = re.compile(
     r"Kanban owner (?:refused: Kanban execution unknown; retained by owner"
     r"|silent for \d+s: [^\n]{0,240})\s*$"
@@ -1166,6 +1164,8 @@ def infra_loss_booking(conn: sqlite3.Connection, task_id: str, lost_reason: str 
     """``{}`` when this death is not a host loss, else the run-metadata stamp:
     ``{"infra_loss": True, "infra_losses": n}`` within budget, or
     ``{"infra_loss_limit_reached": n}`` once the streak is over the limit (books as a crash)."""
+    if lost_reason in _DETERMINISTIC_LOSS_REASONS:
+        return {}
     if lost_reason not in _INFRA_LOSS_REASONS and not _INFRA_LOSS_OUTPUT_RE.search(output or ""):
         return {}
     n = _prior_infra_losses(conn, task_id) + 1
@@ -1174,13 +1174,14 @@ def infra_loss_booking(conn: sqlite3.Connection, task_id: str, lost_reason: str 
     return {"infra_loss": True, "infra_losses": n}
 
 
-def _mark_infra_loss(conn: sqlite3.Connection, task_id: str, dead: _DeadWorker,
+def _mark_infra_loss(conn: sqlite3.Connection, task_id: str, dead: _DeadWorker, worker_result: dict,
                      board: Optional[str] = None) -> None:
     """Flag a dead worker the HOST lost (see ``_INFRA_LOSS_REASONS``), before its run closes."""
-    if dead.rate_limited or dead.protocol_violation or dead.terminal_provider:
+    from hermes_cli.kanban_owner_recovery import apply_attempt_note, run_loss_evidence
+    lost, reason = run_loss_evidence(conn, task_id, worker_result)
+    apply_attempt_note(conn, task_id, dead, lost, reason)
+    if dead.rate_limited or dead.protocol_violation or dead.terminal_provider or reason in _DETERMINISTIC_LOSS_REASONS:
         return
-    lost = dead.event_payload.get("worker_lost")
-    reason = str(lost.get("reason") or "") if isinstance(lost, dict) else ""
     output = "" if reason in _INFRA_LOSS_REASONS else _current_attempt_output(task_id, board)
     stamp = infra_loss_booking(conn, task_id, reason, output)
     dead.event_payload.update(stamp)
@@ -1209,7 +1210,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     rows = conn.execute('SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, current_run_id '
                         "FROM tasks WHERE status='running' AND worker_pid IS NOT NULL").fetchall()
     host_prefix = _kb._host_prefix()
-    from hermes_cli.kanban_owner_recovery import apply_attempt_note, managed_run_exit_code, owner_reclaim_blocked
+    from hermes_cli.kanban_owner_recovery import _latest_run_event, managed_run_exit_code, owner_reclaim_blocked
     for row in rows:
         lock = row['claim_lock'] or ''
         started_at = _kb._to_epoch(row['started_at'])
@@ -1229,10 +1230,10 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
 
             pid = int(row["worker_pid"])
             # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
-            exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
+            worker_result = _latest_run_event(conn, row["id"], "worker_result")
+            exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"], worker_result)
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
-            apply_attempt_note(conn, row["id"], pid, dead)
-            _mark_infra_loss(conn, row["id"], dead, board=board)
+            _mark_infra_loss(conn, row["id"], dead, worker_result, board=board)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -2224,9 +2225,7 @@ def _dispatch_lane_task(
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
     if lane == "review":
-        # Force-load sdlc-review; the kanban lifecycle is already in every
-        # worker's system prompt via KANBAN_GUIDANCE.
-        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), REVIEW_LANE_SKILL]))
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         _publish_worker_spawn(conn, claimed, workspace, pid, board)

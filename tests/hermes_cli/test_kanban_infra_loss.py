@@ -29,9 +29,10 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _start_and_lose(conn, tid, host, n, *, reason="managed_worker_failed", code=1):
+def _start_and_lose(conn, tid, host, n, *, reason="managed_worker_failed", code=1, review=False):
     """Claim a fresh run on this host, bind a dead pid, record the owner's ``worker_lost``."""
-    claimed = kb.claim_task(conn, tid, claimer=f"{host}:w{n}")
+    claim = kb.claim_review_task if review else kb.claim_task
+    claimed = claim(conn, tid, claimer=f"{host}:w{n}")
     pid = 72000 + n * 10 + abs(hash(tid)) % 7
     conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
     if reason:
@@ -82,6 +83,39 @@ def _log(tid, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(text.replace("<EXIT>", TR))
+
+
+def test_unknown_skill_review_deaths_count_even_with_submitter_refusal(kanban_home, monkeypatch):
+    monkeypatch.setattr(kbd, "DEFAULT_FAILURE_LIMIT", 2)
+    with kbc.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="review", assignee="a")
+        assert kb.request_review(conn, tid, reviewer="b")
+        for attempt, status in enumerate(("review", "blocked"), 1):
+            _start_and_lose(conn, tid, host, attempt, reason="unknown_skill", review=True)
+            _log(tid, f"{REFUSAL}\n<EXIT>1\n")
+            kbd.detect_crashed_workers(conn)
+            task = kb.get_task(conn, tid)
+            assert (task.status, task.consecutive_failures) == (status, attempt)
+            assert "managed worker lost: unknown_skill" in task.last_failure_error
+        kinds = [row[0] for row in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
+        assert kinds.count("crashed") == 2 and kbd.INFRA_REQUEUED_EVENT not in kinds
+        assert _gave_up(conn, tid) == 1
+
+
+def test_only_current_worker_result_overrides_generic_owner_loss(kanban_home):
+    with kbc.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="missing preload", assignee="a")
+        _start_and_lose(conn, tid, host, 1)
+        kb._append_event(conn, tid, "worker_result", {"error": "unknown_skill"}, run_id=kb.get_task(conn, tid).current_run_id)
+        kbd.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+        assert task.consecutive_failures == 1 and "managed worker lost: unknown_skill" in task.last_failure_error
+        _start_and_lose(conn, tid, host, 2)
+        kbd.detect_crashed_workers(conn)
+        assert kb.get_task(conn, tid).consecutive_failures == 1
+        assert kbd._prior_infra_losses(conn, tid) == 1
 
 
 def test_owner_refused_output_alone_is_an_infra_loss(kanban_home):

@@ -433,6 +433,35 @@ class TestSyncSkills:
         assert "new-skill" in result["copied"]
         assert (skills_dir / "category" / "new-skill" / "SKILL.md").exists()
 
+    @pytest.mark.parametrize("tracked", [True, False])
+    def test_sync_reseeds_only_suppressed_essentials_and_keeps_archives(self, tmp_path, monkeypatch, tracked):
+        from tools import skill_usage
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        bundled = self._setup_bundled(tmp_path)
+        skills = tmp_path / "skills"
+        essential, other = "sdlc-review", "old-skill"
+        (bundled / essential).mkdir()
+        (bundled / essential / "SKILL.md").write_text("bundled review")
+        for name in (essential, other):
+            archive = skills / ".archive" / name
+            archive.mkdir(parents=True)
+            (archive / "SKILL.md").write_text(f"archived {name}")
+        (skills / ".curator_suppressed").write_text(f"{essential}\n{other}\n")
+        skill_usage.save_usage({name: {"state": "archived"} for name in (essential, other)})
+        with self._patches(bundled, skills, skills / ".bundled_manifest"):
+            _write_manifest({name: dir_hash(skills / ".archive" / name) for name in (essential, other)} if tracked else {})
+            result = sync_skills(quiet=True)
+            assert _read_manifest()[essential] == dir_hash(bundled / essential)
+        assert essential in result["copied"] and result["suppressed"] == [other]
+        assert (skills / essential / "SKILL.md").read_text() == "bundled review"
+        assert not (skills / other).exists()
+        assert skill_usage.read_suppressed_names() == {other}
+        usage = skill_usage.load_usage()
+        assert (usage[essential]["state"], usage[other]["state"]) == ("active", "archived")
+        for name in (essential, other):
+            assert (skills / ".archive" / name / "SKILL.md").read_text() == f"archived {name}"
+
     def test_fresh_install_copies_all_and_records_origin_hashes(self, tmp_path):
         bundled = self._setup_bundled(tmp_path)
         skills_dir = tmp_path / "user_skills"

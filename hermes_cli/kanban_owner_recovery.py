@@ -197,17 +197,17 @@ def owner_attempt_provably_over(conn, task_id) -> bool:
     return settled or (bool(pids) and _owner_process_gone(receipt))
 
 
-def owner_attempt_note(conn, task_id, lost=None) -> str:
-    """One clause naming why the owner says the attempt ended, or ``""``.
+def run_loss_evidence(conn, task_id, result=None) -> tuple[dict, str]:
+    """Keep the owner's raw loss event, but prefer the worker's diagnosis if its frame was lost."""
+    lost = _latest_run_event(conn, task_id, 'worker_lost')
+    if result is None:
+        result = _latest_run_event(conn, task_id, 'worker_result')
+    reason = 'unknown_skill' if result.get('error') == 'unknown_skill' else str(lost.get('reason') or '')
+    return lost, reason
 
-    The reclaim paths put this in the run error so the board says what happened instead of
-    a bare ``stale_lock=``: a managed worker that died (its owner recorded ``worker_lost``,
-    passed as ``lost`` when the caller already read it) is a different fault from a worker
-    that never started.
-    """
-    if lost is None:
-        lost = _latest_run_event(conn, task_id, 'worker_lost')
-    reason = str(lost.get('reason') or '')
+
+def owner_attempt_note(conn, task_id, reason) -> str:
+    """Distinguish a lost run from a worker that never started."""
     if reason:
         return f"managed worker lost: {reason[:80]}"
     receipt = _owner_receipt(conn, task_id)
@@ -219,13 +219,13 @@ def owner_attempt_note(conn, task_id, lost=None) -> str:
     return ""
 
 
-def reclaim_error(conn, task_id, claim_lock) -> str:
+def reclaim_error(conn, task_id, claim_lock, reason) -> str:
     """A stale-lock reclaim's run error, naming how the attempt ended when the owner recorded it."""
-    note = owner_attempt_note(conn, task_id)
+    note = owner_attempt_note(conn, task_id, reason)
     return f"stale_lock={claim_lock}" + (f" [{note}]" if note else "")
 
 
-def apply_attempt_note(conn, task_id, pid, dead) -> None:
+def apply_attempt_note(conn, task_id, dead, lost, reason) -> None:
     """Fold the owner's own record of how the attempt ended into ONE dead worker's booking.
 
     A bound interpreter whose ``worker_result`` says exit 0 after its managed execution was
@@ -233,8 +233,7 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
     turn never finished, so it books as a crash and charges the breaker, and the
     protocol-violation streak (which reads the persisted payload) does not count it.
     """
-    lost = _latest_run_event(conn, task_id, "worker_lost")
-    note = owner_attempt_note(conn, task_id, lost)
+    note = owner_attempt_note(conn, task_id, reason)
     if not note:
         return
     dead.event_payload["attempt_note"] = note
@@ -247,7 +246,7 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
             dead.event_payload["exit_kind"] = dead.kind
             dead.event_kind = "crashed"
             # Keep the worker's last output that _classify_dead_worker appended.
-            dead.error_text = (f"pid {pid} exited cleanly after its managed worker was lost."
+            dead.error_text = (f"pid {dead.event_payload['pid']} exited cleanly after its managed worker was lost."
                                + dead.error_text.removeprefix(_PROTOCOL_VIOLATION_ERROR))
     # Before the worker's own output: the stored error is capped, and the output may be long.
     from hermes_cli.kanban_db_dispatch import WORKER_OUTPUT_SEP
@@ -286,7 +285,7 @@ def owner_reclaim_blocked_after_kill(conn, task_id, *, signalled: bool) -> bool:
     return owner_reclaim_blocked(conn, task_id, crash_sweep=signalled)
 
 
-def managed_run_exit_code(conn, task_id, worker_pid, claim_lock):
+def managed_run_exit_code(conn, task_id, worker_pid, claim_lock, result):
     """The exit code a managed run's authority recorded for the task's CURRENT run, else None.
 
     Managed interpreters are children of the authority, not the dispatcher, so their result is
@@ -295,16 +294,8 @@ def managed_run_exit_code(conn, task_id, worker_pid, claim_lock):
     the dispatcher's own worker, or the owner-side interpreter ``worker_bound`` recorded under
     that claim — ``session_kanban._record_worker_result`` writes the interpreter's pid, never the
     spawned submitter's ``tasks.worker_pid``."""
-    def latest(kind):
-        row = conn.execute(
-            "SELECT e.payload FROM task_events e JOIN tasks t ON t.current_run_id=e.run_id "
-            "WHERE t.id=? AND e.task_id=t.id AND e.kind=? ORDER BY e.id DESC LIMIT 1", (task_id, kind)).fetchone()
-        try:
-            payload = json.loads(row['payload']) if row else {}
-        except ValueError:
-            return {}
-        return payload if isinstance(payload, dict) else {}
-
-    result, bound = latest('worker_result'), latest('worker_bound')
+    if result.get('claim_lock') != claim_lock:
+        return None
+    bound = _latest_run_event(conn, task_id, 'worker_bound')
     pids = {worker_pid, *([bound.get('pid')] if bound.get('claim_lock') == claim_lock else [])}
-    return result.get('exit_code') if result.get('claim_lock') == claim_lock and result.get('pid') in pids else None
+    return result.get('exit_code') if result.get('pid') in pids else None

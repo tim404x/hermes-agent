@@ -2,6 +2,8 @@
 import json
 import os
 
+import pytest
+
 from agent import kanban_turn_recovery as rec
 from gateway import session_kanban
 from hermes_cli import kanban_db as kb
@@ -51,6 +53,16 @@ def _claimed_frame(tmp_path, monkeypatch, *, expired=False, goal_mode=False):
     context = {"db": str(path), "task_id": task_id, "run_id": task.current_run_id, "claim_lock": task.claim_lock,
                "skills": [], "context": "", "goal_mode": goal_mode, "goal_text": "g", "goal_max_turns": 2}
     return path, context, {"text": "work", "policy": {"kanban_json": json.dumps(context)}}
+
+
+def test_missing_preloads_record_a_deterministic_worker_result(tmp_path, monkeypatch):
+    path, context, frame = _claimed_frame(tmp_path, monkeypatch)
+    monkeypatch.setattr("agent.skill_commands.build_preloaded_skills_prompt", lambda *_args, **_kwargs: ("", [], ["missing"]))
+    with pytest.raises(ValueError, match="^kanban_skills_unavailable$") as exc:
+        session_kanban.run_worker_turns(_Agent([]), frame, [])
+    assert exc.value.missing == ["missing"]
+    result = session_kanban.worker_result(path, context)
+    assert (result["exit_code"], result["error"], result["last_output"]) == (1, "unknown_skill", "Unknown skill(s): missing")
 
 
 def test_failed_turn_retries_in_place_from_frame_carrier(tmp_path, monkeypatch):

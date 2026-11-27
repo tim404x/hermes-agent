@@ -3,7 +3,7 @@
 ~/.hermes/skills/, tracking each synced skill's origin hash in .bundled_manifest (v2 "name:hash"
 lines; v1 plain names auto-migrate). NEW skills are copied and recorded; EXISTING skills update
 only when bundled changed AND the user copy still matches the origin hash (else user-customized
--> SKIP); user-DELETED skills are not re-added; upstream-REMOVED ones leave the manifest once no active or
+-> SKIP); user-DELETED skills are not re-added unless essential; upstream-REMOVED ones leave the manifest once no active or
 archived copy remains (the entry is that copy's only built-in provenance record)."""
 
 import hashlib
@@ -307,8 +307,9 @@ def _defer_to_external(st: _SyncState, skill_name: str, dest: Path, bundled_hash
         st.manifest.pop(skill_name, None)
 
 
-def _install_new_skill(st: _SyncState, skill_name: str, skill_src: Path, dest: Path, bundled_hash: str) -> None:
-    """Handle a skill never offered before (not in manifest)."""
+def _install_bundled_skill(st: _SyncState, skill_name: str, skill_src: Path, dest: Path, bundled_hash: str,
+                           *, suppressed: bool) -> None:
+    """Install a new skill or re-seed a missing essential from bundled, never from the archive."""
     try:
         if dest.exists():
             # Never overwrite a same-named user skill. Baseline the manifest only when
@@ -324,8 +325,16 @@ def _install_new_skill(st: _SyncState, skill_name: str, skill_src: Path, dest: P
         else:
             _copy_dir(skill_src, dest)
             st.copied.append(skill_name)
+            restored = skill_name in st.manifest
             st.manifest[skill_name] = bundled_hash
-            st.say(f"  + {skill_name}")
+            st.say(f"  + {skill_name}" + (" (essential, restored)" if restored else ""))
+            if suppressed:
+                try:
+                    from tools import skill_usage
+                    skill_usage._toggle_suppressed_name(skill_name, add=False)
+                    skill_usage.set_state(skill_name, skill_usage.STATE_ACTIVE)
+                except Exception:
+                    logger.debug("Could not reactivate %s", skill_name, exc_info=True)
     except OSError as e:
         st.say(f"  ! Failed to copy {skill_name}: {e}")  # not in manifest — next sync retries
 
@@ -397,8 +406,7 @@ def _seed_category_descriptions(bundled_dir: Path, only_dirs: Optional[set[Path]
 
 def sync_skills(quiet: bool = False) -> dict:
     """Sync bundled skills into ~/.hermes/skills/ using the manifest; returns the per-category
-    result dict. Opted-out profiles seed ONLY ESSENTIAL_SKILLS (the system prompt always
-    points at ``hermes-agent``)."""
+    result dict. Opted-out profiles seed only the operating manual and force-loaded skills."""
     essential_only = (_hermes_home() / NO_BUNDLED_SKILLS_MARKER).exists()
     if essential_only and not quiet:
         print("  (profile opted out of bundled skills via .no-bundled-skills — seeding essential skills only)")
@@ -427,8 +435,8 @@ def sync_skills(quiet: bool = False) -> dict:
             st.relocated.append(skill_name)
         if skill_name in external_index:
             _defer_to_external(st, skill_name, dest, bundled_hash)
-        elif skill_name not in st.manifest:
-            _install_new_skill(st, skill_name, skill_src, dest, bundled_hash)
+        elif skill_name not in st.manifest or (skill_name in ESSENTIAL_SKILLS and not dest.exists()):
+            _install_bundled_skill(st, skill_name, skill_src, dest, bundled_hash, suppressed=skill_name in suppressed)
         elif dest.exists():
             _update_existing_skill(st, skill_name, skill_src, dest, bundled_hash)
         else:

@@ -310,9 +310,13 @@ def _home_relative(p: Path) -> Path:
     return p if p.is_absolute() else get_hermes_home() / p
 
 
-# Never disableable: `hermes-agent` is the agent's own operating manual and the
-# system prompt points at it unconditionally.
-ESSENTIAL_SKILLS: frozenset = frozenset({"hermes-agent"})
+# A skill Hermes loads by name is essential: pruning or disabling it kills workers that need it.
+# New force-loads must use a constant from this set; the Kanban contract test checks the call sites.
+REVIEW_LANE_SKILL = "sdlc-review"
+SWARM_VERIFIER_SKILL = "requesting-code-review"
+SWARM_SYNTHESIZER_SKILL = "humanizer"
+FORCE_LOADED_SKILLS: frozenset = frozenset({REVIEW_LANE_SKILL, SWARM_VERIFIER_SKILL, SWARM_SYNTHESIZER_SKILL})
+ESSENTIAL_SKILLS: frozenset = frozenset({"hermes-agent"}) | FORCE_LOADED_SKILLS
 
 
 def get_disabled_skill_names(platform: str | None = None) -> set[str]:
