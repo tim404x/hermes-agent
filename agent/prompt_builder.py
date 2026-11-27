@@ -263,8 +263,8 @@ SKILLS_GUIDANCE = "When you work out a non-trivial workflow, record it with skil
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from the shared board at `~/.hermes/kanban.db`. Your task id is in "
-    "`$HERMES_KANBAN_TASK` (shells and scripts you start see it as `$HERMES_KANBAN_ORIGIN_TASK`, never as worker "
-    "identity); your workspace is `$HERMES_KANBAN_WORKSPACE`. The `kanban_*` tools in your schema are your "
+    "`$HERMES_KANBAN_TASK` (local shells and scripts you start see it as `$HERMES_KANBAN_ORIGIN_TASK`, never as "
+    "worker identity); your workspace is `$HERMES_KANBAN_WORKSPACE`. The `kanban_*` tools in your schema are your "
     "primary coordination surface — they write directly to the shared SQLite DB and work regardless of terminal "
     "backend (local/docker/modal/ssh).\n"
     "\n"

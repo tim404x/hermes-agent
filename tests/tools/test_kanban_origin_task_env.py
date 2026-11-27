@@ -88,10 +88,65 @@ def test_execute_code_child_carries_origin(tmp_path, monkeypatch):
 def test_a_real_task_replaces_a_stale_inherited_origin_whole(monkeypatch):
     """Task and run id always come from one source: a worker spawned under an old origin never
     pairs its own task with the old run id."""
-    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
+    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", KANBAN_ORIGIN_TASK_ENV, KANBAN_ORIGIN_RUN_ID_ENV):
         monkeypatch.delenv(key, raising=False)
     stale = {KANBAN_ORIGIN_TASK_ENV: "t_old", KANBAN_ORIGIN_RUN_ID_ENV: "7"}
     assert scrub_kanban_env({**stale, "HERMES_KANBAN_TASK": "t_new"})[KANBAN_ORIGIN_TASK_ENV] == "t_new"
     assert KANBAN_ORIGIN_RUN_ID_ENV not in scrub_kanban_env({**stale, "HERMES_KANBAN_TASK": "t_new"})
     kept = scrub_kanban_env(dict(stale))
     assert (kept[KANBAN_ORIGIN_TASK_ENV], kept[KANBAN_ORIGIN_RUN_ID_ENV]) == ("t_old", "7")
+
+
+def test_fenced_child_mcp_server_keeps_the_origin(tmp_path, monkeypatch):
+    """worker -> child -> stdio MCP: the MCP builder starts from an allowlist with no Kanban ids,
+    so the child's own inherited origin pair is the source (Codex review, PR #65)."""
+    from tools.mcp_tool_config import _build_safe_env
+
+    conn, tid, run_id = _worker(tmp_path, monkeypatch)
+    child = delegated_child_subprocess_env(dict(os.environ))
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    for key in (DELEGATED_CHILD_ENV_MARKER, KANBAN_ORIGIN_TASK_ENV, KANBAN_ORIGIN_RUN_ID_ENV):
+        monkeypatch.setenv(key, child[key])  # now this process IS the fenced child
+    env = _build_safe_env({})
+    assert (env[KANBAN_ORIGIN_TASK_ENV], env[KANBAN_ORIGIN_RUN_ID_ENV]) == (tid, run_id)
+    assert "HERMES_KANBAN_TASK" not in env and env[DELEGATED_CHILD_ENV_MARKER]
+    conn.close()
+
+
+def test_task_override_never_borrows_the_base_run_id(tmp_path, monkeypatch):
+    from tools.environments.local import build_subprocess_env
+
+    conn, _tid, _run = _worker(tmp_path, monkeypatch)
+    for scrub in (True, False):
+        env = build_subprocess_env(extra={"HERMES_KANBAN_TASK": "t_other"}, scrub_secrets=scrub)
+        assert env[KANBAN_ORIGIN_TASK_ENV] == "t_other", (scrub, env.get(KANBAN_ORIGIN_TASK_ENV))
+        assert KANBAN_ORIGIN_RUN_ID_ENV not in env, scrub
+    env = build_subprocess_env(extra={"HERMES_KANBAN_TASK": "t_other", "HERMES_KANBAN_RUN_ID": "99"})
+    assert (env[KANBAN_ORIGIN_TASK_ENV], env[KANBAN_ORIGIN_RUN_ID_ENV]) == ("t_other", "99")
+    conn.close()
+
+
+def test_execute_code_passthrough_task_keeps_the_full_pair(tmp_path, monkeypatch):
+    """Only HERMES_KANBAN_TASK registered for passthrough: the second scrub must not re-derive a
+    half pair (task without run id) from the filtered env."""
+    from tools import env_passthrough
+    from tools.code_execution_env import _build_child_env
+
+    conn, tid, run_id = _worker(tmp_path, monkeypatch)
+    env_passthrough.register_env_passthrough(["HERMES_KANBAN_TASK"])
+    try:
+        env = _build_child_env(rpc_endpoint="fixture", rpc_token="fixture", tmpdir=str(tmp_path),
+                               child_python=sys.executable)
+    finally:
+        env_passthrough.clear_env_passthrough()
+    assert (env[KANBAN_ORIGIN_TASK_ENV], env.get(KANBAN_ORIGIN_RUN_ID_ENV)) == (tid, run_id)
+    assert "HERMES_KANBAN_TASK" not in env
+    conn.close()
+
+
+def test_shell_snapshot_never_persists_the_origin_labels():
+    from tools.environments.base_session_env import _export_dump_excluding_session_vars
+
+    snippet = _export_dump_excluding_session_vars("/tmp/x")
+    assert f"{KANBAN_ORIGIN_TASK_ENV} {KANBAN_ORIGIN_RUN_ID_ENV} " in snippet

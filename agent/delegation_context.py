@@ -155,14 +155,25 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
 
 def _kanban_origin_env(env: Mapping[str, str]) -> dict[str, str]:
     """The ``HERMES_KANBAN_ORIGIN_*`` pair a scrubbed descendant env should carry. Task and run id
-    come from the same source (never mixed): *env*'s own task id, else this process's
-    (a caller-built env that omitted it), else the origin *env* already inherited."""
+    always come from ONE source, first match wins: *env*'s task id, *env*'s inherited origin, then
+    the same two from this process (a caller-built allowlist env, e.g. stdio MCP, that omitted both)."""
     for source in (env, os.environ):
-        task = str(source.get("HERMES_KANBAN_TASK") or "").strip()
-        if task:
-            run_id = str(source.get("HERMES_KANBAN_RUN_ID") or "").strip()
-            return {KANBAN_ORIGIN_TASK_ENV: task, **({KANBAN_ORIGIN_RUN_ID_ENV: run_id} if run_id else {})}
-    return {k: str(env[k]) for k in KANBAN_ORIGIN_ENV_KEYS if env.get(k)}
+        for task_key, run_key in (("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"),
+                                  (KANBAN_ORIGIN_TASK_ENV, KANBAN_ORIGIN_RUN_ID_ENV)):
+            task = str(source.get(task_key) or "").strip()
+            if task:
+                run_id = str(source.get(run_key) or "").strip()
+                return {KANBAN_ORIGIN_TASK_ENV: task, **({KANBAN_ORIGIN_RUN_ID_ENV: run_id} if run_id else {})}
+    return {}
+
+
+def unpair_kanban_overrides(env: MutableMapping[str, str], extra: Mapping[str, str] | None) -> None:
+    """Before *extra* is merged over *env*: an override that names a task (or origin task) without
+    its run id must not inherit *env*'s run id, which belongs to another task."""
+    for task_key, run_key in (("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"),
+                              (KANBAN_ORIGIN_TASK_ENV, KANBAN_ORIGIN_RUN_ID_ENV)):
+        if extra and task_key in extra and run_key not in extra:
+            env.pop(run_key, None)
 
 
 def kanban_path_is_fenced(path: os.PathLike[str] | str) -> bool:
