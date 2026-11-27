@@ -123,11 +123,22 @@ class GatewayTurnPersistenceMixin:
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
         # silent; any other human one must not.
-        from gateway.response_filters import is_machinery_display_kind, strip_trailing_silence_marker
+        from gateway.response_filters import (
+            is_machinery_display_kind, is_suppressed_machinery_empty_result, strip_trailing_silence_marker,
+        )
         from gateway.run_turn import _unexpected_silence_reply
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
         _silence_source = agent_result.get("queued_terminal_source", source)
+        if not _intentional_silence and is_suppressed_machinery_empty_result(
+            agent_result, _silence_kind, _silence_reply_expected,
+        ):
+            logger.warning(
+                "empty_response_exhausted on unaddressed machinery turn (%s): suppressing chat no-reply banner (model=%s)",
+                _silence_kind, agent_result.get("model") or "?",
+            )
+            response = ""
+            _intentional_silence = True
         # A bot peer expects no reply even when it addressed us (a DM, a mention): its message may end
         # the exchange in silence, and the visible fallback would be runtime text it answers (#137027).
         if not automatic_notices_allowed(_silence_source):

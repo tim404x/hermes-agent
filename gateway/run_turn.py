@@ -1577,9 +1577,19 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
+        from gateway.response_filters import is_suppressed_machinery_empty_result
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
         _silent = False
-        if self._is_intentional_silence(_delivery_result, first_response):
+        if is_suppressed_machinery_empty_result(
+            _delivery_result, turn_ctx.persist_user_display_kind, turn_ctx.reply_expected,
+        ):
+            logger.warning(
+                "Queued follow-up for session %s: suppressing empty_response_exhausted banner on unaddressed machinery turn (%s).",
+                session_key or "?", turn_ctx.persist_user_display_kind,
+            )
+            first_response = ""
+            _silent = True
+        elif self._is_intentional_silence(_delivery_result, first_response):
             _silent = self._silence_allowed_for_source(
                 turn_ctx.source, turn_ctx.persist_user_display_kind, turn_ctx.reply_expected, _delivery_result)
             if _silent:
