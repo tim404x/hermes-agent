@@ -148,9 +148,43 @@ behavior on the next access.
 
 ## 3. SessionStore — Storage and Operations
 
-`SessionStore` is the main storage layer. It maintains an in-memory dict (`_entries`) persisted
-to `sessions.json`, with SQLite (the storage interface's `sessions` and `messages` repositories) as the canonical store for session metadata and
-message transcripts.
+`SessionStore` keeps an in-memory routing index (`_entries`). Its primary copy is the scoped
+`gateway_routing` table in `state.db`; `sessions.json` is an optional mirror and fallback.
+Session metadata and transcripts live in the `sessions` and `messages` repositories.
+
+### Full saves and retirement
+
+A gateway save compares the captured generation with the last successfully persisted gateway
+generation, not with the contents of the whole SQLite scope. It writes only its own changed or
+removed keys. An independent writer's route is not a deletion just because this gateway never
+loaded it. Single-entry saves share the generation order: an older full save cannot undo a newer
+fast save. `replace_routing_entries` remains a separate whole-scope operation for external callers;
+`rewrite=True` explicitly rewrites that scope.
+
+Even unchanged keys are checked for retirement. The SQLite repository can reuse the previous
+all-live verdict only while its relevant retirement and ownership facts, expiry interval and schema
+still hold. Otherwise it prepares from bounded autocommit reads, then validates in the write
+transaction. A retired target is removed only if the stored route still names it. Native indexes
+support retirement by target and namespace; no message- or activity-wide revision is needed.
+
+With mirror writes off, SQLite must commit. Startup reconciles a legacy file's missing keys and
+records that file's digest in the same transaction, without modifying the backup. With writes on,
+a failed DB save journals just the gateway's edits (including deletions) in the atomic mirror;
+replay compares the previous value so a newer direct edit wins. A projection from this same DB
+is not a seed for missing keys. A delayed snapshot taken during fallback preserves only its edits
+when fresh primary rows become available.
+
+**Retention boundary:** an applicable retirement fence is proof to drop a route. An old
+`gateway_routing.updated_at` is not. Even past `RETRY_HORIZON_S` measured from the owning
+profile's `sessions.ended_at`, a local one-shot or cron creation receipt is not by itself
+proof the route is disposable. Authority restore by id reads the receipt; a cold
+`SessionStore.get_or_create_session(source)` miss goes through peer recovery and can mint a
+different id. The empty-scope authority route also participates in compression/target advances.
+The creation copy need not contain a later pin, suspension, resume marker, or `/yolo` toggle.
+API bindings and ordinary messaging lanes likewise are not made disposable by age. No automatic
+horizon sweep is enabled: it needs scope-correct resolution on **both** key-only lookup and
+admission, including refused or unavailable bindings. That pruning work is a separate release
+dependency, not part of this correction. The legacy opt-in idle prune is separate.
 
 ### Constructor
 
@@ -186,8 +220,8 @@ SessionStore(sessions_dir: Path, config: GatewayConfig, has_active_processes_fn=
 
 ### Internal Helpers
 
-- `_ensure_loaded()` / `_ensure_loaded_locked()` — Load `sessions.json` into `_entries` dict.
-- `_save()` — Atomic write to `sessions.json` via temp file + `atomic_replace`.
+- `_ensure_loaded()` / `_ensure_loaded_locked()` — Load the SQLite scope, then import missing keys from a legacy mirror.
+- `_save()` — Persist a generation-ordered full snapshot, then handle the mirror outside the SQLite writer.
 - `_generate_session_key(source)` — Delegates to `build_session_key()` with config params.
 
 ### Storage Layout

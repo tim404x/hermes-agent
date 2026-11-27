@@ -40,6 +40,8 @@ from ._schema_ddl import (
     fts_layout_current, fts_layout_drift, fts_trigram_session_sql,
 )
 from .conversation._store.list_revision import drop_visible_list_triggers
+from .gateway._revision import EXPIRY_INDEX
+from .gateway._targets import TARGET_INDEX, install_routing_index
 
 if TYPE_CHECKING:
     from ._holder import StoreHolder
@@ -1118,6 +1120,8 @@ def _init_schema(holder: StoreHolder):
     except sqlite3.OperationalError as exc:
         logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
     _execute_ddl_skipping_settled_triggers(cursor, DEFERRED_INDEX_SQL)  # same ordering constraint (``active``)
+    for definition in (TARGET_INDEX, EXPIRY_INDEX):
+        install_routing_index(cursor, definition)
 
     # Heal NULL ``active`` rows on every startup: older reconciler builds added ``active``
     # without NOT NULL DEFAULT 1, so ``WHERE active = 1`` loaders hid whole histories. A

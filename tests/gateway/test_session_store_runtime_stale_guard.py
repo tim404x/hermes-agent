@@ -54,6 +54,7 @@ def _db_returning(rows: dict) -> MagicMock:
     db.sessions.get.side_effect = lambda sid: _record(rows[sid]) if sid in rows else None
     # By default recovery finds nothing (forces a fresh session).
     db.routing.latest_session_for_peer.return_value = None
+    db.routing.save_routing_edits.return_value = (set(), 'mock-owner')
     # No compression continuation → the tip is the session itself (identity),
     # mirroring the real lineage tip. Without this a bare Mock
     # would return a Mock the routing heal then assigns as session_id.

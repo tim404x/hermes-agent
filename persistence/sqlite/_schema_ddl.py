@@ -8,6 +8,7 @@ from typing import Sequence
 from persistence.sqlite._state.keys import CRON_PRINCIPAL_ID
 from persistence.sqlite.conversation._store.list_revision import VISIBLE_LIST_REVISION_SQL
 from persistence.sqlite.conversation._store.local import LOCAL_LINEAGE_INDEX_SQL
+from persistence.sqlite.gateway._revision import REVISION_TRIGGERS_SQL
 
 # Pre-split logger identity so log filtering/capture is unchanged.
 logger = logging.getLogger("hermes_state")
@@ -616,7 +617,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_pinned
 -- The expression must stay structurally identical to local.LOCAL_LINEAGE_LEN_EXPR, or the planner silently
 -- falls back to the scan (a test pins the plan).
 {LOCAL_LINEAGE_INDEX_SQL};
-""" + VISIBLE_LIST_REVISION_SQL
+""" + VISIBLE_LIST_REVISION_SQL + REVISION_TRIGGERS_SQL
 
 
 # ── Deferred FTS rebuild bookkeeping (schema v23) ──

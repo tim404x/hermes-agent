@@ -330,6 +330,7 @@ def test_recovered_db_rows_survive_fallback_structural_save(monkeypatch, tmp_pat
     # The failed open stays in its backoff through the load, however long the load takes.
     store._db_handle_cache._unavailable[db_path.parent].next_retry_at = float("inf")
     store._ensure_loaded()
+    assert (sessions_dir / "sessions.json").exists()
     store._db_handle_cache._unavailable[db_path.parent].next_retry_at = 0
 
     current = SessionEntry(
@@ -356,3 +357,33 @@ def test_recovered_db_rows_survive_fallback_structural_save(monkeypatch, tmp_pat
     )
     assert store._entries[current.session_key].session_id == current.session_id
     store.close_all_db_handles()
+    restarted = SessionStore(sessions_dir, GatewayConfig(sessions_dir=sessions_dir, write_sessions_json=False))
+    restarted._ensure_loaded()
+    assert deleted.session_key not in restarted._entries
+    restarted.close_all_db_handles()
+
+
+def test_delayed_fallback_snapshot_cannot_erase_unseen_primary_rows(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig, Platform
+    from gateway.session import SessionSource, SessionStore
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    config, directory = GatewayConfig(write_sessions_json=False), tmp_path / 'sessions'
+    first = SessionStore(directory, config)
+    entry = first.get_or_create_session(SessionSource(Platform.TELEGRAM, chat_id='kept', chat_type='dm'))
+    first.close_all_db_handles()
+    cold = SessionStore(directory, config)
+    try:
+        routing = cold._routing_persistence.routing
+        with patch.object(routing, 'load_routing_entries', side_effect=OSError('read failed')):
+            cold._ensure_loaded()
+            with cold._lock:
+                incomplete = cold._snapshot_routing_locked()
+        cold._ensure_loaded()
+        assert cold._entries[entry.session_key].session_id == entry.session_id
+        cold._persist_routing_data(*incomplete)
+        assert entry.session_key in routing.load_routing_entries(routing_scope=cold._routing_scope())
+        cold._save_entries()
+        assert not (directory / 'sessions.json').exists()
+    finally:
+        cold.close_all_db_handles()
