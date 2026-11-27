@@ -1113,7 +1113,7 @@ hermes kanban reassign <id>... <profile>               # bulk re-assign tasks to
 hermes kanban edit <id> [--title ...] [--body ...]     # edit task title / body / priority in place
         [--priority N]
 hermes kanban promote <id>...                          # move todo/blocked tasks to ready (recovery)
-hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's scheduled_at start time
+hermes kanban schedule <id> [reason...] [--ids <id>...] [--until <ISO8601-or-epoch>]
 hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)
 hermes kanban link <parent_id> <child_id>
 hermes kanban unlink <parent_id> <child_id>
@@ -1124,6 +1124,7 @@ hermes kanban comment <id> "<text>" [--author NAME]
 hermes kanban complete <id>... [--result "..."] [--force]
 hermes kanban block <id> "<reason>" [--ids <id>...]
 hermes kanban unblock <id>...
+hermes kanban untriage <id>... [--reason TEXT]         # keep the spec, reset the block-loop counter
 hermes kanban archive <id>...
 
 hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewer PROFILE]
@@ -1176,13 +1177,12 @@ kanban:
   default_workdir: ~/work/active-project
 ```
 
-### Scheduled task starts (`scheduled_at`)
+### Scheduled maintenance windows
 
-Set `scheduled_at` on a task to delay dispatch until a specific time. The dispatcher skips ready tasks whose `scheduled_at` is in the future and picks them up on the first tick after that timestamp.
+Use `schedule` rather than a transient block for planned waits. On the first tick at or after `--until`, the dispatcher returns the task to its prior phase (`ready` or `review`), or to `todo` if a parent is unfinished. Repeated parks never count toward triage. Without `--until`, a `SCHEDULED_UNTIL=<ISO8601>` marker in the reason sets the timer; with neither, the task waits for `unblock`. A manual unblock clears the timer. Workers on goal-mode tasks must supply a future resume time no more than 12 hours away; orchestrator CLI calls have no such limit.
 
 ```bash
-hermes kanban create "nightly backup audit" \
-  --assignee ops --scheduled-at "2026-06-01T03:00:00Z"
+hermes kanban schedule t_abcd "database maintenance" --until 2026-11-27T04:21:00Z
 ```
 
 ### Respawn guard

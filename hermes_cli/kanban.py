@@ -24,6 +24,7 @@ from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_swarm as ks
 from hermes_cli import kanban_workflow
+from hermes_cli.kanban_dispatch.resume import format_scheduled_until, goal_schedule_error
 from hermes_cli.kanban_output import (
     _ATTACHMENT_FIELDS, _RUNS_RUN_FIELDS, _SHOW_RUN_FIELDS, _bulk_apply, _err,
     _fmt_counts, _fmt_task_line, _fmt_ts, _json_out, _obj_dict, _print_json,
@@ -211,7 +212,7 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
-    "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+    "schedule", "unblock", "untriage", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -1099,13 +1100,25 @@ def _cmd_block(args: argparse.Namespace) -> int:
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
+    raw_until = getattr(args, "until", None)
+    until = kb.coerce_until(raw_until) if raw_until is not None else kb.parse_scheduled_until(reason)
     author = _profile_author()
     ids = _bulk_ids(args)
+    resume = f" until {format_scheduled_until(until)}" if until is not None else ""
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
+        run_ids = {tid: _worker_run_id_for(tid) for tid in ids}
+        for tid, run_id in run_ids.items():
+            if run_id is None:
+                continue
+            task = kb.get_task(conn, tid)
+            if task and task.goal_mode:
+                error = goal_schedule_error(until, int(time.time()))
+                if error:
+                    return _err(error)
         op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
+            conn, tid, reason=reason, expected_run_id=run_ids[tid], until=until))
+        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{resume}{suffix}", lambda tid: f"cannot schedule {tid}")
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
@@ -1121,6 +1134,20 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+
+
+def _cmd_untriage(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban untriage is orchestrator-only; workers must hand off their assigned task")
+    ids, rc = _require_ids(args)
+    if rc:
+        return rc
+    reason = _stripped_or_none(getattr(args, "reason", None))
+    author = _profile_author() if reason else None
+    with kbc.connect_closing() as conn:
+        return _bulk_apply(ids, lambda tid: kb.untriage_task(conn, tid, author=author, reason=reason),
+                           lambda tid: f"Untriaged {tid} -> {kb.get_task(conn, tid).status}",
+                           lambda tid: f"cannot untriage {tid} (not in triage?)")
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
@@ -1439,7 +1466,7 @@ _HANDLERS = {
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
-    "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "schedule": _cmd_schedule, "unblock": _cmd_unblock, "untriage": _cmd_untriage,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
@@ -1466,7 +1493,8 @@ Common subcommands:
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
-  `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
+  `block <id> [reason]` Mark blocked; `schedule <id> [reason] [--until ISO|epoch]` parks time-delay work; `unblock <id>` to revive
+  `untriage <id>…`      Return to todo without rewriting the spec; reset the block-loop counter
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts

@@ -32,6 +32,9 @@ from typing import Any, Iterable, Optional
 from hermes_cli.kanban_admission import claims as admission
 from hermes_cli.kanban_assignee import assignee_sql_filter, resolve_assignee
 from hermes_cli.kanban_db_graph import _parents_satisfied, unsatisfied_parents
+from hermes_cli.kanban_dispatch.resume import (
+    coerce_until, parse_scheduled_until, parked_status, reclaim_dangling_run,
+)
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from hermes_cli.kanban_admission.declarations import _normalize_task_skills, _validate_model_override
 from utils import unlink_files_older_than
@@ -233,15 +236,6 @@ def notify_task_updated(
         _log.debug("kanban task updated hook failed: %s", exc)
 
 
-# DispatchResult counters whose non-zero value means the tick did something.
-_TICK_ACTIVITY_FIELDS = (
-    "spawned", "adopted", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
-    "retried_workspace_cleanups", "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
-    "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
-    "skipped_nonspawnable",
-)
-
-
 def _fire_dispatch_tick_hook(
     result: DispatchResult, *, board: Optional[str] = None, dry_run: bool = False,
 ) -> None:
@@ -264,14 +258,9 @@ def _fire_dispatch_tick_hook(
                 board = get_current_board()
             except Exception:
                 board = None
-        outcome = "ok"
-        if result.skipped_locked:
-            outcome = "skipped_locked"
-        elif not any(getattr(result, f) for f in _TICK_ACTIVITY_FIELDS):
-            outcome = "idle"
         invoke_hook(
             "on_kanban_dispatch_tick", board=board, profile_name=profile_name,
-            dry_run=bool(dry_run), outcome=outcome, result=result,
+            dry_run=bool(dry_run), outcome=result.tick_outcome(), result=result,
         )
     except Exception as exc:  # pragma: no cover - defensive
         _log.debug("kanban dispatch tick hook failed: %s", exc)
@@ -644,6 +633,7 @@ class Task:
     resource_class: str | None = None
     write_scopes: list[str] | None = None
     admission_reason: str | None = None
+    scheduled_until: Optional[int] = None
 
     def admission_fields(self) -> dict:
         return {key: value for key in ("resource_class", "write_scopes", "admission_reason")
@@ -676,7 +666,7 @@ _TASK_REQUIRED_COLUMNS = (
     "id", "title", "body", "assignee", "status", "priority", "created_by",
     "workspace_kind", "workspace_path", "claim_lock",
 )
-_TASK_EPOCH_COLUMNS = ("created_at", "started_at", "completed_at", "claim_expires", "last_heartbeat_at")
+_TASK_EPOCH_COLUMNS = ("created_at", "started_at", "completed_at", "claim_expires", "last_heartbeat_at", "scheduled_until")
 # Later-added columns read as NULL when absent from the row.
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
@@ -883,10 +873,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
     -- same truly-blocked reason after having been unblocked. When it reaches
     -- BLOCK_RECURRENCE_LIMIT the task is routed to ``triage`` instead of
-    -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
-    -- successful completion — NOT on unblock (resetting on unblock is exactly
-    -- the amnesia that let the loop run unbounded).
+    -- ``blocked`` so a cron can't spin it forever. Completion or a human
+    -- untriage resets it; an ordinary unblock does not.
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- UTC epoch seconds to resume a scheduled task; NULL waits for manual unblock.
+    scheduled_until      INTEGER,
     -- Explicit reopen counter: incremented on reopen so unchanged-body retries
     -- start a new logical input_rev instead of adopting an old receipt.
     reopen_epoch         INTEGER NOT NULL DEFAULT 0,
@@ -2163,7 +2154,7 @@ def claim_task(
         if conn.execute('SELECT 1 FROM kanban_result_receipts WHERE task_id=? LIMIT 1', (task_id,)).fetchone():
             if get_receipt_for_input_rev(conn, task_id, input_rev=compute_input_rev(conn, task_id)) is not None:
                 return None
-        _reclaim_dangling_run(
+        reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
         run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now, expect_assignee=expect_assignee)
@@ -3457,50 +3448,26 @@ def promote_task(
     return True, None
 
 
-def _reclaim_dangling_run(
-    conn: sqlite3.Connection, task_id: str, *, statuses, now: int, note: str,
-) -> None:
-    """Close a leaked open run before a status flip so the invariant
-    ``current_run_id IS NULL <=> run row terminal`` holds; no-op normally."""
-    placeholders = ", ".join("?" for _ in statuses)
-    stale = conn.execute(
-        f"SELECT current_run_id FROM tasks WHERE id = ? AND status IN ({placeholders})",
-        (task_id, *statuses),
-    ).fetchone()
-    if stale and stale["current_run_id"]:
-        conn.execute(
-            """
-            UPDATE task_runs
-               SET status = 'reclaimed', outcome = 'reclaimed',
-                   summary = COALESCE(summary, ?),
-                   ended_at = ?,
-                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
-             WHERE id = ? AND ended_at IS NULL
-            """,
-            (note, now, int(stale["current_run_id"])),
-        )
-
-
 def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str:
     """``ready`` if every parent is terminal else ``todo`` — the re-gate shared by
     unblock/reopen so neither can spawn a child whose upstream is unfinished."""
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(conn: sqlite3.Connection, task_id: str, *, auto_release: Optional[dict] = None) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
     with write_txn(conn):
-        resume_status = (
-            _resume_status_from_events(conn, task_id)
-            if _task_status(conn, task_id) == "blocked"
-            else "ready"
-        )
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
-            note="invariant recovery on unblock",
-        )
+        status = parked_status(conn, task_id, auto_release)
+        if status is None:
+            return False
+        if status == "scheduled":
+            event = _latest_event(conn, task_id, "scheduled")
+            source = _json_dict(_row_get(event, "payload")).get("source_status")
+            resume_status = "review" if source == "review" else "ready"
+        else:
+            resume_status = _resume_status_from_events(conn, task_id)
         # Re-gate on parent completion before restoring the source phase.
         landing_status = _landing_status_after_parents(conn, task_id)
         new_status = (
@@ -3508,39 +3475,55 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
-        if new_status == "review" and _admit_task(conn, task_id, "blocked"):
+        if new_status == "review" and _admit_task(conn, task_id, status):
             return False
+        reclaim_dangling_run(
+            conn, task_id, statuses=("blocked", "scheduled"), now=now,
+            note="invariant recovery on unblock",
+        )
         # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
-        # resetting them is the amnesia that let cron-unblock <-> re-block loop
-        # unbounded; only complete_task clears them. ``consecutive_failures``
-        # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
-        # is a fresh start for the retry budget.
+        # a re-block is still a recurrence; only the dispatch retry budget gets a fresh start.
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "UPDATE tasks SET status = ?, current_run_id = NULL, scheduled_until = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
-        )
+        payload = dict(auto_release or {})
+        if new_status != "ready" or resume_status != "ready" or auto_release == {}:
+            payload.update(status=new_status, resume_status=resume_status)
+        _append_event(conn, task_id, "unblocked", payload)
         return True
+
+
+def release_due_scheduled(conn: sqlite3.Connection, now: Optional[int] = None) -> list[str]:
+    """Re-gate due parks through unblock, comparing the observed deadline under its write lock."""
+    rows = conn.execute(
+        "SELECT id, scheduled_until FROM tasks WHERE status = 'scheduled' "
+        "AND scheduled_until IS NOT NULL AND scheduled_until <= ?",
+        (int(time.time()) if now is None else now,),
+    ).fetchall()
+    released = []
+    for row in rows:
+        task_id = row["id"]
+        try:
+            if unblock_task(conn, task_id, auto_release={"auto": "scheduled_until", "until": row["scheduled_until"]}):
+                released.append(task_id)
+        except Exception:
+            _log.exception("Failed to release scheduled task %s", task_id)
+    return released
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
     comments; restores the implementer from the ``review_requested`` event.
     Preserves ``consecutive_failures`` and the block loop counter (review is
-    not a block; only :func:`complete_task` clears them)."""
+    not a block)."""
     now = int(time.time())
     with write_txn(conn):
-        _reclaim_dangling_run(
+        reclaim_dangling_run(
             conn, task_id, statuses=("review",), now=now,
             note="invariant recovery on review reopen",
         )
@@ -3723,6 +3706,33 @@ def specify_triage_task(
     return True
 
 
+def untriage_task(
+    conn: sqlite3.Connection, task_id: str, *, author: Optional[str] = None, reason: Optional[str] = None,
+) -> bool:
+    """Restore an intact spec to todo: a human ruled this was not a loop.
+
+    Specify kept the counter, so the next block re-triaged the card in 26 s.
+    """
+    with write_txn(conn):
+        prior = conn.execute(
+            "SELECT block_kind, block_recurrences FROM tasks WHERE id = ? AND status = 'triage'", (task_id,),
+        ).fetchone()
+        if prior is None:
+            return False
+        conn.execute(
+            "UPDATE tasks SET status='todo', block_recurrences=0, block_kind=NULL WHERE id=? AND status='triage'",
+            (task_id,),
+        )
+        if reason:
+            add_comment(conn, task_id, author or "operator", f"UNTRIAGE: {reason}")
+        _append_event(conn, task_id, "untriaged", {
+            "prev_block_kind": prior["block_kind"], "prev_block_recurrences": prior["block_recurrences"],
+            "reason": reason,
+        })
+    recompute_ready(conn)
+    return True
+
+
 def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
     """Archive a task; a *running* task's host-local worker is terminated.
 
@@ -3807,15 +3817,23 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    expected_run_id: Optional[int] = None,
+    expected_run_id: Optional[int] = None, until: Optional[int] = None,
 ) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    until the deadline or a manual ``unblock_task`` re-gates it."""
+    scheduled_until = coerce_until(until) if until is not None else parse_scheduled_until(reason)
     with write_txn(conn):
-        params: list[Any] = [task_id]
+        prior_status = _task_status(conn, task_id)
+        source_status = "ready"
+        if prior_status == "running":
+            source_status = _retry_status_for_run(conn, task_id)
+        elif prior_status == "blocked":
+            source_status = _resume_status_from_events(conn, task_id)
+        params: list[Any] = [scheduled_until, task_id]
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
+                   scheduled_until = ?,
                    claim_lock   = NULL,
                    claim_expires= NULL,
                    worker_pid   = NULL
@@ -3830,7 +3848,9 @@ def schedule_task(
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        _append_event(conn, task_id, "scheduled", {
+            "reason": reason, "until": scheduled_until, "source_status": source_status,
+        }, run_id=run_id)
         return True
 
 
