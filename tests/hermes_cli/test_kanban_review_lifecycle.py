@@ -32,6 +32,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_ops
+from plugins.kanban.dashboard import plugin_api
 
 
 @pytest.fixture
@@ -945,6 +946,266 @@ def test_active_pr_guard_lifts_after_untriage_release(
             body="Updated https://github.com/example/repo/pull/68",
         )
         assert kbd.check_respawn_guard(conn, with_reason_id) == "active_pr"
+
+
+def test_active_pr_guard_lifts_after_operator_unblock_task(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit operator/orchestrator ``unblock_task`` (CLI, tool, dashboard,
+    or Python API) lifts ``active_pr`` so an unblocked PR card dispatches
+    instead of deadlocking in ``ready`` (t_821c01d3 repro).
+
+    Also covers same-second operator comment citing a PR URL right before
+    ``unblock_task()``, CLI ``hermes kanban unblock --reason`` citing a PR URL,
+    and immediate re-arming when a worker posts a new PR comment after unblock
+    (even within the same second).
+    """
+    import argparse
+
+    import hermes_cli.config as cfgmod
+    import hermes_cli.kanban as kanban_cli
+    import hermes_cli.profiles as profmod
+    from tools import kanban_tools
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    pr_url = "https://github.com/Hub-xyz/hub-hand-pose-3d/pull/333"
+    pr_comment = f"PR #333 ({pr_url}) merged; awaiting Option A/B decision."
+    claimed_ids: list[str] = []
+
+    def spawn(task, _workspace):
+        claimed_ids.append(task.id)
+
+    with kbc.connect() as conn:
+        # 1. Exact t_821c01d3 repro: worker links PR URL -> blocks needs_input ->
+        #    orchestrator comments decision + calls unblock_task -> dispatches.
+        repro_id = kb.create_task(conn, title="WM3D P1A Fix+Reverify", assignee="kepler")
+        claimed = kb.claim_task(conn, repro_id, claimer="kepler")
+        assert claimed is not None
+        kb.add_comment(conn, repro_id, author="kepler", body=pr_comment)
+        assert kb.block_task(
+            conn, repro_id, kind="needs_input", reason="Option A vs B",
+            expected_run_id=claimed.current_run_id,
+        ) is True
+        _backdate_comments(conn, repro_id)
+        kb.add_comment(conn, repro_id, author="default", body="DECISION NEO-AZ: proceed with Option B.")
+        assert kb.unblock_task(conn, repro_id) is True
+        assert _task_status(conn, repro_id) == "ready"
+        assert kbd.check_respawn_guard(conn, repro_id) is None
+
+        # 2. Same-second operator comment citing the PR URL + unblock_task atomicity.
+        same_sec_id = kb.create_task(conn, title="same second operator comment + unblock", assignee="kepler")
+        c2 = kb.claim_task(conn, same_sec_id, claimer="kepler")
+        assert c2 is not None
+        kb.add_comment(conn, same_sec_id, author="kepler", body=pr_comment)
+        assert kb.block_task(
+            conn, same_sec_id, kind="needs_input", reason="awaiting decision",
+            expected_run_id=c2.current_run_id,
+        ) is True
+        kb.add_comment(conn, same_sec_id, author="default", body=f"DECISION: proceed on {pr_url}")
+        assert kb.unblock_task(conn, same_sec_id) is True
+        assert _task_status(conn, same_sec_id) == "ready"
+        assert kbd.check_respawn_guard(conn, same_sec_id) is None
+
+        # 3. CLI `hermes kanban unblock <id> --reason "... <PR URL>"` lifts active_pr
+        #    and does not write an orphan comment when the card is not blocked.
+        cli_id = kb.create_task(conn, title="cli unblock with pr url", assignee="kepler")
+        c3 = kb.claim_task(conn, cli_id, claimer="kepler")
+        assert c3 is not None
+        kb.add_comment(conn, cli_id, author="kepler", body=pr_comment)
+        assert kb.block_task(
+            conn, cli_id, kind="needs_input", reason="need go",
+            expected_run_id=c3.current_run_id,
+        ) is True
+        parser = argparse.ArgumentParser(prog="hermes")
+        kanban_cli.build_parser(parser.add_subparsers())
+        rc = kanban_cli.kanban_command(
+            parser.parse_args(["kanban", "unblock", cli_id, "--reason", f"Approved {pr_url}"])
+        )
+        assert rc == 0
+        assert _task_status(conn, cli_id) == "ready"
+        assert kbd.check_respawn_guard(conn, cli_id) is None
+        # Calling CLI unblock on an already-ready card fails cleanly without adding a comment.
+        before_comments = len(kb.list_comments(conn, cli_id))
+        rc_fail = kanban_cli.kanban_command(
+            parser.parse_args(["kanban", "unblock", cli_id, "--reason", "should not comment"])
+        )
+        assert rc_fail != 0
+        assert len(kb.list_comments(conn, cli_id)) == before_comments
+
+        # 4. Orchestrator tool `kanban_unblock` lifts active_pr.
+        tool_id = kb.create_task(conn, title="tool unblock", assignee="kepler")
+        c4 = kb.claim_task(conn, tool_id, claimer="kepler")
+        assert c4 is not None
+        kb.add_comment(conn, tool_id, author="kepler", body=pr_comment)
+        assert kb.block_task(
+            conn, tool_id, kind="needs_input", reason="need tool unblock",
+            expected_run_id=c4.current_run_id,
+        ) is True
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+        tool_res = json.loads(kanban_tools._handle_unblock({"task_id": tool_id}))
+        assert tool_res["status"] == "ready"
+        assert kbd.check_respawn_guard(conn, tool_id) is None
+
+        # 5. Dashboard drag blocked -> ready (`_drag_to`) lifts active_pr.
+        dash_id = kb.create_task(conn, title="dashboard unblock", assignee="kepler")
+        c5 = kb.claim_task(conn, dash_id, claimer="kepler")
+        assert c5 is not None
+        kb.add_comment(conn, dash_id, author="kepler", body=pr_comment)
+        assert kb.block_task(
+            conn, dash_id, kind="needs_input", reason="need drag",
+            expected_run_id=c5.current_run_id,
+        ) is True
+        assert plugin_api._drag_to(conn, dash_id, "ready") is True
+        assert _task_status(conn, dash_id) == "ready"
+        assert kbd.check_respawn_guard(conn, dash_id) is None
+
+        # Dispatch claims and spawns all 5 explicitly unblocked PR cards.
+        res = kbd.dispatch_once(conn, spawn_fn=spawn)
+        expected_ids = {repro_id, same_sec_id, cli_id, tool_id, dash_id}
+        assert expected_ids <= {s[0] for s in res.spawned}
+        assert expected_ids <= set(claimed_ids)
+        assert not (expected_ids & set(dict(res.respawn_guarded)))
+
+        # 6. A new worker PR comment AFTER unblock re-arms active_pr (even in the same second).
+        assert kb.reclaim_task(conn, same_sec_id, reason="worker exited") is True
+        kb.add_comment(
+            conn, same_sec_id, author="kepler",
+            body="Opened follow-up https://github.com/Hub-xyz/hub-hand-pose-3d/pull/334",
+        )
+        assert kbd.check_respawn_guard(conn, same_sec_id) == "active_pr"
+
+
+def test_active_pr_guard_holds_on_auto_scheduled_wake_and_legacy_ties(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Automated ``release_due_scheduled`` wakes never lift ``active_pr``, while
+    manual operator unblocks on ``scheduled`` cards do; legacy ``unblocked``
+    rows without ``after_comment_id`` lift strictly after the PR comment and
+    fail closed on same-second ties; earlier ``unblocked`` events never leak
+    past a subsequent ``blocked`` or ``triage`` barrier.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    pr_comment = "Opened https://github.com/Hub-xyz/hub-hand-pose-3d/pull/333 for review."
+    spawned: list[str] = []
+
+    def _strip_unblocked_payload(conn, tid: str) -> int:
+        with kb.write_txn(conn):
+            row = conn.execute(
+                "SELECT id, created_at FROM task_events WHERE task_id = ? AND kind = 'unblocked' "
+                "ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+            assert row is not None
+            conn.execute("UPDATE task_events SET payload = NULL WHERE id = ?", (row["id"],))
+            return int(row["created_at"])
+
+    with kbc.connect() as conn:
+        # 1. Automated scheduled/maintenance-park wake must NOT lift active_pr.
+        auto_wake_id = kb.create_task(conn, title="auto scheduled wake", assignee="kepler")
+        c1 = kb.claim_task(conn, auto_wake_id, claimer="kepler")
+        assert c1 is not None
+        kb.add_comment(conn, auto_wake_id, author="kepler", body=pr_comment)
+        _backdate_comments(conn, auto_wake_id)
+        assert kb.schedule_task(
+            conn, auto_wake_id, reason="quiet window", until=100,
+            expected_run_id=c1.current_run_id,
+        ) is True
+        assert kb.release_due_scheduled(conn, now=200) == [auto_wake_id]
+        assert _task_status(conn, auto_wake_id) == "ready"
+        assert kbd.check_respawn_guard(conn, auto_wake_id) == "active_pr"
+
+        # 2. Explicit operator unblock on a scheduled card DOES lift active_pr.
+        manual_sched_id = kb.create_task(conn, title="manual scheduled unblock", assignee="kepler")
+        c2 = kb.claim_task(conn, manual_sched_id, claimer="kepler")
+        assert c2 is not None
+        kb.add_comment(conn, manual_sched_id, author="kepler", body=pr_comment)
+        assert kb.schedule_task(
+            conn, manual_sched_id, reason="waiting on operator", until=9999999999,
+            expected_run_id=c2.current_run_id,
+        ) is True
+        assert kb.unblock_task(conn, manual_sched_id) is True
+        assert _task_status(conn, manual_sched_id) == "ready"
+        assert kbd.check_respawn_guard(conn, manual_sched_id) is None
+
+        # 3. Legacy unblocked row (payload=None) strictly after PR comment lifts.
+        legacy_after_id = kb.create_task(conn, title="legacy unblock strictly after", assignee="kepler")
+        c3 = kb.claim_task(conn, legacy_after_id, claimer="kepler")
+        assert c3 is not None
+        kb.add_comment(conn, legacy_after_id, author="kepler", body=pr_comment)
+        assert kb.block_task(
+            conn, legacy_after_id, kind="needs_input", reason="decision needed",
+            expected_run_id=c3.current_run_id,
+        ) is True
+        _backdate_comments(conn, legacy_after_id)
+        assert kb.unblock_task(conn, legacy_after_id) is True
+        _strip_unblocked_payload(conn, legacy_after_id)
+        assert kbd.check_respawn_guard(conn, legacy_after_id) is None
+
+        # 4. Legacy unblocked row (payload=None) in the same second fails closed.
+        legacy_tie_id = kb.create_task(conn, title="legacy unblock same second tie", assignee="kepler")
+        c4 = kb.claim_task(conn, legacy_tie_id, claimer="kepler")
+        assert c4 is not None
+        kb.add_comment(conn, legacy_tie_id, author="kepler", body=pr_comment)
+        assert kb.block_task(
+            conn, legacy_tie_id, kind="needs_input", reason="decision needed",
+            expected_run_id=c4.current_run_id,
+        ) is True
+        assert kb.unblock_task(conn, legacy_tie_id) is True
+        unblock_ts = _strip_unblocked_payload(conn, legacy_tie_id)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_comments SET created_at = ? WHERE task_id = ?", (unblock_ts, legacy_tie_id))
+        assert kbd.check_respawn_guard(conn, legacy_tie_id) == "active_pr"
+
+        # 5. Earlier unblock does NOT survive a subsequent block + automated wake.
+        stale_unblock_id = kb.create_task(conn, title="stale unblock before new block", assignee="kepler")
+        c5 = kb.claim_task(conn, stale_unblock_id, claimer="kepler")
+        assert c5 is not None
+        kb.add_comment(conn, stale_unblock_id, author="kepler", body=pr_comment)
+        _backdate_comments(conn, stale_unblock_id)
+        assert kb.block_task(
+            conn, stale_unblock_id, kind="needs_input", reason="first block",
+            expected_run_id=c5.current_run_id,
+        ) is True
+        assert kb.unblock_task(conn, stale_unblock_id) is True
+        c5b = kb.claim_task(conn, stale_unblock_id, claimer="kepler")
+        assert c5b is not None
+        assert kb.block_task(
+            conn, stale_unblock_id, kind="transient", reason="second block",
+            expected_run_id=c5b.current_run_id,
+        ) is True
+        assert kb.schedule_task(conn, stale_unblock_id, reason="parked after block", until=100) is True
+        assert kb.release_due_scheduled(conn, now=200) == [stale_unblock_id]
+        assert _task_status(conn, stale_unblock_id) == "ready"
+        assert kbd.check_respawn_guard(conn, stale_unblock_id) == "active_pr"
+
+        # 6. Corrupt comment created_at stays guarded even with same-second after_comment_id.
+        corrupt_ts_id = kb.create_task(conn, title="corrupt comment ts", assignee="kepler")
+        c6 = kb.claim_task(conn, corrupt_ts_id, claimer="kepler")
+        assert c6 is not None
+        kb.add_comment(conn, corrupt_ts_id, author="kepler", body=pr_comment)
+        assert kb.block_task(
+            conn, corrupt_ts_id, kind="needs_input", reason="wait",
+            expected_run_id=c6.current_run_id,
+        ) is True
+        assert kb.unblock_task(conn, corrupt_ts_id) is True
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_comments SET created_at = 'not-a-timestamp' WHERE task_id = ?", (corrupt_ts_id,))
+        assert kbd.check_respawn_guard(conn, corrupt_ts_id) == "active_pr"
+
+        res = kbd.dispatch_once(conn, spawn_fn=lambda task, _ws: spawned.append(task.id))
+        assert set(spawned) == {manual_sched_id, legacy_after_id}
+        assert dict(res.respawn_guarded) == {
+            auto_wake_id: "active_pr",
+            legacy_tie_id: "active_pr",
+            stale_unblock_id: "active_pr",
+            corrupt_ts_id: "active_pr",
+        }
 
 
 def test_dispatch_json_exposes_suppression_reasons(

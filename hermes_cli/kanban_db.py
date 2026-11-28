@@ -3454,10 +3454,25 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str, *, auto_release: Optional[dict] = None) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    auto_release: Optional[dict] = None,
+    author: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
+    clean_reason = (reason or "").strip() or None
+    if clean_reason is not None:
+        from hermes_cli.kanban_swarm import redact_blackboard_comment
+        clean_reason = (
+            redact_blackboard_comment(clean_reason)
+            or str(redact_review_value(clean_reason)).strip()
+            or None
+        )
     with write_txn(conn):
         status = parked_status(conn, task_id, auto_release)
         if status is None:
@@ -3491,9 +3506,26 @@ def unblock_task(conn: sqlite3.Connection, task_id: str, *, auto_release: Option
         )
         if cur.rowcount != 1:
             return False
+        comment_id = (
+            add_comment(conn, task_id, author or "operator", f"UNBLOCK: {clean_reason}")
+            if clean_reason
+            else None
+        )
         payload = dict(auto_release or {})
+        if auto_release is not None and not payload.get("auto"):
+            payload["auto"] = True
         if new_status != "ready" or resume_status != "ready" or auto_release == {}:
             payload.update(status=new_status, resume_status=resume_status)
+        if comment_id is not None:
+            payload["reason"] = clean_reason
+            payload["comment_id"] = comment_id
+        if auto_release is None:
+            max_cid = conn.execute(
+                "SELECT MAX(id) FROM task_comments WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+            if max_cid is not None:
+                payload["after_comment_id"] = int(max_cid)
         _append_event(conn, task_id, "unblocked", payload)
         return True
 
