@@ -29,8 +29,9 @@ def test_auto_decompose_tick_reads_launch_profile_secrets_under_multiplex(monkey
 
     seen = {}
 
-    def fake_decompose(task_id, author=None):
+    def fake_decompose(task_id, author=None, source=None):
         seen["value"] = ss.get_secret("ANTHROPIC_API_KEY")
+        seen["source"] = source
         return SimpleNamespace(ok=True, fanout=False, child_ids=None, reason=None)
 
     fake = SimpleNamespace(list_triage_ids=lambda: ["t1"], decompose_task=fake_decompose)
@@ -46,6 +47,7 @@ def test_auto_decompose_tick_reads_launch_profile_secrets_under_multiplex(monkey
 
     assert decomposed == 1
     assert seen["value"] == "launch-profile-key"
+    assert seen["source"] == "auto-decomposer"
     assert ss.current_secret_scope() is None
 
 
@@ -66,8 +68,9 @@ def test_auto_decompose_board_pin_stays_inside_the_tick(monkeypatch, tmp_path):
 
     seen = {}
 
-    def fake_decompose(task_id, author=None):
+    def fake_decompose(task_id, author=None, source=None):
         seen["tick"] = kb.get_current_board()
+        seen["source"] = source
         other = threading.Thread(target=lambda: seen.update(other=kb.get_current_board()))
         other.start()
         other.join()
@@ -80,3 +83,4 @@ def test_auto_decompose_board_pin_stays_inside_the_tick(monkeypatch, tmp_path):
     assert asyncio.run(_to_thread_process_service(_dispatcher().auto_decompose_tick, 5)) == 1
     assert seen["tick"] == "clientb"
     assert seen["other"] == "work"
+    assert seen["source"] == "auto-decomposer"

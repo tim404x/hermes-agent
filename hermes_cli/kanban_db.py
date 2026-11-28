@@ -33,7 +33,8 @@ from hermes_cli.kanban_admission import claims as admission
 from hermes_cli.kanban_assignee import assignee_sql_filter, resolve_assignee
 from hermes_cli.kanban_db_graph import _parents_satisfied, unsatisfied_parents
 from hermes_cli.kanban_dispatch.resume import (
-    coerce_until, parse_scheduled_until, parked_status, reclaim_dangling_run,
+    build_unblock_audit_payload, coerce_until, parse_scheduled_until, parked_status,
+    reclaim_dangling_run, specify_triage_updates, untriage_event_payload,
 )
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from hermes_cli.kanban_admission.declarations import _normalize_task_skills, _validate_model_override
@@ -3454,7 +3455,10 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str, *, auto_release: Optional[dict] = None) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection, task_id: str, *, auto_release: Optional[dict] = None,
+    author: Optional[str] = None, reason: Optional[str] = None,
+) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
@@ -3464,25 +3468,17 @@ def unblock_task(conn: sqlite3.Connection, task_id: str, *, auto_release: Option
             return False
         if status == "scheduled":
             event = _latest_event(conn, task_id, "scheduled")
-            source = _json_dict(_row_get(event, "payload")).get("source_status")
-            resume_status = "review" if source == "review" else "ready"
+            resume_status = "review" if _json_dict(_row_get(event, "payload")).get("source_status") == "review" else "ready"
         else:
             resume_status = _resume_status_from_events(conn, task_id)
-        # Re-gate on parent completion before restoring the source phase.
         landing_status = _landing_status_after_parents(conn, task_id)
-        new_status = (
-            "review"
-            if landing_status == "ready" and resume_status == "review"
-            else landing_status
-        )
+        new_status = "review" if landing_status == "ready" and resume_status == "review" else landing_status
         if new_status == "review" and _admit_task(conn, task_id, status):
             return False
         reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
-            note="invariant recovery on unblock",
+            conn, task_id, statuses=("blocked", "scheduled"), now=now, note="invariant recovery on unblock",
         )
-        # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
-        # a re-block is still a recurrence; only the dispatch retry budget gets a fresh start.
+        # ``block_kind``/``block_recurrences`` survive the unblock; only dispatch retries reset.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, scheduled_until = NULL, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
@@ -3491,9 +3487,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str, *, auto_release: Option
         )
         if cur.rowcount != 1:
             return False
-        payload = dict(auto_release or {})
-        if new_status != "ready" or resume_status != "ready" or auto_release == {}:
-            payload.update(status=new_status, resume_status=resume_status)
+        payload = build_unblock_audit_payload(
+            conn, task_id, auto_release=auto_release, new_status=new_status, resume_status=resume_status,
+            author=author, reason=reason, add_comment_fn=add_comment, redact_fn=redact_review_value,
+        )
         _append_event(conn, task_id, "unblocked", payload)
         return True
 
@@ -3652,6 +3649,7 @@ def invalidate_descendants_for_parent_reopen(
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
+    source: str = "operator",
 ) -> bool:
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
@@ -3660,6 +3658,7 @@ def specify_triage_task(
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
+    resolved_source = (source or "").strip() or "operator"
     with write_txn(conn):
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
@@ -3667,25 +3666,12 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
-        sets: list[str] = ["status = 'todo'"]
-        params: list[Any] = []
-        changed_fields: list[str] = []
-        if title is not None and title.strip() != (existing["title"] or ""):
-            sets.append("title = ?")
-            params.append(title.strip())
-            changed_fields.append("title")
-        if body is not None and (body or "") != (existing["body"] or ""):
-            sets.append("body = ?")
-            params.append(body)
-            changed_fields.append("body")
-        if assignee is not None and assignee != (existing["assignee"] or None):
-            sets.append("assignee = ?")
-            params.append(assignee)
-            changed_fields.append("assignee")
+        sets, params, changed_fields = specify_triage_updates(
+            existing, title=title, body=body, assignee=assignee,
+        )
         params.append(task_id)
         cur = conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} "
-            f"WHERE id = ? AND status = 'triage'", tuple(params),
+            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ? AND status = 'triage'", tuple(params),
         )
         if cur.rowcount != 1:
             return False
@@ -3696,10 +3682,10 @@ def specify_triage_task(
                 "Specified — updated " + ", ".join(changed_fields) + " and promoted to todo.",
                 int(time.time()),
             )
-        _append_event(
-            conn, task_id, "specified",
-            {"changed_fields": changed_fields} if changed_fields else None,
-        )
+        payload: dict[str, Any] = {"source": resolved_source}
+        if changed_fields:
+            payload["changed_fields"] = changed_fields
+        _append_event(conn, task_id, "specified", payload)
     # Own IMMEDIATE txn (outside the one above): a parent-free specified task
     # flips to 'ready' now instead of idling until the next tick.
     recompute_ready(conn)
@@ -3723,12 +3709,8 @@ def untriage_task(
             "UPDATE tasks SET status='todo', block_recurrences=0, block_kind=NULL WHERE id=? AND status='triage'",
             (task_id,),
         )
-        if reason:
-            add_comment(conn, task_id, author or "operator", f"UNTRIAGE: {reason}")
-        _append_event(conn, task_id, "untriaged", {
-            "prev_block_kind": prior["block_kind"], "prev_block_recurrences": prior["block_recurrences"],
-            "reason": reason,
-        })
+        comment_id = add_comment(conn, task_id, author or "operator", f"UNTRIAGE: {reason}") if reason else None
+        _append_event(conn, task_id, "untriaged", untriage_event_payload(prior, reason, comment_id))
     recompute_ready(conn)
     return True
 
