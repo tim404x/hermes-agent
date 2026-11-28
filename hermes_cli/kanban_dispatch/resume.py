@@ -3,7 +3,7 @@
 import re
 import sqlite3
 from datetime import UTC, datetime
-from typing import Optional
+from typing import Any, Callable, Optional
 
 
 GOAL_MODE_MAX_SCHEDULE_SECONDS = 12 * 3600
@@ -92,3 +92,89 @@ def reclaim_dangling_run(
             """,
             (note, now, int(stale["current_run_id"])),
         )
+
+
+def build_unblock_audit_payload(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    auto_release: Optional[dict],
+    new_status: str,
+    resume_status: str,
+    author: Optional[str],
+    reason: Optional[str],
+    add_comment_fn: Callable[[sqlite3.Connection, str, str, str], int],
+    redact_fn: Callable[[Any], Any],
+) -> dict[str, Any]:
+    """Write any operator ``UNBLOCK:`` comment and build the ``unblocked`` event payload."""
+    clean_reason = (reason or "").strip() or None
+    if clean_reason is not None:
+        from hermes_cli.kanban_swarm import redact_blackboard_comment
+        clean_reason = (
+            redact_blackboard_comment(clean_reason)
+            or str(redact_fn(clean_reason)).strip()
+            or None
+        )
+    comment_id = (
+        add_comment_fn(conn, task_id, author or "operator", f"UNBLOCK: {clean_reason}")
+        if clean_reason
+        else None
+    )
+    payload: dict[str, Any] = dict(auto_release or {})
+    if auto_release is not None and not payload.get("auto"):
+        payload["auto"] = True
+    if new_status != "ready" or resume_status != "ready" or auto_release == {}:
+        payload.update(status=new_status, resume_status=resume_status)
+    if comment_id is not None:
+        payload["reason"] = clean_reason
+        payload["comment_id"] = comment_id
+    if auto_release is None:
+        max_cid = conn.execute(
+            "SELECT MAX(id) FROM task_comments WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+        if max_cid is not None:
+            payload["after_comment_id"] = int(max_cid)
+    return payload
+
+
+def specify_triage_updates(
+    existing: sqlite3.Row,
+    *,
+    title: Optional[str],
+    body: Optional[str],
+    assignee: Optional[str],
+) -> tuple[list[str], list[Any], list[str]]:
+    """Compute SQL SET clauses, params, and changed field names for ``specify_triage_task``."""
+    sets: list[str] = ["status = 'todo'"]
+    params: list[Any] = []
+    changed_fields: list[str] = []
+    if title is not None and title.strip() != (existing["title"] or ""):
+        sets.append("title = ?")
+        params.append(title.strip())
+        changed_fields.append("title")
+    if body is not None and (body or "") != (existing["body"] or ""):
+        sets.append("body = ?")
+        params.append(body)
+        changed_fields.append("body")
+    if assignee is not None and assignee != (existing["assignee"] or None):
+        sets.append("assignee = ?")
+        params.append(assignee)
+        changed_fields.append("assignee")
+    return sets, params, changed_fields
+
+
+def untriage_event_payload(
+    prior: sqlite3.Row,
+    reason: Optional[str],
+    comment_id: Optional[int],
+) -> dict[str, Any]:
+    """Build the ``untriaged`` event payload with optional verified ``comment_id``."""
+    payload: dict[str, Any] = {
+        "prev_block_kind": prior["block_kind"],
+        "prev_block_recurrences": prior["block_recurrences"],
+        "reason": reason,
+    }
+    if comment_id is not None:
+        payload["comment_id"] = comment_id
+    return payload

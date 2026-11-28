@@ -33,7 +33,8 @@ from hermes_cli.kanban_admission import claims as admission
 from hermes_cli.kanban_assignee import assignee_sql_filter, resolve_assignee
 from hermes_cli.kanban_db_graph import _parents_satisfied, unsatisfied_parents
 from hermes_cli.kanban_dispatch.resume import (
-    coerce_until, parse_scheduled_until, parked_status, reclaim_dangling_run,
+    build_unblock_audit_payload, coerce_until, parse_scheduled_until, parked_status,
+    reclaim_dangling_run, specify_triage_updates, untriage_event_payload,
 )
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from hermes_cli.kanban_admission.declarations import _normalize_task_skills, _validate_model_override
@@ -3455,49 +3456,29 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 
 
 def unblock_task(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    auto_release: Optional[dict] = None,
-    author: Optional[str] = None,
-    reason: Optional[str] = None,
+    conn: sqlite3.Connection, task_id: str, *, auto_release: Optional[dict] = None,
+    author: Optional[str] = None, reason: Optional[str] = None,
 ) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
-    clean_reason = (reason or "").strip() or None
-    if clean_reason is not None:
-        from hermes_cli.kanban_swarm import redact_blackboard_comment
-        clean_reason = (
-            redact_blackboard_comment(clean_reason)
-            or str(redact_review_value(clean_reason)).strip()
-            or None
-        )
     with write_txn(conn):
         status = parked_status(conn, task_id, auto_release)
         if status is None:
             return False
         if status == "scheduled":
             event = _latest_event(conn, task_id, "scheduled")
-            source = _json_dict(_row_get(event, "payload")).get("source_status")
-            resume_status = "review" if source == "review" else "ready"
+            resume_status = "review" if _json_dict(_row_get(event, "payload")).get("source_status") == "review" else "ready"
         else:
             resume_status = _resume_status_from_events(conn, task_id)
-        # Re-gate on parent completion before restoring the source phase.
         landing_status = _landing_status_after_parents(conn, task_id)
-        new_status = (
-            "review"
-            if landing_status == "ready" and resume_status == "review"
-            else landing_status
-        )
+        new_status = "review" if landing_status == "ready" and resume_status == "review" else landing_status
         if new_status == "review" and _admit_task(conn, task_id, status):
             return False
         reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
-            note="invariant recovery on unblock",
+            conn, task_id, statuses=("blocked", "scheduled"), now=now, note="invariant recovery on unblock",
         )
-        # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
-        # a re-block is still a recurrence; only the dispatch retry budget gets a fresh start.
+        # ``block_kind``/``block_recurrences`` survive the unblock; only dispatch retries reset.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, scheduled_until = NULL, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
@@ -3506,26 +3487,10 @@ def unblock_task(
         )
         if cur.rowcount != 1:
             return False
-        comment_id = (
-            add_comment(conn, task_id, author or "operator", f"UNBLOCK: {clean_reason}")
-            if clean_reason
-            else None
+        payload = build_unblock_audit_payload(
+            conn, task_id, auto_release=auto_release, new_status=new_status, resume_status=resume_status,
+            author=author, reason=reason, add_comment_fn=add_comment, redact_fn=redact_review_value,
         )
-        payload = dict(auto_release or {})
-        if auto_release is not None and not payload.get("auto"):
-            payload["auto"] = True
-        if new_status != "ready" or resume_status != "ready" or auto_release == {}:
-            payload.update(status=new_status, resume_status=resume_status)
-        if comment_id is not None:
-            payload["reason"] = clean_reason
-            payload["comment_id"] = comment_id
-        if auto_release is None:
-            max_cid = conn.execute(
-                "SELECT MAX(id) FROM task_comments WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()[0]
-            if max_cid is not None:
-                payload["after_comment_id"] = int(max_cid)
         _append_event(conn, task_id, "unblocked", payload)
         return True
 
@@ -3701,25 +3666,12 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
-        sets: list[str] = ["status = 'todo'"]
-        params: list[Any] = []
-        changed_fields: list[str] = []
-        if title is not None and title.strip() != (existing["title"] or ""):
-            sets.append("title = ?")
-            params.append(title.strip())
-            changed_fields.append("title")
-        if body is not None and (body or "") != (existing["body"] or ""):
-            sets.append("body = ?")
-            params.append(body)
-            changed_fields.append("body")
-        if assignee is not None and assignee != (existing["assignee"] or None):
-            sets.append("assignee = ?")
-            params.append(assignee)
-            changed_fields.append("assignee")
+        sets, params, changed_fields = specify_triage_updates(
+            existing, title=title, body=body, assignee=assignee,
+        )
         params.append(task_id)
         cur = conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} "
-            f"WHERE id = ? AND status = 'triage'", tuple(params),
+            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ? AND status = 'triage'", tuple(params),
         )
         if cur.rowcount != 1:
             return False
@@ -3758,13 +3710,7 @@ def untriage_task(
             (task_id,),
         )
         comment_id = add_comment(conn, task_id, author or "operator", f"UNTRIAGE: {reason}") if reason else None
-        payload: dict[str, Any] = {
-            "prev_block_kind": prior["block_kind"], "prev_block_recurrences": prior["block_recurrences"],
-            "reason": reason,
-        }
-        if comment_id is not None:
-            payload["comment_id"] = comment_id
-        _append_event(conn, task_id, "untriaged", payload)
+        _append_event(conn, task_id, "untriaged", untriage_event_payload(prior, reason, comment_id))
     recompute_ready(conn)
     return True
 

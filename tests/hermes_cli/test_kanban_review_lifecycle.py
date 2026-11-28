@@ -993,7 +993,12 @@ def test_active_pr_guard_lifts_after_operator_unblock_task(
         assert _task_status(conn, repro_id) == "ready"
         assert kbd.check_respawn_guard(conn, repro_id) is None
 
-        # 2. Same-second operator comment citing the PR URL + unblock_task atomicity.
+        # 2. Same-second operator comment citing the PR URL + unblock_task atomicity
+        #    with frozen clock, plus deterministic same-second re-arm on a worker PR comment.
+        import time as _time_mod
+        frozen_now = float(int(_time_mod.time()))
+        monkeypatch.setattr(kb.time, "time", lambda: frozen_now)
+        monkeypatch.setattr(kbd.time, "time", lambda: frozen_now)
         same_sec_id = kb.create_task(conn, title="same second operator comment + unblock", assignee="kepler")
         c2 = kb.claim_task(conn, same_sec_id, claimer="kepler")
         assert c2 is not None
@@ -1006,6 +1011,25 @@ def test_active_pr_guard_lifts_after_operator_unblock_task(
         assert kb.unblock_task(conn, same_sec_id) is True
         assert _task_status(conn, same_sec_id) == "ready"
         assert kbd.check_respawn_guard(conn, same_sec_id) is None
+
+        # A new worker PR comment in the EXACT SAME frozen second immediately re-arms active_pr.
+        rearm_id = kb.create_task(conn, title="same second worker pr rearm", assignee="kepler")
+        c2b = kb.claim_task(conn, rearm_id, claimer="kepler")
+        assert c2b is not None
+        kb.add_comment(conn, rearm_id, author="kepler", body=pr_comment)
+        assert kb.block_task(
+            conn, rearm_id, kind="needs_input", reason="awaiting decision",
+            expected_run_id=c2b.current_run_id,
+        ) is True
+        assert kb.unblock_task(conn, rearm_id) is True
+        assert kbd.check_respawn_guard(conn, rearm_id) is None
+        assert kb.claim_task(conn, rearm_id, claimer="kepler") is not None
+        assert kb.reclaim_task(conn, rearm_id, reason="worker exited") is True
+        kb.add_comment(
+            conn, rearm_id, author="kepler",
+            body="Opened follow-up https://github.com/Hub-xyz/hub-hand-pose-3d/pull/334",
+        )
+        assert kbd.check_respawn_guard(conn, rearm_id) == "active_pr"
 
         # 3. CLI `hermes kanban unblock <id> --reason "... <PR URL>"` lifts active_pr
         #    and does not write an orphan comment when the card is not blocked.
@@ -1061,20 +1085,12 @@ def test_active_pr_guard_lifts_after_operator_unblock_task(
         assert _task_status(conn, dash_id) == "ready"
         assert kbd.check_respawn_guard(conn, dash_id) is None
 
-        # Dispatch claims and spawns all 5 explicitly unblocked PR cards.
+        # Dispatch claims and spawns all 5 explicitly unblocked PR cards, keeping rearm_id guarded.
         res = kbd.dispatch_once(conn, spawn_fn=spawn)
         expected_ids = {repro_id, same_sec_id, cli_id, tool_id, dash_id}
         assert expected_ids <= {s[0] for s in res.spawned}
         assert expected_ids <= set(claimed_ids)
-        assert not (expected_ids & set(dict(res.respawn_guarded)))
-
-        # 6. A new worker PR comment AFTER unblock re-arms active_pr (even in the same second).
-        assert kb.reclaim_task(conn, same_sec_id, reason="worker exited") is True
-        kb.add_comment(
-            conn, same_sec_id, author="kepler",
-            body="Opened follow-up https://github.com/Hub-xyz/hub-hand-pose-3d/pull/334",
-        )
-        assert kbd.check_respawn_guard(conn, same_sec_id) == "active_pr"
+        assert dict(res.respawn_guarded) == {rearm_id: "active_pr"}
 
 
 def test_active_pr_guard_holds_on_auto_scheduled_wake_and_legacy_ties(
@@ -1198,6 +1214,108 @@ def test_active_pr_guard_holds_on_auto_scheduled_wake_and_legacy_ties(
             conn.execute("UPDATE task_comments SET created_at = 'not-a-timestamp' WHERE task_id = ?", (corrupt_ts_id,))
         assert kbd.check_respawn_guard(conn, corrupt_ts_id) == "active_pr"
 
+        # 7. Malformed empty-string "" unblocked payload fails closed (only SQL NULL is legacy).
+        empty_str_id = kb.create_task(conn, title="empty string unblock payload", assignee="kepler")
+        c7 = kb.claim_task(conn, empty_str_id, claimer="kepler")
+        assert c7 is not None
+        kb.add_comment(conn, empty_str_id, author="kepler", body=pr_comment)
+        assert kb.block_task(
+            conn, empty_str_id, kind="needs_input", reason="wait",
+            expected_run_id=c7.current_run_id,
+        ) is True
+        _backdate_comments(conn, empty_str_id)
+        assert kb.unblock_task(conn, empty_str_id) is True
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload = '' WHERE task_id = ? AND kind = 'unblocked'",
+                (empty_str_id,),
+            )
+        assert kbd.check_respawn_guard(conn, empty_str_id) == "active_pr"
+
+        # 8. Unverified {"comment_id": worker_cid} on unblocked cannot hide a worker PR comment.
+        forged_cid_id = kb.create_task(conn, title="forged comment_id cannot hide worker pr", assignee="kepler")
+        c8 = kb.claim_task(conn, forged_cid_id, claimer="kepler")
+        assert c8 is not None
+        assert kb.block_task(
+            conn, forged_cid_id, kind="needs_input", reason="wait",
+            expected_run_id=c8.current_run_id,
+        ) is True
+        assert kb.unblock_task(conn, forged_cid_id) is True
+        worker_cid = kb.add_comment(conn, forged_cid_id, author="kepler", body=pr_comment)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE task_id = ? AND kind = 'unblocked'",
+                (json.dumps({"comment_id": worker_cid}), forged_cid_id),
+            )
+        assert kbd.check_respawn_guard(conn, forged_cid_id) == "active_pr"
+
+        # 9. Fresh schedule_task() + automatic wake is a barrier for a prior manual unblock.
+        sched_barrier_id = kb.create_task(conn, title="schedule barrier after manual unblock", assignee="kepler")
+        c9 = kb.claim_task(conn, sched_barrier_id, claimer="kepler")
+        assert c9 is not None
+        kb.add_comment(conn, sched_barrier_id, author="kepler", body=pr_comment)
+        _backdate_comments(conn, sched_barrier_id)
+        assert kb.block_task(
+            conn, sched_barrier_id, kind="needs_input", reason="decision",
+            expected_run_id=c9.current_run_id,
+        ) is True
+        assert kb.unblock_task(conn, sched_barrier_id) is True
+        c9b = kb.claim_task(conn, sched_barrier_id, claimer="kepler")
+        assert c9b is not None
+        assert kb.schedule_task(
+            conn, sched_barrier_id, reason="maintenance park", until=100,
+            expected_run_id=c9b.current_run_id,
+        ) is True
+        assert kb.release_due_scheduled(conn, now=200) == [sched_barrier_id]
+        assert _task_status(conn, sched_barrier_id) == "ready"
+        assert kbd.check_respawn_guard(conn, sched_barrier_id) == "active_pr"
+
+        # 10. Parked import (`imported` with `parked: true`) is a triage barrier for all prior lifts.
+        imported_id = kb.create_task(conn, title="parked import barrier", assignee="kepler")
+        c10 = kb.claim_task(conn, imported_id, claimer="kepler")
+        assert c10 is not None
+        kb.add_comment(conn, imported_id, author="kepler", body=pr_comment)
+        _backdate_comments(conn, imported_id)
+        assert kb.block_task(
+            conn, imported_id, kind="needs_input", reason="decision",
+            expected_run_id=c10.current_run_id,
+        ) is True
+        assert kb.unblock_task(conn, imported_id) is True
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (imported_id,))
+            kb._append_event(conn, imported_id, "imported", {"board": "imported", "parked": True})
+        assert kb.specify_triage_task(
+            conn, imported_id, body="auto refined", author="auto-decomposer", source="auto-decomposer",
+        ) is True
+        assert _task_status(conn, imported_id) == "ready"
+        assert kbd.check_respawn_guard(conn, imported_id) == "active_pr"
+
+        # 11. Clock step-back: higher worker comment_id vetoes after_comment_id even if event_ts > newest_pr_ts.
+        import time as _time_mod
+        base_now = float(int(_time_mod.time()))
+        stepback_id = kb.create_task(conn, title="clock stepback veto", assignee="kepler")
+        clock = {"now": base_now + 1.0}
+        monkeypatch.setattr(kb.time, "time", lambda: clock["now"])
+        monkeypatch.setattr(kbd.time, "time", lambda: clock["now"])
+        c11 = kb.claim_task(conn, stepback_id, claimer="kepler")
+        assert c11 is not None
+        kb.add_comment(conn, stepback_id, author="kepler", body=pr_comment)
+        assert kb.block_task(
+            conn, stepback_id, kind="needs_input", reason="wait",
+            expected_run_id=c11.current_run_id,
+        ) is True
+        assert kb.unblock_task(conn, stepback_id) is True
+        assert kbd.check_respawn_guard(conn, stepback_id) is None
+        # Clock steps back 1 second before the worker posts a new PR comment.
+        clock["now"] = base_now
+        assert kb.claim_task(conn, stepback_id, claimer="kepler") is not None
+        assert kb.reclaim_task(conn, stepback_id, reason="worker exited") is True
+        kb.add_comment(
+            conn, stepback_id, author="kepler",
+            body="Follow-up https://github.com/Hub-xyz/hub-hand-pose-3d/pull/335",
+        )
+        assert kbd.check_respawn_guard(conn, stepback_id) == "active_pr"
+
         res = kbd.dispatch_once(conn, spawn_fn=lambda task, _ws: spawned.append(task.id))
         assert set(spawned) == {manual_sched_id, legacy_after_id}
         assert dict(res.respawn_guarded) == {
@@ -1205,6 +1323,11 @@ def test_active_pr_guard_holds_on_auto_scheduled_wake_and_legacy_ties(
             legacy_tie_id: "active_pr",
             stale_unblock_id: "active_pr",
             corrupt_ts_id: "active_pr",
+            empty_str_id: "active_pr",
+            forged_cid_id: "active_pr",
+            sched_barrier_id: "active_pr",
+            imported_id: "active_pr",
+            stepback_id: "active_pr",
         }
 
 

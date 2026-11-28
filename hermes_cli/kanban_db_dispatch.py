@@ -1714,174 +1714,24 @@ def check_respawn_guard(
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff or explicit operator release/unblock AFTER the
-    #    newest PR comment (operator reassign, reviewer changes_requested,
-    #    review reopen, operator specify/untriage, explicit operator unblock)
-    #    means the profile named on the card must now work on THAT PR — not a
-    #    duplicate implementation (#111910). A crash, reclaim, ordinary
-    #    comment, background auto-decomposer pass, or automatic scheduled_until
-    #    wake is not a handoff, so the worker that opened the PR is still not
-    #    re-spawned against it.
-    pr_rows = [
-        (t, c["id"], _kb._to_epoch(c["created_at"]) is not None)
-        for t, c in _rows_since(
-            conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
-            cols=", id, body", unreadable=now,  # duplicate-PR risk: fail closed
-        )
-        if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")
-    ]
-    if pr_rows:
-        ignored_cids = _release_audit_comment_ids(conn, task_id)
-        active_pr_rows = [(t, cid, ts_valid) for t, cid, ts_valid in pr_rows if cid not in ignored_cids]
-        if active_pr_rows:
-            newest_pr_ts = max(t for t, _, _ in active_pr_rows)
-            latest_triage_id, latest_block_id = _latest_barrier_event_ids(conn, task_id)
-            for ets, e in _rows_since(
-                conn, "task_events", task_id, newest_pr_ts,
-                _ACTIVE_PR_LIFT_WHERE, cols=", id, kind, payload", strict=False,
-            ):
-                eid = int(e["id"])
-                kind = e["kind"]
-                if eid <= latest_triage_id:
-                    continue
-                if kind == "unblocked" and eid <= latest_block_id:
-                    continue
-                if not _is_handoff_event(kind, e["payload"], conn=conn, task_id=task_id, event_ts=ets):
-                    continue
-                # Strictly after lifts for any handoff/release; a same-second
-                # tie fails closed EXCEPT when an explicit unblock_task()
-                # recorded ``after_comment_id`` inside its write txn covering
-                # every PR comment in the window (operator comment + unblock
-                # in the same second).
-                if ets > newest_pr_ts or _unblock_covers_same_second_prs(kind, e["payload"], active_pr_rows):
-                    return None
-            return "active_pr"
+    #    Lifts only on an explicit handoff / operator release / operator unblock
+    #    after the newest PR comment (see hermes_cli.kanban_dispatch.active_pr).
+    if _is_active_pr_guarded(
+        conn, task_id, now=now, window=_RESPAWN_GUARD_PR_WINDOW,
+        url_re=_RESPAWN_GUARD_PR_URL_RE, rows_since=_rows_since,
+    ):
+        return "active_pr"
 
     return None
 
 
-_ACTIVE_PR_LIFT_EVENTS = ("assigned", "changes_requested", "review_reopened", "specified", "untriaged", "unblocked")
-_ACTIVE_PR_LIFT_WHERE = "AND kind IN (" + ", ".join(f"'{k}'" for k in _ACTIVE_PR_LIFT_EVENTS) + ")"
+from hermes_cli.kanban_dispatch.active_pr import (
+    ACTIVE_PR_LIFT_EVENTS as _ACTIVE_PR_LIFT_EVENTS,
+    is_active_pr_guarded as _is_active_pr_guarded,
+    is_handoff_event as _is_handoff_event,
+)
+
 _GUARD_TIME_COLS = {"task_runs": "ended_at", "task_events": "created_at", "task_comments": "created_at"}
-
-
-def _release_audit_comment_ids(conn: sqlite3.Connection, task_id: str) -> set[int]:
-    """Comment ids written by operator ``untriage_task`` / ``unblock_task`` itself.
-
-    An operator's ``UNTRIAGE:`` or ``UNBLOCK:`` reason may cite the existing PR
-    URL to tell the worker which PR to finish; excluding that comment id prevents
-    the operator's own audit comment from tying with the same-second release
-    event or falsely acting as a worker-opened PR. New events record
-    ``comment_id`` directly; legacy ``untriaged`` events written before
-    ``comment_id`` existed are matched once against the earliest identical
-    ``UNTRIAGE: <reason>`` comment at ``event_ts - 1 .. event_ts``.
-    """
-    ids: set[int] = set()
-    legacy_untriage_events: list[tuple[int, str]] = []
-    for row in conn.execute(
-        "SELECT kind, created_at, payload FROM task_events "
-        "WHERE task_id = ? AND kind IN ('untriaged', 'unblocked') ORDER BY id ASC",
-        (task_id,),
-    ):
-        kind = row["kind"]
-        if kind == "unblocked":
-            data = _kb._json_or(row["payload"], None)
-            if isinstance(data, dict) and not data.get("auto") and data.get("source") in (None, "operator"):
-                cid = data.get("comment_id")
-                if isinstance(cid, int) and not isinstance(cid, bool):
-                    ids.add(cid)
-            continue
-        data = _kb._json_dict(row["payload"])
-        cid = data.get("comment_id")
-        if isinstance(cid, int) and not isinstance(cid, bool):
-            ids.add(cid)
-            continue
-        reason = data.get("reason")
-        event_ts = _kb._to_epoch(row["created_at"])
-        if isinstance(reason, str) and reason and event_ts is not None:
-            legacy_untriage_events.append((event_ts, reason))
-
-    if legacy_untriage_events:
-        from hermes_cli.kanban_swarm import redact_blackboard_comment
-
-        comments = conn.execute(
-            "SELECT id, body, created_at FROM task_comments "
-            "WHERE task_id = ? ORDER BY id ASC",
-            (task_id,),
-        ).fetchall()
-        for event_ts, reason in legacy_untriage_events:
-            raw = f"UNTRIAGE: {reason}".strip()
-            redacted = redact_blackboard_comment(raw) or str(_kb.redact_review_value(raw)).strip()
-            expected = {raw, redacted}
-            for c in comments:
-                cid = c["id"]
-                if cid in ids:
-                    continue
-                cts = _kb._to_epoch(c["created_at"])
-                if cts is None or not (event_ts - 1 <= cts <= event_ts):
-                    continue
-                if (_kb._lossy_text(c["body"]) or "").strip() in expected:
-                    ids.add(cid)
-                    break
-    return ids
-
-
-def _latest_barrier_event_ids(conn: sqlite3.Connection, task_id: str) -> tuple[int, int]:
-    """Return ``(latest_triage_id, latest_block_id)`` from ``task_events``.
-
-    - ``latest_triage_id``: newest event routing the card into ``triage``
-      (``block_loop_detected`` or ``status`` -> ``triage``). No lift event from
-      before entering ``triage`` may authorize dispatch after triage.
-    - ``latest_block_id``: newest event parking the card as ``blocked`` or
-      ``triage`` (``blocked``, ``gave_up``, ``block_loop_detected``, or
-      ``status`` -> ``blocked``/``triage``). An ``unblocked`` event only lifts
-      ``active_pr`` for the block episode it resolved, never past a subsequent
-      block or triage.
-    """
-    latest_triage_id = 0
-    latest_block_id = 0
-    for row in conn.execute(
-        "SELECT id, kind, payload FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected', 'gave_up', 'status') "
-        "ORDER BY id DESC",
-        (task_id,),
-    ):
-        eid = int(row["id"])
-        kind = row["kind"]
-        if kind == "block_loop_detected":
-            latest_triage_id = max(latest_triage_id, eid)
-            latest_block_id = max(latest_block_id, eid)
-        elif kind in ("blocked", "gave_up"):
-            latest_block_id = max(latest_block_id, eid)
-        elif kind == "status":
-            to_status = _kb._json_dict(row["payload"]).get("status")
-            if to_status == "triage":
-                latest_triage_id = max(latest_triage_id, eid)
-                latest_block_id = max(latest_block_id, eid)
-            elif to_status == "blocked":
-                latest_block_id = max(latest_block_id, eid)
-        if latest_triage_id and latest_block_id:
-            break
-    return latest_triage_id, latest_block_id
-
-
-def _unblock_covers_same_second_prs(
-    kind: str,
-    payload: Optional[str],
-    pr_rows: list[tuple[int, int, bool]],
-) -> bool:
-    """Same-second tie-breaker for explicit ``unblock_task()``: lift only when
-    every PR comment in the window has a valid timestamp and ``id <= after_comment_id``
-    recorded inside ``unblock_task``'s write transaction."""
-    if kind != "unblocked":
-        return False
-    data = _kb._json_or(payload, None)
-    if not isinstance(data, dict):
-        return False
-    after_cid = data.get("after_comment_id")
-    if not isinstance(after_cid, int) or isinstance(after_cid, bool):
-        return False
-    return all(ts_valid and cid <= after_cid for _, cid, ts_valid in pr_rows)
 
 
 def _rows_since(conn: sqlite3.Connection, table: str, task_id: str, since: int, where: str = "", *,
@@ -1897,88 +1747,6 @@ def _rows_since(conn: sqlite3.Connection, table: str, task_id: str, since: int, 
         t = unreadable if t is None else t
         if t is not None and (t > since if strict else t >= since):
             yield t, row
-
-
-def _is_legacy_operator_specify(
-    conn: Optional[sqlite3.Connection],
-    task_id: Optional[str],
-    event_ts: Optional[int],
-    data: dict[str, Any],
-) -> bool:
-    """Distinguish a legacy ``specified`` event (no ``source`` key) using the
-    audit comment written inside the same ``specify_triage_task`` transaction.
-
-    - Matching audit comment with non-empty ``author != 'auto-decomposer'`` → True.
-    - Matching audit comment with ``author == 'auto-decomposer'`` → False.
-    - No matching audit comment (ambiguous legacy row) → False (fail closed).
-    """
-    if conn is None or not task_id or event_ts is None:
-        return False
-    changed = data.get("changed_fields")
-    if not isinstance(changed, list) or not changed or not all(isinstance(f, str) and f for f in changed):
-        return False
-    expected_body = "Specified — updated " + ", ".join(changed) + " and promoted to todo."
-    matched_authors: list[str] = []
-    for row in conn.execute(
-        "SELECT author, body, created_at FROM task_comments WHERE task_id = ?",
-        (task_id,),
-    ):
-        cts = _kb._to_epoch(row["created_at"])
-        if cts is None or not (event_ts - 1 <= cts <= event_ts):
-            continue
-        if _kb._lossy_text(row["body"]) == expected_body:
-            matched_authors.append((_kb._lossy_text(row["author"]) or "").strip())
-    return bool(matched_authors) and all(a and a != "auto-decomposer" for a in matched_authors)
-
-
-def _is_handoff_event(
-    kind: str,
-    payload: Optional[str],
-    *,
-    conn: Optional[sqlite3.Connection] = None,
-    task_id: Optional[str] = None,
-    event_ts: Optional[int] = None,
-) -> bool:
-    """Return True when ``kind`` is a deliberate handoff or explicit operator
-    release/unblock that should lift ``active_pr``.
-
-    - ``assigned``: only a move to a DIFFERENT non-null profile (never a no-op
-      dev→dev reassign, unassign, or ``kanban.default_assignee``). Events
-      without ``from`` (written before it was recorded) fail closed.
-    - ``specified``: lifts when ``source == 'operator'``; automatic
-      ``auto-decomposer`` sweeps fail closed. Legacy rows without ``source``
-      must be proven operator-authored by their matching audit comment;
-      ambiguous legacy rows fail closed.
-    - ``unblocked``: lifts for explicit operator/orchestrator unblocks;
-      automated wakes (``auto`` truthy, e.g. ``release_due_scheduled``),
-      non-operator ``source``, and malformed non-object payloads fail closed.
-    - ``changes_requested``, ``review_reopened``, ``untriaged``: always lift.
-    """
-    if kind == "specified":
-        data = _kb._json_or(payload, {})
-        if not isinstance(data, dict):
-            return False
-        if "source" in data:
-            return data.get("source") == "operator"
-        return _is_legacy_operator_specify(conn, task_id, event_ts, data)
-    if kind == "unblocked":
-        if payload is not None and payload != "":
-            data = _kb._json_or(payload, None)
-            if not isinstance(data, dict):
-                return False
-            if data.get("auto"):
-                return False
-            source = data.get("source")
-            if source is not None and source != "operator":
-                return False
-        return True
-    if kind != "assigned":
-        return True
-    data = _kb._json_or(payload, {})
-    if not isinstance(data, dict) or data.get("source") == "kanban.default_assignee":
-        return False
-    to = data.get("assignee")
-    return bool(to) and "from" in data and data["from"] != to
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
